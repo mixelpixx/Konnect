@@ -65,13 +65,19 @@ cargo build --release -p konnect
 
 ## Setup with Claude Desktop
 
+After a PCM install, the server binary lives in your KiCAD documents folder:
+
+```
+C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\bin\konnect.exe
+```
+
 Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "konnect": {
-      "command": "C:\\KiCad\\10.0\\share\\kicad\\scripting\\plugins\\konnect\\bin\\konnect.exe"
+      "command": "C:\\Users\\<YOU>\\Documents\\KiCad\\10.0\\3rdparty\\plugins\\com_github_mixelpixx_konnect\\bin\\konnect.exe"
     }
   }
 }

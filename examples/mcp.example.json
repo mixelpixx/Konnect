@@ -5,7 +5,7 @@
 
   "mcpServers": {
     "konnect": {
-      "command": "C:\\KiCad\\10.0\\share\\kicad\\scripting\\plugins\\konnect\\bin\\konnect.exe",
+      "command": "C:\\Users\\<YOU>\\Documents\\KiCad\\10.0\\3rdparty\\plugins\\com_github_mixelpixx_konnect\\bin\\konnect.exe",
       "args": [
         "--config",
         "C:\\Users\\<YOU>\\konnect-settings.json"
