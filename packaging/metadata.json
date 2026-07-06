@@ -18,10 +18,10 @@
       "status": "stable",
       "kicad_version": "10.0",
       "kicad_version_max": "10.99",
-      "download_sha256": "",
-      "download_size": 0,
+      "download_sha256": "d55b857f46bb6fa62e2f82cf84c31fab6216dbca14747a145011fdf112bbff4c",
+      "download_size": 7775482,
       "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.1.1/konnect-pcm-v0.1.1.zip",
-      "install_size": 0
+      "install_size": 21880825
     }
   ]
 }
