@@ -4,10 +4,58 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-Konnect is the next-generation successor to
-[KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server) (Python/TypeScript),
-rebuilt from scratch for production use: no runtime dependencies, no SWIG, built on
-KiCAD 10's official IPC API.
+**171 tools across 17 on-demand toolsets.** Schematic capture, PCB layout and
+routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
+circuits, and a full manufacturing export pipeline — with bundled skills and agents
+that teach Claude KiCAD conventions out of the box.
+
+> **Status: beta.** The core toolchain is tested and working, but this is a young
+> release and it wants real-world mileage and review. Issues and PRs are welcome —
+> see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Why Konnect exists
+
+Konnect is the successor to [KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server),
+a Python/TypeScript project that proved AI-driven PCB design works — and, in the
+process, showed exactly where that architecture runs out of road. Konnect was built
+to fix those specific problems:
+
+**The call path was too long.** In the original server, a single tool call travels
+through TypeScript, schema validation, a spawned Python subprocess, JSON over
+stdin/stdout, a command router, and finally SWIG-generated C++ proxy objects before
+anything touches your board. That's four language and serialization boundaries, each
+with its own failure modes — subprocess lifecycle management, stdout parsing that
+filters out warnings KiCAD leaks into the stream, chunked-JSON reassembly. In
+Konnect, a tool call is a function call. One process, one language, no plumbing.
+
+**The dependency surface was enormous.** Running the original means carrying Node.js
+and its npm tree, Python and its pip packages, wxPython, kicad-skip, and KiCAD's
+SWIG bindings — two package ecosystems plus a binding layer, every one of them a
+moving target that can break an install. Konnect is a single static binary, about
+5 MB. There is nothing to install alongside it and nothing to version-match.
+
+**SWIG is a dead end.** The original's PCB backend depends on KiCAD's SWIG Python
+bindings, which KiCAD is deprecating in favor of its IPC API. SWIG also carried
+real operational scars: a zone-fill call that can segfault the backend, proxy-object
+comparison bugs, and a fallback path that can silently swap backends mid-session.
+Konnect talks to KiCAD 10 through the official IPC API (protobuf over NNG) — the
+interface KiCAD is investing in — with real-time board edits that integrate with
+KiCAD's own undo/redo.
+
+**Schematic edits should not corrupt files.** Konnect edits `.kicad_sch` files
+through its own S-expression engine with atomic writes (write, fsync, rename), UUID
+preservation, and round-trip tests — no third-party schematic library with known
+gaps, no text-manipulation workarounds.
+
+**Context economy is a feature.** Exposing ~180 tools to an LLM costs roughly 23K
+tokens of context on every listing. Konnect's router loads a starter kit (~2K
+tokens) and lets the model pull in toolsets on demand — plus built-in observability
+(`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
+own tool failures.
+
+The result is smaller, faster to install, aligned with where KiCAD is going, and
+built for production use rather than experimentation. The original project remains
+open, maintained, and useful — see [the comparison below](#relationship-to-kicad-mcp-server).
 
 ## What it does
 
@@ -27,10 +75,7 @@ directly:
   templates with verified component values
 - **Watch it happen** — a live schematic viewer auto-refreshes as the AI edits
 
-**171 tools in 17 on-demand toolsets** (see [tool-directory.md](tool-directory.md)).
-The AI loads only the toolsets it needs, keeping its context small (~2K tokens
-baseline instead of ~23K). Bundled **skills and agents** teach Claude KiCAD
-conventions, wiring patterns, and design-review checklists out of the box.
+The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 
 ## How it works
 
@@ -39,7 +84,7 @@ conventions, wiring patterns, and design-review checklists out of the box.
 | Schematic editing | Direct `.kicad_sch` S-expression editing with atomic writes (no KiCAD required) |
 | PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time, undo-aware, requires KiCAD running |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
-| Transport | MCP JSON-RPC over stdio (default), HTTP + SSE (`transport = "http"` or `"both"`) |
+| Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
 
 ## Installation
 
@@ -94,12 +139,14 @@ A standalone viewer that auto-refreshes as the schematic file changes:
 schematic-viewer.exe path\to\your\schematic.kicad_sch
 ```
 
-Pan with click-drag, zoom with the wheel, `0` to fit, `R` to refresh. Also launchable
-by the AI via the `open_schematic_viewer` tool.
+Pan with click-drag, zoom with the wheel, `0` to fit, `R` to refresh, drag-and-drop
+to open a different file. Also launchable by the AI via the `open_schematic_viewer`
+tool.
 
 ## Requirements
 
-- KiCAD 10 (Windows today; Linux and macOS builds are on the [roadmap](ROADMAP.md))
+- KiCAD 10 (Windows today; Linux and macOS builds are on the [roadmap](ROADMAP.md) —
+  the code already compiles and passes tests on all three platforms in CI)
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For PCB tools: KiCAD running with the target board open (IPC API)
 
@@ -118,17 +165,18 @@ If that doesn't work for you, **commercial licenses are available**: see
 ## Relationship to KiCAD-MCP-Server
 
 The original [Python/TypeScript project](https://github.com/mixelpixx/KiCAD-MCP-Server)
-remains fully open (MIT-style) and maintained. Konnect is where new development
-happens — the architecture it proved, rebuilt for production. A rough comparison:
+remains fully open (MIT) and maintained. Konnect is where new development happens —
+the architecture it proved, rebuilt for production:
 
 | | KiCAD-MCP-Server | Konnect |
 |---|---|---|
-| Runtime | Node + Python + SWIG bindings | Single static binary |
+| Runtime | Node.js + Python + SWIG bindings | Single static binary (~5 MB) |
+| Tool call path | TS → subprocess → Python → SWIG C++ | Direct function call |
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
-| Schematic backend | kicad-skip + custom loaders | Native S-expression engine |
-| Tool discovery | Router meta-tools | Load/unload toolsets + observability |
+| Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
+| Context cost | Router pattern | Load/unload toolsets + observability |
 | Skills / agents | — | 6 skills + 2 agents bundled |
-| License | Open | AGPL-3.0 + commercial |
+| License | MIT | AGPL-3.0 + commercial |
 
 ## Troubleshooting
 
