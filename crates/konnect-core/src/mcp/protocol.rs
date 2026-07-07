@@ -9,13 +9,7 @@ use serde_json::Value;
 
 pub const PARSE_ERROR: i32 = -32700;
 pub const INVALID_REQUEST: i32 = -32600;
-pub const METHOD_NOT_FOUND: i32 = -32601;
-pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
-
-// MCP-specific error codes
-pub const TOOL_NOT_FOUND: i32 = -32000;
-pub const TOOL_EXECUTION_ERROR: i32 = -32001;
 
 // ─── JSON-RPC 2.0 Base Types ─────────────────────────────────────────────────
 
@@ -85,34 +79,6 @@ impl JsonRpcNotification {
 }
 
 // ─── MCP Initialize ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InitializeParams {
-    pub protocol_version: String,
-    pub capabilities: ClientCapabilities,
-    pub client_info: ClientInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ClientCapabilities {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub roots: Option<RootsCapability>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampling: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RootsCapability {
-    pub list_changed: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientInfo {
-    pub name: String,
-    pub version: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

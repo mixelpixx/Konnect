@@ -146,10 +146,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `toolset_not_loaded` | Tool exists but its toolset isn't loaded yet |
 | `unknown_tool` | Tool name doesn't exist in any toolset |
 | `invalid_argument` | Required argument missing/malformed |
-| `ipc_unavailable` | KiCAD PCB editor not running / IPC socket missing |
 | `file_not_found` | Referenced file doesn't exist |
-| `kicad_cli_error` | `kicad-cli` subprocess failed |
-| `not_implemented` | Handler hit an explicit NotImplemented path |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler

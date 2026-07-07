@@ -47,15 +47,8 @@ pub enum ToolErrorKind {
     UnknownTool { tool: String },
     /// A required argument is missing or malformed.
     InvalidArgument { field: String, reason: String },
-    /// KiCAD IPC is not reachable (PCB editor not open / socket missing).
-    IpcUnavailable { reason: String },
     /// A referenced file doesn't exist or can't be read.
     FileNotFound { path: String },
-    /// `kicad-cli` subprocess returned non-zero or failed to spawn.
-    KicadCliError { command: String, stderr: String },
-    /// Handler hit an explicitly "not implemented" path (e.g. a kicad-cli
-    /// command that was removed in KiCAD v10).
-    NotImplemented { tool: String, note: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -70,10 +63,7 @@ impl ToolErrorKind {
             Self::ToolsetNotLoaded { .. } => "toolset_not_loaded",
             Self::UnknownTool { .. } => "unknown_tool",
             Self::InvalidArgument { .. } => "invalid_argument",
-            Self::IpcUnavailable { .. } => "ipc_unavailable",
             Self::FileNotFound { .. } => "file_not_found",
-            Self::KicadCliError { .. } => "kicad_cli_error",
-            Self::NotImplemented { .. } => "not_implemented",
             Self::HandlerError { .. } => "handler_error",
         }
     }
@@ -169,16 +159,7 @@ mod tests {
                 field: "f".into(),
                 reason: "r".into(),
             },
-            ToolErrorKind::IpcUnavailable { reason: "r".into() },
             ToolErrorKind::FileNotFound { path: "p".into() },
-            ToolErrorKind::KicadCliError {
-                command: "c".into(),
-                stderr: "s".into(),
-            },
-            ToolErrorKind::NotImplemented {
-                tool: "t".into(),
-                note: "n".into(),
-            },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {
