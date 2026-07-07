@@ -10,8 +10,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/board/board.proto",
         "proto/board/board_commands.proto",
         "proto/board/board_types.proto",
-        "proto/schematic/schematic_commands.proto",
-        "proto/schematic/schematic_types.proto",
     ];
 
     // Include paths: our proto dir + protoc's well-known types

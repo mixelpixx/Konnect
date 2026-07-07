@@ -29,10 +29,4 @@ pub mod kiapi {
             include!(concat!(env!("OUT_DIR"), "/kiapi.board.commands.rs"));
         }
     }
-
-    pub mod schematic {
-        pub mod types {
-            include!(concat!(env!("OUT_DIR"), "/kiapi.schematic.types.rs"));
-        }
-    }
 }
