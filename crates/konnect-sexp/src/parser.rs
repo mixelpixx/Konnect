@@ -160,14 +160,6 @@ fn unescape(s: &str) -> String {
         .replace("\\\\", "\\")
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Read and parse a `.kicad_sch` or `.kicad_pcb` file.
-pub fn parse_file(path: &std::path::Path) -> Result<SexpNode, SexpError> {
-    let content = std::fs::read_to_string(path)?;
-    parse_sexp(&content)
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

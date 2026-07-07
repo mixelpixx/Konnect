@@ -333,11 +333,6 @@ pub fn format_junction(x: f64, y: f64) -> String {
     )
 }
 
-pub fn format_no_connect(x: f64, y: f64) -> String {
-    let uuid = crate::writer::new_uuid();
-    format!("\n  (no_connect (at {x} {y}) (uuid \"{uuid}\"))")
-}
-
 pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     let uuid = crate::writer::new_uuid();
     format!(
@@ -347,24 +342,6 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     (fields_autoplaced yes)
     (effects (font (size 1.27 1.27)) (justify left))
     (uuid "{uuid}")
-  )"#
-    )
-}
-
-pub fn format_global_label(net: &str, x: f64, y: f64, rotation: f64, shape: &str) -> String {
-    let uuid = crate::writer::new_uuid();
-    format!(
-        r#"
-  (global_label "{net}"
-    (shape {shape})
-    (at {x} {y} {rotation})
-    (fields_autoplaced yes)
-    (effects (font (size 1.27 1.27)) (justify right))
-    (uuid "{uuid}")
-    (property "Intersheetrefs" ""
-      (at {x} {y} {rotation})
-      (effects (font (size 1.27 1.27)) (justify right) (hide yes))
-    )
   )"#
     )
 }

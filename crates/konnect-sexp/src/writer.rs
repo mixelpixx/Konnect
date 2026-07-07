@@ -193,11 +193,6 @@ pub fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Format a UUID as a KiCAD S-expression atom: `(uuid "abc-123-def")`
-pub fn uuid_sexp(id: &str) -> String {
-    format!(r#"(uuid "{}")"#, id)
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -235,12 +230,5 @@ mod tests {
         let content = r#"(text "hello (world)") "#;
         let (s, e) = find_balanced_block(content, 0).unwrap();
         assert_eq!(&content[s..e], r#"(text "hello (world)")"#);
-    }
-
-    #[test]
-    fn uuid_format() {
-        let u = new_uuid();
-        assert!(u.contains('-'));
-        assert_eq!(uuid_sexp(&u), format!(r#"(uuid "{}")"#, u));
     }
 }

@@ -110,28 +110,6 @@ pub fn point_on_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64, to
     }
 }
 
-/// Return the orientation string KiCAD uses for a label given a rotation angle.
-/// Used when placing net labels.
-pub fn label_orientation_for_rotation(rotation_deg: f64) -> &'static str {
-    let angle = ((rotation_deg % 360.0) + 360.0) % 360.0;
-    match angle as u32 {
-        0 => "right",
-        90 => "up",
-        180 => "left",
-        270 => "down",
-        _ => "right",
-    }
-}
-
-/// Return the `justify` value KiCAD uses for a label given its orientation.
-pub fn label_justify_for_orientation(orientation: &str) -> &'static str {
-    match orientation {
-        "left" => "right",
-        "right" => "left",
-        _ => "left",
-    }
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
