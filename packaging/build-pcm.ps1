@@ -59,9 +59,12 @@ $metadata = Get-Content "$repoRoot/packaging/metadata.json" -Raw | ConvertFrom-J
 $metadata.versions[0].version = $Version
 $installSize = (Get-ChildItem $staging -Recurse -File | Measure-Object Length -Sum).Sum
 $metadata.versions[0].install_size = [long]$installSize
-$metadata.versions[0].download_sha256 = ""
-$metadata.versions[0].download_url = ""
-$metadata.versions[0].download_size = 0
+# KiCAD 10 PCM validates the *format* of these fields even for install-from-file.
+# Use schema-valid placeholders; the real values (from the printed output below)
+# get filled in when the kicad-addons repository entry is authored.
+$metadata.versions[0].download_sha256 = "0" * 64
+$metadata.versions[0].download_url = "https://example.invalid/placeholder.zip"
+$metadata.versions[0].download_size = 1
 $metadata | ConvertTo-Json -Depth 10 | Set-Content "$staging/metadata.json"
 
 # Zip it
