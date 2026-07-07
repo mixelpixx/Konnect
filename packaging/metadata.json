@@ -6,7 +6,10 @@
   "identifier": "com.github.mixelpixx.konnect",
   "type": "plugin",
   "author": {
-    "name": "mixelpixx"
+    "name": "mixelpixx",
+    "contact": {
+      "web": "https://github.com/mixelpixx"
+    }
   },
   "license": "AGPL-3.0-only",
   "resources": {
