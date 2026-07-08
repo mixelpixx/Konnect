@@ -783,6 +783,7 @@ dependencies = [
  "konnect-ipc",
  "konnect-schematic-editor",
  "konnect-sexp",
+ "prost-types",
  "reqwest",
  "rusqlite",
  "serde",

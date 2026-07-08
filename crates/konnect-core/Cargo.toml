@@ -10,6 +10,7 @@ konnect-sexp.workspace = true
 konnect-ipc.workspace = true
 konnect-schematic-editor.workspace = true
 
+prost-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

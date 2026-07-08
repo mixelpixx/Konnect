@@ -304,6 +304,18 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Update existing items by KIID. Generic wrapper mirroring create_items/delete_items;
+    /// each `Any` must be a fully-formed board item with an existing `id` populated.
+    pub fn update_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        let header = self.make_header()?;
+        let cmd = kiapi::common::commands::UpdateItems {
+            header: Some(header),
+            items,
+        };
+        self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
+        Ok(())
+    }
+
     /// Delete items by KIID.
     pub fn delete_items(&self, ids: Vec<String>) -> Result<()> {
         let header = self.make_header()?;
@@ -705,67 +717,6 @@ impl KiCadIpcClient {
         } else {
             Ok(vec![])
         }
-    }
-
-    /// Set board outline (rectangle on Edge.Cuts) via S-expression string.
-    pub fn set_board_outline(
-        &self,
-        _shape: &str,
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-    ) -> Result<()> {
-        let x2 = x + width;
-        let y2 = y + height;
-        // 4 line segments forming a rectangle on Edge.Cuts
-        let sexp = format!(
-            r#"(gr_line (start {} {}) (end {} {}) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
-(gr_line (start {} {}) (end {} {}) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
-(gr_line (start {} {}) (end {} {}) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))
-(gr_line (start {} {}) (end {} {}) (stroke (width 0.05) (type default)) (layer "Edge.Cuts"))"#,
-            x,
-            y,
-            x2,
-            y, // top
-            x2,
-            y,
-            x2,
-            y2, // right
-            x2,
-            y2,
-            x,
-            y2, // bottom
-            x,
-            y2,
-            x,
-            y, // left
-        );
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
-        };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
-        Ok(())
-    }
-
-    /// Add text to the board via S-expression string.
-    pub fn add_text(&self, layer: &str, text: &str, x: f64, y: f64) -> Result<()> {
-        let sexp = format!(
-            r#"(gr_text "{}" (at {} {}) (layer "{}") (effects (font (size 1.5 1.5) (thickness 0.15))))"#,
-            text.replace('"', "\\\""),
-            x,
-            y,
-            layer
-        );
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
-        };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
-        Ok(())
     }
 
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).

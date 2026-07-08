@@ -7,11 +7,31 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use konnect_ipc::builders;
 use konnect_sexp::{
     parser::parse_sexp,
     writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
 };
 use serde_json::json;
+
+// Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
+fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_types::Any> {
+    let sides = [
+        (x1, y1, x2, y1),
+        (x2, y1, x2, y2),
+        (x2, y2, x1, y2),
+        (x1, y2, x1, y1),
+    ];
+    sides
+        .iter()
+        .map(|&(a, b, c, d)| {
+            builders::pack_any(
+                &builders::board_segment("Edge.Cuts", w, a, b, c, d),
+                "kiapi.board.types.BoardGraphicShape",
+            )
+        })
+        .collect()
+}
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
@@ -266,7 +286,7 @@ pub fn tools() -> Vec<ToolDef> {
 
 async fn handle_set_board_size(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let width = match require_f64(args, "width") {
@@ -284,6 +304,23 @@ async fn handle_set_board_size(
     let y2 = oy + height;
     let w = 0.05_f64;
 
+    // Try IPC first (live board in KiCAD, undo-aware); fall through to file edit.
+    // ponytail: 4 segments over a single BoardRectangle keeps one builder path;
+    // switch to board_rectangle if a native rect proves less flaky.
+    let items = rect_outline_items(ox, oy, x2, y2, w);
+    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        c.create_items(items)
+    })
+    .await?
+    .is_ok()
+    {
+        return Ok(CallToolResult::json(&json!({
+            "width": width, "height": height,
+            "x1": ox, "y1": oy, "x2": x2, "y2": y2,
+            "source": "ipc"
+        })));
+    }
+
     // Append 4 Edge.Cuts lines (top, right, bottom, left)
     let lines = format!(
         "{}{}{}{}",
@@ -300,7 +337,8 @@ async fn handle_set_board_size(
 
     Ok(CallToolResult::json(&json!({
         "width": width, "height": height,
-        "x1": ox, "y1": oy, "x2": x2, "y2": y2
+        "x1": ox, "y1": oy, "x2": x2, "y2": y2,
+        "source": "file"
     })))
 }
 
@@ -550,7 +588,7 @@ async fn handle_set_active_layer(
 
 async fn handle_add_board_outline(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let x1 = match require_f64(args, "x1") {
@@ -571,6 +609,21 @@ async fn handle_add_board_outline(
     };
     let w = 0.05_f64;
 
+    // Try IPC first; fall through to file edit if KiCAD is not reachable.
+    let items = rect_outline_items(x1, y1, x2, y2, w);
+    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        c.create_items(items)
+    })
+    .await?
+    .is_ok()
+    {
+        return Ok(CallToolResult::json(&json!({
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+            "source": "ipc"
+        })));
+    }
+
     let lines = format!(
         "{}{}{}{}",
         format_gr_line(x1, y1, x2, y1, "Edge.Cuts", w),
@@ -586,7 +639,8 @@ async fn handle_add_board_outline(
 
     Ok(CallToolResult::json(&json!({
         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-        "width": (x2-x1).abs(), "height": (y2-y1).abs()
+        "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+        "source": "file"
     })))
 }
 
@@ -619,7 +673,7 @@ async fn handle_add_mounting_hole(
 
 async fn handle_add_board_text(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let text = match require_str(args, "text") {
@@ -634,18 +688,36 @@ async fn handle_add_board_text(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let layer = args["layer"].as_str().unwrap_or("F.SilkS");
+    let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
     let size = args["size"].as_f64().unwrap_or(1.0);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
 
-    let gr_text = format_gr_text(&text, x, y, rotation, layer, size);
+    // Try IPC first; fall through to file edit if KiCAD isn't reachable.
+    let text_ipc = text.clone();
+    let layer_ipc = layer.clone();
+    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
+        let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
+        c.create_items(vec![any])
+    })
+    .await?
+    .is_ok()
+    {
+        return Ok(CallToolResult::json(&json!({
+            "text": text, "x": x, "y": y, "layer": layer, "size": size,
+            "source": "ipc"
+        })));
+    }
+
+    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, gr_text)]);
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
-        "text": text, "x": x, "y": y, "layer": layer, "size": size
+        "text": text, "x": x, "y": y, "layer": layer, "size": size,
+        "source": "file"
     })))
 }
 
