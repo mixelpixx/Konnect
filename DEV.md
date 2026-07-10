@@ -32,7 +32,7 @@ Konnect/
 │   │           ├── stdio.rs         # Line-by-line JSON-RPC over stdin/stdout (default)
 │   │           └── http.rs          # Streamable HTTP: POST + GET (SSE) on /mcp (transport = "http" / "both")
 │   │
-│   ├── konnect-core/          # All tool logic (17 toolsets)
+│   ├── konnect-core/          # All tool logic (18 toolsets)
 │   │   └── src/
 │   │       ├── mcp/
 │   │       │   ├── protocol.rs      # MCP JSON-RPC 2.0 types
@@ -51,6 +51,7 @@ Konnect/
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 10 tools (single-read/single-write atomic operations)
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC)
+│   │           ├── sch_hierarchy.rs  # 7 tools (typed Sheet model, add/edit/move/delete/duplicate + hierarchy/page queries)
 │   │           ├── pcb_board.rs      # 10 tools (S-expr file editing, IPC fallback)
 │   │           ├── pcb_components.rs # 13 tools (IPC real-time via NNG+protobuf)
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
@@ -221,9 +222,9 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 
 ## Current Stats
 
-- **17 toolsets, 175 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **18 toolsets, 182 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): ~181 tools / ~23K tokens
+- Full-catalog `tools/list` (all loaded): ~188 tools / ~24K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)

@@ -1,5 +1,6 @@
 pub mod label;
 pub mod misc;
+pub mod sheet;
 pub mod symbol;
 pub mod wire;
 
@@ -14,6 +15,7 @@ use label::{
     LabelCollection,
 };
 use misc::{Junction, NoConnect, Text};
+use sheet::{Sheet, SheetCollection};
 use symbol::{Symbol, SymbolCollection};
 use wire::{Wire, WireCollection};
 
@@ -80,8 +82,9 @@ pub struct Schematic {
     pub junctions: Vec<Junction>,
     pub texts: Vec<Text>,
     pub no_connects: Vec<NoConnect>,
+    pub sheets: SheetCollection,
 
-    /// All nodes we don't model (title_block, lib_symbols, bus, sheet, …)
+    /// All nodes we don't model (title_block, lib_symbols, bus, sheet_instances, …)
     /// preserved verbatim so round-trips don't lose anything.
     pub raw_other: Vec<SexpNode>,
 }
@@ -165,6 +168,13 @@ impl Schematic {
     /// Add a pre-built Symbol to the schematic.
     pub fn add_symbol(&mut self, symbol: Symbol) {
         self.symbols.push(symbol);
+    }
+
+    /// Add a pre-built Sheet to the schematic. Returns a mutable reference to it.
+    pub fn add_sheet(&mut self, sheet: Sheet) -> &mut Sheet {
+        self.sheets.push(sheet);
+        let last = self.sheets.as_slice().len() - 1;
+        self.sheets.get_mut(last).expect("just pushed")
     }
 
     // ---- diff / change summary ----------------------------------------------
@@ -340,6 +350,7 @@ impl Schematic {
         let mut junctions: Vec<Junction> = vec![];
         let mut texts: Vec<Text> = vec![];
         let mut no_connects: Vec<NoConnect> = vec![];
+        let mut sheets: Vec<Sheet> = vec![];
         let mut raw_other: Vec<SexpNode> = vec![];
 
         for child in root.args() {
@@ -393,6 +404,10 @@ impl Schematic {
                     Ok(nc) => no_connects.push(nc),
                     Err(e) => eprintln!("[konnect-schematic-editor] skipping no_connect: {e}"),
                 },
+                Some("sheet") => match Sheet::from_sexp(child) {
+                    Ok(s) => sheets.push(s),
+                    Err(e) => eprintln!("[konnect-schematic-editor] skipping sheet: {e}"),
+                },
                 _ => {
                     raw_other.push(child.clone());
                 }
@@ -414,6 +429,7 @@ impl Schematic {
             junctions,
             texts,
             no_connects,
+            sheets: SheetCollection::new(sheets),
             raw_other,
         })
     }
@@ -451,7 +467,7 @@ impl Schematic {
         }
 
         // Typed elements in KiCAD 10 required order:
-        // junctions → no_connects → wires → texts → labels → symbols (LAST)
+        // junctions → no_connects → wires → texts → labels → sheets → symbols (LAST)
         for j in &self.junctions {
             c.push(j.to_sexp());
         }
@@ -472,6 +488,9 @@ impl Schematic {
         }
         for h in self.hierarchical_labels.iter() {
             c.push(h.to_sexp());
+        }
+        for s in self.sheets.iter() {
+            c.push(s.to_sexp());
         }
         for s in self.symbols.iter() {
             c.push(s.to_sexp());

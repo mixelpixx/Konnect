@@ -169,6 +169,90 @@ impl Symbol {
         self.set_property("Datasheet", v);
     }
 
+    // ---- instance paths -------------------------------------------------------
+
+    /// Ensure this symbol carries an `(instances (project "name" (path "path"
+    /// (reference "ref") (unit N))))` entry. Updates the entry if one already
+    /// exists for this project+path, otherwise appends it (creating the
+    /// `project`/`instances` wrapper nodes as needed).
+    ///
+    /// Needed when a sheet is linked to a sub-sheet file that already has
+    /// symbols in it (a reused file, or one authored before being linked) —
+    /// without this, ERC can't resolve those symbols' hierarchical references.
+    pub fn set_instance_path(
+        &mut self,
+        project_name: &str,
+        path: &str,
+        reference: &str,
+        unit: u32,
+    ) {
+        if self
+            .raw_sub_nodes
+            .iter()
+            .position(|n| n.tag() == Some("instances"))
+            .is_none()
+        {
+            self.raw_sub_nodes
+                .push(SexpNode::List(vec![atom("instances")]));
+        }
+        let instances_idx = self
+            .raw_sub_nodes
+            .iter()
+            .position(|n| n.tag() == Some("instances"))
+            .expect("just ensured present");
+
+        let SexpNode::List(instances_children) = &mut self.raw_sub_nodes[instances_idx] else {
+            return;
+        };
+
+        let project_idx = instances_children
+            .iter()
+            .position(|c| c.tag() == Some("project") && c.value() == Some(project_name));
+        if project_idx.is_none() {
+            instances_children.push(SexpNode::List(vec![
+                atom("project"),
+                qstr(project_name.to_owned()),
+            ]));
+        }
+        let project_idx = instances_children
+            .iter()
+            .position(|c| c.tag() == Some("project") && c.value() == Some(project_name))
+            .expect("just ensured present");
+
+        let SexpNode::List(project_children) = &mut instances_children[project_idx] else {
+            return;
+        };
+
+        let new_path_node = SexpNode::List(vec![
+            atom("path"),
+            qstr(path.to_owned()),
+            tagged("reference", vec![qstr(reference.to_owned())]),
+            tagged("unit", vec![atom(unit.to_string())]),
+        ]);
+        match project_children
+            .iter()
+            .position(|c| c.tag() == Some("path") && c.value() == Some(path))
+        {
+            Some(idx) => project_children[idx] = new_path_node,
+            None => project_children.push(new_path_node),
+        }
+    }
+
+    /// Whether this symbol already has an instance entry for the given
+    /// project name and hierarchical path.
+    pub fn has_instance_path(&self, project_name: &str, path: &str) -> bool {
+        self.raw_sub_nodes
+            .iter()
+            .find(|n| n.tag() == Some("instances"))
+            .map(|inst| {
+                inst.find_all("project").iter().any(|p| {
+                    p.value() == Some(project_name)
+                        && p.find_all("path").iter().any(|pp| pp.value() == Some(path))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     // ---- position -----------------------------------------------------------
 
     pub fn position(&self) -> (f64, f64) {

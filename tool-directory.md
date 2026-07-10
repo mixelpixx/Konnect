@@ -9,8 +9,8 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 
 ## Overview
 
-- **17 toolsets** organized into 10 categories
-- **175 registered tools** + **6 always-visible meta-tools** = **181 total**
+- **18 toolsets** organized into 10 categories
+- **182 registered tools** + **6 always-visible meta-tools** = **188 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -156,6 +156,22 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
+
+### `sch_hierarchy` · 7 tools
+**Purpose:** Hierarchical sheets: add, edit, move, delete, duplicate a sheet, plus recursive hierarchy and page-numbering queries.
+**Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
+
+Sheet lifecycle only (PR-A); pin lifecycle (`import_sheet_pins`, `add_sheet_pin`, `edit_sheet_pin`, `delete_sheet_pin`) lands in a follow-up.
+
+| Tool | Description |
+|------|-------------|
+| `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Patches existing symbols' instance paths if the linked file already has components. |
+| `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. |
+| `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |
+| `delete_sheet` | Remove a sheet reference from the parent schematic. Does not delete the child file. |
+| `duplicate_sheet` | Copy an existing sheet and its child file under a new name/file, offset from the source, with an independent internal UUID. |
+| `get_sheet_hierarchy` | Recursively walk the sheet tree, returning nested JSON with each sheet's name/file/uuid/position/size/page/pins and its own children. |
+| `renumber_sheet_pages` | Walk the whole sheet tree and reassign sequential page numbers in depth-first order, fixing gaps left by delete/duplicate. |
 
 ---
 

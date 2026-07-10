@@ -10,6 +10,7 @@ pub use schematic::label::{
     LabelCollection,
 };
 pub use schematic::misc::{Junction, NoConnect, Text};
+pub use schematic::sheet::{Sheet, SheetCollection, SheetInstance, SheetPin};
 pub use schematic::symbol::{Symbol, SymbolCollection};
 pub use schematic::wire::{Wire, WireCollection};
 pub use schematic::{LocatedElement, Schematic};

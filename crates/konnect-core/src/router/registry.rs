@@ -55,6 +55,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 6,
     },
     ToolsetMeta {
+        name: "sch_hierarchy",
+        description: "Hierarchical sheets: add, edit, move, delete, duplicate a sheet, plus recursive hierarchy and page-numbering queries",
+        category: "schematic",
+        tool_count: 7,
+    },
+    ToolsetMeta {
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text",
         category: "pcb",
@@ -132,6 +138,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_analysis" => Some(sch_analysis::tools()),
         "sch_batch" => Some(sch_batch::tools()),
         "sch_export" => Some(sch_export::tools()),
+        "sch_hierarchy" => Some(sch_hierarchy::tools()),
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
