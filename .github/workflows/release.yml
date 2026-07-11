@@ -101,6 +101,13 @@ jobs:
             -ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe `
             -OutDir dist
 
+      - name: Validate PCM package against KiCAD schema (release gate)
+        shell: pwsh
+        run: |
+          pip install jsonschema
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          python packaging/validate-pcm.py --zip "dist/konnect-pcm-v$version.zip"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

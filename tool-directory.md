@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **182 registered tools** + **6 always-visible meta-tools** = **188 total**
+- **179 registered tools** + **6 always-visible meta-tools** = **185 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -22,7 +22,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 17 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 18 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |

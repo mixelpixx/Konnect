@@ -61,19 +61,17 @@ $pluginManifest | ConvertTo-Json -Depth 10 | Set-Content "$staging/plugins/plugi
 Copy-Item "$repoRoot/packaging/resources/icon.png" "$staging/resources/icon.png"
 Copy-Item "$repoRoot/packaging/resources/icon.png" "$staging/plugins/resources/icon.png"
 
-# Metadata with the version stamped in. download_* fields stay blank inside
-# the zip (PCM ignores them for install-from-file); the values printed below
-# go into the kicad-addons repository submission.
+# Metadata with the version stamped in. The schema only *requires* version/
+# status/kicad_version; download_* fields are OMITTED inside the zip — an
+# empty string violates the sha256 pattern and placeholder values are lies.
+# The real values (printed below) go into the kicad-addons repo submission.
 $metadata = Get-Content "$repoRoot/packaging/metadata.json" -Raw | ConvertFrom-Json
 $metadata.versions[0].version = $Version
 $installSize = (Get-ChildItem $staging -Recurse -File | Measure-Object Length -Sum).Sum
-$metadata.versions[0].install_size = [long]$installSize
-# KiCAD 10 PCM validates the *format* of these fields even for install-from-file.
-# Use schema-valid placeholders; the real values (from the printed output below)
-# get filled in when the kicad-addons repository entry is authored.
-$metadata.versions[0].download_sha256 = "0" * 64
-$metadata.versions[0].download_url = "https://example.invalid/placeholder.zip"
-$metadata.versions[0].download_size = 1
+$metadata.versions[0] | Add-Member -NotePropertyName install_size -NotePropertyValue ([long]$installSize) -Force
+foreach ($field in @("download_sha256", "download_url", "download_size")) {
+    $metadata.versions[0].PSObject.Properties.Remove($field)
+}
 $metadata | ConvertTo-Json -Depth 10 | Set-Content "$staging/metadata.json"
 
 # Zip it

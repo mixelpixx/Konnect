@@ -51,3 +51,22 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  packaging:
+    name: PCM packaging validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install jsonschema
+      - name: Validate repository metadata
+        run: python packaging/validate-pcm.py --metadata packaging/metadata.json
+      - name: Assemble PCM zip with a stub binary and validate structure
+        shell: pwsh
+        run: |
+          New-Item -ItemType File -Path stub-konnect.exe | Out-Null
+          Set-Content stub-konnect.exe "stub"
+          ./packaging/build-pcm.ps1 -Version 0.0.0-ci -BinaryPath stub-konnect.exe -OutDir dist
+          python packaging/validate-pcm.py --zip dist/konnect-pcm-v0.0.0-ci.zip

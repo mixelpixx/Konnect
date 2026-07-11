@@ -1,8 +1,8 @@
 {
-  "$schema": "https://raw.githubusercontent.com/KiCad/kicad-addons/main/schemas/packages.v1.schema.json",
+  "$schema": "https://go.kicad.org/pcm/schemas/v1",
   "name": "Konnect",
-  "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 171 tools organized into on-demand toolsets.",
-  "description_full": "Konnect exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, routing, library management, JLCPCB part search, Freerouting autoroute, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 17 toolsets loaded on demand so the AI only sees relevant tools at once.",
+  "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 179 tools organized into on-demand toolsets.",
+  "description_full": "Konnect exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, routing, library management, JLCPCB part search, Freerouting autoroute, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 18 toolsets loaded on demand so the AI only sees relevant tools at once.",
   "identifier": "com.github.mixelpixx.konnect",
   "type": "plugin",
   "author": {
@@ -11,7 +11,7 @@
       "web": "https://github.com/mixelpixx"
     }
   },
-  "license": "AGPL-3.0-only",
+  "license": "open-source",
   "resources": {
     "homepage": "https://github.com/mixelpixx/Konnect"
   },
@@ -20,11 +20,7 @@
       "version": "0.1.2",
       "status": "stable",
       "kicad_version": "10.0",
-      "kicad_version_max": "10.99",
-      "download_sha256": "",
-      "download_size": 0,
-      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.1.2/konnect-pcm-v0.1.2.zip",
-      "install_size": 0
+      "kicad_version_max": "10.99"
     }
   ]
 }
