@@ -57,6 +57,8 @@ jobs:
           & $cli --version
 
       - name: E2E design loop (create → wire → ERC → Gerber → DRC)
+        env:
+          KONNECT_E2E_KEEP_DIR: ${{ github.workspace }}/e2e-artifacts
         run: cargo test -p konnect --test e2e_kicad -- --ignored --nocapture
 
       - name: Demo-corpus conformance (115+ eeschema-authored schematics)
@@ -80,4 +82,5 @@ jobs:
           name: e2e-failure-artifacts
           path: |
             dist/
+            e2e-artifacts/
           if-no-files-found: ignore

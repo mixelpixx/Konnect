@@ -144,8 +144,17 @@ fn full_design_loop_with_real_kicad() {
     let Some(kicad_cli) = find_kicad_cli() else {
         panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
     };
+    // KONNECT_E2E_KEEP_DIR: persist the generated project there (CI uploads
+    // it as a failure artifact so file-format rejections can be diagnosed).
     let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("e2e");
+    let base: std::path::PathBuf = match std::env::var("KONNECT_E2E_KEEP_DIR") {
+        Ok(d) => {
+            std::fs::create_dir_all(&d).unwrap();
+            d.into()
+        }
+        Err(_) => tmp.path().to_path_buf(),
+    };
+    let proj = base.join("e2e");
     let proj_s = proj.to_string_lossy().to_string();
     let sch = proj.join("e2e.kicad_sch");
     let pcb = proj.join("e2e.kicad_pcb");
