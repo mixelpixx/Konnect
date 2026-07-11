@@ -23,7 +23,7 @@ If the AGPL doesn't work for your organization, a commercial license is availabl
 It removes the copyleft obligations: use Konnect in proprietary products, internal
 tools, and hosted services without releasing your source.
 
-Contact: **nate.slidebyone.summers@gmail.com** — include a sentence or two about how you
+Contact: **nate.slidebyone.summers@gmail.com** or **chris_stockslager@comcast.net** — include a sentence or two about how you
 plan to use Konnect and the size of your team, and I'll get back to you with terms.
 
 ## Contributions
