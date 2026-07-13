@@ -1,6 +1,13 @@
 # Hosted HTTP MCP server -- for a coworker or IT to run centrally.
 #   docker compose up -d
-# Point an MCP client at http://<host>:3000/mcp
+# Point an MCP client at http://127.0.0.1:3000/mcp
+#
+# SECURITY: the MCP server has no authentication, and its tools edit files and
+# run kicad-cli subprocesses. The port is published to host loopback only
+# (127.0.0.1) so it is not reachable from the network by default. To expose it
+# beyond this host, put it behind an authenticating reverse proxy on a trusted
+# network -- do NOT just change this to "3000:3000", which opens the unguarded
+# tool surface to the whole LAN.
 #
 # For the stdio use case (like markitdown) you don't need compose; just run:
 #   docker run --rm -i -v /path/to/project:/work konnect
@@ -11,7 +18,8 @@ services:
     image: konnect
     command: ["--config", "/etc/konnect/konnect.toml"]
     ports:
-      - "3000:3000"
+      # Host loopback only. See the SECURITY note above before widening.
+      - "127.0.0.1:3000:3000"
     volumes:
       # Mount KiCAD projects so the schematic-edit tools can reach them.
       - ./projects:/work

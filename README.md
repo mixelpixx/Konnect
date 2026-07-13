@@ -141,11 +141,16 @@ KiCAD project you want to work on at `/work`:
 ```
 
 **As a hosted HTTP server** (one long-running instance, many clients). Point MCP
-clients at `http://<host>:3000/mcp`:
+clients at `http://127.0.0.1:3000/mcp`:
 
 ```bash
-docker compose up -d      # uses docker/konnect.toml (HTTP, binds 0.0.0.0:3000)
+docker compose up -d      # HTTP, published to host loopback (127.0.0.1:3000)
 ```
+
+The server has no authentication and its tools edit files and run `kicad-cli`,
+so compose publishes the port to loopback only. To reach it from other machines,
+front it with an authenticating reverse proxy on a trusted network -- do not just
+publish `0.0.0.0`.
 
 The schematic-edit tools work on file paths, so mount your projects (compose maps
 `./projects`). PCB/IPC and `kicad-cli` export tools need a running KiCAD, which is
