@@ -567,7 +567,20 @@ impl KiCadIpcClient {
                     .map(|t| t.text.as_str())
                     .unwrap_or("");
                 if ref_text == reference {
-                    fp.position = Some(crate::builders::vec2(x, y));
+                    let old = fp.position.unwrap_or_default();
+                    let new_pos = crate::builders::vec2(x, y);
+                    fp.position = Some(new_pos);
+                    // KiCAD carries the footprint's children (pads, silk,
+                    // text) in absolute board coordinates and re-creates them
+                    // verbatim on update, so they must be shifted along with
+                    // the anchor (issue #23).
+                    crate::transform::transform_footprint_children(
+                        &mut fp,
+                        &crate::transform::Xform::Translate {
+                            dx_nm: new_pos.x_nm - old.x_nm,
+                            dy_nm: new_pos.y_nm - old.y_nm,
+                        },
+                    )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
 
                     let header = self.make_header()?;
@@ -598,9 +611,26 @@ impl KiCadIpcClient {
                     .map(|t| t.text.as_str())
                     .unwrap_or("");
                 if ref_text == reference {
+                    let old_deg = fp
+                        .orientation
+                        .as_ref()
+                        .map(|a| a.value_degrees)
+                        .unwrap_or(0.0);
                     fp.orientation = Some(kiapi::common::types::Angle {
                         value_degrees: angle,
                     });
+                    // Children are carried in absolute board coordinates and
+                    // angles; rotate them around the anchor like KiCAD's
+                    // FOOTPRINT::SetOrientation does natively (issue #23).
+                    let anchor = fp.position.unwrap_or_default();
+                    crate::transform::transform_footprint_children(
+                        &mut fp,
+                        &crate::transform::Xform::Rotate {
+                            cx_nm: anchor.x_nm,
+                            cy_nm: anchor.y_nm,
+                            delta_deg: angle - old_deg,
+                        },
+                    )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
                     let header = self.make_header()?;
                     let cmd = kiapi::common::commands::UpdateItems {
