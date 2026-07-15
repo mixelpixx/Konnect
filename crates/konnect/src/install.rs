@@ -11,7 +11,7 @@
 use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -397,21 +397,45 @@ fn remove_hooks_from_settings() -> Result<()> {
     Ok(())
 }
 
-/// Auto-detect KiCAD installation on Windows.
-/// Checks registry and standard paths for kicad-cli.exe.
+/// Auto-detect a KiCAD installation.
+/// Checks standard per-platform paths for kicad-cli (plus the registry on Windows).
 pub fn detect_kicad() -> Option<PathBuf> {
     // Standard paths (check these first — faster than registry)
-    let standard_paths = [
+    #[cfg(target_os = "windows")]
+    let standard_paths: Vec<PathBuf> = [
         r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
         r"C:\Program Files (x86)\KiCad\10.0\bin\kicad-cli.exe",
         r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
         r"C:\Program Files (x86)\KiCad\9.0\bin\kicad-cli.exe",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+
+    #[cfg(target_os = "macos")]
+    let standard_paths: Vec<PathBuf> = {
+        let mut paths = vec![
+            PathBuf::from("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
+            PathBuf::from("/usr/local/bin/kicad-cli"),
+        ];
+        if let Ok(home) = std::env::var("HOME") {
+            // Per-user install (KiCad.app dragged into ~/Applications)
+            paths.push(
+                PathBuf::from(home).join("Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
+            );
+        }
+        paths
+    };
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let standard_paths: Vec<PathBuf> = vec![
+        PathBuf::from("/usr/bin/kicad-cli"),
+        PathBuf::from("/usr/local/bin/kicad-cli"),
     ];
 
-    for path_str in &standard_paths {
-        let path = Path::new(path_str);
+    for path in &standard_paths {
         if path.exists() {
-            return Some(path.to_path_buf());
+            return Some(path.clone());
         }
     }
 
@@ -442,7 +466,9 @@ fn detect_kicad_from_registry() -> Option<PathBuf> {
         for line in stdout.lines() {
             if line.contains("REG_SZ") {
                 let path_str = line.split("REG_SZ").last()?.trim();
-                let cli_path = Path::new(path_str).join("bin").join("kicad-cli.exe");
+                let cli_path = std::path::Path::new(path_str)
+                    .join("bin")
+                    .join("kicad-cli.exe");
                 if cli_path.exists() {
                     return Some(cli_path);
                 }
