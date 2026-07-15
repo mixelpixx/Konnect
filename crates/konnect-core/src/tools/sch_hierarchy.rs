@@ -9,7 +9,10 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, opt_f64, opt_str, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{
+    ensure_root_uuid, get_path, opt_f64, opt_str, project_name_for, require_f64, require_str,
+    ToolContext, ToolDef,
+};
 use konnect_schematic_editor as cse;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -35,7 +38,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Top-left Y in mm. Default: 50" },
                     "width": { "type": "number", "description": "Sheet box width in mm. Default: 80" },
                     "height": { "type": "number", "description": "Sheet box height in mm. Default: 50" },
-                    "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Default: '' (matches this codebase's existing convention for symbol instances)" }
+                    "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic", "sheet_file"]
             }),
@@ -56,7 +59,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_file": { "type": "string" },
                     "x": { "type": "number" }, "y": { "type": "number" },
                     "width": { "type": "number" }, "height": { "type": "number" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -105,7 +108,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "source_sheet_name": { "type": "string" },
                     "new_sheet_name": { "type": "string" },
                     "new_file": { "type": "string", "description": "Filename for the copy, resolved relative to the parent's directory. Must not already exist." },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic", "source_sheet_name", "new_sheet_name", "new_file"]
             }),
@@ -121,7 +124,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Root schematic to start from" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic"]
             }),
@@ -137,7 +140,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Root schematic to start from" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic"]
             }),
@@ -156,7 +159,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to the parent .kicad_sch file" },
                     "sheet_name": { "type": "string" },
                     "side": { "type": "string", "enum": ["right", "left"], "description": "Which edge to place new pins on. Default: 'right'" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -256,8 +259,8 @@ fn parent_dir(sch_path: &Path) -> PathBuf {
 }
 
 fn create_blank_schematic(path: &Path) -> anyhow::Result<()> {
-    let template = "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
-    konnect_sexp::writer::write_atomic(path, template)?;
+    let template = crate::tools::blank_schematic_template();
+    konnect_sexp::writer::write_atomic(path, &template)?;
     // Round-trip through cse so the file is normalised to its writer's format,
     // matching the existing `create_schematic` tool's behavior.
     let sch = cse::Schematic::load(path)?;
@@ -307,12 +310,16 @@ fn link_sheet(
     patch_existing_symbols: bool,
 ) -> anyhow::Result<usize> {
     let sheet_uuid = sheet.uuid.clone();
+    let root_uuid = ensure_root_uuid(parent);
     parent.add_sheet(sheet);
 
     let mut patched = 0usize;
     if patch_existing_symbols {
         let mut child = cse::Schematic::load(child_path)?;
-        let hier_path = format!("/{}/", sheet_uuid);
+        // eeschema's path format: "/<root-uuid>/<sheet-symbol-uuid>", no
+        // trailing slash. KiCAD's netlister can't resolve any other shape and
+        // silently drops the symbol from net formation.
+        let hier_path = format!("/{}/{}", root_uuid, sheet_uuid);
         for sym in child.symbols.iter_mut() {
             if !sym.has_instance_path(project_name, &hier_path) {
                 let reference = sym.reference().unwrap_or("").to_string();
@@ -343,7 +350,9 @@ async fn handle_add_hierarchical_sheet(
     let y = opt_f64(args, "y").unwrap_or(50.0);
     let width = opt_f64(args, "width").unwrap_or(80.0);
     let height = opt_f64(args, "height").unwrap_or(50.0);
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .unwrap_or_else(|| project_name_for(&parent_path));
 
     let dir = parent_dir(&parent_path);
     let child_path = dir.join(&sheet_file);
@@ -372,7 +381,10 @@ async fn handle_add_hierarchical_sheet(
         width,
         height,
     );
-    sheet.set_page(&project_name, "/", &page);
+    // Sheet page entries live at the parent's own instance path — for a root
+    // sheet that's "/<root-uuid>", matching what eeschema writes.
+    let root_path = format!("/{}", ensure_root_uuid(&mut parent));
+    sheet.set_page(&project_name, &root_path, &page);
 
     let patched = link_sheet(
         &mut parent,
@@ -399,7 +411,9 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .unwrap_or_else(|| project_name_for(&sch_path));
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
@@ -518,7 +532,9 @@ async fn handle_duplicate_sheet(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .unwrap_or_else(|| project_name_for(&sch_path));
 
     let mut parent = cse::Schematic::load(&sch_path)?;
 
@@ -580,7 +596,8 @@ async fn handle_duplicate_sheet(
         src_w,
         src_h,
     );
-    new_sheet.set_page(&project_name, "/", &page);
+    let root_path = format!("/{}", ensure_root_uuid(&mut parent));
+    new_sheet.set_page(&project_name, &root_path, &page);
 
     let patched = link_sheet(&mut parent, new_sheet, &new_child, &project_name, true)?;
     parent.overwrite()?;
@@ -599,7 +616,9 @@ async fn handle_get_sheet_hierarchy(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let root_path = get_path(args, "schematic")?;
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .unwrap_or_else(|| project_name_for(&root_path));
 
     if !root_path.exists() {
         return Ok(CallToolResult::error(format!(
@@ -678,7 +697,9 @@ async fn handle_renumber_sheet_pages(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let root_path = get_path(args, "schematic")?;
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .unwrap_or_else(|| project_name_for(&root_path));
 
     if !root_path.exists() {
         return Ok(CallToolResult::error(format!(
@@ -687,11 +708,22 @@ async fn handle_renumber_sheet_pages(
         )));
     }
 
+    // Page paths are hierarchical instance paths rooted at the root sheet's
+    // UUID ("/<root-uuid>", then "/<root-uuid>/<sheet-uuid>" one level down),
+    // matching what eeschema writes.
+    let root_prefix = {
+        let mut root = cse::Schematic::load(&root_path)?;
+        let uuid = ensure_root_uuid(&mut root);
+        root.overwrite()?;
+        format!("/{}", uuid)
+    };
+
     let mut next_page = 2u32; // page 1 is always the root, left untouched
     let mut renumbered = Vec::new();
     let mut visited = HashSet::new();
     renumber_walk(
         &root_path,
+        &root_prefix,
         &project_name,
         &mut next_page,
         &mut renumbered,
@@ -706,6 +738,7 @@ async fn handle_renumber_sheet_pages(
 
 fn renumber_walk(
     path: &Path,
+    hier_prefix: &str,
     project_name: &str,
     next_page: &mut u32,
     renumbered: &mut Vec<Value>,
@@ -721,18 +754,18 @@ fn renumber_walk(
     let mut changed = false;
 
     // Snapshot the sheet order first: recursing below needs `sch` unborrowed.
-    let sheet_order: Vec<(String, String)> = sch
+    let sheet_order: Vec<(String, String, String)> = sch
         .sheets
         .iter()
-        .map(|s| (s.name().to_string(), s.file().to_string()))
+        .map(|s| (s.name().to_string(), s.file().to_string(), s.uuid.clone()))
         .collect();
 
-    for (name, file) in &sheet_order {
+    for (name, file, sheet_uuid) in &sheet_order {
         let page = next_page.to_string();
         *next_page += 1;
         if let Some(sheet) = sch.sheets.by_name_mut(name) {
             if sheet.page(project_name) != Some(page.as_str()) {
-                sheet.set_page(project_name, "/", &page);
+                sheet.set_page(project_name, hier_prefix, &page);
                 changed = true;
             }
         }
@@ -740,7 +773,15 @@ fn renumber_walk(
 
         let child_path = dir.join(file);
         if child_path.exists() {
-            renumber_walk(&child_path, project_name, next_page, renumbered, visited)?;
+            let child_prefix = format!("{}/{}", hier_prefix, sheet_uuid);
+            renumber_walk(
+                &child_path,
+                &child_prefix,
+                project_name,
+                next_page,
+                renumbered,
+                visited,
+            )?;
         }
     }
 
@@ -1142,8 +1183,10 @@ mod tests {
             parent.sheets.by_name("Power Supply").unwrap().file(),
             "power.kicad_sch"
         );
+        // Pages are stored under the default project name (the file stem) at
+        // the parent's "/<root-uuid>" instance path.
         assert_eq!(
-            parent.sheets.by_name("Power Supply").unwrap().page(""),
+            parent.sheets.by_name("Power Supply").unwrap().page("root"),
             Some("2")
         );
     }
@@ -1182,8 +1225,8 @@ mod tests {
         .unwrap();
 
         let parent = cse::Schematic::load(&root).unwrap();
-        assert_eq!(parent.sheets.by_name("A").unwrap().page(""), Some("2"));
-        assert_eq!(parent.sheets.by_name("B").unwrap().page(""), Some("3"));
+        assert_eq!(parent.sheets.by_name("A").unwrap().page("root"), Some("2"));
+        assert_eq!(parent.sheets.by_name("B").unwrap().page("root"), Some("3"));
     }
 
     #[tokio::test]
@@ -1458,8 +1501,8 @@ mod tests {
         assert!(!result.is_error);
 
         let parent = cse::Schematic::load(&root).unwrap();
-        assert_eq!(parent.sheets.by_name("A").unwrap().page(""), Some("2"));
-        assert_eq!(parent.sheets.by_name("C").unwrap().page(""), Some("3"));
+        assert_eq!(parent.sheets.by_name("A").unwrap().page("root"), Some("2"));
+        assert_eq!(parent.sheets.by_name("C").unwrap().page("root"), Some("3"));
     }
 
     #[tokio::test]
@@ -1489,13 +1532,15 @@ mod tests {
 
         let child = cse::Schematic::load(&child_path).unwrap();
         let sym = child.symbols.by_reference("R1").unwrap();
-        assert!(sym.has_instance_path(
-            "",
-            &format!("/{}/", {
-                let parent = cse::Schematic::load(&root).unwrap();
-                parent.sheets.by_name("Reused").unwrap().uuid.clone()
-            })
-        ));
+        // eeschema path format: "/<root-uuid>/<sheet-symbol-uuid>", keyed
+        // under the default project name (the parent file's stem).
+        let parent = cse::Schematic::load(&root).unwrap();
+        let hier_path = format!(
+            "/{}/{}",
+            parent.uuid.as_deref().expect("root uuid must exist"),
+            parent.sheets.by_name("Reused").unwrap().uuid
+        );
+        assert!(sym.has_instance_path("root", &hier_path));
     }
 
     // ─── PR-B: sheet pin lifecycle ─────────────────────────────────────────

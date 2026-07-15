@@ -5,7 +5,9 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, opt_f64, opt_str, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, opt_f64, opt_str, project_name_for, require_f64, require_str, ToolContext, ToolDef,
+};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
@@ -937,22 +939,16 @@ async fn handle_add_power_symbol(
     sym.properties.push(cse::Property::new("Footprint", ""));
     sym.properties.push(cse::Property::new("Datasheet", ""));
 
-    // Add instances raw node
-    use cse::sexp::{atom, qstr, SexpNode};
-    let instances = SexpNode::List(vec![
-        atom("instances"),
-        SexpNode::List(vec![
-            atom("project"),
-            qstr(""),
-            SexpNode::List(vec![
-                atom("path"),
-                qstr("/"),
-                SexpNode::List(vec![atom("reference"), qstr(&pwr_ref)]),
-                SexpNode::List(vec![atom("unit"), atom("1")]),
-            ]),
-        ]),
-    ]);
-    sym.raw_sub_nodes.push(instances);
+    // Instance entry, keyed to the root sheet UUID like eeschema writes it —
+    // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
+    // symbol from net formation.
+    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
+    sym.set_instance_path(
+        &project_name_for(&sch_path),
+        &format!("/{}", root_uuid),
+        &pwr_ref,
+        1,
+    );
 
     sch.add_symbol(sym);
     sch.overwrite()?;

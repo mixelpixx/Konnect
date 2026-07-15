@@ -293,6 +293,41 @@ pub fn get_path(args: &Value, key: &str) -> anyhow::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(s))
 }
 
+/// Project name used in symbol/sheet `(instances (project "..." ...))` entries:
+/// the schematic's file stem, matching what eeschema writes when it saves a
+/// standalone root sheet.
+pub fn project_name_for(sch_path: &std::path::Path) -> String {
+    sch_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Minimal valid blank schematic, with a freshly generated root `(uuid ...)`.
+/// The root UUID is mandatory: KiCAD's netlister resolves symbol instance
+/// paths against it and silently forms no wire-only nets when it's missing.
+pub fn blank_schematic_template() -> String {
+    format!(
+        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n",
+        konnect_sexp::writer::new_uuid()
+    )
+}
+
+/// Root UUID of a loaded schematic, assigning a fresh one when the file
+/// predates Konnect writing root UUIDs — the file is repaired on its next
+/// overwrite. Instance paths are built as "/<root-uuid>[/<sheet-uuid>…]".
+pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String {
+    match &sch.uuid {
+        Some(u) => u.clone(),
+        None => {
+            let u = konnect_sexp::writer::new_uuid();
+            sch.uuid = Some(u.clone());
+            u
+        }
+    }
+}
+
 #[cfg(test)]
 mod arg_helper_tests {
     use super::*;

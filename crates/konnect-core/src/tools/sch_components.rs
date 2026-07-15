@@ -6,7 +6,9 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, opt_f64, opt_str, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, opt_f64, opt_str, project_name_for, require_f64, require_str, ToolContext, ToolDef,
+};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
@@ -282,11 +284,11 @@ async fn handle_create_schematic(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
-    // Build a minimal valid schematic and save via cse's atomic writer
-    let template = "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
+    // Build a minimal valid schematic and save via cse's atomic writer.
+    let template = crate::tools::blank_schematic_template();
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
-    write_atomic(&path, template)?;
+    write_atomic(&path, &template)?;
     let sch = cse::Schematic::load(&path)?;
     sch.overwrite()?;
     Ok(CallToolResult::json(
@@ -323,6 +325,12 @@ async fn handle_add_schematic_component(
 
     // Load via konnect-schematic-editor
     let mut sch = cse::Schematic::load(&sch_path)?;
+
+    // The instance path below must be "/<root-uuid>" — KiCAD's netlister
+    // resolves instances against the root sheet UUID and silently forms no
+    // wire-only nets for symbols whose path doesn't resolve.
+    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
+    let project_name = project_name_for(&sch_path);
 
     // Embed the library symbol definition
     cse::library::ensure_lib_symbol(&mut sch, &lib_id);
@@ -389,24 +397,9 @@ async fn handle_add_schematic_component(
     ds_prop.sub_nodes.push(effects_node(true));
     sym.properties.push(ds_prop);
 
-    // Instances node
-    let instances = cse::sexp::SexpNode::List(vec![
-        cse::sexp::atom("instances"),
-        cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("project"),
-            cse::sexp::qstr(""),
-            cse::sexp::SexpNode::List(vec![
-                cse::sexp::atom("path"),
-                cse::sexp::qstr("/"),
-                cse::sexp::SexpNode::List(vec![
-                    cse::sexp::atom("reference"),
-                    cse::sexp::qstr(ref_str),
-                ]),
-                cse::sexp::SexpNode::List(vec![cse::sexp::atom("unit"), cse::sexp::atom("1")]),
-            ]),
-        ]),
-    ]);
-    sym.raw_sub_nodes.push(instances);
+    // Instance entry, keyed to the root sheet UUID like eeschema writes it:
+    // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
+    sym.set_instance_path(&project_name, &format!("/{}", root_uuid), ref_str, 1);
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
@@ -1082,3 +1075,106 @@ async fn handle_replace_component(
 }
 
 // Library symbol resolution moved to tools/mod.rs (shared with sch_wiring.rs)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_schematic_writes_root_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.kicad_sch");
+        let ctx = test_ctx();
+
+        let result = handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(
+            sch.uuid.is_some(),
+            "root (uuid ...) is required for KiCAD's netlister to resolve instance paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_component_writes_eeschema_style_instance_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("amp.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "x": 100.0, "y": 80.0,
+                "reference": "R1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let root_uuid = sch.uuid.clone().expect("root uuid present");
+        let sym = sch.symbols.by_reference("R1").unwrap();
+        // KiCAD only forms wire-only nets when the instance path is exactly
+        // "/<root-uuid>"; the project key mirrors eeschema (file stem).
+        assert!(
+            sym.has_instance_path("amp", &format!("/{}", root_uuid)),
+            "instance path must be /<root-uuid> under the file-stem project name"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_component_repairs_legacy_file_without_root_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.kicad_sch");
+        // File shape produced by Konnect before root UUIDs were written.
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "x": 50.0, "y": 50.0,
+                "reference": "R1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let root_uuid = sch.uuid.clone().expect("legacy file gains a root uuid");
+        let sym = sch.symbols.by_reference("R1").unwrap();
+        assert!(sym.has_instance_path("legacy", &format!("/{}", root_uuid)));
+    }
+}

@@ -384,8 +384,8 @@ fn blank_kicad_pro(name: &str) -> String {
     )
 }
 
-fn blank_kicad_sch() -> &'static str {
-    "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n"
+fn blank_kicad_sch() -> String {
+    crate::tools::blank_schematic_template()
 }
 
 fn blank_kicad_pcb() -> &'static str {
@@ -427,6 +427,22 @@ mod tests {
         let content = blank_kicad_sch();
         assert!(content.starts_with("(kicad_sch"));
         assert!(content.contains("(lib_symbols"));
+    }
+
+    #[test]
+    fn blank_kicad_sch_has_root_uuid() {
+        // Without a root (uuid ...) KiCAD's netlister silently drops every
+        // wire-only net (symbol instance paths can't resolve).
+        let content = blank_kicad_sch();
+        assert!(content.contains("(uuid \""));
+        let sch = {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t.kicad_sch");
+            std::fs::write(&path, &content).unwrap();
+            konnect_schematic_editor::Schematic::load(&path).unwrap()
+        };
+        let uuid = sch.uuid.expect("blank schematic must carry a root uuid");
+        assert_eq!(uuid.len(), 36, "expected a v4 uuid, got '{uuid}'");
     }
 
     #[test]
