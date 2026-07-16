@@ -2,6 +2,56 @@ use crate::error::{Error, Result};
 use crate::sexp::{atom, qstr, tagged, SexpNode};
 use crate::types::{At, Effects, Property};
 
+// ---- Label text effects -----------------------------------------------------
+
+/// Build the `(effects …)` a label needs to render the way eeschema draws it.
+///
+/// `justify` — not the `(at)` rotation — is what decides which way the text
+/// runs, so it has to be derived from the rotation or the label attaches
+/// correctly and renders backwards over whatever it points at. Plain labels
+/// additionally carry `bottom`, which lifts the text off the wire.
+///
+/// Rotation → justify follows `konnect_sexp::schematic::label_justify`.
+fn label_effects(rotation: f64, plain: bool) -> Effects {
+    let mut justify = vec![
+        atom("justify"),
+        atom(konnect_sexp::schematic::label_justify(rotation)),
+    ];
+    if plain {
+        justify.push(atom("bottom"));
+    }
+    Effects(SexpNode::List(vec![
+        atom("effects"),
+        tagged(
+            "font",
+            vec![tagged("size", vec![atom("1.27"), atom("1.27")])],
+        ),
+        SexpNode::List(justify),
+    ]))
+}
+
+/// Replace the `justify` inside an existing `(effects …)`, preserving font and
+/// everything else the file already carried.
+fn reface_justify(effects: &Effects, rotation: f64, plain: bool) -> Effects {
+    let SexpNode::List(children) = &effects.0 else {
+        return label_effects(rotation, plain);
+    };
+    let mut justify = vec![
+        atom("justify"),
+        atom(konnect_sexp::schematic::label_justify(rotation)),
+    ];
+    if plain {
+        justify.push(atom("bottom"));
+    }
+    let mut out: Vec<SexpNode> = children
+        .iter()
+        .filter(|c| c.tag() != Some("justify"))
+        .cloned()
+        .collect();
+    out.push(SexpNode::List(justify));
+    Effects(SexpNode::List(out))
+}
+
 // ---- Label ------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -65,6 +115,16 @@ impl Label {
     }
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.translate(dx, dy);
+    }
+
+    /// Set the rotation and keep the text's justify in step with it, creating
+    /// the `(effects …)` block when the label doesn't have one yet.
+    pub fn set_rotation(&mut self, rotation: f64) {
+        self.at.rotation = Some(rotation);
+        self.effects = Some(match &self.effects {
+            Some(e) => reface_justify(e, rotation, true),
+            None => label_effects(rotation, true),
+        });
     }
 }
 
@@ -146,6 +206,16 @@ impl GlobalLabel {
         self.at.translate(dx, dy);
     }
 
+    /// Set the rotation and keep the text's justify in step with it, creating
+    /// the `(effects …)` block when the label doesn't have one yet.
+    pub fn set_rotation(&mut self, rotation: f64) {
+        self.at.rotation = Some(rotation);
+        self.effects = Some(match &self.effects {
+            Some(e) => reface_justify(e, rotation, false),
+            None => label_effects(rotation, false),
+        });
+    }
+
     pub fn property(&self, name: &str) -> Option<&str> {
         self.properties
             .iter()
@@ -212,6 +282,16 @@ impl HierarchicalLabel {
     }
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.translate(dx, dy);
+    }
+
+    /// Set the rotation and keep the text's justify in step with it, creating
+    /// the `(effects …)` block when the label doesn't have one yet.
+    pub fn set_rotation(&mut self, rotation: f64) {
+        self.at.rotation = Some(rotation);
+        self.effects = Some(match &self.effects {
+            Some(e) => reface_justify(e, rotation, false),
+            None => label_effects(rotation, false),
+        });
     }
 }
 

@@ -675,26 +675,27 @@ async fn handle_add_net_label(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
+    // set_rotation also writes the (effects … (justify …)) block. justify is
+    // what turns the text away from the anchor, so a label created without one
+    // renders backwards at 180°/270°, over whatever it points at.
     match label_type {
         "global_label" => {
             sch.add_global_label(&net, shape, x, y);
-            // Set rotation on the just-added global label
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
-                gl.at.rotation = Some(rotation);
+                gl.set_rotation(rotation);
             }
         }
         "hierarchical_label" => {
             sch.add_hierarchical_label(&net, shape, x, y);
-            // Set rotation on the just-added hierarchical label
             let idx = sch.hierarchical_labels.len() - 1;
             if let Some(hl) = sch.hierarchical_labels.get_mut(idx) {
-                hl.at.rotation = Some(rotation);
+                hl.set_rotation(rotation);
             }
         }
         _ => {
             let label = sch.add_label(&net, x, y);
-            label.at.rotation = Some(rotation);
+            label.set_rotation(rotation);
         }
     }
 
@@ -867,35 +868,105 @@ async fn handle_rotate_label(
     };
 
     let content = std::fs::read_to_string(&sch_path)?;
-    let search = format!(r#""{net}""#);
-    let found = content
-        .find(&search)
-        .ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
-    let before = &content[..found];
-    let label_start = ["(net_label", "(global_label", "(hierarchical_label"]
+
+    let labels = find_label_blocks(&content);
+    let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
+    let Some(label) = named
         .iter()
-        .filter_map(|s| before.rfind(s))
-        .max()
-        .ok_or_else(|| anyhow::anyhow!("Label block not found"))?;
+        .find(|l| same_point(l.x, x) && same_point(l.y, y))
+    else {
+        let positions: Vec<String> = named
+            .iter()
+            .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
+            .collect();
+        return Ok(CallToolResult::error(if positions.is_empty() {
+            format!("No label named '{}' in this schematic", net)
+        } else {
+            format!(
+                "No label '{}' at ({}, {}). Found: {}",
+                net,
+                x,
+                y,
+                positions.join("; ")
+            )
+        }));
+    };
 
-    // Find the (at X Y ROT) in the label block
-    let at_search = "(at ";
-    let at_pos = content[label_start..]
-        .find(at_search)
-        .map(|o| label_start + o + at_search.len())
+    let (block_start, block_end) = find_balanced_block(&content, label.start)
+        .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
+    let block = &content[block_start..block_end];
+
+    let mut edits = Vec::new();
+
+    // 1. The (at X Y ROT) anchor.
+    let at_rel = block
+        .find("(at ")
         .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
-    let close_pos = content[at_pos..]
+    let at_val = block_start + at_rel + "(at ".len();
+    let at_close = content[at_val..]
         .find(')')
-        .map(|o| at_pos + o)
+        .map(|o| at_val + o)
         .ok_or_else(|| anyhow::anyhow!("Malformed (at)"))?;
+    edits.push(SexpEdit::replace(
+        at_val,
+        at_close,
+        format!("{x} {y} {rotation}"),
+    ));
 
-    let new_at = format!("{x} {y} {rotation}");
-    let edits = vec![SexpEdit::replace(at_pos, close_pos, new_at)];
+    // 2. The justify, which is what actually turns the text — rotating the
+    //    anchor alone leaves the text running back over whatever the label
+    //    points at. Plain labels also carry `bottom` to lift text off the wire.
+    let plain = label.kind == "label";
+    let justify = konnect_sexp::schematic::label_justify(rotation);
+    let justify_sexp = if plain {
+        format!("(justify {justify} bottom)")
+    } else {
+        format!("(justify {justify})")
+    };
+
+    if let Some(j_rel) = block.find("(justify ") {
+        // Replace the existing justify in place.
+        let j_start = block_start + j_rel;
+        let j_end = find_balanced_block(&content, j_start)
+            .map(|(_, e)| e)
+            .ok_or_else(|| anyhow::anyhow!("Malformed (justify)"))?;
+        edits.push(SexpEdit::replace(j_start, j_end, justify_sexp));
+    } else if let Some(e_rel) = block.find("(effects") {
+        // An effects block with no justify — add one just inside it.
+        let e_start = block_start + e_rel;
+        let (_, e_end) = find_balanced_block(&content, e_start)
+            .ok_or_else(|| anyhow::anyhow!("Malformed (effects)"))?;
+        edits.push(SexpEdit::insert(e_end - 1, format!(" {justify_sexp}")));
+    } else {
+        // No effects at all — the shape add_schematic_net_label used to write.
+        // Insert a complete block where eeschema puts it: before the uuid,
+        // matching that line's indentation.
+        let insert_at = block
+            .find("(uuid")
+            .map(|r| block_start + r)
+            .unwrap_or(block_end - 1);
+        let line_start = content[..insert_at]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(insert_at);
+        let indent: String = content[line_start..insert_at]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        edits.push(SexpEdit::insert(
+            insert_at,
+            format!("(effects (font (size 1.27 1.27)) {justify_sexp})\n{indent}"),
+        ));
+    }
+
     let new_content = apply_edits(content, edits);
     write_atomic(&sch_path, &new_content)?;
-    Ok(CallToolResult::json(
-        &json!({ "rotated_label": net, "rotation": rotation }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "rotated_label": net,
+        "type": label.kind,
+        "rotation": rotation,
+        "justify": justify
+    })))
 }
 
 async fn handle_move_labels_by_offset(
@@ -1487,5 +1558,106 @@ mod label_tests {
         let (_d, path) = sch_with(TWO_PLAIN);
         let result = delete(&path, "NOPE", 100.0, 100.0).await;
         assert!(result.is_error);
+    }
+
+    // ─── justify / rotation ────────────────────────────────────────────────
+
+    async fn rotate(path: &std::path::Path, net: &str, x: f64, y: f64, rot: f64) -> CallToolResult {
+        handle_rotate_label(
+            &json!({ "schematic": path.display().to_string(), "net": net,
+                     "x": x, "y": y, "rotation": rot }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn justify_of(body: &str, net: &str) -> String {
+        let start = body.find(&format!("\"{net}\"")).expect("label present");
+        let block = &body[start..];
+        let end = block.find("(uuid").unwrap_or(block.len());
+        match block[..end].find("(justify ") {
+            Some(j) => {
+                let rest = &block[..end][j + "(justify ".len()..];
+                rest[..rest.find(')').unwrap()].trim().to_string()
+            }
+            None => "<none>".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_creates_the_effects_block_when_absent() {
+        // The shape add_schematic_net_label used to write: no (effects) at all.
+        let (_d, path) = sch_with(
+            "  (global_label \"EN\"\n    (shape input)\n    (at 10 20 0)\n    (uuid \"88888888-8888-8888-8888-888888888888\")\n  )",
+        );
+        let result = rotate(&path, "EN", 10.0, 20.0, 180.0).await;
+        assert!(!result.is_error);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("(at 10 20 180)"), "anchor must rotate");
+        assert_eq!(
+            justify_of(&body, "EN"),
+            "right",
+            "a 180° label must be right-justified or its text renders backwards"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_replaces_an_existing_justify_and_keeps_the_font() {
+        let (_d, path) = sch_with(
+            "  (global_label \"EN\"\n    (shape input)\n    (at 10 20 0)\n    (effects (font (size 2.54 2.54)) (justify left))\n    (uuid \"99999999-9999-9999-9999-999999999999\")\n  )",
+        );
+        assert!(!rotate(&path, "EN", 10.0, 20.0, 180.0).await.is_error);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(justify_of(&body, "EN"), "right");
+        assert!(
+            body.contains("(size 2.54 2.54)"),
+            "the file's own font must be preserved"
+        );
+        assert_eq!(body.matches("(justify").count(), 1, "no duplicate justify");
+    }
+
+    #[tokio::test]
+    async fn rotate_adds_justify_to_an_effects_block_that_lacks_one() {
+        let (_d, path) = sch_with(
+            "  (global_label \"EN\"\n    (shape input)\n    (at 10 20 0)\n    (effects (font (size 1.27 1.27)))\n    (uuid \"aaaaaaaa-9999-9999-9999-999999999999\")\n  )",
+        );
+        assert!(!rotate(&path, "EN", 10.0, 20.0, 270.0).await.is_error);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(justify_of(&body, "EN"), "right", "270° is right-justified");
+        assert_eq!(body.matches("(effects").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rotating_back_to_zero_restores_left() {
+        let (_d, path) = sch_with(
+            "  (global_label \"EN\"\n    (shape input)\n    (at 10 20 180)\n    (effects (font (size 1.27 1.27)) (justify right))\n    (uuid \"bbbbbbbb-9999-9999-9999-999999999999\")\n  )",
+        );
+        assert!(!rotate(&path, "EN", 10.0, 20.0, 0.0).await.is_error);
+        assert_eq!(
+            justify_of(&std::fs::read_to_string(&path).unwrap(), "EN"),
+            "left"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_labels_keep_the_bottom_alignment_eeschema_writes() {
+        let (_d, path) = sch_with(
+            "  (label \"MID\"\n    (at 10 20 0)\n    (uuid \"cccccccc-9999-9999-9999-999999999999\")\n  )",
+        );
+        assert!(!rotate(&path, "MID", 10.0, 20.0, 180.0).await.is_error);
+        assert_eq!(
+            justify_of(&std::fs::read_to_string(&path).unwrap(), "MID"),
+            "right bottom"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_reports_real_positions_when_coordinates_miss() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let result = rotate(&path, "VCC", 555.0, 555.0, 180.0).await;
+        assert!(result.is_error, "must not rotate the nearest label instead");
     }
 }
