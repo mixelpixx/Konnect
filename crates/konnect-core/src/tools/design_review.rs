@@ -828,9 +828,10 @@ fn collect_power_nets(content: &str) -> Vec<String> {
     let _search = content.as_bytes();
     let mut pos = 0;
     while pos < content.len() {
-        // Look for net_label or global_label with power-ish names
-        if let Some(label_pos) = content[pos..].find("(net_label \"") {
-            let abs = pos + label_pos + 12;
+        // Look for plain labels with power-ish names. KiCAD's tag is `label`;
+        // `net_label` is not in the schematic format and matched nothing.
+        if let Some(label_pos) = content[pos..].find("(label \"") {
+            let abs = pos + label_pos + 8;
             if let Some(end) = content[abs..].find('"') {
                 let name = &content[abs..abs + end];
                 if is_power_net_name(name) {
@@ -947,12 +948,13 @@ fn has_pull_up_on_net(
 
 /// Find the net name at a given schematic point by checking nearby labels and wires.
 fn find_net_at_point(content: &str, x: f64, y: f64) -> Option<String> {
-    // Check net_labels near this point
+    // Check plain labels near this point (KiCAD's tag is `label`, not
+    // `net_label` — the latter matched nothing in any real schematic).
     let tolerance = 0.5; // mm
     let mut search = 0;
-    while let Some(pos) = content[search..].find("(net_label \"") {
+    while let Some(pos) = content[search..].find("(label \"") {
         let abs = search + pos;
-        let after = &content[abs + 12..];
+        let after = &content[abs + 8..];
         let name_end = after.find('"')?;
         let name = &after[..name_end];
 

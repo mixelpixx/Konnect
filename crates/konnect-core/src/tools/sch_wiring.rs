@@ -11,11 +11,15 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
+    parser::parse_sexp,
     schematic::{
         extract_lib_pins, extract_symbol_instances, extract_wires, find_t_junctions,
-        format_junction, format_wire, pin_endpoint, read_schematic,
+        format_junction, format_wire, parse_at, pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_block_with_leading_whitespace, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
+        write_atomic, SexpEdit,
+    },
 };
 use serde_json::json;
 
@@ -721,56 +725,123 @@ async fn handle_delete_net_label(
 
     let content = std::fs::read_to_string(&sch_path)?;
 
-    // Find ALL label occurrences with this net name, then pick the closest to (target_x, target_y).
-    // This handles the common case of multiple labels on the same net.
-    let search = format!(r#""{net}""#);
-    let label_starts_patterns = ["(net_label", "(global_label", "(hierarchical_label"];
+    let labels = find_label_blocks(&content);
+    let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
 
-    let mut best_start = None;
-    let mut best_dist = f64::MAX;
-
-    let mut search_from = 0usize;
-    while let Some(name_offset) = content[search_from..]
-        .find(&search)
-        .map(|i| i + search_from)
-    {
-        // Walk back to find the enclosing label block
-        let before = &content[..name_offset];
-        if let Some(label_start) = label_starts_patterns
-            .iter()
-            .filter_map(|s| before.rfind(s))
-            .max()
-        {
-            // Parse the (at X Y) from this block to check proximity
-            let block_rest = &content[label_start..];
-            if let Some(at_pos) = block_rest.find("(at ") {
-                let at_str = &block_rest[at_pos + 4..];
-                let parts: Vec<&str> = at_str.split([' ', ')']).collect();
-                if parts.len() >= 2 {
-                    let lx: f64 = parts[0].parse().unwrap_or(f64::MAX);
-                    let ly: f64 = parts[1].parse().unwrap_or(f64::MAX);
-                    let dist = (lx - target_x).abs() + (ly - target_y).abs();
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_start = Some(label_start);
-                    }
-                }
-            }
-        }
-        search_from = name_offset + 1;
+    if named.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No label named '{}' in this schematic",
+            net
+        )));
     }
 
-    let label_start = best_start.ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
+    // Exact position match. Deleting the *nearest* label instead would silently
+    // remove a same-named label elsewhere on the sheet — same-named labels are
+    // how KiCAD joins nets, so they are the normal case, not an edge case.
+    let matched: Vec<&&LabelBlock> = named
+        .iter()
+        .filter(|l| same_point(l.x, target_x) && same_point(l.y, target_y))
+        .collect();
 
-    let (del_start, del_end) = find_block_with_leading_whitespace(&content, label_start)
+    let label = match matched.as_slice() {
+        [one] => **one,
+        [] => {
+            let positions: Vec<String> = named
+                .iter()
+                .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
+                .collect();
+            return Ok(CallToolResult::error(format!(
+                "No label '{}' at ({}, {}). Found {} label(s) named '{}': {}",
+                net,
+                target_x,
+                target_y,
+                named.len(),
+                net,
+                positions.join("; ")
+            )));
+        }
+        _ => {
+            return Ok(CallToolResult::error(format!(
+                "{} labels named '{}' share position ({}, {}) — delete by uuid is not \
+                 supported yet; remove the duplicates in eeschema",
+                matched.len(),
+                net,
+                target_x,
+                target_y
+            )));
+        }
+    };
+
+    let (del_start, del_end) = find_block_with_leading_whitespace(&content, label.start)
         .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
 
+    let kind = label.kind;
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
     write_atomic(&sch_path, &new_content)?;
-    Ok(CallToolResult::json(
-        &json!({ "deleted_label": net, "at": { "x": target_x, "y": target_y } }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "deleted_label": net,
+        "type": kind,
+        "at": { "x": target_x, "y": target_y }
+    })))
+}
+
+/// One label block located in the raw file text.
+struct LabelBlock {
+    /// Byte offset of the block's opening paren.
+    start: usize,
+    /// S-expression tag: `label`, `global_label`, or `hierarchical_label`.
+    kind: &'static str,
+    net: String,
+    x: f64,
+    y: f64,
+}
+
+/// KiCAD's three label tags. `label` is the plain net label — the type
+/// `add_schematic_net_label` writes by default. (`net_label` is this codebase's
+/// internal name for it and never appears in a .kicad_sch.)
+const LABEL_TAGS: [&str; 3] = ["label", "global_label", "hierarchical_label"];
+
+/// Locate every label block in `content` by scanning forward for the label tags
+/// and parsing each block, rather than searching for a name string and walking
+/// backwards — a quoted net name also appears in symbol properties, pin names,
+/// and sheet pins, and walking back from one of those lands on an unrelated
+/// block.
+fn find_label_blocks(content: &str) -> Vec<LabelBlock> {
+    let mut out = Vec::new();
+    for kind in LABEL_TAGS {
+        for start in find_block_starts(content, kind) {
+            let Some((bs, be)) = find_balanced_block(content, start) else {
+                continue;
+            };
+            let Ok(node) = parse_sexp(&content[bs..be]) else {
+                continue;
+            };
+            // (label "NAME" (at X Y ROT) …) — the name is the first argument,
+            // and (at) is a direct child, so a nested (at) on a global label's
+            // intersheet-refs property can't be mistaken for the anchor.
+            let Some(net) = node.get(1).and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let Some((x, y, _)) = parse_at(&node) else {
+                continue;
+            };
+            out.push(LabelBlock {
+                start: bs,
+                kind,
+                net: net.to_string(),
+                x,
+                y,
+            });
+        }
+    }
+    out
+}
+
+/// Compare schematic coordinates. KiCAD stores mm to 4 decimals, so this is an
+/// exact match in practice while tolerating float round-trip noise.
+fn same_point(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
 }
 
 async fn handle_rotate_label(
@@ -1269,4 +1340,152 @@ async fn handle_add_schematic_connection(
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn sch_with(labels: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("labels.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n  (paper \"A4\")\n  (lib_symbols\n  )\n{labels}\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    async fn delete(path: &std::path::Path, net: &str, x: f64, y: f64) -> CallToolResult {
+        handle_delete_net_label(
+            &json!({ "schematic": path.display().to_string(), "net": net, "x": x, "y": y }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap()
+    }
+
+    const TWO_PLAIN: &str = "  (label \"VCC\"\n    (at 100 100 0)\n    (uuid \"11111111-1111-1111-1111-111111111111\")\n  )\n  (label \"VCC\"\n    (at 200 100 0)\n    (uuid \"22222222-2222-2222-2222-222222222222\")\n  )";
+
+    #[tokio::test]
+    async fn deletes_the_plain_label_the_add_tool_writes() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let result = delete(&path, "VCC", 200.0, 100.0).await;
+        assert!(!result.is_error, "plain (label) blocks must be deletable");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(at 100 100 0)"),
+            "the label at (100,100) must survive"
+        );
+        assert!(
+            !after.contains("(at 200 100 0)"),
+            "the targeted label at (200,100) must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_coordinates_delete_nothing_and_report_the_real_positions() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = delete(&path, "VCC", 300.0, 300.0).await;
+        assert!(result.is_error, "a miss must not fall back to nearest-wins");
+
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected a text result");
+        };
+        assert!(
+            text.contains("100") && text.contains("200"),
+            "error should list the actual label positions: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "file must be untouched when nothing matched"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_name_label_of_another_kind_elsewhere_is_not_collateral() {
+        // The old backwards-scan could walk from any occurrence of the quoted
+        // name to an unrelated block and delete that instead.
+        let (_d, path) = sch_with(
+            "  (global_label \"VBUS\"\n    (shape input)\n    (at 50 50 0)\n    (uuid \"33333333-3333-3333-3333-333333333333\")\n  )\n  (label \"VBUS\"\n    (at 150 150 0)\n    (uuid \"44444444-4444-4444-4444-444444444444\")\n  )",
+        );
+
+        let result = delete(&path, "VBUS", 150.0, 150.0).await;
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(global_label \"VBUS\""),
+            "the global label at a different position must survive"
+        );
+        assert!(!after.contains("(at 150 150 0)"));
+    }
+
+    #[tokio::test]
+    async fn global_and_hierarchical_labels_are_deletable_by_exact_position() {
+        for (kind, block) in [
+            (
+                "global_label",
+                "  (global_label \"NET\"\n    (shape input)\n    (at 10 20 0)\n    (uuid \"55555555-5555-5555-5555-555555555555\")\n  )",
+            ),
+            (
+                "hierarchical_label",
+                "  (hierarchical_label \"NET\"\n    (shape input)\n    (at 10 20 0)\n    (uuid \"66666666-6666-6666-6666-666666666666\")\n  )",
+            ),
+        ] {
+            let (_d, path) = sch_with(block);
+            let result = delete(&path, "NET", 10.0, 20.0).await;
+            assert!(!result.is_error, "{kind} should be deletable");
+            assert!(!std::fs::read_to_string(&path).unwrap().contains(kind));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_net_name_appearing_in_a_property_does_not_confuse_the_match() {
+        // "VCC" also occurs as a symbol property value; only the real label
+        // block at the requested position may be deleted.
+        let (_d, path) = sch_with(
+            "  (symbol\n    (lib_id \"Device:R\")\n    (at 60 60 0)\n    (property \"Value\" \"VCC\"\n      (at 60 62 0)\n    )\n  )\n  (label \"VCC\"\n    (at 100 100 0)\n    (uuid \"77777777-7777-7777-7777-777777777777\")\n  )",
+        );
+
+        let result = delete(&path, "VCC", 100.0, 100.0).await;
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(property \"Value\" \"VCC\""),
+            "the symbol property must be untouched"
+        );
+        assert!(!after.contains("(label \"VCC\""));
+    }
+
+    #[tokio::test]
+    async fn unknown_net_name_is_an_error() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let result = delete(&path, "NOPE", 100.0, 100.0).await;
+        assert!(result.is_error);
+    }
 }
