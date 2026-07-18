@@ -147,6 +147,9 @@ PY
 
 # Zip it (staged contents at the archive root, matching Compress-Archive)
 mkdir -p "$out_dir"
+# zip runs from inside $staging below; a relative --out would resolve there
+# and fail with "Could not create output file". Absolutize it first.
+out_dir="$(cd "$out_dir" && pwd)"
 zip_path="$out_dir/konnect-pcm-v$version-$platform.zip"
 rm -f "$zip_path"
 ( cd "$staging" && zip -rqX "$zip_path" metadata.json plugins resources )
