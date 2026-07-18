@@ -584,19 +584,51 @@ fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
     }
 }
 
+/// Structured "this lib_id doesn't exist" error, with did-you-mean hints —
+/// silently accepting an unresolvable lib_id writes a netlist-invisible
+/// component with an empty pin list (#34).
+pub fn lib_symbol_not_found_error(lib_id: &str) -> CallToolResult {
+    let library = lib_id.split(':').next().unwrap_or(lib_id);
+    let mut msg = if !konnect_schematic_editor::library::library_exists(library) {
+        format!(
+            "Library '{}' not found in the installed KiCAD symbol libraries \
+             (lib_id '{}'). Check the library name, the KiCAD install, or \
+             KICAD10_SYMBOL_DIR.",
+            library, lib_id
+        )
+    } else {
+        format!(
+            "Library symbol '{}' not found in the installed KiCAD libraries.",
+            lib_id
+        )
+    };
+    let suggestions = konnect_schematic_editor::library::suggest_symbols(lib_id, 3);
+    if !suggestions.is_empty() {
+        msg.push_str(&format!(
+            " Did you mean: {}? (KiCAD 10 renamed several older symbol names)",
+            suggestions.join(", ")
+        ));
+    }
+    CallToolResult::error(msg)
+}
+
 /// Insert a symbol definition into the schematic's lib_symbols section.
 /// Creates the lib_symbols section if it doesn't exist. Skips if already present.
-pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) {
+///
+/// Returns `false` when `lib_id` cannot be resolved — callers must surface
+/// that as an error rather than writing a definition-less instance (#34).
+#[must_use]
+pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> bool {
     // Check if already present
     let lib_id_check = format!("(symbol \"{}\"", lib_id);
     if content.contains(&lib_id_check) {
-        return;
+        return true;
     }
 
     // Resolve the symbol from KiCAD libraries
     let sym_def = match resolve_lib_symbol(lib_id) {
         Some(s) => s,
-        None => return,
+        None => return false,
     };
 
     // Ensure lib_symbols section exists
@@ -636,6 +668,7 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) {
             .join("\n");
         content.insert_str(ls_end, &format!("\n{}\n\t", indented));
     }
+    true
 }
 
 /// Find directories where KiCAD symbol libraries are stored.

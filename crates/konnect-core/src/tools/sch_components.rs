@@ -334,7 +334,9 @@ async fn handle_add_schematic_component(
     let project_name = project_name_for(&sch_path);
 
     // Embed the library symbol definition
-    cse::library::ensure_lib_symbol(&mut sch, &lib_id);
+    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
+    }
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(&lib_id, x, y);
@@ -764,24 +766,33 @@ async fn handle_get_schematic_pin_locations(
         .iter()
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
 
-    let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
-        let lib_pins = extract_lib_pins(sym);
-        let t = inst.pin_transform();
-        lib_pins
-            .iter()
-            .map(|p| {
-                let (sx, sy) = pin_endpoint(p, t);
-                json!({
-                    "number": p.number,
-                    "name": p.name,
-                    "x": sx,
-                    "y": sy
-                })
-            })
-            .collect()
-    } else {
-        Vec::new()
+    // A missing embedded definition is an error, not an empty pin list —
+    // silently returning [] hid every bad-lib_id component until wiring or
+    // netlisting failed much later (#34).
+    let Some(sym) = lib_sym else {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' has no embedded definition for '{}' in this \
+             schematic's lib_symbols — it was likely added with a lib_id that \
+             doesn't exist in the installed libraries, so it is invisible to \
+             KiCAD's netlister. Re-add it with a valid lib_id \
+             (delete_schematic_component + add_schematic_component).",
+            reference, inst.lib_id
+        )));
     };
+    let lib_pins = extract_lib_pins(sym);
+    let t = inst.pin_transform();
+    let pins: Vec<serde_json::Value> = lib_pins
+        .iter()
+        .map(|p| {
+            let (sx, sy) = pin_endpoint(p, t);
+            json!({
+                "number": p.number,
+                "name": p.name,
+                "x": sx,
+                "y": sy
+            })
+        })
+        .collect();
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
@@ -823,18 +834,25 @@ async fn handle_batch_get_pin_locations(
             let lib_sym = lib_syms
                 .iter()
                 .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
-            let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
-                let t = inst.pin_transform();
-                extract_lib_pins(sym)
-                    .iter()
-                    .map(|p| {
-                        let (sx, sy) = pin_endpoint(p, t);
-                        json!({ "number": p.number, "name": p.name, "x": sx, "y": sy })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
+            // Per-entry error rather than a silent empty pin list (#34).
+            let Some(sym) = lib_sym else {
+                return json!({
+                    "reference": reference,
+                    "error": format!(
+                        "no embedded definition for '{}' in lib_symbols — \
+                         likely added with a nonexistent lib_id",
+                        inst.lib_id
+                    )
+                });
             };
+            let t = inst.pin_transform();
+            let pins: Vec<serde_json::Value> = extract_lib_pins(sym)
+                .iter()
+                .map(|p| {
+                    let (sx, sy) = pin_endpoint(p, t);
+                    json!({ "number": p.number, "name": p.name, "x": sx, "y": sy })
+                })
+                .collect();
             json!({ "reference": reference, "x": inst.x, "y": inst.y, "pins": pins })
         })
         .collect();
@@ -1031,8 +1049,12 @@ async fn handle_replace_component(
     );
     content = new_content;
 
-    // Ensure the new library symbol definition is present
-    super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id);
+    // Ensure the new library symbol definition is present. Bail BEFORE writing:
+    // a replace that can't embed its definition would leave the component
+    // netlist-invisible (#34).
+    if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id));
+    }
     write_atomic(&sch_path, &content)?;
 
     Ok(CallToolResult::json(&json!({
@@ -1064,6 +1086,28 @@ mod tests {
         )
     }
 
+    /// Serializes tests that set KICAD10_SYMBOL_DIR (process-wide env).
+    static SYMBOL_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A stub symbol library so component adds resolve without an installed
+    /// KiCAD (CI has none): Device:R and Device:C_Polarized in the KiCAD 10
+    /// symdir layout. Returns (tempdir guard, env lock).
+    fn stub_symbol_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = SYMBOL_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let symdir = dir.path().join("Device.kicad_symdir");
+        std::fs::create_dir_all(&symdir).unwrap();
+        let symbol = |name: &str| {
+            format!(
+                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"{name}\"\n\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t(property \"Value\" \"{name}\" (at 0 0 0))\n\t\t(symbol \"{name}_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -3.81 90) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
+            )
+        };
+        std::fs::write(symdir.join("R.kicad_sym"), symbol("R")).unwrap();
+        std::fs::write(symdir.join("C_Polarized.kicad_sym"), symbol("C_Polarized")).unwrap();
+        std::env::set_var("KICAD10_SYMBOL_DIR", dir.path());
+        (dir, guard)
+    }
+
     #[tokio::test]
     async fn create_schematic_writes_root_uuid() {
         let dir = tempfile::tempdir().unwrap();
@@ -1084,6 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_writes_eeschema_style_instance_path() {
+        let (_symdir, _env) = stub_symbol_dir();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("amp.kicad_sch");
         let ctx = test_ctx();
@@ -1117,6 +1162,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_repairs_legacy_file_without_root_uuid() {
+        let (_symdir, _env) = stub_symbol_dir();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.kicad_sch");
         // File shape produced by Konnect before root UUIDs were written.
@@ -1144,5 +1190,100 @@ mod tests {
         let root_uuid = sch.uuid.clone().expect("legacy file gains a root uuid");
         let sym = sch.symbols.by_reference("R1").unwrap();
         assert!(sym.has_instance_path("legacy", &format!("/{}", root_uuid)));
+    }
+
+    #[tokio::test]
+    async fn add_component_with_nonexistent_lib_id_errors_with_suggestion() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ghost.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Device:CP is the KiCAD ≤9 name; 10 renamed it to C_Polarized (#34).
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:CP",
+                "x": 100.0, "y": 80.0,
+                "reference": "C1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "nonexistent lib_id must be an error");
+        let msg = format!("{:?}", result.content);
+        assert!(msg.contains("Device:CP"), "names the bad lib_id: {msg}");
+        assert!(
+            msg.contains("C_Polarized"),
+            "did-you-mean should surface the rename: {msg}"
+        );
+
+        // And nothing was written: no ghost instance in the file.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn add_component_with_unknown_library_says_so() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nolib.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Transistor_FET_xyzzy:IRF830",
+                "x": 100.0, "y": 80.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let msg = format!("{:?}", result.content);
+        assert!(
+            msg.contains("Library 'Transistor_FET_xyzzy' not found"),
+            "distinguishes missing library from missing symbol: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_locations_error_when_definition_not_embedded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noembed.kicad_sch");
+        // A symbol instance whose lib_id has NO lib_symbols entry — the file
+        // shape a ghost lib_id used to leave behind (#34).
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\t(lib_symbols\n\t)\n\t(symbol\n\t\t(lib_id \"Device:CP\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n\t\t(property \"Reference\" \"C1\"\n\t\t\t(at 102 78 0)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_get_schematic_pin_locations(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "C1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_error,
+            "missing embedded definition must be an error, not pins: []"
+        );
+        let msg = format!("{:?}", result.content);
+        assert!(msg.contains("Device:CP"));
+        assert!(msg.contains("no embedded definition"));
     }
 }
