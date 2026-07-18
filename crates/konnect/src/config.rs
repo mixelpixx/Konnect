@@ -79,20 +79,33 @@ fn default_log_level() -> String {
 impl Config {
     /// Load config from the default search path.
     pub fn load() -> Result<Self> {
-        let config_paths = [
+        let mut config_paths = vec![
             PathBuf::from("konnect.toml"),
             PathBuf::from("settings.json"),
-            dirs_config_path(),
         ];
+        config_paths.extend(exe_relative_settings_paths());
+        config_paths.push(dirs_config_path());
 
+        let mut config = None;
         for path in &config_paths {
             if path.exists() {
-                return Self::load_from(path);
+                config = Some(Self::load_from(path)?);
+                break;
             }
         }
 
-        // No config file found; use defaults
-        Ok(Config::default())
+        let mut config = config.unwrap_or_default();
+
+        // Env var wins over an unset/blank ipc_address either way.
+        if config.ipc_address.is_empty() {
+            if let Ok(sock) = std::env::var("KICAD_API_SOCKET") {
+                if !sock.is_empty() {
+                    config.ipc_address = sock;
+                }
+            }
+        }
+
+        Ok(config)
     }
 
     /// Load config from a specific file path. Auto-detects JSON vs TOML by extension.
@@ -127,6 +140,20 @@ impl Default for Config {
             log_level: default_log_level(),
         }
     }
+}
+
+/// settings.json next to the binary, and one dir up (covers <plugin_dir>/bin/konnect).
+fn exe_relative_settings_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            paths.push(exe_dir.join("settings.json"));
+            if let Some(parent_dir) = exe_dir.parent() {
+                paths.push(parent_dir.join("settings.json"));
+            }
+        }
+    }
+    paths
 }
 
 fn dirs_config_path() -> PathBuf {
@@ -243,6 +270,41 @@ mod tests {
         assert!(matches!(c.transport, TransportMode::Http));
         assert_eq!(c.http_address, "127.0.0.1:9999");
         assert_eq!(c.log_level, "info"); // untouched default
+    }
+
+    // Mutates the process-wide env var, so these two run serially.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn empty_ipc_address_falls_back_to_env_var_when_no_config_found() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("KICAD_API_SOCKET", "ipc://env-fallback.sock");
+        let c = Config::default();
+        assert_eq!(c.ipc_address, "ipc://env-fallback.sock");
+        std::env::remove_var("KICAD_API_SOCKET");
+    }
+
+    #[test]
+    fn explicit_empty_ipc_address_in_config_file_does_not_block_env_var() {
+        // A present-but-blank field must not out-rank the env var the way
+        // a merely-missing field would (#39).
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("KICAD_API_SOCKET", "ipc://env-wins.sock");
+
+        let f = write_temp("json", r#"{"ipc_socket_path": ""}"#);
+        let mut c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.ipc_address, "", "sanity: file's blank value loaded as-is");
+
+        if c.ipc_address.is_empty() {
+            if let Ok(sock) = std::env::var("KICAD_API_SOCKET") {
+                if !sock.is_empty() {
+                    c.ipc_address = sock;
+                }
+            }
+        }
+        assert_eq!(c.ipc_address, "ipc://env-wins.sock");
+
+        std::env::remove_var("KICAD_API_SOCKET");
     }
 
     #[test]
