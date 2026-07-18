@@ -110,10 +110,61 @@ Verify: open the **PCB Editor** → **Tools → External Plugins** → you shoul
 ### Build from source
 
 ```bash
-# protoc is required (protobuf code generation)
-# Windows: choco install protoc / macOS: brew install protobuf / Linux: apt install protobuf-compiler
+# protoc is required (protobuf code generation), and cmake (the nng crate
+# compiles the NNG C library with it).
+# Windows: choco install protoc cmake
+# macOS:   brew install protobuf cmake
+# Linux:   apt install protobuf-compiler cmake
 cargo build --release -p konnect
 ```
+
+### macOS
+
+The [Releases](https://github.com/mixelpixx/Konnect/releases) page ships
+standalone server binaries for both Apple Silicon (`aarch64-apple-darwin`) and
+Intel (`x86_64-apple-darwin`). They are not yet code-signed, so if you download
+one through a browser, clear the quarantine flag before first launch:
+
+```bash
+tar xzf konnect-v*-aarch64-apple-darwin.tar.gz
+xattr -d com.apple.quarantine ./konnect   # only needed for browser downloads
+./konnect --help
+```
+
+Or build from source as above (verified on Apple Silicon; the same
+`target/release/konnect` binary is the MCP server).
+
+KiCad on macOS keeps its tools inside the app bundle and they are not on
+`PATH`, so point Konnect at them in `~/Library/Application Support/konnect/config.toml`:
+
+```toml
+kicad_cli = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
+kicad_binary = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad"
+# KiCad 10's IPC socket on macOS (enable it in KiCad:
+# Preferences → Plugins → "Enable KiCad API")
+ipc_address = "ipc:///tmp/kicad/api.sock"
+```
+
+Claude Desktop's config lives at
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "konnect": {
+      "command": "/path/to/konnect"
+    }
+  }
+}
+```
+
+For Claude Code, put the same snippet in a `.mcp.json` in your project root.
+
+Known macOS gaps: the PCM zip currently bundles only the Windows binary, so
+install the server via a release tarball or a source build. The schematic
+viewer compiles and launches on macOS (Tauri 2 uses the system WKWebView —
+WebView2 is only a Windows requirement) but hasn't had the same mileage as
+the Windows build yet.
 
 ## Setup with Claude Desktop
 
@@ -160,8 +211,10 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
 
 ## Requirements
 
-- KiCAD 10 (Windows today; Linux and macOS builds are on the [roadmap](ROADMAP.md) —
-  the code already compiles and passes tests on all three platforms in CI)
+- KiCAD 10 (Windows is the most-tested platform; macOS works from the release
+  binaries or a source build — see the [macOS section](#macos) above. Linux
+  compiles and passes tests in CI but hasn't had per-platform QA yet; both are
+  tracked on the [roadmap](ROADMAP.md))
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For PCB tools: KiCAD running with the target board open (IPC API)
 
