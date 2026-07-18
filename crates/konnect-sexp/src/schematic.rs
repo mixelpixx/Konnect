@@ -291,11 +291,14 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
 /// Compute the schematic-space pin endpoint (where wires connect) for a lib pin
 /// given a component's placement transform.
 pub fn pin_endpoint(pin: &LibPin, t: PinTransform) -> (f64, f64) {
-    // The wire-connection point is at pin_origin + length in pin direction
-    let angle_rad = pin.rotation.to_radians();
-    let tip_x = pin.local_x + pin.length * angle_rad.cos();
-    let tip_y = pin.local_y + pin.length * angle_rad.sin();
-    transform_pin(tip_x, tip_y, t)
+    // In the KiCAD symbol format the pin's (at x y angle) IS the electrical
+    // connection point: the angle points from that tip TOWARD the symbol body,
+    // and the drawn pin line extends `length` mm inward. Adding length here
+    // would land on the body-attachment end — 1 pin-length away from where
+    // KiCAD actually joins wires (eeschema's ERC reports pin positions at the
+    // (at) point, and pin tips land exactly on the body outline only after
+    // adding length — verified against Device:R in the KiCAD 10 libraries).
+    transform_pin(pin.local_x, pin.local_y, t)
 }
 
 // ─── T-Junction detection ─────────────────────────────────────────────────────
@@ -361,4 +364,63 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     (uuid "{uuid}")
   )"#
     )
+}
+
+#[cfg(test)]
+mod pin_endpoint_tests {
+    use super::*;
+
+    fn device_r_pin(number: &str, local_y: f64, rotation: f64) -> LibPin {
+        // Device:R in the KiCAD 10 libraries: (pin ... (at 0 3.81 270) (length 1.27))
+        // and (at 0 -3.81 90) — the (at) point is the electrical tip; the angle
+        // points toward the body.
+        LibPin {
+            number: number.to_string(),
+            name: "~".to_string(),
+            local_x: 0.0,
+            local_y,
+            rotation,
+            length: 1.27,
+        }
+    }
+
+    fn placed(comp_x: f64, comp_y: f64, rotation_deg: f64) -> PinTransform {
+        PinTransform {
+            comp_x,
+            comp_y,
+            rotation_deg,
+            mirror_x: false,
+            mirror_y: false,
+        }
+    }
+
+    #[test]
+    fn endpoint_is_the_electrical_tip_not_the_body_end() {
+        // R placed at (100.33, 80.01), rotation 0. eeschema's own ERC reports
+        // these pins at y = 76.20 and 83.82 — the (at)-derived tips.
+        let (x1, y1) = pin_endpoint(&device_r_pin("1", 3.81, 270.0), placed(100.33, 80.01, 0.0));
+        assert!((x1 - 100.33).abs() < 1e-9);
+        assert!(
+            (y1 - 76.20).abs() < 1e-9,
+            "pin 1 tip must be at 76.20 (got {y1}); 77.47 would be the body end"
+        );
+
+        let (x2, y2) = pin_endpoint(&device_r_pin("2", -3.81, 90.0), placed(100.33, 80.01, 0.0));
+        assert!((x2 - 100.33).abs() < 1e-9);
+        assert!(
+            (y2 - 83.82).abs() < 1e-9,
+            "pin 2 tip must be at 83.82 (got {y2}); 82.55 would be the body end"
+        );
+    }
+
+    #[test]
+    fn endpoint_respects_rotation() {
+        // Same resistor rotated 90°: the pin tips swing onto the X axis.
+        let (x, y) = pin_endpoint(&device_r_pin("1", 3.81, 270.0), placed(100.0, 80.0, 90.0));
+        assert!((y - 80.0).abs() < 1e-9);
+        assert!(
+            (x - 96.19).abs() < 1e-9 || (x - 103.81).abs() < 1e-9,
+            "rotated tip must sit 3.81 mm from center on the X axis, got {x}"
+        );
+    }
 }
