@@ -70,12 +70,29 @@ jobs:
           path: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.*
 
   pcm-package:
-    name: KiCAD PCM plugin package
-    runs-on: windows-latest
+    name: KiCAD PCM plugin package (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+          - platform: macos
+            os: macos-latest
+          - platform: linux
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # macOS packages ship a universal binary so one download serves both
+      # Apple Silicon and Intel — PCM has no architecture dimension, only
+      # platform, so an arm64-only "macos" package would break Intel Macs.
+      - name: Add x86_64 target (macOS universal)
+        if: matrix.platform == 'macos'
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - uses: arduino/setup-protoc@v3
         with:
@@ -83,35 +100,87 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: pcm-package
+          key: pcm-package-${{ matrix.platform }}
 
       - name: Build server binary
+        if: matrix.platform != 'macos'
         run: cargo build --release -p konnect
 
       - name: Build schematic viewer (optional)
+        if: matrix.platform != 'macos'
         continue-on-error: true
         run: cargo build --release --manifest-path crates/schematic-viewer/Cargo.toml
 
-      - name: Assemble PCM package
+      - name: Build universal binaries (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p konnect --target "$target"
+          done
+          mkdir -p dist/universal
+          lipo -create -output dist/universal/konnect \
+            target/aarch64-apple-darwin/release/konnect \
+            target/x86_64-apple-darwin/release/konnect
+          lipo -info dist/universal/konnect
+
+      - name: Build universal schematic viewer (macOS, optional)
+        if: matrix.platform == 'macos'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --manifest-path crates/schematic-viewer/Cargo.toml --target "$target"
+          done
+          lipo -create -output dist/universal/schematic-viewer \
+            crates/schematic-viewer/target/aarch64-apple-darwin/release/schematic-viewer \
+            crates/schematic-viewer/target/x86_64-apple-darwin/release/schematic-viewer
+          lipo -info dist/universal/schematic-viewer
+
+      - name: Assemble PCM package (Windows)
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart('v')
           ./packaging/build-pcm.ps1 -Version $version `
             -BinaryPath target/release/konnect.exe `
             -ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe `
+            -Platform windows `
             -OutDir dist
 
-      - name: Validate PCM package against KiCAD schema (release gate)
-        shell: pwsh
+      - name: Assemble PCM package (macOS)
+        if: matrix.platform == 'macos'
         run: |
+          version="${GITHUB_REF_NAME#v}"
+          ./packaging/build-pcm.sh --version "$version" \
+            --binary dist/universal/konnect \
+            --viewer dist/universal/schematic-viewer \
+            --platform macos --out dist
+
+      - name: Assemble PCM package (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ./packaging/build-pcm.sh --version "$version" \
+            --binary target/release/konnect \
+            --viewer crates/schematic-viewer/target/release/schematic-viewer \
+            --platform linux --out dist
+
+      # Gate: the package must declare the platform it carries, and the bundled
+      # binary must actually be that platform's executable format.
+      - name: Validate PCM package against KiCAD schema (release gate)
+        shell: bash
+        run: |
+          set -euo pipefail
           pip install jsonschema
-          $version = "${{ github.ref_name }}".TrimStart('v')
-          python packaging/validate-pcm.py --zip "dist/konnect-pcm-v$version.zip"
+          version="${GITHUB_REF_NAME#v}"
+          python packaging/validate-pcm.py \
+            --zip "dist/konnect-pcm-v$version-${{ matrix.platform }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: konnect-pcm
+          name: konnect-pcm-${{ matrix.platform }}
           path: dist/konnect-pcm-*.zip
 
   release:

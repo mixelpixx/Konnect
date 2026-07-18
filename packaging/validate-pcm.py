@@ -36,6 +36,28 @@ REQUIRED_ZIP_ENTRIES = [
     "resources/icon.png",
 ]
 
+# Executable formats, by the magic bytes each platform's loader requires. A
+# package bundles a native binary, so its declared platform is checkable rather
+# than a promise: a Windows PE in a package declaring "macos" is unrunnable.
+EXECUTABLE_MAGIC = {
+    "windows": [b"MZ"],
+    "linux": [b"\x7fELF"],
+    "macos": [
+        b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit, little-endian
+        b"\xce\xfa\xed\xfe",  # Mach-O 32-bit, little-endian
+        b"\xca\xfe\xba\xbe",  # universal ("fat") binary
+        b"\xbe\xba\xfe\xca",  # universal, byte-swapped
+    ],
+}
+
+
+def identify_executable(blob: bytes) -> str | None:
+    """Name the platform whose loader can run `blob`, or None if unrecognized."""
+    for platform, magics in EXECUTABLE_MAGIC.items():
+        if any(blob.startswith(m) for m in magics):
+            return platform
+    return None
+
 
 def load_schema():
     return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -87,6 +109,45 @@ def validate_zip(zip_path: Path) -> list[str]:
                         f"omit the field or provide a real value"
                     )
 
+        errors += validate_platforms(z, meta, binaries, zip_path.name)
+
+    return errors
+
+
+def validate_platforms(z, meta: dict, binaries: list[str], label: str) -> list[str]:
+    """Every version must declare exactly the platform its binaries can run on.
+
+    Omitting `platforms` means "all platforms" to KiCAD's PCM, which is never
+    true of a package that bundles one native binary — that is how a
+    Windows-only package came to be offered to macOS and Linux users.
+    """
+    errors = []
+    for v in meta.get("versions", []):
+        declared = v.get("platforms")
+        if not declared:
+            errors.append(
+                f"{label}: version {v.get('version')} declares no 'platforms' — "
+                f"PCM would offer this native package to every OS. Declare the "
+                f"one platform its binaries are built for."
+            )
+            continue
+        if len(declared) != 1:
+            errors.append(
+                f"{label}: version {v.get('version')} declares platforms "
+                f"{declared}; a package bundles one platform's binaries"
+            )
+            continue
+
+        # The declaration must match what is actually in the zip.
+        for name in binaries:
+            actual = identify_executable(z.read(name)[:4])
+            if actual is None:
+                errors.append(f"{label}: {name} is not a recognized executable")
+            elif actual != declared[0]:
+                errors.append(
+                    f"{label}: declares platforms {declared} but {name} is a "
+                    f"{actual} executable"
+                )
     return errors
 
 

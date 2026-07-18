@@ -97,9 +97,12 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 
 ### From the KiCAD Plugin Manager (recommended)
 
-1. Download `konnect-pcm-v<version>.zip` from [Releases](https://github.com/mixelpixx/Konnect/releases)
-   (the `konnect-pcm-*` asset is the KiCAD plugin package; the other archives are
-   standalone server binaries)
+1. Download the package for your OS from [Releases](https://github.com/mixelpixx/Konnect/releases):
+   `konnect-pcm-v<version>-windows.zip`, `-macos.zip`, or `-linux.zip`. Each
+   bundles that platform's server binary — the macOS package is a universal
+   build, so one download covers Apple Silicon and Intel. (The `konnect-pcm-*`
+   assets are the KiCAD plugin packages; the other archives are standalone
+   server binaries.)
 2. Open KiCAD 10 → **Plugin and Content Manager**
 3. Click **Install from File** and select the zip
 4. Restart KiCAD

@@ -19,10 +19,16 @@
 # (bin/konnect) so the KiCAD 10 IPC action resolves on macOS/Linux, mirroring
 # build-pcm.ps1 which stamps bin/konnect.exe for Windows.
 #
-# Usage:
-#   packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH] [--out DIR]
+# The package declares the platform it carries binaries for, so KiCAD's PCM
+# only offers it to machines that can run it. A package bundles one native
+# binary, so it is never valid for "all platforms".
 #
-# Defaults: version from Cargo.toml, binary target/release/konnect, output dist/.
+# Usage:
+#   packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH]
+#                          [--platform macos|linux] [--out DIR]
+#
+# Defaults: version from Cargo.toml, binary target/release/konnect, platform
+# from the host, output dist/.
 # Prints the zip path, size, and SHA256 (needed for the kicad-addons metadata).
 set -euo pipefail
 
@@ -32,14 +38,17 @@ bin_name="konnect"
 version=""
 binary="$repo_root/target/release/$bin_name"
 viewer=""
+platform=""
 out_dir="$repo_root/dist"
 
 usage() {
     cat >&2 <<'EOF'
-Usage: packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH] [--out DIR]
+Usage: packaging/build-pcm.sh [--version X.Y.Z] [--binary PATH] [--viewer PATH]
+                              [--platform macos|linux] [--out DIR]
 
 Assembles the KiCAD PCM plugin zip (macOS/Linux port of build-pcm.ps1).
-Defaults: version from Cargo.toml, binary target/release/konnect, output dist/.
+Defaults: version from Cargo.toml, binary target/release/konnect, platform from
+the host, output dist/.
 EOF
 }
 
@@ -48,6 +57,7 @@ while [ $# -gt 0 ]; do
         --version) version="${2:?--version needs a value}"; shift 2;;
         --binary)  binary="${2:?--binary needs a value}";   shift 2;;
         --viewer)  viewer="${2:?--viewer needs a value}";   shift 2;;
+        --platform) platform="${2:?--platform needs a value}"; shift 2;;
         --out)     out_dir="${2:?--out needs a value}";     shift 2;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown argument: $1" >&2; usage; exit 2;;
@@ -59,6 +69,20 @@ if [ -z "$version" ]; then
     version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
 fi
 [ -n "$version" ] || { echo "Could not determine version; pass --version" >&2; exit 1; }
+
+# Default platform = the host we're packaging on.
+if [ -z "$platform" ]; then
+    case "$(uname -s)" in
+        Darwin) platform="macos";;
+        Linux)  platform="linux";;
+        *) echo "Cannot infer platform from $(uname -s); pass --platform" >&2; exit 1;;
+    esac
+fi
+case "$platform" in
+    macos|linux) ;;
+    windows) echo "Windows packages come from build-pcm.ps1" >&2; exit 2;;
+    *) echo "--platform must be 'macos' or 'linux' (got '$platform')" >&2; exit 2;;
+esac
 if [ ! -f "$binary" ]; then
     echo "Binary not found: $binary" >&2
     echo "Build it first: cargo build --release -p konnect" >&2
@@ -98,28 +122,35 @@ json.dump(m, open(path, "w"), indent=2)
 open(path, "a").write("\n")
 PY
 
-# metadata.json: stamp version + install_size; download_* get schema-valid
-# placeholders (PCM ignores them for install-from-file; the printed values below
-# go into the kicad-addons repository submission). install_size is the staged
-# file total BEFORE metadata.json is written, matching build-pcm.ps1.
+# metadata.json: stamp version + install_size + platforms. download_* are
+# OMITTED inside the zip, matching build-pcm.ps1: the schema only requires
+# version/status/kicad_version, and placeholder values are lies that PCM shows
+# to users ("Download Size: 1 B"). The real values (printed below) go into the
+# kicad-addons repository submission. install_size is the staged file total
+# BEFORE metadata.json is written, matching build-pcm.ps1.
 install_size="$(python3 -c 'import os,sys; print(sum(os.path.getsize(os.path.join(d,f)) for d,_,fs in os.walk(sys.argv[1]) for f in fs))' "$staging")"
-python3 - "$repo_root/packaging/metadata.json" "$staging/metadata.json" "$version" "$install_size" <<'PY'
+python3 - "$repo_root/packaging/metadata.json" "$staging/metadata.json" "$version" "$install_size" "$platform" <<'PY'
 import json, sys
-src, dst, version, install_size = sys.argv[1:5]
+src, dst, version, install_size, platform = sys.argv[1:6]
 m = json.load(open(src))
 v = m["versions"][0]
 v["version"] = version
 v["install_size"] = int(install_size)
-v["download_sha256"] = "0" * 64
-v["download_url"] = "https://example.invalid/placeholder.zip"
-v["download_size"] = 1
+# This package carries one platform's native binary — say so, or PCM offers a
+# macOS build to a Windows user and vice versa.
+v["platforms"] = [platform]
+for field in ("download_sha256", "download_url", "download_size"):
+    v.pop(field, None)
 json.dump(m, open(dst, "w"), indent=2)
 open(dst, "a").write("\n")
 PY
 
 # Zip it (staged contents at the archive root, matching Compress-Archive)
 mkdir -p "$out_dir"
-zip_path="$out_dir/konnect-pcm-v$version.zip"
+# zip runs from inside $staging below; a relative --out would resolve there
+# and fail with "Could not create output file". Absolutize it first.
+out_dir="$(cd "$out_dir" && pwd)"
+zip_path="$out_dir/konnect-pcm-v$version-$platform.zip"
 rm -f "$zip_path"
 ( cd "$staging" && zip -rqX "$zip_path" metadata.json plugins resources )
 
@@ -135,4 +166,5 @@ echo "PCM package: $zip_path"
 echo "  download_size:   $size"
 echo "  install_size:    $install_size"
 echo "  download_sha256: $sha"
-echo "  download_url:    https://github.com/mixelpixx/Konnect/releases/download/v$version/konnect-pcm-v$version.zip"
+echo "  platforms:       [$platform]"
+echo "  download_url:    https://github.com/mixelpixx/Konnect/releases/download/v$version/konnect-pcm-v$version-$platform.zip"

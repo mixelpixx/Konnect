@@ -63,10 +63,38 @@ jobs:
       - run: pip install jsonschema
       - name: Validate repository metadata
         run: python packaging/validate-pcm.py --metadata packaging/metadata.json
-      - name: Assemble PCM zip with a stub binary and validate structure
+
+      # Stub binaries carry each platform's executable magic: the validator
+      # checks a package's bundled binary against the platform it declares,
+      # which is what stops a Windows-only zip from being offered to every OS.
+      - name: Assemble Windows PCM zip with a stub binary and validate structure
         shell: pwsh
         run: |
-          New-Item -ItemType File -Path stub-konnect.exe | Out-Null
-          Set-Content stub-konnect.exe "stub"
-          ./packaging/build-pcm.ps1 -Version 0.0.0 -BinaryPath stub-konnect.exe -OutDir dist
-          python packaging/validate-pcm.py --zip dist/konnect-pcm-v0.0.0.zip
+          [System.IO.File]::WriteAllBytes("stub-konnect.exe", [byte[]](0x4D, 0x5A, 0x90, 0x00))
+          ./packaging/build-pcm.ps1 -Version 0.0.0 -BinaryPath stub-konnect.exe `
+            -Platform windows -OutDir dist
+          python packaging/validate-pcm.py --zip dist/konnect-pcm-v0.0.0-windows.zip
+
+      # build-pcm.sh is what the macOS and Linux release packages are built
+      # with, so it gets the same structural check.
+      - name: Assemble Linux PCM zip with a stub binary and validate structure
+        run: |
+          set -euo pipefail
+          printf '\177ELF\002\001\001\000' > stub-konnect
+          ./packaging/build-pcm.sh --version 0.0.0 --binary stub-konnect \
+            --platform linux --out dist
+          python packaging/validate-pcm.py --zip dist/konnect-pcm-v0.0.0-linux.zip
+
+      - name: Reject a package whose binary contradicts its platform
+        run: |
+          set -euo pipefail
+          # The exact mistake v0.1.3 shipped: a Windows binary in a package
+          # non-Windows users are offered. The gate must fail here.
+          printf 'MZ\220\000' > stub-konnect-win
+          ./packaging/build-pcm.sh --version 0.0.0 --binary stub-konnect-win \
+            --platform linux --out dist-bad
+          if python packaging/validate-pcm.py --zip dist-bad/konnect-pcm-v0.0.0-linux.zip; then
+            echo "::error::validator accepted a Windows binary in a linux package"
+            exit 1
+          fi
+          echo "OK: mismatched binary/platform correctly rejected"
