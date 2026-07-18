@@ -163,8 +163,9 @@ Claude Desktop's config lives at
 
 For Claude Code, put the same snippet in a `.mcp.json` in your project root.
 
-Known macOS gaps: the PCM zip currently bundles only the Windows binary, so
-install the server via a release tarball or a source build. The schematic
+Starting with the next release, the PCM package for macOS
+(`konnect-pcm-v<version>-macos.zip`) bundles a universal server binary; for
+v0.1.3 and earlier, install via a release tarball or a source build. The schematic
 viewer compiles and launches on macOS (Tauri 2 uses the system WKWebView —
 WebView2 is only a Windows requirement) but hasn't had the same mileage as
 the Windows build yet.
