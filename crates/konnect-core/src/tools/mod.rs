@@ -662,7 +662,29 @@ fn find_kicad_symbol_dirs() -> Vec<std::path::PathBuf> {
             }
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // KiCad on macOS ships its libraries inside the app bundle.
+        let mut candidates = vec![
+            std::path::PathBuf::from(
+                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
+            ),
+            std::path::PathBuf::from("/usr/local/share/kicad/symbols"),
+        ];
+        if let Ok(home) = std::env::var("HOME") {
+            // Per-user install (KiCad.app dragged into ~/Applications)
+            candidates.push(
+                std::path::PathBuf::from(home)
+                    .join("Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
+            );
+        }
+        for p in candidates {
+            if p.is_dir() && !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let candidates = ["/usr/share/kicad/symbols", "/usr/local/share/kicad/symbols"];
         for c in &candidates {
