@@ -118,7 +118,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "create_symbol",
-            "Create a new KiCAD schematic symbol and append it to a .kicad_sym library file.",
+            "Create a new KiCAD schematic symbol and append it to a .kicad_sym library file. \
+             Supports single-unit symbols (via `pins`) and multi-unit parts like dual/quad \
+             op-amps or gate banks (via `units` + optional `common_pins`). Each unit gets a \
+             rectangular body sized to its pins.",
             json!({
                 "type": "object",
                 "properties": {
@@ -144,9 +147,53 @@ pub fn tools() -> Vec<ToolDef> {
                         }
                     },
                     "show_pin_names": { "type": "boolean", "description": "Show pin names on the symbol (default true).", "default": true },
-                    "show_pin_numbers": { "type": "boolean", "description": "Show pin numbers on the symbol (default true).", "default": true }
+                    "show_pin_numbers": { "type": "boolean", "description": "Show pin numbers on the symbol (default true).", "default": true },
+                    "units": {
+                        "type": "array",
+                        "description": "For MULTI-UNIT parts (dual/quad op-amps, gate banks, multi-bank connectors). Each element is one unit (becomes Unit A, B, C...) with its own pins and its own rectangular body. When given, `units` replaces `pins` (use `pins` for single-unit symbols instead). Each unit's pins use the same shape as `pins`.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "pins": {
+                                    "type": "array",
+                                    "description": "Pins for this unit",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "number": { "type": "string" },
+                                            "name": { "type": "string" },
+                                            "type": { "type": "string", "description": "'input', 'output', 'bidirectional', 'power_in', 'power_out', 'passive'" },
+                                            "x": { "type": "number" },
+                                            "y": { "type": "number" },
+                                            "angle": { "type": "number", "default": 0 },
+                                            "length": { "type": "number", "default": 2.54 }
+                                        },
+                                        "required": ["number", "name", "type", "x", "y"]
+                                    }
+                                }
+                            },
+                            "required": ["pins"]
+                        }
+                    },
+                    "power_pins": {
+                        "type": "array",
+                        "description": "Shared power pins (V+/V-, VCC/GND). Only meaningful with `units`: they become a dedicated final 'power unit' (e.g. Unit C of a dual op-amp, Unit E of a quad gate) placed once, following KiCAD's own 74xx convention. This avoids drawing the power pins on every unit (which would each need wiring to pass ERC). Same shape as `pins`.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "number": { "type": "string" },
+                                "name": { "type": "string" },
+                                "type": { "type": "string" },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "angle": { "type": "number", "default": 0 },
+                                "length": { "type": "number", "default": 2.54 }
+                            },
+                            "required": ["number", "name", "type", "x", "y"]
+                        }
+                    }
                 },
-                "required": ["library_path", "name", "reference_prefix", "pins"]
+                "required": ["library_path", "name", "reference_prefix"]
             }),
             |args, ctx| async move { handle_create_symbol(args, ctx).await }
         ),
@@ -1120,22 +1167,13 @@ fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
     Some((min_x, min_y, max_x, max_y))
 }
 
-async fn handle_create_symbol(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let lib_path = get_path(args, "library_path")?;
-    let name = args["name"].as_str().unwrap_or("Symbol");
-    let ref_prefix = args["reference_prefix"].as_str().unwrap_or("U");
-    let value_str = args["value"].as_str().unwrap_or(name);
-    let pins_val = args["pins"].as_array().cloned().unwrap_or_default();
-    let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
-    let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
-
-    // Build pin S-expressions and collect pin geometry for the body rectangle.
+/// Build one unit's inner S-expression — an optional body rectangle (when
+/// `with_body`) followed by its pins — and return it with the body rect (used
+/// for reference/value placement). Shared by the single- and multi-unit paths.
+fn build_symbol_unit(pins_val: &[serde_json::Value], with_body: bool) -> (String, SymbolRect) {
     let mut pins_sexp = String::new();
     let mut pin_geoms: Vec<PinGeom> = Vec::new();
-    for pin in &pins_val {
+    for pin in pins_val {
         let number = pin["number"].as_str().unwrap_or("1");
         let pin_name = pin["name"].as_str().unwrap_or("~");
         let pin_type = pin["type"].as_str().unwrap_or("passive");
@@ -1155,10 +1193,11 @@ async fn handle_create_symbol(
             pin_type, x, y, angle, length, pin_name, number
         ));
     }
-
-    // Body rectangle enclosing the pin roots, plus reference/value placement
-    // above/below it (symbol coordinates are Y-up).
-    let body = symbol_body_rect(&pin_geoms);
+    let body = if with_body {
+        symbol_body_rect(&pin_geoms)
+    } else {
+        None
+    };
     let body_sexp = match body {
         Some((min_x, min_y, max_x, max_y)) => format!(
             "\n      (rectangle (start {:.4} {:.4}) (end {:.4} {:.4})\n        (stroke (width 0.254) (type default))\n        (fill (type background))\n      )",
@@ -1166,7 +1205,80 @@ async fn handle_create_symbol(
         ),
         None => String::new(),
     };
-    let (ref_y, value_y) = match body {
+    (format!("{}{}", body_sexp, pins_sexp), body)
+}
+
+type SymbolRect = Option<(f64, f64, f64, f64)>;
+
+async fn handle_create_symbol(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let lib_path = get_path(args, "library_path")?;
+    let name = args["name"].as_str().unwrap_or("Symbol");
+    let ref_prefix = args["reference_prefix"].as_str().unwrap_or("U");
+    let value_str = args["value"].as_str().unwrap_or(name);
+    let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
+    let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
+
+    // Multi-unit when `units` is a non-empty array; otherwise the single-unit
+    // `pins` path. Sub-symbols are named NAME_<unit>_1; unit 0 holds items drawn
+    // on every unit (common power pins), units 1..N are the individual units.
+    let units: Vec<Vec<serde_json::Value>> = args["units"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|u| u["pins"].as_array().cloned().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    let power_pins = args["power_pins"].as_array().cloned().unwrap_or_default();
+
+    let mut units_sexp = String::new();
+    let unit_count: usize;
+    let ref_body: SymbolRect;
+    if units.is_empty() {
+        // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
+        let pins_val = args["pins"].as_array().cloned().unwrap_or_default();
+        let (inner, body) = build_symbol_unit(&pins_val, true);
+        units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
+        unit_count = 1;
+        ref_body = body;
+    } else {
+        // Multi-unit: each signal unit is NAME_1_1..NAME_N_1, and the power
+        // pins (if any) become a dedicated FINAL unit rather than being drawn
+        // on every unit. KiCAD's own multi-unit parts do this (e.g. 74LS00 has
+        // the four gates as units 1..4 and VCC/GND as unit 5). It means the
+        // power pins appear on exactly one placed unit instead of on every
+        // unit, where each duplicate would otherwise need wiring to pass ERC.
+        let mut first_body: SymbolRect = None;
+        for (i, unit_pins) in units.iter().enumerate() {
+            let (inner, body) = build_symbol_unit(unit_pins, true);
+            if i == 0 {
+                first_body = body;
+            }
+            units_sexp.push_str(&format!(
+                "\n    (symbol \"{}_{}_1\"{}\n    )",
+                name,
+                i + 1,
+                inner
+            ));
+        }
+        let mut total = units.len();
+        if !power_pins.is_empty() {
+            let (inner, _) = build_symbol_unit(&power_pins, true);
+            total += 1;
+            units_sexp.push_str(&format!(
+                "\n    (symbol \"{}_{}_1\"{}\n    )",
+                name, total, inner
+            ));
+        }
+        unit_count = total;
+        ref_body = first_body;
+    }
+
+    // Reference/value placement above/below the (first) unit body (Y-up).
+    let (ref_y, value_y) = match ref_body {
         Some((_, min_y, _, max_y)) => (max_y + 2.54, min_y - 2.54),
         None => (2.54, -2.54),
     };
@@ -1175,8 +1287,8 @@ async fn handle_create_symbol(
     let names_vis = if show_names { "" } else { " hide" };
 
     let symbol_sexp = format!(
-        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset 1.016){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (symbol \"{}_0_1\"{}{}\n    )\n  )",
-        name, numbers_vis, names_vis, ref_prefix, ref_y, value_str, value_y, name, body_sexp, pins_sexp
+        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset 1.016){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)){}\n  )",
+        name, numbers_vis, names_vis, ref_prefix, ref_y, value_str, value_y, units_sexp
     );
 
     // If file doesn't exist, create scaffold
@@ -1200,8 +1312,8 @@ async fn handle_create_symbol(
             "success": true,
             "symbol": name,
             "library": lib_path.to_str().unwrap_or(""),
-            "pin_count": pins_val.len(),
-            "body": body.is_some()
+            "unit_count": unit_count,
+            "power_pin_count": power_pins.len()
         }))
         .unwrap(),
     ))
@@ -1931,6 +2043,101 @@ mod tests {
         assert!(
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated symbol doesn't parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_single_unit_uses_unit_0_only() {
+        // Regression: without `units`, a symbol is one sub-symbol NAME_0_1 and
+        // creates no NAME_1_1 unit (unchanged from before multi-unit support).
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("s.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "SINGLE",
+            "reference_prefix": "U",
+            "pins": [{"number":"1","name":"A","type":"passive","x":-5.08,"y":0.0,"angle":0,"length":2.54}]
+        });
+        handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        let c = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            c.contains("(symbol \"SINGLE_0_1\""),
+            "single unit lives in _0_1:\n{c}"
+        );
+        assert!(
+            !c.contains("SINGLE_1_1"),
+            "single unit must not create a _1_1 unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_multi_unit_emits_units_and_common() {
+        // A dual op-amp: two signal units + power pins as a dedicated 3rd unit.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("dual.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "DUAL_OPAMP",
+            "reference_prefix": "U",
+            "value": "DUAL_OPAMP",
+            "units": [
+                { "pins": [
+                    {"number":"3","name":"+","type":"input","x":-10.16,"y":2.54,"angle":0,"length":2.54},
+                    {"number":"2","name":"-","type":"input","x":-10.16,"y":-2.54,"angle":0,"length":2.54},
+                    {"number":"1","name":"~","type":"output","x":10.16,"y":0.0,"angle":180,"length":2.54}
+                ]},
+                { "pins": [
+                    {"number":"5","name":"+","type":"input","x":-10.16,"y":2.54,"angle":0,"length":2.54},
+                    {"number":"6","name":"-","type":"input","x":-10.16,"y":-2.54,"angle":0,"length":2.54},
+                    {"number":"7","name":"~","type":"output","x":10.16,"y":0.0,"angle":180,"length":2.54}
+                ]}
+            ],
+            "power_pins": [
+                {"number":"8","name":"V+","type":"power_in","x":0.0,"y":7.62,"angle":270,"length":2.54},
+                {"number":"4","name":"V-","type":"power_in","x":0.0,"y":-7.62,"angle":90,"length":2.54}
+            ]
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error);
+        let c = std::fs::read_to_string(&lib).unwrap();
+        // Two signal units + a dedicated power unit (unit 3). No common _0_1,
+        // and the power pins are NOT drawn on every unit.
+        assert!(
+            !c.contains("DUAL_OPAMP_0_1"),
+            "multi-unit must not use a common _0_1:\n{c}"
+        );
+        assert!(
+            c.contains("(symbol \"DUAL_OPAMP_1_1\""),
+            "missing signal unit 1"
+        );
+        assert!(
+            c.contains("(symbol \"DUAL_OPAMP_2_1\""),
+            "missing signal unit 2"
+        );
+        assert!(
+            c.contains("(symbol \"DUAL_OPAMP_3_1\""),
+            "missing dedicated power unit 3"
+        );
+        assert!(
+            !c.contains("DUAL_OPAMP_4_1"),
+            "should be exactly three units"
+        );
+        // The power pins appear once (in the power unit), not per signal unit.
+        assert_eq!(
+            c.matches("\"V+\"").count(),
+            1,
+            "V+ must appear exactly once"
+        );
+        assert_eq!(
+            c.matches("\"V-\"").count(),
+            1,
+            "V- must appear exactly once"
+        );
+        // A body rectangle per unit (2 signal + 1 power).
+        assert_eq!(c.matches("(rectangle").count(), 3, "one body per unit");
+        assert!(
+            konnect_sexp::parser::parse_sexp(&c).is_ok(),
+            "multi-unit symbol doesn't parse"
         );
     }
 }
