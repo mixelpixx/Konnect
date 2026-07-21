@@ -45,7 +45,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
                     "reference": { "type": "string", "description": "Optional override for reference designator" },
-                    "value": { "type": "string", "description": "Optional override for value field" }
+                    "value": { "type": "string", "description": "Optional override for value field" },
+                    "unit": { "type": "integer", "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
             }),
@@ -317,6 +318,7 @@ async fn handle_add_schematic_component(
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
     let reference = opt_str(args, "reference");
     let value = opt_str(args, "value");
+    let unit = opt_f64(args, "unit").unwrap_or(1.0) as u32;
 
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
@@ -341,6 +343,7 @@ async fn handle_add_schematic_component(
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(&lib_id, x, y);
     sym.at.rotation = Some(rotation);
+    sym.unit = unit;
 
     // Helper: build an effects sub-node  (font (size 1.27 1.27))  with optional (hide yes)
     let effects_node = |hide: bool| -> cse::sexp::SexpNode {
@@ -402,7 +405,7 @@ async fn handle_add_schematic_component(
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
-    sym.set_instance_path(&project_name, &format!("/{}", root_uuid), ref_str, 1);
+    sym.set_instance_path(&project_name, &format!("/{}", root_uuid), ref_str, unit);
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
@@ -413,6 +416,7 @@ async fn handle_add_schematic_component(
         "reference": ref_str,
         "value": val_str,
         "x": x, "y": y,
+        "unit": unit,
         "uuid": uuid
     })))
 }
@@ -1158,6 +1162,40 @@ mod tests {
             sym.has_instance_path("amp", &format!("/{}", root_uuid)),
             "instance path must be /<root-uuid> under the file-stem project name"
         );
+    }
+
+    #[tokio::test]
+    async fn add_component_writes_requested_unit() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "x": 100.0, "y": 80.0,
+                "reference": "U1",
+                "unit": 3
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch.symbols.by_reference("U1").unwrap();
+        assert_eq!(sym.unit, 3, "symbol (unit N) must match the requested unit");
+        let root_uuid = sch.uuid.clone().unwrap();
+        // Instance entry must carry the same unit, not a hardcoded 1.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(&format!("/{}", root_uuid)));
+        assert!(raw.contains("(unit 3)"), "instance unit must be 3");
     }
 
     #[tokio::test]
