@@ -6,6 +6,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use konnect_sexp::parser::parse_sexp;
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -1372,6 +1373,31 @@ async fn handle_delete_symbol(
     ))
 }
 
+/// Extract the names of every top-level symbol defined in a `.kicad_sym`
+/// library body, sorted and de-duplicated.
+///
+/// KiCad writes these files with CRLF line endings (on Windows) and TAB
+/// indentation, so a fixed string search such as `\n  (symbol "` does not work
+/// — it returned 0 symbols for every real library (KiCad 10, format version
+/// 20251024). Instead we parse the S-expression structurally and read the
+/// **direct** children of the `(kicad_symbol_lib …)` root whose head is
+/// `symbol`. Nested unit sub-symbols (`NAME_0_1`, `NAME_1_1`, …) live one
+/// level deeper, so they are excluded automatically — no name-pattern
+/// heuristics required, and names containing underscores are preserved
+/// verbatim.
+fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
+    let root = parse_sexp(content)
+        .map_err(|e| anyhow::anyhow!("failed to parse .kicad_sym library: {e}"))?;
+    let mut names: Vec<String> = root
+        .find_all("symbol")
+        .into_iter()
+        .filter_map(|sym| sym.get(1).and_then(|n| n.as_str()).map(str::to_owned))
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 async fn handle_list_symbols_in_library(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1379,28 +1405,7 @@ async fn handle_list_symbols_in_library(
     let lib_path = get_path(args, "library_path")?;
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    // Match all top-level symbol names: `  (symbol "NAME"` at depth 1
-    let mut symbols = Vec::new();
-    let mut search = content.as_str();
-    while let Some(pos) = search.find("\n  (symbol \"") {
-        let after = &search[pos + 13..]; // skip `\n  (symbol "`
-        if let Some(end) = after.find('"') {
-            let sym_name = &after[..end];
-            // Exclude sub-units like "NAME_0_1"
-            if !sym_name.contains('_') || {
-                // Allow symbols whose name contains underscores but are NOT sub-unit patterns
-                let parts: Vec<&str> = sym_name.rsplitn(3, '_').collect();
-                parts.len() < 3 || parts[0].parse::<u32>().is_err()
-            } {
-                symbols.push(sym_name.to_string());
-            }
-            search = &search[pos + 1..];
-        } else {
-            break;
-        }
-    }
-    symbols.sort();
-    symbols.dedup();
+    let symbols = top_level_symbol_names(&content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
@@ -1443,24 +1448,20 @@ async fn handle_search_symbols(
             };
 
             let nickname = lib["nickname"].as_str().unwrap_or("");
-            let mut search = lib_content.as_str();
-            while let Some(pos) = search.find("\n  (symbol \"") {
-                let after = &search[pos + 13..];
-                if let Some(end) = after.find('"') {
-                    let sym_name = &after[..end];
-                    if sym_name.to_lowercase().contains(&query) && !sym_name.contains('_') {
-                        results.push(json!({
-                            "library": nickname,
-                            "name": sym_name,
-                            "id": format!("{}:{}", nickname, sym_name)
-                        }));
-                        if results.len() >= limit {
-                            break 'outer;
-                        }
+            let names = match top_level_symbol_names(&lib_content) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            for sym_name in names {
+                if sym_name.to_lowercase().contains(&query) {
+                    results.push(json!({
+                        "library": nickname,
+                        "name": sym_name,
+                        "id": format!("{}:{}", nickname, sym_name)
+                    }));
+                    if results.len() >= limit {
+                        break 'outer;
                     }
-                    search = &search[pos + 1..];
-                } else {
-                    break;
                 }
             }
         }
@@ -2067,6 +2068,54 @@ mod tests {
         assert!(
             !c.contains("SINGLE_1_1"),
             "single unit must not create a _1_1 unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_symbols_parses_kicad10_crlf_tab_format() {
+        // Regression: konnect 0.2.0 hard-coded the needle `\n  (symbol "` (LF +
+        // exactly 2 spaces) and so returned 0 symbols for every real KiCad
+        // library. On disk those files are CRLF-terminated and TAB-indented
+        // (KiCad 10, format version 20251024), so the needle never matched.
+        // Build a fixture in that exact on-disk shape and confirm we now find
+        // the top-level symbols and skip the nested `_N_M` sub-units.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("kicad10.kicad_sym");
+        let unit = |name: &str| {
+            format!("\t(symbol \"{name}\"\r\n\t\t(symbol \"{name}_0_1\"\r\n\t\t)\r\n\t)\r\n")
+        };
+        let content = format!(
+            "(kicad_symbol_lib\r\n\t(version 20251024)\r\n\t(generator \"kicad_symbol_editor\")\r\n{}{})\r\n",
+            unit("R_ohm"),
+            unit("LED"),
+        );
+        // Sanity: the fixture really is CRLF + TAB and lacks the old needle.
+        assert!(content.contains("\r\n"));
+        assert!(
+            !content.contains("\n  (symbol \""),
+            "fixture must not contain the old LF/2-space needle"
+        );
+        std::fs::write(&lib, content).unwrap();
+
+        let args = json!({ "library_path": lib.to_string_lossy() });
+        let res = handle_list_symbols_in_library(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let text = match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            out["count"],
+            2,
+            "expected 2 top-level symbols (R_ohm, LED), got: {text}"
+        );
+        let names: Vec<String> = serde_json::from_value(out["symbols"].clone()).unwrap();
+        assert!(names.contains(&"R_ohm".to_string()), "names={names:?}");
+        assert!(names.contains(&"LED".to_string()), "names={names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with("_0_1")),
+            "sub-units must not leak into the listing: {names:?}"
         );
     }
 
