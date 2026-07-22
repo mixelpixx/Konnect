@@ -1444,6 +1444,53 @@ fn descendants_with_head<'a>(node: &'a SexpNode, head: &str) -> Vec<&'a SexpNode
     out
 }
 
+/// Resolve the effective pins of a symbol, following `(extends "BASE")` so
+/// derived symbols inherit pins from their base. Walks from the most-derived
+/// symbol (`sym_node`) up through each base found among `root`'s top-level
+/// symbols, collecting pin nodes with most-derived precedence (a pin number
+/// declared on a derived symbol shadows the same number on a base). A visited
+/// set guards against cyclic `extends`; a missing base stops the walk
+/// gracefully and returns whatever pins were collected.
+fn resolve_symbol_pins<'a>(root: &'a SexpNode, sym_node: &'a SexpNode) -> Vec<&'a SexpNode> {
+    // Build the chain [sym_node, base, base-of-base, ...] (most-derived first).
+    let mut chain: Vec<&SexpNode> = Vec::new();
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut current = sym_node;
+    loop {
+        let Some(name) = current.get(1).and_then(|n| n.as_str()) else {
+            break;
+        };
+        if !visited.insert(name) {
+            break; // cycle guard: name already seen
+        }
+        chain.push(current);
+        let Some(base_name) = current.find_str("extends") else {
+            break; // terminal base (no extends)
+        };
+        let Some(base) = root
+            .find_all("symbol")
+            .into_iter()
+            .find(|s| s.get(1).and_then(|n| n.as_str()) == Some(base_name))
+        else {
+            break; // missing base — stop gracefully
+        };
+        current = base;
+    }
+
+    // Collect pins most-derived first, dedup by number.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pins: Vec<&SexpNode> = Vec::new();
+    for sym in &chain {
+        for pin in descendants_with_head(sym, "pin") {
+            let number = pin.find_str("number").unwrap_or("").to_owned();
+            if seen.insert(number) {
+                pins.push(pin);
+            }
+        }
+    }
+    pins
+}
+
 /// Search one library body for top-level symbols whose name contains `query`
 /// (case-insensitive), returning result objects shaped like `search_symbols`.
 fn search_lib_symbols(nickname: &str, content: &str, query: &str) -> Vec<serde_json::Value> {
@@ -1778,9 +1825,9 @@ async fn handle_get_symbol_info(
     };
 
     // Pins live inside nested unit sub-symbols, so recurse to collect them all.
-    // NOTE: derived symbols (`(extends …)`) inherit pins from their base and may
-    // report 0 pins here — resolving the extends chain is not yet supported.
-    let pins: Vec<serde_json::Value> = descendants_with_head(sym_node, "pin")
+    // Derived symbols (`(extends …)`) inherit pins from their base; the helper
+    // walks the extends chain so derived symbols report their inherited pins.
+    let pins: Vec<serde_json::Value> = resolve_symbol_pins(&root, sym_node)
         .into_iter()
         .map(|pin| {
             let pin_type = pin.get(1).and_then(|n| n.as_str()).unwrap_or("");
@@ -2213,6 +2260,73 @@ mod tests {
         assert_eq!(g_pin["name"], "G", "{g_pin}");
         assert_eq!(out["properties"]["Reference"], "Q", "{out}");
         assert_eq!(out["properties"]["Value"], "T1", "{out}");
+    }
+
+    const EXTENDS_DERIVED_LIB: &str = "\
+(kicad_symbol_lib
+  (version 20251024)
+  (symbol \"Base\"
+    (symbol \"Base_1_1\"
+      (pin input line (at -5.08 2.54 0) (length 2.54) (name \"G\") (number \"1\"))
+      (pin output line (at 5.08 0 180) (length 2.54) (name \"S\") (number \"3\"))
+    )
+  )
+  (symbol \"Derived\"
+    (extends \"Base\")
+    (property \"Reference\" \"U\" (at 0 5.08 0))
+    (property \"Value\" \"Derived\" (at 0 -5.08 0))
+  )
+)
+";
+
+    #[test]
+    fn resolve_symbol_pins_inherits_from_base() {
+        let root = parse_sexp(EXTENDS_DERIVED_LIB).unwrap();
+        let derived = root
+            .find_all("symbol")
+            .into_iter()
+            .find(|s| s.get(1).and_then(|n| n.as_str()) == Some("Derived"))
+            .unwrap();
+        let pins = resolve_symbol_pins(&root, derived);
+        let numbers: Vec<&str> = pins
+            .iter()
+            .map(|p| p.find_str("number").unwrap_or(""))
+            .collect();
+        assert_eq!(
+            pins.len(),
+            2,
+            "derived symbol should inherit base pins: {numbers:?}"
+        );
+        assert!(numbers.contains(&"1"), "{numbers:?}");
+        assert!(numbers.contains(&"3"), "{numbers:?}");
+    }
+
+    #[tokio::test]
+    async fn get_symbol_info_resolves_extends_pins() {
+        // Derived symbol (extends Base) has no own pins; get_symbol_info must
+        // follow the extends chain and report the base's pins.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = write_project_sym_lib(&tmp, "testlib", EXTENDS_DERIVED_LIB);
+        let args = json!({
+            "lib_id": "testlib:Derived",
+            "project_dir": proj.to_string_lossy(),
+        });
+        let res = handle_get_symbol_info(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(
+            out["pin_count"], 2,
+            "derived symbol should inherit 2 base pins: {out}"
+        );
+        let numbers: Vec<&str> = out["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["number"].as_str().unwrap_or(""))
+            .collect();
+        assert!(numbers.contains(&"1"), "pins: {out}");
+        assert!(numbers.contains(&"3"), "pins: {out}");
+        assert_eq!(out["properties"]["Reference"], "U", "{out}");
     }
 
     #[tokio::test]
