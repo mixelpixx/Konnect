@@ -85,6 +85,50 @@ pub fn transform_pin(pin_x: f64, pin_y: f64, t: PinTransform) -> (f64, f64) {
     (t.comp_x + rx, t.comp_y + ry)
 }
 
+/// Transform a **pad** from footprint-local space to board space.
+///
+/// This is the PCB counterpart of [`transform_pin`]. Unlike symbol pins,
+/// `.kicad_pcb` pad coordinates are already in **Y-down** board orientation,
+/// so there is no Y-up→Y-down flip — but the rotation sense is the same
+/// screen-CCW-in-Y-down convention KiCAD uses everywhere:
+///
+/// ```text
+/// board_x = fp_x + lx * cos(θ) + ly * sin(θ)
+/// board_y = fp_y - lx * sin(θ) + ly * cos(θ)
+/// ```
+///
+/// Note the sign pattern: this is **not** the textbook rotation matrix.
+/// The textbook form (`-ly*sin`, `+lx*sin`) agrees with KiCAD at 0° and 180°
+/// but reflects the footprint end-for-end about its origin at ±90°, which
+/// silently reports e.g. a connector's pin 1 at the wrong end.
+///
+/// `rotation_deg` is the footprint's `(at x y rot)` angle in degrees.
+///
+/// # Examples
+/// ```
+/// use konnect_sexp::geometry::transform_pad;
+///
+/// // Footprint at (0, 0) rotated -90°, pad at local (10, 0).
+/// let (x, y) = transform_pad(10.0, 0.0, 0.0, 0.0, -90.0);
+/// assert!((x - 0.0).abs() < 1e-9);
+/// assert!((y - 10.0).abs() < 1e-9);
+/// ```
+pub fn transform_pad(
+    local_x: f64,
+    local_y: f64,
+    fp_x: f64,
+    fp_y: f64,
+    rotation_deg: f64,
+) -> (f64, f64) {
+    let theta = rotation_deg * PI / 180.0;
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+    (
+        fp_x + local_x * cos_t + local_y * sin_t,
+        fp_y - local_x * sin_t + local_y * cos_t,
+    )
+}
+
 /// Snap a coordinate to KiCAD's schematic grid (default 1.27 mm = 50 mil).
 pub fn snap_to_grid(value: f64, grid: f64) -> f64 {
     (value / grid).round() * grid
@@ -178,6 +222,73 @@ mod tests {
             t(100.0, 100.0, 270.0, false, false),
             (103.81, 100.0),
             "rot270",
+        );
+    }
+
+    fn assert_pad(local: (f64, f64), fp: (f64, f64, f64), expected: (f64, f64), label: &str) {
+        let (x, y) = transform_pad(local.0, local.1, fp.0, fp.1, fp.2);
+        assert!(
+            (x - expected.0).abs() < 1e-3 && (y - expected.1).abs() < 1e-3,
+            "{}: got ({}, {}), expected ({}, {})",
+            label,
+            x,
+            y,
+            expected.0,
+            expected.1
+        );
+    }
+
+    /// Ground truth for the PCB pad transform, taken from routed copper on a
+    /// fabricated, publicly available board: Antmicro's Kria K26 devboard
+    /// (Apache-2.0, github.com/antmicro/kria-k26-devboard). For each pad the
+    /// board-space position was confirmed by finding a routed track segment or
+    /// via **of the same net** within 0.05 mm of the predicted point — copper a
+    /// fab actually built, not a second calculation.
+    ///
+    /// Across that board, footprints at ±90° have 1190 net-assigned pads with
+    /// routed copper; this transform locates 900 of them (the remainder are
+    /// pads whose copper starts elsewhere, e.g. reached only through a zone).
+    /// The textbook-rotation-matrix form locates 64.
+    #[test]
+    fn pad_transform_kicad_ground_truth() {
+        // rot 0 and 180 are the cases where both conventions agree — they must
+        // keep working, and they are why this bug is invisible in most tests.
+        assert_pad((10.0, 4.0), (100.0, 100.0, 0.0), (110.0, 104.0), "rot0");
+        assert_pad((10.0, 4.0), (100.0, 100.0, 180.0), (90.0, 96.0), "rot180");
+
+        // rot 90 / 270: (x, y) -> (y, -x) and (-y, x) respectively.
+        assert_pad((10.0, 4.0), (100.0, 100.0, 90.0), (104.0, 90.0), "rot90");
+        assert_pad((10.0, 4.0), (100.0, 100.0, 270.0), (96.0, 110.0), "rot270");
+        // -90 must equal 270.
+        assert_pad((10.0, 4.0), (100.0, 100.0, -90.0), (96.0, 110.0), "rot-90");
+
+        // Real board, real copper: connector J_SOM240_1 at (91.5765, 117.6215)
+        // rotated -90 deg; pad A01 at footprint-local (18.732, -1.75), net
+        // VCC_BATT. The VCC_BATT track on F.Cu terminates at (93.3265, 136.354).
+        assert_pad(
+            (18.732, -1.75),
+            (91.5765, 117.6215, -90.0),
+            (93.3265, 136.3535),
+            "kria-k26-devboard J_SOM240_1.A01",
+        );
+    }
+
+    /// The textbook rotation matrix reflects the footprint end-for-end about
+    /// its origin at +/-90 deg. Guard against anyone reintroducing it.
+    #[test]
+    fn pad_transform_rejects_textbook_rotation() {
+        let (lx, ly) = (18.732, -1.75);
+        let (fx, fy, rot) = (91.5765, 117.6215, -90.0);
+        let (x, y) = transform_pad(lx, ly, fx, fy, rot);
+        let rad: f64 = rot.to_radians();
+        let (bad_x, bad_y) = (
+            fx + lx * rad.cos() - ly * rad.sin(),
+            fy + lx * rad.sin() + ly * rad.cos(),
+        );
+        assert!(
+            (x - bad_x).abs() + (y - bad_y).abs() > 1.0,
+            "transform_pad matches the textbook (Y-up) rotation matrix; \
+             KiCAD's Y axis points down, so the sin terms must swap sign"
         );
     }
 
