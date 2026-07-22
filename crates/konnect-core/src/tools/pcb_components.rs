@@ -269,8 +269,15 @@ async fn handle_place_component(
 
     let reference_for_ipc = reference.clone();
     let value_for_ipc = value.clone();
-    let fp = ipc!(ctx, |c| c
-        .place_footprint(&footprint, &reference_for_ipc, &value_for_ipc, x, y, rotation, &layer));
+    let fp = ipc!(ctx, |c| c.place_footprint(
+        &footprint,
+        &reference_for_ipc,
+        &value_for_ipc,
+        x,
+        y,
+        rotation,
+        &layer
+    ));
     Ok(CallToolResult::json(&json!({
         "placed": fp.reference,
         "footprint": fp.footprint,
@@ -534,8 +541,9 @@ async fn handle_place_array(
             })
             .await?
             {
-                Ok(fp) => placed
-                    .push(json!({ "reference": ref_for_result, "x": fp.position.x, "y": fp.position.y })),
+                Ok(fp) => placed.push(
+                    json!({ "reference": ref_for_result, "x": fp.position.x, "y": fp.position.y }),
+                ),
                 Err(e) => {
                     return Ok(CallToolResult::error(format!(
                         "IPC error placing {}: {}",

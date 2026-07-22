@@ -705,9 +705,7 @@ impl KiCadIpcClient {
                 kiapi::board::types::BoardLayer::BlFSilkS as i32,
             )),
             value_field: Some(make_placement_field(
-                kiapi::board::types::FieldId {
-                    id: FIELD_ID_VALUE,
-                },
+                kiapi::board::types::FieldId { id: FIELD_ID_VALUE },
                 "Value",
                 value,
                 kiapi::board::types::BoardLayer::BlFFab as i32,
@@ -733,9 +731,7 @@ impl KiCadIpcClient {
                 kiapi::board::types::BoardLayer::BlFSilkS as i32,
             )),
             value_field: Some(make_placement_field(
-                kiapi::board::types::FieldId {
-                    id: FIELD_ID_VALUE,
-                },
+                kiapi::board::types::FieldId { id: FIELD_ID_VALUE },
                 "Value",
                 value,
                 kiapi::board::types::BoardLayer::BlFFab as i32,
@@ -743,8 +739,7 @@ impl KiCadIpcClient {
             ..Default::default()
         };
 
-        let any =
-            crate::builders::pack_any(&fp_instance, "kiapi.board.types.FootprintInstance");
+        let any = crate::builders::pack_any(&fp_instance, "kiapi.board.types.FootprintInstance");
 
         let header = self.make_header()?;
         let cmd = kiapi::common::commands::CreateItems {
@@ -884,11 +879,10 @@ fn make_placement_field(
             text: Some(kiapi::common::types::Text {
                 position: Some(crate::builders::vec2(0.0, 0.0)),
                 attributes: Some(kiapi::common::types::TextAttributes {
-                    horizontal_alignment: kiapi::common::types::HorizontalAlignment::HaCenter as i32,
+                    horizontal_alignment: kiapi::common::types::HorizontalAlignment::HaCenter
+                        as i32,
                     vertical_alignment: kiapi::common::types::VerticalAlignment::VaCenter as i32,
-                    angle: Some(kiapi::common::types::Angle {
-                        value_degrees: 0.0,
-                    }),
+                    angle: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
                     stroke_width: Some(crate::builders::distance(0.2)),
                     visible: true,
                     size: Some(crate::builders::vec2(1.27, 1.27)),
