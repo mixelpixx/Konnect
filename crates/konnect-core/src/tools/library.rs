@@ -2118,7 +2118,9 @@ mod tests {
         std::fs::write(&lib, content).unwrap();
 
         let args = json!({ "library_path": lib.to_string_lossy() });
-        let res = handle_list_symbols_in_library(&args, &test_ctx()).await.unwrap();
+        let res = handle_list_symbols_in_library(&args, &test_ctx())
+            .await
+            .unwrap();
         assert!(!res.is_error, "handler errored: {:?}", res.content);
         let text = match res.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
@@ -2126,8 +2128,7 @@ mod tests {
         };
         let out: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
-            out["count"],
-            2,
+            out["count"], 2,
             "expected 2 top-level symbols (R_ohm, LED), got: {text}"
         );
         let names: Vec<String> = serde_json::from_value(out["symbols"].clone()).unwrap();
