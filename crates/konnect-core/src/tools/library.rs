@@ -2739,4 +2739,119 @@ mod tests {
             "unresolved env-var URI must not produce a path: got {resolved:?}"
         );
     }
+
+    #[tokio::test]
+    async fn search_then_get_symbol_info_through_nested_table() {
+        // Given: a project dir whose sym-lib-table uses a (type "Table") entry
+        // to reference an inner table that holds the real library — the same
+        // nested structure KiCad 10 ships in its bundled template tables.
+        // The symbol uses a deliberately unique name so global libraries
+        // (if present on the test host) never match the query.
+        let tmp = tempfile::tempdir().unwrap();
+
+        let lib_file = tmp.path().join("nested.kicad_sym");
+        let lib_body = concat!(
+            "(kicad_symbol_lib\r\n",
+            "\t(version 20251024)\r\n",
+            "\t(generator \"kicad_symbol_editor\")\r\n",
+            "\t(symbol \"ZZ_NT\"\r\n",
+            "\t\t(property \"Reference\" \"U\" (at 0 5.08 0))\r\n",
+            "\t\t(property \"Value\" \"ZZ_NT\" (at 0 -5.08 0))\r\n",
+            "\t\t(symbol \"ZZ_NT_1_1\"\r\n",
+            "\t\t\t(pin input line (at -5.08 2.54 0) (length 2.54) (name \"INA\") (number \"1\"))\r\n",
+            "\t\t\t(pin output line (at 5.08 0 180) (length 2.54) (name \"OUT\") (number \"3\"))\r\n",
+            "\t\t)\r\n",
+            "\t)\r\n",
+            ")\r\n",
+        );
+        std::fs::write(&lib_file, lib_body).unwrap();
+
+        let inner_table = tmp.path().join("inner-sym-lib-table");
+        let uri = lib_file.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &inner_table,
+            format!(
+                "(sym_lib_table\n  (lib (name \"NestedTbl\") (type \"Normal\") (uri \"{uri}\") (options \"\") (descr \"\"))\n)\n"
+            ),
+        )
+        .unwrap();
+
+        let inner_uri = inner_table.to_string_lossy().replace('\\', "/");
+        let proj_dir = tmp.path().to_path_buf();
+        std::fs::write(
+            proj_dir.join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (lib (name \"tmpl\") (type \"Table\") (uri \"{inner_uri}\") (options \"\") (descr \"\"))\n)\n"
+            ),
+        )
+        .unwrap();
+
+        // When: search_symbols walks the nested table and returns an id.
+        let search_args = json!({
+            "query": "zz_nt",
+            "project_dir": proj_dir.to_string_lossy(),
+        });
+        let search_res = handle_search_symbols(&search_args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(
+            !search_res.is_error,
+            "search errored: {:?}",
+            search_res.content
+        );
+        let search_out: serde_json::Value =
+            serde_json::from_str(&result_text(&search_res)).unwrap();
+        let results = search_out["results"]
+            .as_array()
+            .expect("results must be an array");
+        assert!(
+            !results.is_empty(),
+            "search returned no results: {search_out}"
+        );
+        // Pass the id through unchanged — no rewriting.
+        let id = results[0]["id"]
+            .as_str()
+            .expect("results[0].id must be a string");
+        assert_eq!(id, "NestedTbl:ZZ_NT");
+
+        // Then: get_symbol_info resolves the same id through the nested table.
+        let info_args = json!({
+            "lib_id": id,
+            "project_dir": proj_dir.to_string_lossy(),
+        });
+        let info_res = handle_get_symbol_info(&info_args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(
+            !info_res.is_error,
+            "get_symbol_info errored: {:?}",
+            info_res.content
+        );
+        let info_out: serde_json::Value = serde_json::from_str(&result_text(&info_res)).unwrap();
+        assert_eq!(
+            info_out["name"], "ZZ_NT",
+            "symbol name mismatch: {info_out}"
+        );
+        assert_eq!(
+            info_out["library"], "NestedTbl",
+            "library name mismatch: {info_out}"
+        );
+        assert_eq!(info_out["pin_count"], 2, "expected 2 pins: {info_out}");
+        let numbers: Vec<&str> = info_out["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["number"].as_str().unwrap_or(""))
+            .collect();
+        assert!(numbers.contains(&"1"), "missing pin 1: {info_out}");
+        assert!(numbers.contains(&"3"), "missing pin 3: {info_out}");
+        assert_eq!(
+            info_out["properties"]["Reference"], "U",
+            "Reference prop: {info_out}"
+        );
+        assert_eq!(
+            info_out["properties"]["Value"], "ZZ_NT",
+            "Value prop: {info_out}"
+        );
+    }
 }
