@@ -651,41 +651,128 @@ impl KiCadIpcClient {
         self.delete_items(vec![kiid])
     }
 
-    /// Place a footprint — currently requires KiCAD's ParseAndCreateItemsFromString.
+    /// Place a footprint via KiCAD's ParseAndCreateItemsFromString IPC.
+    ///
+    /// KiCAD 10 has no direct "place footprint from library" command, so we
+    /// build a minimal S-expression that names the library id, layer,
+    /// position, and the Reference/Value properties. KiCAD resolves the
+    /// library id against its own loaded fp-lib-table and fills in pads,
+    /// courtyard, and graphics from the canonical `.kicad_mod` definition.
+    /// Place a footprint via KiCAD's IPC `CreateItems` command.
+    ///
+    /// KiCAD 10's `ParseAndCreateItemsFromString` handler is a stub that accepts
+    /// the S-expression string and returns an empty `CreateItemsResponse`
+    /// without creating anything (see `API_HANDLER_BOARD::handleParseAndCreateItemsFromString`
+    /// in `pcbnew/api/api_handler_board.cpp`).  The production code path for
+    /// creating items is `CreateItems` with a serialized `FootprintInstance`
+    /// protobuf.  We build a minimal instance that names the library id, layer,
+    /// position, orientation and the Reference/Value fields, and let KiCAD
+    /// resolve the library id against its loaded fp-lib-table and fill in pads,
+    /// courtyard, and graphics from the canonical `.kicad_mod` definition.
     pub fn place_footprint(
         &self,
         lib_id: &str,
+        reference: &str,
+        value: &str,
         x: f64,
         y: f64,
         rotation: f64,
         layer: &str,
     ) -> Result<IpcFootprint> {
-        // KiCAD 10 IPC doesn't have a direct "place footprint from library" command.
-        // The CreateItems command requires a fully formed FootprintInstance protobuf,
-        // which needs the complete footprint definition (pads, shapes, etc.) from the library.
-        // For now, use ParseAndCreateItemsFromString with S-expression format.
-        let sexp = format!(
-            r#"(footprint "{lib_id}"
-  (layer "{layer}")
-  (at {x} {y} {rotation})
-)"#,
-            lib_id = lib_id,
-            layer = layer,
-            x = crate::builders::mm_to_nm(x) as f64 / 1_000_000.0,
-            y = crate::builders::mm_to_nm(y) as f64 / 1_000_000.0,
-            rotation = rotation,
-        );
-
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
+        let (lib_nickname, entry_name) = match lib_id.split_once(':') {
+            Some((nick, entry)) => (nick, entry),
+            None => ("", lib_id),
         };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
+
+        let layer_enum = crate::builders::layer_from_name(layer);
+
+        let footprint_def = kiapi::board::types::Footprint {
+            id: Some(kiapi::common::types::LibraryIdentifier {
+                library_nickname: lib_nickname.to_string(),
+                entry_name: entry_name.to_string(),
+            }),
+            anchor: Some(crate::builders::vec2(0.0, 0.0)),
+            attributes: Some(kiapi::board::types::FootprintAttributes {
+                mounting_style: kiapi::board::types::FootprintMountingStyle::FmsSmd as i32,
+                ..Default::default()
+            }),
+            reference_field: Some(make_placement_field(
+                kiapi::board::types::FieldId {
+                    id: FIELD_ID_REFERENCE,
+                },
+                "Reference",
+                reference,
+                kiapi::board::types::BoardLayer::BlFSilkS as i32,
+            )),
+            value_field: Some(make_placement_field(
+                kiapi::board::types::FieldId {
+                    id: FIELD_ID_VALUE,
+                },
+                "Value",
+                value,
+                kiapi::board::types::BoardLayer::BlFFab as i32,
+            )),
+            ..Default::default()
+        };
+
+        let fp_instance = kiapi::board::types::FootprintInstance {
+            id: None,
+            position: Some(crate::builders::vec2(x, y)),
+            orientation: Some(kiapi::common::types::Angle {
+                value_degrees: rotation,
+            }),
+            layer: layer_enum as i32,
+            locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+            definition: Some(footprint_def),
+            reference_field: Some(make_placement_field(
+                kiapi::board::types::FieldId {
+                    id: FIELD_ID_REFERENCE,
+                },
+                "Reference",
+                reference,
+                kiapi::board::types::BoardLayer::BlFSilkS as i32,
+            )),
+            value_field: Some(make_placement_field(
+                kiapi::board::types::FieldId {
+                    id: FIELD_ID_VALUE,
+                },
+                "Value",
+                value,
+                kiapi::board::types::BoardLayer::BlFFab as i32,
+            )),
+            ..Default::default()
+        };
+
+        let any =
+            crate::builders::pack_any(&fp_instance, "kiapi.board.types.FootprintInstance");
+
+        let header = self.make_header()?;
+        let cmd = kiapi::common::commands::CreateItems {
+            header: Some(header),
+            items: vec![any],
+            container: None,
+        };
+
+        // CreateItems returns CreateItemsResponse; the outer ApiResponse status
+        // can be AS_OK even when the inner per-item status reports
+        // ISC_INVALID_DATA (e.g. layer mismatch) or ISC_INVALID_TYPE.  Decode
+        // and verify the inner response.
+        let resp_any = self.send_command(&cmd, "kiapi.common.commands.CreateItems")?;
+
+        let resp: kiapi::common::commands::CreateItemsResponse = match resp_any {
+            Some(any) => unpack_any(&any)?,
+            None => anyhow::bail!(
+                "KiCAD returned an empty response body to CreateItems; \
+                 footprint '{}' was not created",
+                lib_id
+            ),
+        };
+
+        verify_create_items_response(&resp, lib_id)?;
 
         Ok(IpcFootprint {
-            reference: String::new(),
-            value: String::new(),
+            reference: reference.to_string(),
+            value: value.to_string(),
             footprint: lib_id.to_string(),
             position: IpcVector2 { x, y },
             rotation,
@@ -775,4 +862,107 @@ impl KiCadIpcClient {
         self.send_command(&cmd, "kiapi.common.commands.RunAction")?;
         Ok(())
     }
+}
+
+// KiCad FOOTPRINT_FIELD_T numeric ids used inside kiapi.board.types.FieldId.
+// These mirror FOOTPRINT_FIELD_T in KiCad source (REFERENCE=0, VALUE=1) and
+// are not re-exported by the kiapi proto, so we pin them here.
+const FIELD_ID_REFERENCE: i32 = 0;
+const FIELD_ID_VALUE: i32 = 1;
+
+fn make_placement_field(
+    id: kiapi::board::types::FieldId,
+    name: &str,
+    text: &str,
+    layer: i32,
+) -> kiapi::board::types::Field {
+    kiapi::board::types::Field {
+        id: Some(id),
+        name: name.to_string(),
+        text: Some(kiapi::board::types::BoardText {
+            id: None,
+            text: Some(kiapi::common::types::Text {
+                position: Some(crate::builders::vec2(0.0, 0.0)),
+                attributes: Some(kiapi::common::types::TextAttributes {
+                    horizontal_alignment: kiapi::common::types::HorizontalAlignment::HaCenter as i32,
+                    vertical_alignment: kiapi::common::types::VerticalAlignment::VaCenter as i32,
+                    angle: Some(kiapi::common::types::Angle {
+                        value_degrees: 0.0,
+                    }),
+                    stroke_width: Some(crate::builders::distance(0.2)),
+                    visible: true,
+                    size: Some(crate::builders::vec2(1.27, 1.27)),
+                    ..Default::default()
+                }),
+                text: text.to_string(),
+                hyperlink: String::new(),
+            }),
+            layer,
+            knockout: false,
+            locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        }),
+        visible: true,
+    }
+}
+
+fn verify_create_items_response(
+    resp: &kiapi::common::commands::CreateItemsResponse,
+    lib_id: &str,
+) -> Result<()> {
+    use kiapi::common::commands::ItemStatusCode;
+    use kiapi::common::types::ItemRequestStatus;
+
+    if resp.status != ItemRequestStatus::IrsOk as i32 {
+        let code = ItemRequestStatus::try_from(resp.status)
+            .map(|c| c.as_str_name().to_string())
+            .unwrap_or_else(|_| format!("code {}", resp.status));
+        anyhow::bail!(
+            "KiCAD rejected footprint placement (request status {}): lib_id='{}'",
+            code,
+            lib_id
+        );
+    }
+
+    match resp.created_items.first() {
+        Some(result) => {
+            let item_code_val = result
+                .status
+                .as_ref()
+                .map(|s| s.code)
+                .unwrap_or(ItemStatusCode::IscUnknown as i32);
+            if item_code_val != ItemStatusCode::IscOk as i32 {
+                let code = ItemStatusCode::try_from(item_code_val)
+                    .map(|c| c.as_str_name().to_string())
+                    .unwrap_or_else(|_| format!("code {}", item_code_val));
+                let msg = result
+                    .status
+                    .as_ref()
+                    .map(|s| s.error_message.clone())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "KiCAD did not create footprint '{}' (item status {}{}{}). \
+                     Check that the library nickname is in fp-lib-table and the board \
+                     document is the one open in the PCB editor.",
+                    lib_id,
+                    code,
+                    if msg.is_empty() {
+                        String::new()
+                    } else {
+                        ": ".to_string()
+                    },
+                    msg,
+                );
+            }
+        }
+        None => {
+            anyhow::bail!(
+                "KiCAD returned IRS_OK but created zero items for footprint '{}' \
+                 (the protobuf was accepted but produced no footprint instance)",
+                lib_id
+            );
+        }
+    }
+
+    Ok(())
 }

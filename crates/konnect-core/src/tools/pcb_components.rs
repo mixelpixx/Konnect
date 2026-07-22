@@ -251,6 +251,11 @@ async fn handle_place_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let value = args["value"].as_str().unwrap_or("").to_string();
     let x = match require_f64(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -262,8 +267,10 @@ async fn handle_place_component(
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
 
+    let reference_for_ipc = reference.clone();
+    let value_for_ipc = value.clone();
     let fp = ipc!(ctx, |c| c
-        .place_footprint(&footprint, x, y, rotation, &layer));
+        .place_footprint(&footprint, &reference_for_ipc, &value_for_ipc, x, y, rotation, &layer));
     Ok(CallToolResult::json(&json!({
         "placed": fp.reference,
         "footprint": fp.footprint,
@@ -520,14 +527,15 @@ async fn handle_place_array(
             let y = start_y + row as f64 * spacing_y;
             let reference = format!("{prefix}{n}");
             let fp_id = footprint.clone();
-            let ref2 = reference.clone();
+            let ref_for_ipc = reference.clone();
+            let ref_for_result = reference.clone();
             match with_ipc(ctx.config.ipc_address.clone(), move |c| {
-                c.place_footprint(&fp_id, x, y, 0.0, "F.Cu")
+                c.place_footprint(&fp_id, &ref_for_ipc, "", x, y, 0.0, "F.Cu")
             })
             .await?
             {
                 Ok(fp) => placed
-                    .push(json!({ "reference": ref2, "x": fp.position.x, "y": fp.position.y })),
+                    .push(json!({ "reference": ref_for_result, "x": fp.position.x, "y": fp.position.y })),
                 Err(e) => {
                     return Ok(CallToolResult::error(format!(
                         "IPC error placing {}: {}",
@@ -593,7 +601,7 @@ async fn handle_duplicate_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let _new_reference = match require_str(args, "new_reference") {
+    let new_reference = match require_str(args, "new_reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
@@ -613,8 +621,12 @@ async fn handle_duplicate_component(
             .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", ref_ipc))
     });
 
+    let new_ref_ipc = new_reference.clone();
+    let new_value_ipc = src.value.clone();
     let fp = ipc!(ctx, |c| c.place_footprint(
         &src.footprint,
+        &new_ref_ipc,
+        &new_value_ipc,
         x,
         y,
         src.rotation,

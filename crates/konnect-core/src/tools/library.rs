@@ -8,6 +8,7 @@ use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -822,30 +823,283 @@ fn global_sym_lib_table() -> PathBuf {
     super::kicad_config_dir().join("sym-lib-table")
 }
 
+/// Locate the KiCad install root by probing env vars, the running binary's
+/// install location, and OS-standard paths.  Used to expand the `${KICAD10_*}`
+/// variables that appear inside template fp/sym-lib-table files.
+fn kicad_install_root() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("KICAD10_INSTALL_DIR") {
+        let p = PathBuf::from(&dir);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(grandparent) = exe.parent().and_then(|p| p.parent()) {
+            if grandparent.join("share").join("kicad").is_dir() {
+                return Some(grandparent.to_path_buf());
+            }
+        }
+    }
+    let candidates: &[&str] = &[
+        "/usr/share/kicad",
+        "/usr/local/share/kicad",
+        "/opt/kicad/share/kicad",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.is_dir() {
+            return Some(p.parent().and_then(|p| p.parent())?.to_path_buf());
+        }
+    }
+    None
+}
+
+fn kicad_share_dir() -> Option<PathBuf> {
+    kicad_install_root().map(|r| r.join("share").join("kicad"))
+}
+
+/// Expand `${VAR}` references in a lib-table URI using KiCad's well-known
+/// install-relative variables plus the process environment.  Unknown
+/// variables are left untouched (KiCad also leaves them unresolved).
+fn expand_kicad_uri(uri: &str) -> String {
+    let mut out = String::with_capacity(uri.len());
+    let bytes = uri.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = uri[i + 2..].find('}') {
+                let var = &uri[i + 2..i + 2 + end];
+                let resolved = resolve_kicad_var(var);
+                out.push_str(&resolved);
+                i = i + 2 + end + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn resolve_kicad_var(name: &str) -> String {
+    if let Ok(v) = std::env::var(name) {
+        return v;
+    }
+    let share = match kicad_share_dir() {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    match name {
+        "KICAD10_FOOTPRINT_DIR" | "KICAD8_FOOTPRINT_DIR" | "KICAD_FOOTPRINT_DIR" => {
+            share.join("footprints").to_string_lossy().into_owned()
+        }
+        "KICAD10_SYMBOL_DIR" | "KICAD8_SYMBOL_DIR" | "KICAD_SYMBOL_DIR" => {
+            share.join("symbols").to_string_lossy().into_owned()
+        }
+        "KICAD10_TEMPLATE_DIR" | "KICAD8_TEMPLATE_DIR" | "KICAD_TEMPLATE_DIR" => {
+            share.join("template").to_string_lossy().into_owned()
+        }
+        "KICAD10_3RD_PARTY" | "KICAD8_3RD_PARTY" | "KICAD_3RD_PARTY" => super::kicad_config_dir()
+            .join("3rdparty")
+            .to_string_lossy()
+            .into_owned(),
+        "KICAD_CONFIG_HOME" | "KICAD10_CONFIG_HOME" => {
+            super::kicad_config_dir().to_string_lossy().into_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Recursively parse a lib-table file, expanding any `(lib ... (type "Table"))`
+/// entries that point at another lib-table file.  KiCad's own LIBRARY_MANAGER
+/// does this transparently when loading fp/sym-lib-table, so callers that
+/// enumerate libraries (list/get/search) must mirror the behavior or they
+/// cannot resolve entries from the bundled `template/*-lib-table`.
+///
+/// `visited` guards against reference cycles; `depth` bounds runaway recursion.
+async fn parse_lib_table_recursive(
+    table_path: &Path,
+    scope: &str,
+    visited: &mut HashSet<PathBuf>,
+    depth: u32,
+) -> Vec<serde_json::Value> {
+    const MAX_DEPTH: u32 = 8;
+    if depth > MAX_DEPTH || !table_path.exists() {
+        return Vec::new();
+    }
+    let canonical = match table_path.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    if visited.contains(&canonical) {
+        return Vec::new();
+    }
+    visited.insert(canonical.clone());
+
+    let content = match tokio::fs::read_to_string(table_path).await {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for mut lib in parse_lib_table(&content) {
+        let lib_type = lib["type"].as_str().unwrap_or("").to_string();
+        let uri = lib["uri"].as_str().unwrap_or("").to_string();
+        if lib_type == "Table" {
+            let expanded = expand_kicad_uri(&uri);
+            let child_path = PathBuf::from(&expanded);
+            let children =
+                Box::pin(parse_lib_table_recursive(&child_path, scope, visited, depth + 1)).await;
+            out.extend(children);
+        } else {
+            lib["scope"] = json!(scope);
+            out.push(lib);
+        }
+    }
+    out
+}
+
+/// Pick the S-expression root element name for a new lib-table based on its
+/// file name. `sym-lib-table` → `sym_lib_table`, `fp-lib-table` → `fp_lib_table`.
+/// Anything else defaults to `sym_lib_table` to stay on the safe side for symbol use.
+fn table_root_element(table_path: &Path) -> &'static str {
+    match table_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+    {
+        "fp-lib-table" => "fp_lib_table",
+        "sym-lib-table" => "sym_lib_table",
+        _ => "sym_lib_table",
+    }
+}
+
+/// Find the next `(lib ` entry in `content` starting at `pos`, returning
+/// (start_of_lib_paren, end_of_block_exclusive). Handles both TAB- and
+/// space-indented tables, which KiCad emits either way depending on version.
+fn find_lib_block(content: &str, pos: usize) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut i = pos;
+    while i + 5 <= bytes.len() {
+        if &bytes[i..i + 5] == b"(lib " {
+            // Require a preceding whitespace character so we don't match
+            // inside tokens like `sub_lib` or `lib_symbols`.
+            let prev_is_ws = i == 0
+                || bytes[i - 1] == b' '
+                || bytes[i - 1] == b'\t'
+                || bytes[i - 1] == b'\n'
+                || bytes[i - 1] == b'\r';
+            if prev_is_ws {
+                let mut depth = 0i32;
+                let mut j = i;
+                for (k, &b) in bytes[i..].iter().enumerate() {
+                    match b {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                j = i + k + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if depth == 0 {
+                    return Some((i, j));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the next `(symbol "NAME"` block in `content` starting at `pos`,
+/// returning (start_index, end_index_exclusive). Handles both TAB- and
+/// space-indented entries, as well as the very first entry at offset 0.
+fn find_symbol_block(content: &str, symbol_name: &str, pos: usize) -> Option<(usize, usize)> {
+    let needle = format!("(symbol \"{}\"", symbol_name);
+    let bytes = content.as_bytes();
+    let mut search_from = pos;
+    while let Some(rel) = content[search_from..].find(&needle) {
+        let abs = search_from + rel;
+        // Require a preceding whitespace (or start-of-file) so we don't match
+        // `(sub_symbol "..."` or other tokens containing "symbol".
+        let prev_ok = abs == 0
+            || matches!(bytes[abs - 1], b' ' | b'\t' | b'\n' | b'\r');
+        if prev_ok {
+            let mut depth = 0i32;
+            let mut end = abs;
+            for (k, &b) in bytes[abs..].iter().enumerate() {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = abs + k + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if depth == 0 {
+                return Some((abs, end));
+            }
+        }
+        search_from = abs + needle.len();
+    }
+    None
+}
+
+/// Find the next block in `content` starting at `pos` whose opening element is
+/// `(prefix ` (e.g. `(pad `, `(pin `, `(lib `). Returns (start, end_exclusive)
+/// with balanced parentheses. Matches both TAB- and space-indented layouts.
+fn find_prefixed_block(content: &str, prefix: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut i = pos;
+    while i + prefix.len() <= bytes.len() {
+        if &bytes[i..i + prefix.len()] == prefix {
+            let prev_is_ws = i == 0
+                || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+            if prev_is_ws {
+                let mut depth = 0i32;
+                let mut end = i;
+                for (k, &b) in bytes[i..].iter().enumerate() {
+                    match b {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = i + k + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if depth == 0 {
+                    return Some((i, end));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the next `(pad ` block in `content` starting at `pos`.
+fn find_pad_block(content: &str, pos: usize) -> Option<(usize, usize)> {
+    find_prefixed_block(content, b"(pad ", pos)
+}
+
 /// Parse a lib-table S-expression and return list of (nickname, uri, type) tuples.
 fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
     let mut libs = Vec::new();
     // Each entry: (lib (name "NICK") (type "...") (uri "...") (options "") (descr "..."))
     let mut pos = 0;
-    while let Some(lib_start) = content[pos..].find("\n  (lib ").map(|i| pos + i) {
-        // Find the end of this lib block
-        let inner_start = lib_start + 2; // skip "\n  "
-        let mut depth = 0i32;
-        let mut end = inner_start;
-        for (i, ch) in content[inner_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = inner_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let block = &content[inner_start..end];
+    while let Some((lib_start, lib_end)) = find_lib_block(content, pos) {
+        let block = &content[lib_start..lib_end];
 
         let nickname = extract_sexp_string(block, "name").unwrap_or_default();
         let uri = extract_sexp_string(block, "uri").unwrap_or_default();
@@ -858,7 +1112,7 @@ fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
             "type": lib_type,
             "description": descr
         }));
-        pos = end;
+        pos = lib_end;
     }
     libs
 }
@@ -921,11 +1175,8 @@ async fn handle_list_footprint_libraries(
     if scope == "global" || scope == "all" {
         let table = global_fp_lib_table();
         if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("global");
-            }
+            let mut visited = HashSet::new();
+            let libs = parse_lib_table_recursive(&table, "global", &mut visited, 0).await;
             all_libs.extend(libs);
         }
     }
@@ -934,11 +1185,8 @@ async fn handle_list_footprint_libraries(
         let proj = PathBuf::from(args["project"].as_str().unwrap());
         let table = proj.parent().unwrap_or(Path::new(".")).join("fp-lib-table");
         if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("project");
-            }
+            let mut visited = HashSet::new();
+            let libs = parse_lib_table_recursive(&table, "project", &mut visited, 0).await;
             all_libs.extend(libs);
         }
     }
@@ -1002,11 +1250,8 @@ async fn handle_list_symbol_libraries(
     if scope == "global" || scope == "all" {
         let table = global_sym_lib_table();
         if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("global");
-            }
+            let mut visited = HashSet::new();
+            let libs = parse_lib_table_recursive(&table, "global", &mut visited, 0).await;
             all_libs.extend(libs);
         }
     }
@@ -1018,11 +1263,8 @@ async fn handle_list_symbol_libraries(
             .unwrap_or(Path::new("."))
             .join("sym-lib-table");
         if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("project");
-            }
+            let mut visited = HashSet::new();
+            let libs = parse_lib_table_recursive(&table, "project", &mut visited, 0).await;
             all_libs.extend(libs);
         }
     }
@@ -1037,7 +1279,9 @@ async fn handle_list_symbol_libraries(
 }
 
 /// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
-/// Creates the file with minimal scaffolding if it doesn't exist.
+/// Creates the file with minimal scaffolding if it doesn't exist. The root
+/// element is chosen from the file name so a fresh `sym-lib-table` does not
+/// accidentally get an `(fp_lib_table ...)` header.
 async fn register_in_lib_table(
     table_path: &Path,
     nickname: &str,
@@ -1047,15 +1291,14 @@ async fn register_in_lib_table(
     let content = if table_path.exists() {
         tokio::fs::read_to_string(table_path).await?
     } else {
-        "(fp_lib_table\n  (version 7)\n)\n".to_string()
+        let root = table_root_element(table_path);
+        format!("({}\n  (version 7)\n)\n", root)
     };
 
-    // Check if nickname already registered
     if content.contains(&format!("(name \"{}\")", nickname)) {
-        return Ok(()); // already registered, idempotent
+        return Ok(());
     }
 
-    // Find closing paren of the root expression
     let insert_pos = content.rfind(')').unwrap_or(content.len());
     let entry = format!(
         "\n  (lib (name \"{}\") (type \"{}\") (uri \"{}\") (options \"\") (descr \"\"))",
@@ -1424,16 +1667,16 @@ async fn handle_search_symbols(
     let mut results = Vec::new();
 
     if table.exists() {
-        let table_content = tokio::fs::read_to_string(&table).await?;
-        let libs = parse_lib_table(&table_content);
+        let mut visited = HashSet::new();
+        let libs = parse_lib_table_recursive(&table, "global", &mut visited, 0).await;
 
         'outer: for lib in &libs {
             let uri = lib["uri"].as_str().unwrap_or("");
-            // Expand KiCAD env vars ${KICAD8_SYMBOL_DIR} etc. — skip if unresolvable
-            if uri.starts_with("${") {
+            let uri = expand_kicad_uri(uri);
+            if uri.is_empty() {
                 continue;
             }
-            let lib_path = PathBuf::from(uri);
+            let lib_path = PathBuf::from(&uri);
             if !lib_path.exists() {
                 continue;
             }
@@ -1526,10 +1769,11 @@ async fn handle_get_footprint_info(
             let (nick, fp_name) = (parts[0], parts[1]);
             let table = global_fp_lib_table();
             if table.exists() {
-                let tc = tokio::fs::read_to_string(&table).await?;
-                let libs = parse_lib_table(&tc);
+                let mut visited = HashSet::new();
+                let libs = parse_lib_table_recursive(&table, "global", &mut visited, 0).await;
                 if let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) {
                     let uri = lib["uri"].as_str().unwrap_or("");
+                    let uri = expand_kicad_uri(uri);
                     PathBuf::from(uri).join(format!("{}.kicad_mod", fp_name))
                 } else {
                     return Ok(CallToolResult::error(format!(
@@ -1555,8 +1799,12 @@ async fn handle_get_footprint_info(
             .to_string()
     });
 
-    // Count pads
-    let pad_count = content.matches("\n  (pad ").count();
+    let mut pad_count = 0usize;
+    let mut scan_pos = 0usize;
+    while let Some((_, end)) = find_pad_block(&content, scan_pos) {
+        pad_count += 1;
+        scan_pos = end;
+    }
 
     // Extract courtyard bbox (gr_poly on B.CrtYd or F.CrtYd) — simplified
     let has_courtyard = content.contains("B.CrtYd") || content.contains("F.CrtYd");
@@ -1590,57 +1838,39 @@ async fn handle_search_footprints(
     let mut results = Vec::new();
 
     if fp_lib_table_path.exists() {
-        let tc = tokio::fs::read_to_string(&fp_lib_table_path).await?;
+        let mut visited = HashSet::new();
+        let libs =
+            parse_lib_table_recursive(&fp_lib_table_path, "global", &mut visited, 0).await;
 
-        // Parse lib entries
-        let mut search = tc.as_str();
-        'outer: while let Some(lib_pos) = search.find("\n  (lib ") {
-            let block_start = lib_pos + 3;
-            let mut depth = 0i32;
-            let mut block_end = block_start;
-            for (i, ch) in search[block_start..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            block_end = block_start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+        'outer: for lib in &libs {
+            let nickname = lib["nickname"].as_str().unwrap_or_default();
+            let uri = lib["uri"].as_str().unwrap_or_default();
+            let uri = expand_kicad_uri(uri);
+            if uri.is_empty() {
+                continue;
             }
-            let block = &search[block_start..block_end];
-            let nickname = extract_sexp_string(block, "name").unwrap_or_default();
-            let uri = extract_sexp_string(block, "uri").unwrap_or_default();
-
-            if !uri.starts_with("${") {
-                let dir = PathBuf::from(uri);
-                if dir.is_dir() {
-                    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
-                        while let Ok(Some(entry)) = rd.next_entry().await {
-                            let fname = entry.file_name();
-                            let fname_str = fname.to_string_lossy();
-                            if fname_str.ends_with(".kicad_mod") {
-                                let fp_name = fname_str.trim_end_matches(".kicad_mod");
-                                if fp_name.to_lowercase().contains(&query) {
-                                    results.push(json!({
-                                        "library": nickname,
-                                        "name": fp_name,
-                                        "id": format!("{}:{}", nickname, fp_name)
-                                    }));
-                                    if results.len() >= limit {
-                                        break 'outer;
-                                    }
+            let dir = PathBuf::from(&uri);
+            if dir.is_dir() {
+                if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        let fname = entry.file_name();
+                        let fname_str = fname.to_string_lossy();
+                        if fname_str.ends_with(".kicad_mod") {
+                            let fp_name = fname_str.trim_end_matches(".kicad_mod");
+                            if fp_name.to_lowercase().contains(&query) {
+                                results.push(json!({
+                                    "library": nickname,
+                                    "name": fp_name,
+                                    "id": format!("{}:{}", nickname, fp_name)
+                                }));
+                                if results.len() >= limit {
+                                    break 'outer;
                                 }
                             }
                         }
                     }
                 }
             }
-
-            search = &search[lib_pos + 1..];
         }
     }
 
@@ -1708,38 +1938,16 @@ async fn handle_get_symbol_info(
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    // Find symbol block
-    let sym_pat = format!(r#"  (symbol "{}""#, sym_name);
-    let sym_start = content.find(&sym_pat).ok_or_else(|| {
+    let (sym_start, sym_end) = find_symbol_block(&content, sym_name, 0).ok_or_else(|| {
         anyhow::anyhow!("Symbol '{}' not found in library '{}'", sym_name, lib_nick)
     })?;
-
-    let sym_end = {
-        let mut depth = 0i32;
-        let mut end = sym_start;
-        for (i, ch) in content[sym_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = sym_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        end
-    };
     let sym_block = &content[sym_start..sym_end];
 
-    // Extract pins
     let mut pins = Vec::new();
-    let mut search = sym_block;
-    while let Some(pos) = search.find("\n    (pin ") {
-        let inner = &search[pos + 10..];
-        let pin_type = inner.split_whitespace().next().unwrap_or("").to_string();
+    let mut search_from = 0usize;
+    while let Some((pin_start, pin_end)) = find_prefixed_block(sym_block, b"(pin ", search_from) {
+        let inner = &sym_block[pin_start..pin_end];
+        let pin_type = inner.split_whitespace().nth(1).unwrap_or("").to_string();
         let pin_name = extract_sexp_string(inner, "name").unwrap_or_default();
         let pin_num = extract_sexp_string(inner, "number").unwrap_or_default();
         let (px, py) = extract_at_xy(inner).unwrap_or((0.0, 0.0));
@@ -1750,14 +1958,17 @@ async fn handle_get_symbol_info(
             "x": px,
             "y": py
         }));
-        search = &search[pos + 1..];
+        search_from = pin_end;
     }
 
     // Extract properties
     let mut properties = serde_json::Map::new();
-    let mut search = sym_block;
-    while let Some(pos) = search.find("\n    (property \"") {
-        let inner = &search[pos + 16..];
+    let mut search_from = 0usize;
+    while let Some((prop_start, prop_end)) =
+        find_prefixed_block(sym_block, b"(property \"", search_from)
+    {
+        let block = &sym_block[prop_start..prop_end];
+        let inner = &block["(property \"".len()..];
         if let Some(key_end) = inner.find('"') {
             let key = &inner[..key_end];
             let val_start = inner[key_end + 1..]
@@ -1775,7 +1986,7 @@ async fn handle_get_symbol_info(
                 );
             }
         }
-        search = &search[pos + 1..];
+        search_from = prop_end;
     }
 
     Ok(CallToolResult::text(
