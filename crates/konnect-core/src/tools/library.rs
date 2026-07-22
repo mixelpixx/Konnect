@@ -2329,6 +2329,120 @@ mod tests {
         assert_eq!(out["properties"]["Reference"], "U", "{out}");
     }
 
+    #[test]
+    fn resolve_symbol_pins_follows_multilevel_chain() {
+        let src = "\
+(kicad_symbol_lib
+  (symbol \"C\"
+    (symbol \"C_1_1\"
+      (pin passive line (at 0 5.08 0) (length 2.54) (name \"C1\") (number \"1\"))
+    )
+  )
+  (symbol \"B\" (extends \"C\"))
+  (symbol \"A\" (extends \"B\"))
+)";
+        let root = parse_sexp(src).unwrap();
+        let a = root
+            .find_all("symbol")
+            .into_iter()
+            .find(|s| s.get(1).and_then(|n| n.as_str()) == Some("A"))
+            .unwrap();
+        let pins = resolve_symbol_pins(&root, a);
+        let numbers: Vec<&str> = pins
+            .iter()
+            .map(|p| p.find_str("number").unwrap_or(""))
+            .collect();
+        assert_eq!(numbers, vec!["1"], "A→B→C should resolve to C's pin");
+    }
+
+    #[test]
+    fn resolve_symbol_pins_handles_cycle() {
+        let src = "\
+(kicad_symbol_lib
+  (symbol \"A\"
+    (extends \"B\")
+    (symbol \"A_1_1\"
+      (pin passive line (at 0 5.08 0) (length 2.54) (name \"A1\") (number \"1\"))
+    )
+  )
+  (symbol \"B\"
+    (extends \"A\")
+    (symbol \"B_1_1\"
+      (pin passive line (at 0 -5.08 0) (length 2.54) (name \"B2\") (number \"2\"))
+    )
+  )
+)";
+        let root = parse_sexp(src).unwrap();
+        let a = root
+            .find_all("symbol")
+            .into_iter()
+            .find(|s| s.get(1).and_then(|n| n.as_str()) == Some("A"))
+            .unwrap();
+        let pins = resolve_symbol_pins(&root, a);
+        let numbers: Vec<&str> = pins
+            .iter()
+            .map(|p| p.find_str("number").unwrap_or(""))
+            .collect();
+        // Terminates (no hang); collects A's pin "1" then B's pin "2".
+        assert!(numbers.contains(&"1"), "{numbers:?}");
+        assert!(numbers.contains(&"2"), "{numbers:?}");
+    }
+
+    #[test]
+    fn resolve_symbol_pins_missing_base_falls_back() {
+        let src = "\
+(kicad_symbol_lib
+  (symbol \"Orphan\"
+    (extends \"NoSuch\")
+    (symbol \"Orphan_1_1\"
+      (pin passive line (at 0 5.08 0) (length 2.54) (name \"P\") (number \"7\"))
+    )
+  )
+)";
+        let root = parse_sexp(src).unwrap();
+        let orphan = root
+            .find_all("symbol")
+            .into_iter()
+            .find(|s| s.get(1).and_then(|n| n.as_str()) == Some("Orphan"))
+            .unwrap();
+        let pins = resolve_symbol_pins(&root, orphan);
+        let numbers: Vec<&str> = pins
+            .iter()
+            .map(|p| p.find_str("number").unwrap_or(""))
+            .collect();
+        // Missing base: walk stops, returns Orphan's own pin (no panic).
+        assert_eq!(numbers, vec!["7"]);
+    }
+
+    #[test]
+    fn resolve_symbol_pins_derived_shadows_base() {
+        let src = "\
+(kicad_symbol_lib
+  (symbol \"Base\"
+    (symbol \"Base_1_1\"
+      (pin input line (at 0 5.08 0) (length 2.54) (name \"BASE_G\") (number \"1\"))
+    )
+  )
+  (symbol \"Derived\"
+    (extends \"Base\")
+    (symbol \"Derived_1_1\"
+      (pin output line (at 0 -5.08 0) (length 2.54) (name \"DERIVED_G\") (number \"1\"))
+    )
+  )
+)";
+        let root = parse_sexp(src).unwrap();
+        let derived = root
+            .find_all("symbol")
+            .into_iter()
+            .find(|s| s.get(1).and_then(|n| n.as_str()) == Some("Derived"))
+            .unwrap();
+        let pins = resolve_symbol_pins(&root, derived);
+        // Derived's own pin "1" shadows base's pin "1": one pin, derived's name.
+        assert_eq!(pins.len(), 1, "{pins:?}");
+        assert_eq!(pins[0].find_str("name"), Some("DERIVED_G"));
+        assert_eq!(pins[0].find_str("number"), Some("1"));
+    }
+
     #[tokio::test]
     async fn search_lib_symbols_matches_underscore_names_and_skips_units() {
         // Pure check of the per-library matcher factored out of search_symbols:
