@@ -7,6 +7,8 @@
 
 # Konnect *BETA Release
 
+</div>
+
 **AI-assisted PCB design for KiCAD 10.** Konnect is a native KiCAD plugin — a single
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
