@@ -83,20 +83,57 @@ pub fn build_track(
     }
 }
 
-/// Build S-expression for a via (used with ParseAndCreateItemsFromString).
-/// Complex protobuf PadStack construction is avoided this way.
-pub fn via_sexp(
+/// Build a through-via `Via` protobuf message (F.Cu → B.Cu).
+///
+/// Mirrors [`build_track`]: the caller `pack_any`s the result and hands it to
+/// `create_items`. The earlier implementation built a bare `(via …)`
+/// S-expression string and fed it to `ParseAndCreateItemsFromString`; that
+/// paste path silently created nothing (the command returns a
+/// `CreateItemsResponse` whose overall status is `IRS_OK` even when zero items
+/// are created), so `add_via` reported success while no via ever appeared.
+/// Building the protobuf and going through `create_items` is the same path that
+/// `add_track` (and the reference `kipy` client) use, and it actually persists.
+pub fn build_via(
     net_name: &str,
     net_code: i32,
     x: f64,
     y: f64,
     drill_mm: f64,
     size_mm: f64,
-) -> String {
-    format!(
-        r#"(via (at {} {}) (size {}) (drill {}) (layers "F.Cu" "B.Cu") (net {} "{}"))"#,
-        x, y, size_mm, drill_mm, net_code, net_name
-    )
+) -> kiapi::board::types::Via {
+    use kiapi::board::types::{
+        BoardLayer, DrillProperties, PadStack, PadStackLayer, PadStackShape, PadStackType, ViaType,
+    };
+
+    // A round copper pad of `size_mm` diameter on the given layer.
+    let copper_pad = |layer: BoardLayer| kiapi::board::types::PadStackLayer {
+        layer: layer as i32,
+        shape: PadStackShape::PssCircle as i32,
+        size: Some(vec2(size_mm, size_mm)),
+        ..PadStackLayer::default()
+    };
+
+    let pad_stack = PadStack {
+        r#type: PadStackType::PstNormal as i32,
+        layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+        drill: Some(DrillProperties {
+            start_layer: BoardLayer::BlFCu as i32,
+            end_layer: BoardLayer::BlBCu as i32,
+            diameter: Some(vec2(drill_mm, drill_mm)),
+            ..DrillProperties::default()
+        }),
+        copper_layers: vec![copper_pad(BoardLayer::BlFCu), copper_pad(BoardLayer::BlBCu)],
+        ..PadStack::default()
+    };
+
+    kiapi::board::types::Via {
+        id: None, // KiCAD assigns the ID
+        position: Some(vec2(x, y)),
+        pad_stack: Some(pad_stack),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        net: Some(net(net_name, net_code)),
+        r#type: ViaType::VtThrough as i32,
+    }
 }
 
 /// Pack a protobuf message into a prost_types::Any.
@@ -457,6 +494,45 @@ mod tests {
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Polygon(poly_set) => assert!(poly_set.polygons.is_empty()),
             _ => panic!("expected Polygon geometry"),
+        }
+    }
+
+    #[test]
+    fn via_is_a_through_via_with_position_drill_size_and_net() {
+        use kiapi::board::types::{BoardLayer, PadStackShape, PadStackType, ViaType};
+
+        let v = build_via("VCC_BATT", 7, 146.268, 89.194, 0.2, 0.45);
+
+        // Position, in nanometers.
+        let pos = v.position.expect("position");
+        assert_eq!(pos.x_nm, 146_268_000);
+        assert_eq!(pos.y_nm, 89_194_000);
+
+        // Net carried through.
+        let net = v.net.expect("net");
+        assert_eq!(net.name, "VCC_BATT");
+        assert_eq!(net.code.unwrap().value, 7);
+
+        // Through via (F.Cu → B.Cu), normal pad stack.
+        assert_eq!(v.r#type, ViaType::VtThrough as i32);
+        let ps = v.pad_stack.expect("pad_stack");
+        assert_eq!(ps.r#type, PadStackType::PstNormal as i32);
+        assert_eq!(
+            ps.layers,
+            vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32]
+        );
+
+        // Drill diameter honored on both outer layers.
+        let drill = ps.drill.expect("drill");
+        assert_eq!(drill.start_layer, BoardLayer::BlFCu as i32);
+        assert_eq!(drill.end_layer, BoardLayer::BlBCu as i32);
+        assert_eq!(drill.diameter.unwrap().x_nm, 200_000);
+
+        // Copper pad on both layers, round, at the requested diameter.
+        assert_eq!(ps.copper_layers.len(), 2);
+        for layer in &ps.copper_layers {
+            assert_eq!(layer.shape, PadStackShape::PssCircle as i32);
+            assert_eq!(layer.size.unwrap().x_nm, 450_000);
         }
     }
 }

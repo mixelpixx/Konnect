@@ -475,16 +475,17 @@ impl KiCadIpcClient {
         Ok(())
     }
 
-    /// Add a via to the board using S-expression string (simpler than full protobuf PadStack construction).
+    /// Add a through via (F.Cu → B.Cu) to the board.
+    ///
+    /// Uses the protobuf `Via` message via `create_items`, the same path as
+    /// [`add_track`](Self::add_track). The previous implementation sent a bare
+    /// `(via …)` S-expression through `ParseAndCreateItemsFromString`, which
+    /// returned success but never created the via (see `builders::build_via`).
     pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<()> {
         let net_code = self.resolve_net_code(net_name)?;
-        let sexp = crate::builders::via_sexp(net_name, net_code, x, y, drill, pad_size);
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
-        };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
+        let via = crate::builders::build_via(net_name, net_code, x, y, drill, pad_size);
+        let any = crate::builders::pack_any(&via, "kiapi.board.types.Via");
+        self.create_items(vec![any])?;
         Ok(())
     }
 
