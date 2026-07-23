@@ -443,12 +443,11 @@ fn find_pad_board_position(
     let local_x = pad_at.get_f64(1).unwrap_or(0.0);
     let local_y = pad_at.get_f64(2).unwrap_or(0.0);
 
-    // Transform local pad coords to board space (rotation)
-    let rad = fp_rot.to_radians();
-    let board_x = fp_x + local_x * rad.cos() - local_y * rad.sin();
-    let board_y = fp_y + local_x * rad.sin() + local_y * rad.cos();
-
-    Ok((board_x, board_y))
+    // Transform local pad coords to board space (rotation only).
+    // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
+    Ok(konnect_sexp::geometry::transform_pad(
+        local_x, local_y, fp_x, fp_y, fp_rot,
+    ))
 }
 
 async fn handle_add_via(

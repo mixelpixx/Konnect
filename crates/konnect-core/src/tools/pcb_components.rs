@@ -417,10 +417,10 @@ async fn handle_get_component_pads(
             let pad_at = pad.find("at")?;
             let local_x = pad_at.get_f64(1)?;
             let local_y = pad_at.get_f64(2)?;
-            // Transform local pad coords to board space (simplified: only rotation)
-            let rad = fp_rot.to_radians();
-            let board_x = fp_x + local_x * rad.cos() - local_y * rad.sin();
-            let board_y = fp_y + local_x * rad.sin() + local_y * rad.cos();
+            // Transform local pad coords to board space (rotation only).
+            // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
+            let (board_x, board_y) =
+                konnect_sexp::geometry::transform_pad(local_x, local_y, fp_x, fp_y, fp_rot);
             let net = pad
                 .find("net")
                 .and_then(|n| n.get(2))
