@@ -6,6 +6,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -265,7 +266,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword match)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 }
+                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 },
+                    "project_dir": { "type": "string", "description": "Project directory whose sym-lib-table is also searched. Defaults to the configured project_dir." }
                 },
                 "required": ["query"]
             }),
@@ -314,7 +316,8 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "lib_id": { "type": "string", "description": "Library:Symbol identifier (e.g. 'Device:R')" }
+                    "lib_id": { "type": "string", "description": "Library:Symbol identifier (e.g. 'Device:R')" },
+                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries. Defaults to the configured project_dir." }
                 },
                 "required": ["lib_id"]
             }),
@@ -1372,6 +1375,94 @@ async fn handle_delete_symbol(
     ))
 }
 
+/// Extract the names of every top-level symbol defined in a `.kicad_sym`
+/// library body, sorted and de-duplicated.
+///
+/// KiCad writes these files with CRLF line endings (on Windows) and TAB
+/// indentation, so a fixed string search such as `\n  (symbol "` does not work
+/// — it returned 0 symbols for every real library (KiCad 10, format version
+/// 20251024). Instead we parse the S-expression structurally and read the
+/// **direct** children of the `(kicad_symbol_lib …)` root whose head is
+/// `symbol`. Nested unit sub-symbols (`NAME_0_1`, `NAME_1_1`, …) live one
+/// level deeper, so they are excluded automatically — no name-pattern
+/// heuristics required, and names containing underscores are preserved
+/// verbatim.
+fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
+    let root = parse_sexp(content)
+        .map_err(|e| anyhow::anyhow!("failed to parse .kicad_sym library: {e}"))?;
+    let mut names: Vec<String> = root
+        .find_all("symbol")
+        .into_iter()
+        .filter_map(|sym| sym.get(1).and_then(|n| n.as_str()).map(str::to_owned))
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Resolve a symbol library nickname to an on-disk `.kicad_sym` path.
+///
+/// Checks the **global** sym-lib-table first, then the **project** table at
+/// `project_dir/sym-lib-table` (if a project dir is supplied). Returns the first
+/// entry whose nickname matches and whose `uri` does not use an unresolved KiCad
+/// env var (`${…}`). Both tables are read with `parse_lib_table`.
+async fn resolve_symbol_lib_path(nick: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut tables = vec![global_sym_lib_table()];
+    if let Some(pd) = project_dir {
+        tables.push(pd.join("sym-lib-table"));
+    }
+    for table in tables {
+        let Ok(content) = tokio::fs::read_to_string(&table).await else {
+            continue;
+        };
+        for lib in parse_lib_table(&content) {
+            if lib["nickname"].as_str() == Some(nick) {
+                if let Some(uri) = lib["uri"].as_str().filter(|u| !u.starts_with("${")) {
+                    return Some(PathBuf::from(uri));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Recursively collect every descendant `SexpNode::List` whose head matches
+/// `head` (depth-first, document order). Pins live inside nested unit
+/// sub-symbols `(symbol "NAME_N_M" …)`, not as direct children of the top-level
+/// symbol, so a direct-children lookup is not enough.
+fn descendants_with_head<'a>(node: &'a SexpNode, head: &str) -> Vec<&'a SexpNode> {
+    fn walk<'a>(node: &'a SexpNode, head: &str, out: &mut Vec<&'a SexpNode>) {
+        for child in node.children().unwrap_or(&[]) {
+            if child.head() == Some(head) {
+                out.push(child);
+            }
+            walk(child, head, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, head, &mut out);
+    out
+}
+
+/// Search one library body for top-level symbols whose name contains `query`
+/// (case-insensitive), returning result objects shaped like `search_symbols`.
+fn search_lib_symbols(nickname: &str, content: &str, query: &str) -> Vec<serde_json::Value> {
+    let Ok(names) = top_level_symbol_names(content) else {
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter(|n| n.to_lowercase().contains(query))
+        .map(|sym_name| {
+            json!({
+                "library": nickname,
+                "name": sym_name,
+                "id": format!("{}:{}", nickname, sym_name)
+            })
+        })
+        .collect()
+}
+
 async fn handle_list_symbols_in_library(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1379,28 +1470,7 @@ async fn handle_list_symbols_in_library(
     let lib_path = get_path(args, "library_path")?;
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    // Match all top-level symbol names: `  (symbol "NAME"` at depth 1
-    let mut symbols = Vec::new();
-    let mut search = content.as_str();
-    while let Some(pos) = search.find("\n  (symbol \"") {
-        let after = &search[pos + 13..]; // skip `\n  (symbol "`
-        if let Some(end) = after.find('"') {
-            let sym_name = &after[..end];
-            // Exclude sub-units like "NAME_0_1"
-            if !sym_name.contains('_') || {
-                // Allow symbols whose name contains underscores but are NOT sub-unit patterns
-                let parts: Vec<&str> = sym_name.rsplitn(3, '_').collect();
-                parts.len() < 3 || parts[0].parse::<u32>().is_err()
-            } {
-                symbols.push(sym_name.to_string());
-            }
-            search = &search[pos + 1..];
-        } else {
-            break;
-        }
-    }
-    symbols.sort();
-    symbols.dedup();
+    let symbols = top_level_symbol_names(&content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
@@ -1414,54 +1484,55 @@ async fn handle_list_symbols_in_library(
 
 async fn handle_search_symbols(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let query = args["query"].as_str().unwrap_or("").to_lowercase();
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    // Walk all global symbol libraries
-    let table = global_sym_lib_table();
+    let project_dir = args["project_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .or_else(|| ctx.config.project_dir.clone());
+
+    // Gather (nickname, uri) entries from the global sym-lib-table and, when a
+    // project dir is supplied, the project's own sym-lib-table too — this is
+    // what makes project-attached libraries searchable.
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut tables = vec![global_sym_lib_table()];
+    if let Some(pd) = &project_dir {
+        tables.push(pd.join("sym-lib-table"));
+    }
+    for table in &tables {
+        if !table.exists() {
+            continue;
+        }
+        let Ok(content) = tokio::fs::read_to_string(table).await else {
+            continue;
+        };
+        for lib in parse_lib_table(&content) {
+            if let (Some(nick), Some(uri)) = (lib["nickname"].as_str(), lib["uri"].as_str()) {
+                entries.push((nick.to_string(), uri.to_string()));
+            }
+        }
+    }
+
     let mut results = Vec::new();
-
-    if table.exists() {
-        let table_content = tokio::fs::read_to_string(&table).await?;
-        let libs = parse_lib_table(&table_content);
-
-        'outer: for lib in &libs {
-            let uri = lib["uri"].as_str().unwrap_or("");
-            // Expand KiCAD env vars ${KICAD8_SYMBOL_DIR} etc. — skip if unresolvable
-            if uri.starts_with("${") {
-                continue;
-            }
-            let lib_path = PathBuf::from(uri);
-            if !lib_path.exists() {
-                continue;
-            }
-            let lib_content = match tokio::fs::read_to_string(&lib_path).await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let nickname = lib["nickname"].as_str().unwrap_or("");
-            let mut search = lib_content.as_str();
-            while let Some(pos) = search.find("\n  (symbol \"") {
-                let after = &search[pos + 13..];
-                if let Some(end) = after.find('"') {
-                    let sym_name = &after[..end];
-                    if sym_name.to_lowercase().contains(&query) && !sym_name.contains('_') {
-                        results.push(json!({
-                            "library": nickname,
-                            "name": sym_name,
-                            "id": format!("{}:{}", nickname, sym_name)
-                        }));
-                        if results.len() >= limit {
-                            break 'outer;
-                        }
-                    }
-                    search = &search[pos + 1..];
-                } else {
-                    break;
-                }
+    'outer: for (nickname, uri) in entries {
+        // Skip KiCad env-var URIs (${KICAD*_SYMBOL_DIR}) — unresolvable here.
+        if uri.starts_with("${") {
+            continue;
+        }
+        let lib_path = PathBuf::from(&uri);
+        if !lib_path.exists() {
+            continue;
+        }
+        let Ok(lib_content) = tokio::fs::read_to_string(&lib_path).await else {
+            continue;
+        };
+        for hit in search_lib_symbols(&nickname, &lib_content, &query) {
+            results.push(hit);
+            if results.len() >= limit {
+                break 'outer;
             }
         }
     }
@@ -1658,7 +1729,7 @@ async fn handle_search_footprints(
 
 async fn handle_get_symbol_info(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_id = require_str(args, "lib_id").map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
@@ -1670,112 +1741,72 @@ async fn handle_get_symbol_info(
     }
     let (lib_nick, sym_name) = (parts[0], parts[1]);
 
-    // Look up library path from global sym-lib-table
-    let sym_lib_table_path = super::kicad_config_dir().join("sym-lib-table");
+    // Project dir is optional: an explicit arg wins, else the server default.
+    let project_dir = args["project_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .or_else(|| ctx.config.project_dir.clone());
 
-    let lib_path = if sym_lib_table_path.exists() {
-        let tc = tokio::fs::read_to_string(&sym_lib_table_path).await?;
-        // Parse lib entries: (lib (name "NICK") ... (uri "PATH") ...)
-        let pat = format!(r#"(name "{}")"#, lib_nick);
-        if let Some(block_start) = tc.find(&pat) {
-            let block_end = tc[block_start..]
-                .find(")\n")
-                .map(|i| block_start + i + 2)
-                .unwrap_or(tc.len());
-            let block = &tc[block_start..block_end];
-            if let Some(uri_pos) = block.find("(uri \"") {
-                let after = &block[uri_pos + 6..];
-                after.find('"').map(|end| PathBuf::from(&after[..end]))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let lib_path = match lib_path {
-        Some(p) if !p.to_str().unwrap_or("").starts_with("${") => p,
-        _ => {
+    let lib_path = match resolve_symbol_lib_path(lib_nick, project_dir.as_deref()).await {
+        Some(p) => p,
+        None => {
             return Ok(CallToolResult::error(format!(
-                "Library '{}' not found or path uses unresolved env var",
+                "Library '{}' not found in global or project sym-lib-table, or its uri uses an unresolved env var",
                 lib_nick
             )));
         }
     };
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
+    let root = parse_sexp(&content)
+        .map_err(|e| anyhow::anyhow!("failed to parse .kicad_sym library '{lib_nick}': {e}"))?;
 
-    // Find symbol block
-    let sym_pat = format!(r#"  (symbol "{}""#, sym_name);
-    let sym_start = content.find(&sym_pat).ok_or_else(|| {
-        anyhow::anyhow!("Symbol '{}' not found in library '{}'", sym_name, lib_nick)
-    })?;
-
-    let sym_end = {
-        let mut depth = 0i32;
-        let mut end = sym_start;
-        for (i, ch) in content[sym_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = sym_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
+    // Top-level symbol with the exact name (the lib_id suffix). Nested unit
+    // sub-symbols (NAME_N_M) are one level deeper, so they are skipped here.
+    let sym_node = root
+        .find_all("symbol")
+        .into_iter()
+        .find(|s| s.get(1).and_then(|n| n.as_str()) == Some(sym_name));
+    let sym_node = match sym_node {
+        Some(n) => n,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Symbol '{}' not found in library '{}'",
+                sym_name, lib_nick
+            )));
         }
-        end
     };
-    let sym_block = &content[sym_start..sym_end];
 
-    // Extract pins
-    let mut pins = Vec::new();
-    let mut search = sym_block;
-    while let Some(pos) = search.find("\n    (pin ") {
-        let inner = &search[pos + 10..];
-        let pin_type = inner.split_whitespace().next().unwrap_or("").to_string();
-        let pin_name = extract_sexp_string(inner, "name").unwrap_or_default();
-        let pin_num = extract_sexp_string(inner, "number").unwrap_or_default();
-        let (px, py) = extract_at_xy(inner).unwrap_or((0.0, 0.0));
-        pins.push(json!({
-            "number": pin_num,
-            "name": pin_name,
-            "type": pin_type,
-            "x": px,
-            "y": py
-        }));
-        search = &search[pos + 1..];
-    }
+    // Pins live inside nested unit sub-symbols, so recurse to collect them all.
+    // NOTE: derived symbols (`(extends …)`) inherit pins from their base and may
+    // report 0 pins here — resolving the extends chain is not yet supported.
+    let pins: Vec<serde_json::Value> = descendants_with_head(sym_node, "pin")
+        .into_iter()
+        .map(|pin| {
+            let pin_type = pin.get(1).and_then(|n| n.as_str()).unwrap_or("");
+            let (px, py) = pin
+                .find("at")
+                .and_then(|a| Some((a.get_f64(1)?, a.get_f64(2)?)))
+                .unwrap_or((0.0, 0.0));
+            json!({
+                "number": pin.find("number").and_then(|n| n.get(1)).and_then(|n| n.as_str()).unwrap_or(""),
+                "name": pin.find("name").and_then(|n| n.get(1)).and_then(|n| n.as_str()).unwrap_or(""),
+                "type": pin_type,
+                "x": px,
+                "y": py
+            })
+        })
+        .collect();
 
-    // Extract properties
+    // Properties are direct children of the top-level symbol.
     let mut properties = serde_json::Map::new();
-    let mut search = sym_block;
-    while let Some(pos) = search.find("\n    (property \"") {
-        let inner = &search[pos + 16..];
-        if let Some(key_end) = inner.find('"') {
-            let key = &inner[..key_end];
-            let val_start = inner[key_end + 1..]
-                .find('"')
-                .map(|i| key_end + 1 + i + 1)
-                .unwrap_or(0);
-            let val_end = inner[val_start..]
-                .find('"')
-                .map(|i| val_start + i)
-                .unwrap_or(0);
-            if val_end > val_start {
-                properties.insert(
-                    key.to_string(),
-                    json!(inner[val_start..val_end].to_string()),
-                );
-            }
+    for prop in sym_node.find_all("property") {
+        if let (Some(key), Some(val)) = (
+            prop.get(1).and_then(|n| n.as_str()),
+            prop.get(2).and_then(|n| n.as_str()),
+        ) {
+            properties.insert(key.to_string(), json!(val));
         }
-        search = &search[pos + 1..];
     }
 
     Ok(CallToolResult::text(
@@ -1789,16 +1820,6 @@ async fn handle_get_symbol_info(
         }))
         .unwrap(),
     ))
-}
-
-fn extract_at_xy(block: &str) -> Option<(f64, f64)> {
-    let pos = block.find("(at ")?;
-    let after = &block[pos + 4..];
-    let end = after.find(')')?;
-    let parts: Vec<&str> = after[..end].split_whitespace().collect();
-    let x = parts.first()?.parse::<f64>().ok()?;
-    let y = parts.get(1)?.parse::<f64>().ok()?;
-    Some((x, y))
 }
 
 #[cfg(test)]
@@ -2067,6 +2088,155 @@ mod tests {
         assert!(
             !c.contains("SINGLE_1_1"),
             "single unit must not create a _1_1 unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_symbols_parses_kicad10_crlf_tab_format() {
+        // Regression: konnect 0.2.0 hard-coded the needle `\n  (symbol "` (LF +
+        // exactly 2 spaces) and so returned 0 symbols for every real KiCad
+        // library. On disk those files are CRLF-terminated and TAB-indented
+        // (KiCad 10, format version 20251024), so the needle never matched.
+        // Build a fixture in that exact on-disk shape and confirm we now find
+        // the top-level symbols and skip the nested `_N_M` sub-units.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("kicad10.kicad_sym");
+        let unit = |name: &str| {
+            format!("\t(symbol \"{name}\"\r\n\t\t(symbol \"{name}_0_1\"\r\n\t\t)\r\n\t)\r\n")
+        };
+        let content = format!(
+            "(kicad_symbol_lib\r\n\t(version 20251024)\r\n\t(generator \"kicad_symbol_editor\")\r\n{}{})\r\n",
+            unit("R_ohm"),
+            unit("LED"),
+        );
+        // Sanity: the fixture really is CRLF + TAB and lacks the old needle.
+        assert!(content.contains("\r\n"));
+        assert!(
+            !content.contains("\n  (symbol \""),
+            "fixture must not contain the old LF/2-space needle"
+        );
+        std::fs::write(&lib, content).unwrap();
+
+        let args = json!({ "library_path": lib.to_string_lossy() });
+        let res = handle_list_symbols_in_library(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let text = match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            out["count"], 2,
+            "expected 2 top-level symbols (R_ohm, LED), got: {text}"
+        );
+        let names: Vec<String> = serde_json::from_value(out["symbols"].clone()).unwrap();
+        assert!(names.contains(&"R_ohm".to_string()), "names={names:?}");
+        assert!(names.contains(&"LED".to_string()), "names={names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with("_0_1")),
+            "sub-units must not leak into the listing: {names:?}"
+        );
+    }
+
+    fn result_text(res: &CallToolResult) -> String {
+        match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// Build a temp "project dir" containing a `sym-lib-table` that references a
+    /// single `.kicad_sym` library, returning the project dir path. The URI is
+    /// absolute (not `${KICAD_*}`) so it resolves without KiCad env vars.
+    fn write_project_sym_lib(tmp: &tempfile::TempDir, nick: &str, lib_body: &str) -> PathBuf {
+        let lib_file = tmp.path().join(format!("{nick}.kicad_sym"));
+        std::fs::write(&lib_file, lib_body).unwrap();
+        let uri = lib_file.to_string_lossy().replace('\\', "/");
+        let table = format!(
+            "(sym_lib_table\n  (lib (name \"{nick}\") (type \"Normal\") (uri \"{uri}\") (options \"\") (descr \"\"))\n)\n",
+        );
+        std::fs::write(tmp.path().join("sym-lib-table"), table).unwrap();
+        tmp.path().to_path_buf()
+    }
+
+    #[tokio::test]
+    async fn get_symbol_info_parses_kicad10_pins_and_props() {
+        // Regression: get_symbol_info hard-coded `  (symbol "NAME"` / `\n    (pin `
+        // string searches and only consulted the GLOBAL table, so it returned
+        // "not found" for every real KiCad 10 symbol (CRLF + TAB files) and could
+        // never resolve project libraries. Fixture is a KiCad-10-shaped (CRLF +
+        // TAB) library resolved via a project sym-lib-table; we expect pins +
+        // properties read from the tree, with the nested _1_1 unit's pins
+        // collected recursively.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = concat!(
+            "(kicad_symbol_lib\r\n",
+            "\t(version 20251024)\r\n",
+            "\t(generator \"kicad_symbol_editor\")\r\n",
+            "\t(symbol \"T1\"\r\n",
+            "\t\t(property \"Reference\" \"Q\" (at 0 5.08 0))\r\n",
+            "\t\t(property \"Value\" \"T1\" (at 0 -5.08 0))\r\n",
+            "\t\t(symbol \"T1_1_1\"\r\n",
+            "\t\t\t(pin input line (at -5.08 2.54 0) (length 2.54) (name \"G\") (number \"1\"))\r\n",
+            "\t\t\t(pin output line (at 5.08 0 180) (length 2.54) (name \"S\") (number \"3\"))\r\n",
+            "\t\t)\r\n",
+            "\t)\r\n",
+            ")\r\n",
+        );
+        let proj = write_project_sym_lib(&tmp, "testlib", body);
+
+        let args = json!({
+            "lib_id": "testlib:T1",
+            "project_dir": proj.to_string_lossy(),
+        });
+        let res = handle_get_symbol_info(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["pin_count"], 2, "full result: {out}");
+        let numbers: Vec<&str> = out["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["number"].as_str().unwrap_or(""))
+            .collect();
+        assert!(numbers.contains(&"1"), "pins: {out}");
+        assert!(numbers.contains(&"3"), "pins: {out}");
+        let g_pin = out["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["number"] == "1")
+            .unwrap();
+        assert_eq!(g_pin["type"], "input", "{g_pin}");
+        assert_eq!(g_pin["name"], "G", "{g_pin}");
+        assert_eq!(out["properties"]["Reference"], "Q", "{out}");
+        assert_eq!(out["properties"]["Value"], "T1", "{out}");
+    }
+
+    #[tokio::test]
+    async fn search_lib_symbols_matches_underscore_names_and_skips_units() {
+        // Pure check of the per-library matcher factored out of search_symbols:
+        // top-level symbols with underscores must be returned verbatim, and the
+        // nested _0_1 unit sub-symbols must not leak into results.
+        let body = concat!(
+            "(kicad_symbol_lib\r\n\t(version 20251024)\r\n",
+            "\t(symbol \"FOO_BAR\"\r\n\t\t(symbol \"FOO_BAR_0_1\")\r\n\t)\r\n",
+            "\t(symbol \"LED\"\r\n\t\t(symbol \"LED_0_1\")\r\n\t)\r\n",
+            ")\r\n",
+        );
+        let results = search_lib_symbols("projlib", body, "foo");
+        let names: Vec<&str> = results
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"FOO_BAR"), "names={names:?}");
+        assert_eq!(results[0]["library"], "projlib");
+        assert_eq!(results[0]["id"], "projlib:FOO_BAR");
+        assert!(
+            !names.iter().any(|n| n.ends_with("_0_1")),
+            "sub-units leaked: {names:?}"
         );
     }
 
