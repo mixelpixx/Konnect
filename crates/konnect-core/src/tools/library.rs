@@ -1456,10 +1456,7 @@ fn resolve_symbol_pins<'a>(root: &'a SexpNode, sym_node: &'a SexpNode) -> Vec<&'
     let mut chain: Vec<&SexpNode> = Vec::new();
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut current = sym_node;
-    loop {
-        let Some(name) = current.get(1).and_then(|n| n.as_str()) else {
-            break;
-        };
+    while let Some(name) = current.get(1).and_then(|n| n.as_str()) {
         if !visited.insert(name) {
             break; // cycle guard: name already seen
         }
