@@ -1007,6 +1007,202 @@ mod footprint_sexp_tests {
         .join("\r\n")
     }
 
+    fn test_ctx() -> ToolContext {
+        // No IPC address: the handler's IPC attempt fails immediately and it
+        // takes the file path, which is what KiCad 10.0 forces in practice
+        // anyway (ParseAndCreateItemsFromString creates nothing).
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    const EMPTY_BOARD: &str = "(kicad_pcb
+	(version 20260206)
+	(generator \"pcbnew\")
+	(net 0 \"\")
+)
+";
+
+    /// Write a library footprint and an empty board into `dir`.
+    fn fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let modfile = dir.join("R_0805_2012Metric.kicad_mod");
+        std::fs::write(&modfile, library_footprint()).unwrap();
+        let board = dir.join("b.kicad_pcb");
+        std::fs::write(&board, EMPTY_BOARD).unwrap();
+        (modfile, board)
+    }
+
+    #[tokio::test]
+    async fn place_component_puts_a_real_footprint_on_the_board() {
+        // Regression: place_component reported success while the board stayed
+        // empty. It sent a body-less stub — (footprint "Lib:Fp") with a layer
+        // and a position and nothing else — and discarded KiCad's response, so
+        // two "successful" placements followed by a save produced a board file
+        // containing zero footprints.
+        let tmp = tempfile::tempdir().unwrap();
+        let (modfile, board) = fixture(tmp.path());
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            // A direct path skips the fp-lib-table, keeping this test hermetic.
+            "footprint": modfile.to_string_lossy(),
+            "reference": "R7",
+            "x": 50.0, "y": 60.0,
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+
+        let out = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(
+            out.matches("(footprint \"").count(),
+            1,
+            "no footprint:
+{out}"
+        );
+        assert!(
+            out.contains("(at 50 60 0)"),
+            "placement missing:
+{out}"
+        );
+        assert!(out.contains("(property \"Reference\" \"R7\""), "{out}");
+        // The heart of the bug: the payload must carry the real definition.
+        assert!(
+            out.contains("(pad \"1\" smd roundrect"),
+            "pads missing:
+{out}"
+        );
+        assert!(out.contains("(size 1.025 1.4)"), "pad geometry missing");
+        assert!(out.contains("(uuid \""), "board items need a uuid");
+        assert_eq!(
+            count_parens(&out),
+            0,
+            "board is no longer balanced:
+{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_component_reports_which_path_it_took() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (modfile, board) = fixture(tmp.path());
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": modfile.to_string_lossy(),
+            "reference": "R1", "x": 1.0, "y": 2.0,
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["source"], "file");
+        assert_eq!(out["placed"], "R1");
+        // KiCad was never reachable here, so no reopen warning is warranted.
+        assert!(out.get("warning").is_none(), "unexpected warning: {out}");
+    }
+
+    #[tokio::test]
+    async fn place_component_rejects_an_unknown_footprint_without_touching_the_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, board) = fixture(tmp.path());
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": tmp.path().join("does_not_exist.kicad_mod").to_string_lossy(),
+            "reference": "R1", "x": 1.0, "y": 2.0,
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(res.is_error, "a missing footprint must be an error");
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            EMPTY_BOARD,
+            "board must be left untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn placed_rotation_reaches_the_pads() {
+        // A rotated placement whose pads keep angle 0 trips KiCad's own
+        // lib_footprint_mismatch check, so the rotation has to reach them.
+        let tmp = tempfile::tempdir().unwrap();
+        let (modfile, board) = fixture(tmp.path());
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": modfile.to_string_lossy(),
+            "reference": "R1", "x": 10.0, "y": 20.0, "rotation": -90.0,
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+
+        let out = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            out.contains("(at 10 20 -90)"),
+            "footprint angle:
+{out}"
+        );
+        assert!(
+            out.contains("(at -0.9125 0 270)"),
+            "pad angle:
+{out}"
+        );
+        assert!(
+            out.contains("(at 0 -1.65 90)"),
+            "readable text angle:
+{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_component_array_writes_every_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (modfile, board) = fixture(tmp.path());
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": modfile.to_string_lossy(),
+            "start_x": 10.0, "start_y": 10.0,
+            "count_x": 3, "count_y": 2, "spacing_x": 5.0,
+            "ref_prefix": "R", "ref_start": 1,
+        });
+        let res = handle_place_array(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+
+        let out = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(out.matches("(footprint \"").count(), 6, "{out}");
+        for r in ["R1", "R2", "R3", "R4", "R5", "R6"] {
+            assert!(
+                out.contains(&format!("(property \"Reference\" \"{r}\"")),
+                "missing {r}"
+            );
+        }
+        assert_eq!(count_parens(&out), 0, "board is no longer balanced");
+    }
+
+    /// Net paren depth, ignoring anything inside quoted strings.
+    fn count_parens(s: &str) -> i32 {
+        let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+        for ch in s.chars() {
+            match ch {
+                _ if esc => esc = false,
+                '\\' if in_str => esc = true,
+                '"' => in_str = !in_str,
+                '(' if !in_str => depth += 1,
+                ')' if !in_str => depth -= 1,
+                _ => {}
+            }
+        }
+        depth
+    }
+
+    fn result_text(res: &CallToolResult) -> String {
+        match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
     #[test]
     fn name_span_covers_the_quoted_header_name() {
         let c = library_footprint();
