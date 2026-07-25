@@ -652,46 +652,58 @@ impl KiCadIpcClient {
         self.delete_items(vec![kiid])
     }
 
-    /// Place a footprint — currently requires KiCAD's ParseAndCreateItemsFromString.
-    pub fn place_footprint(
-        &self,
-        lib_id: &str,
-        x: f64,
-        y: f64,
-        rotation: f64,
-        layer: &str,
-    ) -> Result<IpcFootprint> {
-        // KiCAD 10 IPC doesn't have a direct "place footprint from library" command.
-        // The CreateItems command requires a fully formed FootprintInstance protobuf,
-        // which needs the complete footprint definition (pads, shapes, etc.) from the library.
-        // For now, use ParseAndCreateItemsFromString with S-expression format.
-        let sexp = format!(
-            r#"(footprint "{lib_id}"
-  (layer "{layer}")
-  (at {x} {y} {rotation})
-)"#,
-            lib_id = lib_id,
-            layer = layer,
-            x = crate::builders::mm_to_nm(x) as f64 / 1_000_000.0,
-            y = crate::builders::mm_to_nm(y) as f64 / 1_000_000.0,
-            rotation = rotation,
-        );
-
+    /// Paste a fully-formed S-expression into the open board, the way the
+    /// editor's Paste action does, and report how many items KiCAD created.
+    ///
+    /// KiCAD answers with a `CreateItemsResponse` whose own documentation warns
+    /// that the overall status "may return IRS_OK even if no items were
+    /// created", so the per-item results are the only trustworthy signal. An
+    /// unparseable payload therefore looks like a success at the transport
+    /// level and must be caught by inspecting `created_items`.
+    pub fn parse_and_create_items(&self, contents: &str) -> Result<usize> {
         let doc = self.get_board_document()?;
         let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
             document: Some(doc),
-            contents: sexp,
+            contents: contents.to_string(),
         };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
+        let resp_any =
+            self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
 
-        Ok(IpcFootprint {
-            reference: String::new(),
-            value: String::new(),
-            footprint: lib_id.to_string(),
-            position: IpcVector2 { x, y },
-            rotation,
-            layer: layer.to_string(),
-        })
+        let Some(any) = resp_any else {
+            anyhow::bail!("KiCAD returned no response to ParseAndCreateItemsFromString");
+        };
+        let resp: kiapi::common::commands::CreateItemsResponse = unpack_any(&any)?;
+        tracing::debug!(
+            type_url = %any.type_url,
+            body_len = any.value.len(),
+            status = resp.status,
+            created = resp.created_items.len(),
+            "ParseAndCreateItemsFromString response"
+        );
+        Ok(resp.created_items.len())
+    }
+
+    /// Place a footprint on the open board from a fully-formed `(footprint …)`
+    /// S-expression.
+    ///
+    /// The caller supplies the complete block — read from the library's
+    /// `.kicad_mod` and stamped with position, rotation and reference — because
+    /// KiCAD's parser needs the real pad and graphic definitions. The previous
+    /// implementation synthesised a three-line stub naming the library id with
+    /// no body; KiCAD parsed it to nothing and, since the response was
+    /// discarded, every call reported success while the board stayed empty.
+    /// This is the same failure the `(via …)` path had before it moved to a
+    /// typed message — see [`add_via`](Self::add_via).
+    pub fn place_footprint(&self, footprint_sexp: &str) -> Result<usize> {
+        let created = self.parse_and_create_items(footprint_sexp)?;
+        if created == 0 {
+            anyhow::bail!(
+                "KiCAD accepted the request but created no footprint — the S-expression was \
+                 rejected by its parser. This usually means the library footprint could not be \
+                 read or is not valid for this KiCAD version."
+            );
+        }
+        Ok(created)
     }
 
     /// Get board extents (bounding box of all items).

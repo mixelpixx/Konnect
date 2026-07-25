@@ -6,9 +6,219 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::library::resolve_footprint_path;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_sexp::writer::{
+    apply_edits, find_balanced_block, find_block_starts, new_uuid, write_atomic,
+};
+use konnect_sexp::SexpEdit;
 use serde_json::json;
+
+// ─── Library footprint → board footprint ──────────────────────────────────────
+
+/// Build a board-ready `(footprint …)` block for `lib_id`.
+///
+/// A library `.kicad_mod` is a complete footprint definition sitting at the
+/// origin with a `REF**` placeholder reference. Placing it on a board means
+/// renaming it to the full `Library:Footprint` id, stamping in a position,
+/// rotation and fresh UUID, and substituting the real reference designator.
+///
+/// KiCAD's own parser then handles the pads and graphics, which is why the
+/// whole definition is forwarded rather than reconstructed.
+fn board_footprint_sexp(
+    lib_id: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    layer: &str,
+    reference: Option<&str>,
+) -> Result<String, String> {
+    let path = resolve_footprint_path(lib_id)?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read footprint {}: {}", path.display(), e))?;
+
+    let name_span = footprint_name_span(&content).ok_or_else(|| {
+        format!(
+            "{} does not start with a (footprint \"NAME\" …) block",
+            path.display()
+        )
+    })?;
+
+    // Board footprints carry the full library id, not the bare footprint name.
+    let mut out = String::with_capacity(content.len() + 128);
+    out.push_str(&content[..name_span.start]);
+    out.push_str(&escape_sexp_string(lib_id));
+    out.push_str(&format!(
+        "\n\t(at {x} {y} {rotation})\n\t(uuid \"{}\")",
+        new_uuid()
+    ));
+    out.push_str(&content[name_span.end..]);
+
+    if rotation != 0.0 {
+        out = apply_rotation_to_children(&out, rotation);
+    }
+    if let Some(reference) = reference {
+        out = replace_property_value(&out, "Reference", reference);
+    }
+    if layer != "F.Cu" {
+        out = replace_footprint_layer(&out, layer);
+    }
+
+    Ok(out)
+}
+
+/// Fold the footprint's placement rotation into its pads and text items.
+///
+/// KiCad stores each pad's and text item's *absolute* orientation while their
+/// positions stay in unrotated footprint-local coordinates — a `C_0603` placed
+/// at -90° keeps `(at -0.775 0 270)` on pad 1. Omitting this leaves the pad
+/// shapes unrotated relative to the body and makes KiCad's
+/// `lib_footprint_mismatch` check fire.
+///
+/// Text is additionally kept readable: KiCad flips an angle that would leave a
+/// label upside down by 180°, so a -90° footprint carries `90` on its reference.
+fn apply_rotation_to_children(content: &str, rotation: f64) -> String {
+    let mut out = content.to_string();
+
+    for tag in ["pad", "property", "fp_text"] {
+        let readable = tag != "pad";
+        // Rewrite back-to-front so earlier byte offsets stay valid.
+        let starts: Vec<usize> = find_block_starts(&out, tag);
+        for start in starts.into_iter().rev() {
+            let Some((bstart, bend)) = find_balanced_block(&out, start) else {
+                continue;
+            };
+            // The block's own `(at …)` is its first — nested ones (a pad's
+            // `(primitives …)`, for instance) come later.
+            let Some(at_start) = find_block_starts(&out[bstart..bend], "at")
+                .first()
+                .map(|i| bstart + i)
+            else {
+                continue;
+            };
+            let Some((astart, aend)) = find_balanced_block(&out, at_start) else {
+                continue;
+            };
+            let Some(rewritten) = rotate_at_block(&out[astart..aend], rotation, readable) else {
+                continue;
+            };
+            out.replace_range(astart..aend, &rewritten);
+        }
+    }
+    out
+}
+
+/// Rewrite `(at x y [angle])`, adding `rotation` to the angle.
+///
+/// Returns `None` when the block does not look like a positional `at`.
+fn rotate_at_block(block: &str, rotation: f64, readable: bool) -> Option<String> {
+    let inner = block.strip_prefix('(')?.strip_suffix(')')?;
+    let mut parts = inner.split_whitespace();
+    if parts.next()? != "at" {
+        return None;
+    }
+    let x: f64 = parts.next()?.parse().ok()?;
+    let y: f64 = parts.next()?.parse().ok()?;
+    let existing: f64 = parts.next().and_then(|a| a.parse().ok()).unwrap_or(0.0);
+    if parts.next().is_some() {
+        return None; // `(at …)` with unexpected extra tokens — leave alone.
+    }
+
+    let mut angle = (existing + rotation).rem_euclid(360.0);
+    if readable && angle > 90.0 && angle <= 270.0 {
+        angle -= 180.0;
+    }
+    Some(format_at(x, y, angle))
+}
+
+/// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
+/// trimming trailing zeros from the decimals.
+fn format_at(x: f64, y: f64, angle: f64) -> String {
+    let n = |v: f64| {
+        let s = format!("{v:.6}");
+        let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+        if s == "-0" {
+            "0".to_string()
+        } else {
+            s
+        }
+    };
+    if angle == 0.0 {
+        format!("(at {} {})", n(x), n(y))
+    } else {
+        format!("(at {} {} {})", n(x), n(y), n(angle))
+    }
+}
+
+/// Byte range of the quoted name in the leading `(footprint "NAME"` header,
+/// including the surrounding quotes.
+fn footprint_name_span(content: &str) -> Option<std::ops::Range<usize>> {
+    let block = *find_block_starts(content, "footprint").first()?;
+    let after_tag = block + "(footprint".len();
+    let rel = content[after_tag..].find('"')?;
+    let start = after_tag + rel;
+    let end = start + 1 + content[start + 1..].find('"')?;
+    Some(start..end + 1)
+}
+
+/// Quote and escape `value` as an S-expression string literal.
+fn escape_sexp_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Replace the value of the first `(property "<key>" "<value>" …)` entry.
+fn replace_property_value(content: &str, key: &str, value: &str) -> String {
+    let needle = format!("(property \"{key}\"");
+    let Some(prop) = find_block_starts(content, "property")
+        .into_iter()
+        .find(|&i| content[i..].starts_with(&needle))
+    else {
+        return content.to_string();
+    };
+    let after_key = prop + needle.len();
+    let Some(rel) = content[after_key..].find('"') else {
+        return content.to_string();
+    };
+    let vstart = after_key + rel;
+    let Some(rel_end) = content[vstart + 1..].find('"') else {
+        return content.to_string();
+    };
+    let vend = vstart + 1 + rel_end + 1;
+
+    let mut out = String::with_capacity(content.len());
+    out.push_str(&content[..vstart]);
+    out.push_str(&escape_sexp_string(value));
+    out.push_str(&content[vend..]);
+    out
+}
+
+/// Replace the footprint's own `(layer "…")` — the first `layer` block that is a
+/// direct child of the footprint, not one belonging to a pad or graphic.
+///
+/// Note this only retargets the footprint; a true F.Cu↔B.Cu flip would also
+/// have to mirror every child item, which KiCAD does itself when the user flips
+/// a placed footprint.
+fn replace_footprint_layer(content: &str, layer: &str) -> String {
+    let Some(name) = footprint_name_span(content) else {
+        return content.to_string();
+    };
+    let Some(start) = find_block_starts(content, "layer")
+        .into_iter()
+        .find(|&i| i > name.end)
+    else {
+        return content.to_string();
+    };
+    let Some((bstart, bend)) = find_balanced_block(content, start) else {
+        return content.to_string();
+    };
+
+    let mut out = String::with_capacity(content.len());
+    out.push_str(&content[..bstart]);
+    out.push_str(&format!("(layer {})", escape_sexp_string(layer)));
+    out.push_str(&content[bend..]);
+    out
+}
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
@@ -261,15 +471,80 @@ async fn handle_place_component(
     };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
+    let reference = args["reference"].as_str().map(str::to_string);
 
-    let fp = ipc!(ctx, |c| c
-        .place_footprint(&footprint, x, y, rotation, &layer));
-    Ok(CallToolResult::json(&json!({
-        "placed": fp.reference,
-        "footprint": fp.footprint,
-        "x": fp.position.x, "y": fp.position.y,
-        "rotation": fp.rotation, "layer": fp.layer
-    })))
+    let board_path = get_path(args, "board")?;
+    let sexp = match board_footprint_sexp(&footprint, x, y, rotation, &layer, reference.as_deref())
+    {
+        Ok(s) => s,
+        Err(msg) => return Ok(CallToolResult::error(msg)),
+    };
+
+    // Try IPC first, then fall back to editing the board file — the same
+    // strategy `pcb_board`'s tools use. KiCad 10.0 answers
+    // ParseAndCreateItemsFromString with an empty CreateItemsResponse and
+    // creates nothing, so in practice this always falls through; the IPC
+    // attempt is kept so the tool starts working the moment KiCad implements
+    // the command.
+    let sexp_ipc = sexp.clone();
+    let ipc_result = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        c.place_footprint(&sexp_ipc)
+    })
+    .await?;
+
+    if ipc_result.is_ok() {
+        return Ok(CallToolResult::json(&json!({
+            "placed": reference.unwrap_or_default(),
+            "footprint": footprint,
+            "x": x, "y": y, "rotation": rotation, "layer": layer,
+            "source": "ipc"
+        })));
+    }
+
+    // A "created no footprint" error means KiCad answered — so it is running and
+    // may hold this board open, in which case it cannot see a file edit and will
+    // overwrite it on its next save.
+    let kicad_reachable = ipc_result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.contains("created no footprint"));
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let close_pos = content.rfind(')').unwrap_or(content.len());
+    let block = format!("\n{}", indent_block(sexp.trim_end(), "\t"));
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, block)]);
+    write_atomic(&board_path, &new_content)?;
+
+    let mut out = json!({
+        "placed": reference.unwrap_or_default(),
+        "footprint": footprint,
+        "x": x, "y": y, "rotation": rotation, "layer": layer,
+        "source": "file"
+    });
+    if kicad_reachable {
+        out["warning"] = json!(
+            "KiCAD is running and could not place this over IPC (KiCAD 10.0's \
+             ParseAndCreateItemsFromString does nothing), so the board file was edited \
+             directly. If this board is open in the PCB editor, close it without saving \
+             and reopen it — otherwise KiCAD will overwrite this change."
+        );
+    }
+    Ok(CallToolResult::json(&out))
+}
+
+/// Prefix every non-empty line with `indent`.
+fn indent_block(block: &str, indent: &str) -> String {
+    block
+        .lines()
+        .map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{indent}{l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn handle_move_component(
@@ -512,35 +787,68 @@ async fn handle_place_array(
     let prefix = args["ref_prefix"].as_str().unwrap_or("U").to_string();
     let ref_start = args["ref_start"].as_u64().unwrap_or(1) as usize;
 
+    let board_path = get_path(args, "board")?;
+
+    // Build every block up front so a bad footprint id fails before anything is
+    // written or sent.
     let mut placed = Vec::new();
+    let mut blocks = Vec::new();
     let mut n = ref_start;
     for row in 0..count_y {
         for col in 0..count_x {
             let x = start_x + col as f64 * spacing_x;
             let y = start_y + row as f64 * spacing_y;
             let reference = format!("{prefix}{n}");
-            let fp_id = footprint.clone();
-            let ref2 = reference.clone();
-            match with_ipc(ctx.config.ipc_address.clone(), move |c| {
-                c.place_footprint(&fp_id, x, y, 0.0, "F.Cu")
-            })
-            .await?
-            {
-                Ok(fp) => placed
-                    .push(json!({ "reference": ref2, "x": fp.position.x, "y": fp.position.y })),
-                Err(e) => {
-                    return Ok(CallToolResult::error(format!(
-                        "IPC error placing {}: {}",
-                        reference, e
-                    )))
-                }
+            match board_footprint_sexp(&footprint, x, y, 0.0, "F.Cu", Some(&reference)) {
+                Ok(s) => blocks.push(s),
+                Err(msg) => return Ok(CallToolResult::error(msg)),
             }
+            placed.push(json!({ "reference": reference, "x": x, "y": y }));
             n += 1;
         }
     }
-    Ok(CallToolResult::json(
-        &json!({ "placed_count": placed.len(), "components": placed }),
-    ))
+
+    // Same IPC-then-file strategy as place_component.
+    let ipc_blocks = blocks.clone();
+    let ipc_result = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        for b in &ipc_blocks {
+            c.place_footprint(b)?;
+        }
+        Ok(())
+    })
+    .await?;
+
+    if ipc_result.is_ok() {
+        return Ok(CallToolResult::json(&json!({
+            "placed_count": placed.len(), "components": placed, "source": "ipc"
+        })));
+    }
+
+    let kicad_reachable = ipc_result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.contains("created no footprint"));
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let close_pos = content.rfind(')').unwrap_or(content.len());
+    let joined: String = blocks
+        .iter()
+        .map(|b| format!("\n{}", indent_block(b.trim_end(), "\t")))
+        .collect();
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, joined)]);
+    write_atomic(&board_path, &new_content)?;
+
+    let mut out = json!({
+        "placed_count": placed.len(), "components": placed, "source": "file"
+    });
+    if kicad_reachable {
+        out["warning"] = json!(
+            "KiCAD is running but cannot place footprints over IPC on KiCAD 10.0, so the \
+             board file was edited directly. If this board is open in the PCB editor, close \
+             it without saving and reopen it — otherwise KiCAD will overwrite this change."
+        );
+    }
+    Ok(CallToolResult::json(&out))
 }
 
 async fn handle_align_components(
@@ -593,7 +901,7 @@ async fn handle_duplicate_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let _new_reference = match require_str(args, "new_reference") {
+    let new_reference = match require_str(args, "new_reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
@@ -613,17 +921,24 @@ async fn handle_duplicate_component(
             .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", ref_ipc))
     });
 
-    let fp = ipc!(ctx, |c| c.place_footprint(
+    let sexp = match board_footprint_sexp(
         &src.footprint,
         x,
         y,
         src.rotation,
-        &src.layer
-    ));
+        &src.layer,
+        Some(&new_reference),
+    ) {
+        Ok(s) => s,
+        Err(msg) => return Ok(CallToolResult::error(msg)),
+    };
+
+    ipc!(ctx, |c| c.place_footprint(&sexp));
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
-        "new_reference": fp.reference,
-        "x": fp.position.x, "y": fp.position.y
+        "new_reference": new_reference,
+        "footprint": src.footprint,
+        "x": x, "y": y, "rotation": src.rotation, "layer": src.layer
     })))
 }
 
@@ -658,4 +973,201 @@ async fn handle_get_board_2d_view(
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(CallToolResult::image(b64, "image/png"))
+}
+
+#[cfg(test)]
+mod footprint_sexp_tests {
+    use super::*;
+
+    /// A library footprint in the exact shape KiCad ships: TAB-indented, name
+    /// without a library prefix, `REF**` placeholder, no `(at …)`.
+    fn library_footprint() -> String {
+        [
+            "(footprint \"R_0805_2012Metric\"",
+            "\t(version 20260206)",
+            "\t(generator \"kicad-footprint-generator\")",
+            "\t(layer \"F.Cu\")",
+            "\t(descr \"Resistor SMD 0805\")",
+            "\t(property \"Reference\" \"REF**\"",
+            "\t\t(at 0 -1.65 0)",
+            "\t\t(layer \"F.SilkS\")",
+            "\t)",
+            "\t(property \"Value\" \"R_0805_2012Metric\"",
+            "\t\t(at 0 1.65 0)",
+            "\t\t(layer \"F.Fab\")",
+            "\t)",
+            "\t(pad \"1\" smd roundrect",
+            "\t\t(at -0.9125 0)",
+            "\t\t(size 1.025 1.4)",
+            "\t\t(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")",
+            "\t)",
+            ")",
+            "",
+        ]
+        .join("\r\n")
+    }
+
+    #[test]
+    fn name_span_covers_the_quoted_header_name() {
+        let c = library_footprint();
+        let span = footprint_name_span(&c).expect("header not found");
+        assert_eq!(&c[span], "\"R_0805_2012Metric\"");
+    }
+
+    #[test]
+    fn name_span_is_none_without_a_footprint_block() {
+        assert!(footprint_name_span("(kicad_pcb (version 20250610))").is_none());
+    }
+
+    #[test]
+    fn reference_substitution_targets_the_reference_property_only() {
+        let out = replace_property_value(&library_footprint(), "Reference", "R42");
+        assert!(out.contains("(property \"Reference\" \"R42\""), "{out}");
+        assert!(
+            out.contains("(property \"Value\" \"R_0805_2012Metric\""),
+            "Value must be untouched:\n{out}"
+        );
+        assert!(!out.contains("REF**"));
+    }
+
+    #[test]
+    fn reference_substitution_is_a_no_op_when_the_property_is_absent() {
+        let c = "(footprint \"X\"\n\t(layer \"F.Cu\")\n)";
+        assert_eq!(replace_property_value(c, "Reference", "R1"), c);
+    }
+
+    #[test]
+    fn layer_override_retargets_the_footprint_not_its_pads() {
+        let out = replace_footprint_layer(&library_footprint(), "B.Cu");
+        assert!(out.contains("(layer \"B.Cu\")"), "{out}");
+        // The pad's layer list and the silkscreen text layer must survive.
+        assert!(out.contains("(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")"));
+        assert!(out.contains("(layer \"F.SilkS\")"));
+        assert_eq!(
+            out.matches("(layer \"B.Cu\")").count(),
+            1,
+            "only the footprint's own layer should change:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pad_angles_absorb_the_footprint_rotation() {
+        // KiCad stores each pad's absolute orientation: a footprint placed at
+        // -90 carries 270 on its pads, while pad positions stay in unrotated
+        // footprint-local coordinates.
+        let out = apply_rotation_to_children(&library_footprint(), -90.0);
+        assert!(out.contains("(at -0.9125 0 270)"), "{out}");
+        // Position is unchanged; only the angle was added.
+        assert!(
+            !out.contains("(at 0 -0.9125"),
+            "pad position must not rotate"
+        );
+    }
+
+    #[test]
+    fn pad_angles_wrap_into_zero_to_360() {
+        let out = apply_rotation_to_children(&library_footprint(), 270.0);
+        assert!(out.contains("(at -0.9125 0 270)"), "{out}");
+        // 270 + 270 = 540 -> 180
+        let twice = apply_rotation_to_children(&out, 270.0);
+        assert!(twice.contains("(at -0.9125 0 180)"), "{twice}");
+    }
+
+    #[test]
+    fn text_angles_are_kept_readable() {
+        // A -90 footprint would put text at 270, which reads upside down, so
+        // KiCad flips it by 180 to 90 — matching what eeschema/pcbnew write.
+        let out = apply_rotation_to_children(&library_footprint(), -90.0);
+        assert!(
+            out.contains("(at 0 -1.65 90)"),
+            "reference text:
+{out}"
+        );
+        assert!(
+            out.contains("(at 0 1.65 90)"),
+            "value text:
+{out}"
+        );
+    }
+
+    #[test]
+    fn zero_rotation_is_written_without_an_angle() {
+        assert_eq!(format_at(1.5, -2.0, 0.0), "(at 1.5 -2)");
+        assert_eq!(format_at(0.0, 0.0, 90.0), "(at 0 0 90)");
+    }
+
+    #[test]
+    fn rotate_at_block_rejects_non_positional_at() {
+        assert!(rotate_at_block("(at)", 90.0, false).is_none());
+        assert!(rotate_at_block("(atomic 1 2)", 90.0, false).is_none());
+        assert!(rotate_at_block("(at 1 2 3 4)", 90.0, false).is_none());
+    }
+
+    #[test]
+    fn indent_block_prefixes_each_line_and_leaves_blanks_alone() {
+        assert_eq!(
+            indent_block(
+                "a
+
+b", "	"
+            ),
+            "	a
+
+	b"
+        );
+    }
+
+    #[test]
+    fn sexp_strings_are_escaped() {
+        // Input characters:  a " b \ c
+        // Expected output:   " a \ " b \ \ c "
+        let input = ['a', '"', 'b', '\\', 'c'].iter().collect::<String>();
+        let expected = ['"', 'a', '\\', '"', 'b', '\\', '\\', 'c', '"']
+            .iter()
+            .collect::<String>();
+        assert_eq!(escape_sexp_string(&input), expected);
+        assert_eq!(escape_sexp_string("plain"), "\"plain\"");
+    }
+
+    /// The end-to-end transform, exercised through a real library file on disk.
+    #[test]
+    fn board_footprint_carries_the_definition_position_and_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(
+            pretty.join("R_0805_2012Metric.kicad_mod"),
+            library_footprint(),
+        )
+        .unwrap();
+
+        // resolve_footprint_path takes a plain path when it isn't a lib id.
+        let direct = pretty.join("R_0805_2012Metric.kicad_mod");
+        let content = std::fs::read_to_string(&direct).unwrap();
+        let span = footprint_name_span(&content).unwrap();
+
+        // Reproduce board_footprint_sexp's transform on the resolved content so
+        // the assertions do not depend on the machine's fp-lib-table.
+        let mut out = String::new();
+        out.push_str(&content[..span.start]);
+        out.push_str(&escape_sexp_string("Resistor_SMD:R_0805_2012Metric"));
+        out.push_str("\n\t(at 50 60 90)\n\t(uuid \"fixed-uuid\")");
+        out.push_str(&content[span.end..]);
+        let out = replace_property_value(&out, "Reference", "R7");
+
+        // The library id replaces the bare name.
+        assert!(
+            out.starts_with("(footprint \"Resistor_SMD:R_0805_2012Metric\""),
+            "{out}"
+        );
+        // Placement is stamped in.
+        assert!(out.contains("(at 50 60 90)"));
+        assert!(out.contains("(uuid \"fixed-uuid\")"));
+        // The reference designator is real, not the placeholder.
+        assert!(out.contains("(property \"Reference\" \"R7\""));
+        // Critically, the pad definition survives — a body-less stub is exactly
+        // what made KiCad create nothing.
+        assert!(out.contains("(pad \"1\" smd roundrect"));
+        assert!(out.contains("(size 1.025 1.4)"));
+    }
 }
