@@ -607,10 +607,18 @@ async fn handle_place_component(
 /// the assumption is at least consistent.
 fn insert_into_board(board_path: &std::path::Path, blocks: &[String]) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(board_path)?;
+    // KiCad writes these files CRLF on Windows — its bundled .kicad_mod
+    // libraries are CRLF throughout — so an inserted block joined with bare LF
+    // would leave the board with two conventions in it.
+    let eol = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let joined: String = blocks
         .iter()
-        .map(|b| format!("\n{}", indent_block(b.trim_end(), "\t")))
+        .map(|b| format!("{eol}{}", indent_block(b.trim_end(), "\t", eol)))
         .collect();
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, joined)]);
 
@@ -655,8 +663,11 @@ fn check_single_board_form(content: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Prefix every non-empty line with `indent`.
-fn indent_block(block: &str, indent: &str) -> String {
+/// Prefix every non-empty line with `indent`, joining them with `eol`.
+fn indent_block(block: &str, indent: &str, eol: &str) -> String {
+    // `lines()` strips a trailing \r along with the \n, so rejoining with `eol`
+    // re-imposes one convention on a block that may have arrived with another —
+    // a CRLF library footprint going into an LF board, or the reverse.
     block
         .lines()
         .map(|l| {
@@ -667,7 +678,7 @@ fn indent_block(block: &str, indent: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join(eol)
 }
 
 async fn handle_move_component(
@@ -1364,6 +1375,89 @@ mod footprint_sexp_tests {
         );
     }
 
+    /// Force LF, whatever the checkout did to this source file's literals.
+    ///
+    /// Git normalises these files to CRLF in a Windows working tree, so a
+    /// multi-line string literal here is CRLF locally and LF on CI. A test
+    /// about line endings has to state which it wants rather than inherit it.
+    fn lf(s: &str) -> String {
+        s.replace("\r\n", "\n")
+    }
+
+    /// Force CRLF, likewise.
+    fn crlf(s: &str) -> String {
+        lf(s).replace('\n', "\r\n")
+    }
+
+    #[tokio::test]
+    async fn a_crlf_board_stays_crlf() {
+        // KiCad writes these files CRLF on Windows — its bundled .kicad_mod
+        // libraries are CRLF throughout, verified against a 10.0 install — so
+        // placing into a CRLF board must not leave two conventions in it.
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let modfile = pretty.join("R_0805_2012Metric.kicad_mod");
+        std::fs::write(&modfile, crlf(&library_footprint())).unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, crlf(EMPTY_BOARD)).unwrap();
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": modfile.to_string_lossy(),
+            "reference": "R1", "x": 1.0, "y": 2.0,
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+
+        let out = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            out.contains("(pad \"1\" smd roundrect"),
+            "footprint missing"
+        );
+        let bare_lf = out
+            .match_indices('\n')
+            .filter(|(i, _)| *i == 0 || out.as_bytes()[i - 1] != b'\r')
+            .count();
+        assert_eq!(
+            bare_lf, 0,
+            "a CRLF board gained {bare_lf} bare LF line endings:
+{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_lf_board_stays_lf() {
+        // The reverse: a CRLF library footprint must not drag \r into an LF
+        // board, which is the common case on Linux and macOS.
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let modfile = pretty.join("R_0805_2012Metric.kicad_mod");
+        std::fs::write(&modfile, crlf(&library_footprint())).unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, lf(EMPTY_BOARD)).unwrap();
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": modfile.to_string_lossy(),
+            "reference": "R1", "x": 1.0, "y": 2.0,
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+
+        let out = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            out.contains("(pad \"1\" smd roundrect"),
+            "footprint missing"
+        );
+        assert!(
+            !out.contains('\r'),
+            "a CRLF library footprint dragged \\r into an LF board:
+{out:?}"
+        );
+    }
+
     #[tokio::test]
     async fn place_component_reports_which_path_it_took() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1581,12 +1675,20 @@ mod footprint_sexp_tests {
             indent_block(
                 "a
 
-b", "	"
+b", "	", "\n"
             ),
             "	a
 
 	b"
         );
+    }
+
+    #[test]
+    fn indent_block_reimposes_one_line_ending() {
+        // A CRLF library footprint going into an LF board and the reverse:
+        // whichever the destination uses is what comes out.
+        assert_eq!(indent_block("a\r\nb", "\t", "\n"), "\ta\n\tb");
+        assert_eq!(indent_block("a\nb", "\t", "\r\n"), "\ta\r\n\tb");
     }
 
     #[test]
