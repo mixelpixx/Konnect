@@ -58,6 +58,36 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml
 
+  viewer-native:
+    name: Schematic Studio (native Vello)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: viewer-native
+          workspaces: crates/schematic-viewer
+      - name: Format
+        run: cargo fmt --manifest-path crates/schematic-viewer/Cargo.toml -- --check
+      - name: Test
+        run: >-
+          cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml
+          --no-default-features --features renderer-vello
+      - name: Clippy
+        run: >-
+          cargo clippy --locked --manifest-path crates/schematic-viewer/Cargo.toml
+          --no-default-features --features renderer-vello --all-targets -- -D warnings
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: >-
+          cargo doc --locked --manifest-path crates/schematic-viewer/Cargo.toml
+          --no-default-features --features renderer-vello --no-deps
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

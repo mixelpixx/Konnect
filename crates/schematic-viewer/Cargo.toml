@@ -5,27 +5,73 @@ license = "AGPL-3.0-only"
 edition = "2021"
 publish = false
 
-# No lib — everything is in main.rs for simplicity
 [[bin]]
 name = "schematic-viewer"
 path = "src/main.rs"
 
+[features]
+default = ["renderer-kicad-cli"]
+# Compatibility mode: KiCad itself exports SVG and the existing Tauri
+# WebView presents it. This remains the default until native rendering reaches
+# full golden-image parity with KiCad.
+renderer-kicad-cli = [
+    "dep:konnect-schematic-editor",
+    "dep:serde",
+    "dep:tauri",
+    "dep:tauri-build",
+]
+# Native mode: parse the .kicad_sch directly and draw its semantic scene on a
+# GPU surface. Build with:
+#   cargo build --no-default-features --features renderer-vello
+renderer-vello = [
+    "dep:arboard",
+    "dep:anyhow",
+    "dep:fontdb",
+    "dep:konnect-sexp",
+    "dep:pollster",
+    "dep:png",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:rustybuzz",
+    "dep:skrifa",
+    "dep:vello",
+    "dep:vello_svg",
+    "dep:winit",
+]
+# Development-only oracle path: render KiCad's exported SVG through the same
+# Vello backend as the native semantic scene, isolating geometry differences
+# from cross-rasterizer antialiasing differences in golden comparisons.
+golden-svg-reference = ["renderer-vello"]
+
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = [], optional = true }
 notify = "7"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 # Not a workspace member (Tauri app, built separately), so this is a plain
 # path dependency rather than `.workspace = true`.
-konnect-schematic-editor = { path = "../konnect-schematic-editor" }
+konnect-schematic-editor = { path = "../konnect-schematic-editor", optional = true }
+konnect-sexp = { path = "../konnect-sexp", optional = true }
+
+# Optional native renderer. Vello 0.7 is the newest release that preserves
+# this crate's Rust 1.88 MSRV; Vello 0.8 raised it to Rust 1.92.
+anyhow = { version = "1", optional = true }
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"], optional = true }
+fontdb = { version = "0.23", optional = true }
+pollster = { version = "0.4", optional = true }
+png = { version = "0.18", optional = true }
+rustybuzz = { version = "0.20", optional = true }
+skrifa = { version = "0.40", default-features = false, features = ["autohint_shaping"], optional = true }
+vello = { version = "0.7", optional = true }
+vello_svg = { version = "0.9", optional = true }
+winit = { version = "0.30.12", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [package.metadata.bundle]
 identifier = "com.konnect.schematic-viewer"
-icon = ["icons/icon.png"]
+icon = ["../../packaging/resources/icon.png"]
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", optional = true }

@@ -1,0 +1,15 @@
+(kicad_sch
+  (version 20250610)
+  (generator "eeschema")
+  (generator_version "10.0")
+  (uuid "5eb56be7-432d-4369-a118-59307b847d53")
+  (paper "A4")
+  (lib_symbols)
+  (wire
+    (pts
+      (xy 50.8 76.2)
+      (xy 127 76.2)
+    )
+    (uuid "71625527-8b48-4372-967e-b6c3c46861cd")
+  )
+)

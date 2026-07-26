@@ -17,6 +17,10 @@
     --accent: #e94560;
     --overlay-h: #533483;
     --overlay-p: #666;
+    --filmstrip-bg: #11182d;
+    --thumb-bg: #20243a;
+    --thumb-border: #39466e;
+    --thumb-canvas: #282824;
   }
   body.light {
     --bg: #f5f5f5;
@@ -30,6 +34,10 @@
     --accent: #c22b47;
     --overlay-h: #7a6bb0;
     --overlay-p: #999;
+    --filmstrip-bg: #dddde7;
+    --thumb-bg: #f4f4f7;
+    --thumb-border: #aaaabd;
+    --thumb-canvas: #f5f4ef;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -84,17 +92,6 @@
     font-weight: 600;
     color: var(--accent);
   }
-  .toolbar select#sheet-selector {
-    background: var(--btn-bg);
-    border: 1px solid var(--btn-border);
-    color: var(--text);
-    padding: 5px 8px;
-    border-radius: 4px;
-    font-size: 13px;
-    max-width: 240px;
-  }
-  .toolbar select#sheet-selector[hidden] { display: none; }
-
   /* SVG Container */
   #viewer {
     flex: 1;
@@ -111,6 +108,88 @@
   #svg-container {
     position: absolute;
     transform-origin: 0 0;
+  }
+
+  /* Bottom page filmstrip. Every sheet stays visible as a vector thumbnail;
+     the active one is a real button with keyboard focus, not a decorative
+     image that only happens to respond to a mouse. */
+  #filmstrip {
+    height: 166px;
+    flex: 0 0 166px;
+    display: flex;
+    align-items: stretch;
+    gap: 10px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    background: var(--filmstrip-bg);
+    border-top: 1px solid var(--toolbar-border);
+    scroll-snap-type: x proximity;
+    scrollbar-gutter: stable;
+  }
+  #filmstrip[hidden] { display: none; }
+  .sheet-thumbnail {
+    width: 190px;
+    min-width: 190px;
+    height: 138px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 5px;
+    overflow: hidden;
+    color: var(--text);
+    background: var(--thumb-bg);
+    border: 1px solid var(--thumb-border);
+    border-radius: 6px;
+    cursor: pointer;
+    scroll-snap-align: center;
+    transition: border-color 120ms, box-shadow 120ms, transform 120ms;
+  }
+  .sheet-thumbnail:hover {
+    border-color: var(--btn-hover);
+    transform: translateY(-1px);
+  }
+  .sheet-thumbnail:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .sheet-thumbnail.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  .thumbnail-canvas {
+    min-height: 0;
+    flex: 1;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+    background: var(--thumb-canvas);
+    border-radius: 3px;
+  }
+  .thumbnail-canvas svg {
+    position: static;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .thumbnail-canvas.missing::after {
+    content: "Preview unavailable";
+    color: var(--text-dim);
+    font-size: 11px;
+  }
+  .thumbnail-label {
+    overflow: hidden;
+    color: var(--text);
+    font-size: 11px;
+    line-height: 18px;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  @media (max-height: 650px) {
+    #filmstrip { height: 132px; flex-basis: 132px; padding-block: 7px; }
+    .sheet-thumbnail { width: 158px; min-width: 158px; height: 112px; }
   }
 
   /* Loading / empty state */
@@ -168,7 +247,6 @@
 
 <div class="toolbar">
   <span class="filename" id="filename">No file loaded</span>
-  <select id="sheet-selector" hidden onchange="onSheetSelected()"></select>
   <!-- Status sits on the left of the flexible spacer: its text changes
        constantly (Live / Rendering / errors), and when it lived at the far
        right it kept shifting the buttons sideways under the cursor. -->
@@ -196,6 +274,8 @@
   </div>
 </div>
 
+<div id="filmstrip" hidden aria-label="Schematic pages"></div>
+
 <div class="flash" id="flash">Updated</div>
 
 <script>
@@ -216,6 +296,12 @@
   let isDragging = false;
   let dragStartX, dragStartY;
   let darkTheme = true;
+  let currentSvgContent = '';
+  let sheets = [];
+  let activeSheetFile = '';
+
+  const darkColorCache = new Map();
+  const previewSvgByFile = new Map();
 
   const viewer = document.getElementById('viewer');
   const container = document.getElementById('svg-container');
@@ -223,7 +309,7 @@
   const statusEl = document.getElementById('status');
   const flashEl = document.getElementById('flash');
   const emptyState = document.getElementById('empty-state');
-  const sheetSelector = document.getElementById('sheet-selector');
+  const filmstrip = document.getElementById('filmstrip');
   const filenameEl = document.getElementById('filename');
   const loadingOverlay = document.getElementById('loading-overlay');
   const loadingText = document.getElementById('loading-text');
@@ -250,43 +336,73 @@
     zoomDisplay.textContent = Math.round(scale * 100) + '%';
   }
 
+  function toDarkSvgColor(hex) {
+    const cached = darkColorCache.get(hex);
+    if (cached) return cached;
+
+    const value = parseInt(hex.slice(1), 16);
+    const r = ((value >> 16) & 0xff) / 255;
+    const g = ((value >> 8) & 0xff) / 255;
+    const b = (value & 0xff) / 255;
+
+    // Equivalent color matrix to the old CSS
+    // `invert(0.85) hue-rotate(180deg)` palette conversion. Applying it to
+    // the SVG's colors keeps the result vector-based; a CSS filter makes
+    // WebKitGTK rasterize the 297 x 210 A4 viewBox before Fit enlarges it.
+    const transformed = [
+      0.4018 * r - 1.0010 * g - 0.1008 * b + 0.85,
+      -0.2982 * r - 0.3010 * g - 0.1008 * b + 0.85,
+      -0.2982 * r - 1.0010 * g + 0.5992 * b + 0.85,
+    ];
+    const dark = '#' + transformed.map(channel =>
+      Math.round(Math.min(1, Math.max(0, channel)) * 255)
+        .toString(16)
+        .padStart(2, '0')
+    ).join('');
+    darkColorCache.set(hex, dark);
+    return dark;
+  }
+
+  function themeSvgContent(svgContent) {
+    if (!darkTheme) return svgContent;
+    return svgContent.replace(/#[0-9a-f]{6}\b/gi, color =>
+      toDarkSvgColor(color.toLowerCase())
+    );
+  }
+
   function applySvgTheme() {
+    if (!currentSvgContent) return;
+    container.innerHTML = themeSvgContent(currentSvgContent);
+
     const svgEl = container.querySelector('svg');
-    if (svgEl) {
-      svgEl.style.filter = darkTheme ? 'invert(0.85) hue-rotate(180deg)' : 'none';
+    if (!svgEl) return;
+    svgEl.style.background = 'transparent';
+
+    // Ensure a viewBox so fitToPage can compute dimensions.
+    if (!svgEl.getAttribute('viewBox') && svgEl.getAttribute('width')) {
+      const w = parseFloat(svgEl.getAttribute('width'));
+      const h = parseFloat(svgEl.getAttribute('height'));
+      if (w && h) svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`);
     }
+
+    // kicad-cli's width/height carry real-world units (e.g. "419.9890mm"
+    // for an A3 sheet). Force them to the viewBox's numeric units so Fit's
+    // scale math and the browser's on-screen dimensions use the same basis.
+    const vb = svgEl.getAttribute('viewBox');
+    if (vb) {
+      const parts = vb.split(/\s+/).map(Number);
+      if (parts.length === 4 && parts[2] && parts[3]) {
+        svgEl.setAttribute('width', String(parts[2]));
+        svgEl.setAttribute('height', String(parts[3]));
+      }
+    }
+    renderFilmstrip();
   }
 
   function setSvg(svgContent) {
-    container.innerHTML = svgContent;
+    currentSvgContent = svgContent;
     emptyState.style.display = 'none';
     hideLoading();
-
-    const svgEl = container.querySelector('svg');
-    if (svgEl) {
-      svgEl.style.background = 'transparent';
-      // Ensure a viewBox so fitToPage can compute dimensions
-      if (!svgEl.getAttribute('viewBox') && svgEl.getAttribute('width')) {
-        const w = parseFloat(svgEl.getAttribute('width'));
-        const h = parseFloat(svgEl.getAttribute('height'));
-        if (w && h) svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`);
-      }
-      // kicad-cli's width/height carry real-world units (e.g. "419.9890mm"
-      // for an A3 sheet). The browser renders the SVG's on-screen size from
-      // those — at ~3.78 CSS px/mm, an A3 sheet is natively ~1587x1122px —
-      // but fitToPage()'s scale math assumes 1 viewBox unit = 1 CSS pixel.
-      // Left alone, that mismatch makes "Fit" wildly over-zoom on anything
-      // bigger than a postage stamp. Force width/height to the viewBox's
-      // own numeric units so the two always agree, regardless of sheet size.
-      const vb = svgEl.getAttribute('viewBox');
-      if (vb) {
-        const parts = vb.split(/\s+/).map(Number);
-        if (parts.length === 4 && parts[2] && parts[3]) {
-          svgEl.setAttribute('width', String(parts[2]));
-          svgEl.setAttribute('height', String(parts[3]));
-        }
-      }
-    }
     applySvgTheme();
   }
 
@@ -386,16 +502,19 @@
     else if (e.key === '-') zoomOut();
     else if (e.key === '0') fitToPage();
     else if (e.key === 'r' || e.key === 'R') manualRefresh();
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); navigateSheet(-1); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); navigateSheet(1); }
   });
 
   async function manualRefresh() {
     try {
       statusEl.textContent = 'Refreshing...';
       showLoading('Refreshing...');
-      const svg = await invoke('refresh');
-      setSvg(svg);
+      const preview = await invoke('refresh');
+      previewSvgByFile.set(preview.file, preview.svg);
+      setSvg(preview.svg);
       flash('Refreshed');
-      statusEl.textContent = 'Ready';
+      statusEl.textContent = 'Live';
     } catch (e) {
       hideLoading();
       statusEl.textContent = 'Error: ' + e;
@@ -403,45 +522,105 @@
     }
   }
 
-  // ─── Sheet selector ────────────────────────────────────────────────────
+  // ─── Live page filmstrip ───────────────────────────────────────────────
 
-  // Depth-indented flat list, in the same depth-first order the backend's
-  // walk (and sch_hierarchy's get_sheet_hierarchy/renumber_sheet_pages)
-  // already use — not a collapsible tree, see the design note for why.
-  function populateSheetSelector(sheets, activeFile) {
-    sheetSelector.innerHTML = '';
-    if (!sheets || sheets.length <= 1) {
-      sheetSelector.hidden = true;
-      return;
-    }
-    for (const s of sheets) {
-      const opt = document.createElement('option');
-      opt.value = s.file;
-      // Plain spaces collapse to a single space inside <option> text (normal HTML whitespace rules apply even here), so indentation below uses non-breaking spaces, not regular ones, to actually show up.
-      const indent = '    '.repeat(s.depth);
-      const marker = s.depth > 0 ? '└─ ' : ''; // box-drawing tree marker
-      opt.textContent = indent + marker + s.name;
-      sheetSelector.appendChild(opt);
-    }
-    sheetSelector.value = activeFile;
-    sheetSelector.hidden = false;
+  function fileName(path) {
+    return path.split(/[\\/]/).pop() || path;
   }
 
-  async function onSheetSelected() {
-    const file = sheetSelector.value;
+  function renderFilmstrip(scrollActive = false) {
+    filmstrip.replaceChildren();
+    filmstrip.hidden = sheets.length === 0;
+    if (!sheets.length) return;
+
+    const fragment = document.createDocumentFragment();
+    let activeButton = null;
+    sheets.forEach((sheet, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'sheet-thumbnail';
+      button.classList.toggle('active', sheet.file === activeSheetFile);
+      button.setAttribute('aria-pressed', String(sheet.file === activeSheetFile));
+      button.title = `Open ${sheet.name}`;
+
+      const canvas = document.createElement('span');
+      canvas.className = 'thumbnail-canvas';
+      const svg = previewSvgByFile.get(sheet.file);
+      if (svg) {
+        canvas.innerHTML = themeSvgContent(svg);
+      } else {
+        canvas.classList.add('missing');
+      }
+
+      const label = document.createElement('span');
+      label.className = 'thumbnail-label';
+      const hierarchy = sheet.depth > 0 ? `${'› '.repeat(sheet.depth)}` : '';
+      label.textContent = `${index + 1}. ${hierarchy}${sheet.name}`;
+
+      button.append(canvas, label);
+      button.addEventListener('click', () => selectSheet(sheet.file));
+      fragment.appendChild(button);
+      if (sheet.file === activeSheetFile) activeButton = button;
+    });
+    filmstrip.appendChild(fragment);
+
+    if (scrollActive && activeButton) {
+      requestAnimationFrame(() => activeButton.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+        inline: 'center',
+      }));
+    }
+  }
+
+  function updateSheetState(nextSheets, updatedPreviews, activeFile, replacePreviews = false) {
+    if (replacePreviews) previewSvgByFile.clear();
+    for (const preview of updatedPreviews || []) {
+      previewSvgByFile.set(preview.file, preview.svg);
+    }
+
+    sheets = nextSheets || [];
+    const knownFiles = new Set(sheets.map(sheet => sheet.file));
+    for (const file of previewSvgByFile.keys()) {
+      if (!knownFiles.has(file)) previewSvgByFile.delete(file);
+    }
+
+    activeSheetFile = activeFile || sheets[0]?.file || '';
+    if (activeSheetFile) filenameEl.textContent = fileName(activeSheetFile);
+    renderFilmstrip();
+  }
+
+  async function selectSheet(file) {
+    if (!file || file === activeSheetFile) return;
     try {
       statusEl.textContent = 'Loading sheet...';
       showLoading('Loading sheet...');
       const svg = await invoke('select_sheet', { file });
+      activeSheetFile = file;
+      filenameEl.textContent = fileName(file);
       setSvg(svg);
       fitToPage();
-      statusEl.textContent = 'Watching for changes...';
+      renderFilmstrip(true);
+      statusEl.textContent = 'Live';
     } catch (e) {
       hideLoading();
       statusEl.textContent = 'Error: ' + e;
       flash(String(e), true);
     }
   }
+
+  function navigateSheet(delta) {
+    if (!sheets.length) return;
+    const current = Math.max(0, sheets.findIndex(sheet => sheet.file === activeSheetFile));
+    const next = Math.min(sheets.length - 1, Math.max(0, current + delta));
+    if (next !== current) selectSheet(sheets[next].file);
+  }
+
+  filmstrip.addEventListener('wheel', (e) => {
+    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+    e.preventDefault();
+    filmstrip.scrollLeft += e.deltaY;
+  }, { passive: false });
 
   // Live updates and errors from the Rust backend.
   //
@@ -464,9 +643,11 @@
     statusEl.textContent = 'Live';
   });
 
-  // Fired whenever the watcher re-walks the tree — keeps the selector in
-  // sync without requiring the viewer to be reopened. `active_file` reflects
-  // any backend fallback-to-root (e.g. the selected sheet was deleted).
+  // Fired whenever the watcher completes a render cycle. Sheet metadata keeps
+  // the filmstrip ordered and removes deleted pages; updated_previews carries
+  // only SVGs rendered in this cycle, avoiding a full hierarchy transfer for
+  // every one-sheet edit. `active_file` reflects a backend fallback-to-root
+  // when the selected sheet was deleted.
   // Emitted at the end of every render cycle (whether or not the active
   // sheet changed) — so it also retires the sticky "re-rendering" flash.
   // The retirement is deferred a beat: when the active sheet WAS
@@ -475,7 +656,11 @@
   // just reads as flicker. It only appears when it's genuinely the final
   // word (the edit touched sheets other than the one on screen).
   listenOrWarn('sheets-updated', (event) => {
-    populateSheetSelector(event.payload.sheets, event.payload.active_file);
+    updateSheetState(
+      event.payload.sheets,
+      event.payload.updated_previews,
+      event.payload.active_file
+    );
     statusEl.textContent = 'Live';
     setTimeout(() => {
       if (flashEl.classList.contains('visible') && flashEl.textContent === RENDERING_MSG) {
@@ -528,13 +713,13 @@
       statusEl.textContent = 'Rendering...';
       showLoading('Rendering... (a large hierarchical design can take a while — every sheet is rendered up front)');
       const result = await invoke('open_schematic', { path });
-      populateSheetSelector(result.sheets, result.active_file);
+      updateSheetState(result.sheets, result.previews, result.active_file, true);
       setSvg(result.svg);
       fitToPage();
       if (result.render_errors && result.render_errors.length) {
         flash(`${result.render_errors.length} sheet(s) failed to render`, true);
       }
-      statusEl.textContent = 'Watching for changes...';
+      statusEl.textContent = 'Live — watching for changes';
     } catch (e) {
       hideLoading();
       statusEl.textContent = 'Error: ' + e;
