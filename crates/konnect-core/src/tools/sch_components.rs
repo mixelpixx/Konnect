@@ -12,9 +12,15 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
+    commit_command,
     geometry::snap_point,
+    parse_sexp,
     schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint, read_schematic},
-    writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_balanced_block, find_block_starts, new_uuid, read_consistent,
+        write_atomic_if_unchanged, write_new_atomic, SexpEdit,
+    },
+    ItemId, SchematicCommand,
 };
 use serde_json::json;
 
@@ -265,6 +271,22 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_replace_component(args, ctx).await }
         ),
         tool!(
+            "sync_embedded_symbol_from_library",
+            "Refresh one embedded lib_symbols definition from its authoritative .kicad_sym \
+             library copy. Symbol instances, UUIDs, fields, positions, wires, and nets are \
+             untouched; only the cached library definition inside the schematic is replaced.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "lib_id": { "type": "string", "description": "Qualified Library:Symbol identifier used by the schematic" },
+                    "library_path": { "type": "string", "description": "Authoritative .kicad_sym library file" }
+                },
+                "required": ["schematic", "lib_id", "library_path"]
+            }),
+            |args, ctx| async move { handle_sync_embedded_symbol_from_library(args, ctx).await }
+        ),
+        tool!(
             "get_schematic_view",
             "Render the schematic to a PNG image (base64-encoded) via kicad-cli.",
             json!({
@@ -290,7 +312,7 @@ async fn handle_create_schematic(
     let template = crate::tools::blank_schematic_template();
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
-    write_atomic(&path, &template)?;
+    write_new_atomic(&path, &template)?;
     let sch = cse::Schematic::load(&path)?;
     sch.overwrite()?;
     Ok(CallToolResult::json(
@@ -421,6 +443,84 @@ async fn handle_add_schematic_component(
     })))
 }
 
+fn find_named_symbol_definition(content: &str, name: &str) -> Option<(usize, usize)> {
+    let header = format!("(symbol \"{name}\"");
+    find_block_starts(content, "symbol")
+        .into_iter()
+        .find(|&start| content[start..].starts_with(&header))
+        .and_then(|start| find_balanced_block(content, start))
+}
+
+async fn handle_sync_embedded_symbol_from_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let library_path = get_path(args, "library_path")?;
+    let lib_id = match require_str(args, "lib_id") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some((_, symbol_name)) = lib_id.rsplit_once(':') else {
+        return Ok(CallToolResult::error(
+            "lib_id must be a qualified Library:Symbol identifier",
+        ));
+    };
+    if library_path.extension().and_then(|value| value.to_str()) != Some("kicad_sym") {
+        return Ok(CallToolResult::error(
+            "library_path must point to a .kicad_sym file",
+        ));
+    }
+
+    let authoritative = read_consistent(&library_path)?;
+    let Some((library_start, library_end)) =
+        find_named_symbol_definition(&authoritative, symbol_name)
+    else {
+        return Ok(CallToolResult::error(format!(
+            "Symbol '{symbol_name}' was not found in '{}'",
+            library_path.display()
+        )));
+    };
+    let library_block = &authoritative[library_start..library_end];
+    let qualified_block = library_block.replacen(
+        &format!("(symbol \"{symbol_name}\""),
+        &format!("(symbol \"{lib_id}\""),
+        1,
+    );
+
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
+    let Some((embedded_start, embedded_end)) = find_named_symbol_definition(&content, &lib_id)
+    else {
+        return Ok(CallToolResult::error(format!(
+            "Embedded definition '{lib_id}' was not found in '{}'",
+            sch_path.display()
+        )));
+    };
+    if content[embedded_start..embedded_end] == qualified_block {
+        return Ok(CallToolResult::json(&json!({
+            "schematic": sch_path,
+            "lib_id": lib_id,
+            "changed": false
+        })));
+    }
+
+    let mut updated = content.clone();
+    updated.replace_range(embedded_start..embedded_end, &qualified_block);
+    parse_sexp(&updated).map_err(|error| {
+        anyhow::anyhow!("refreshed embedded symbol produced invalid S-expression: {error}")
+    })?;
+    write_atomic_if_unchanged(&sch_path, &expected, &updated)?;
+
+    Ok(CallToolResult::json(&json!({
+        "schematic": sch_path,
+        "lib_id": lib_id,
+        "library_path": library_path,
+        "changed": true,
+        "instances_untouched": true
+    })))
+}
+
 async fn handle_delete_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -455,7 +555,8 @@ async fn handle_edit_schematic_component(
         Err(e) => return Ok(e),
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut changed = Vec::new();
 
     // Helper: update a property field value in-place within the symbol block
@@ -519,7 +620,14 @@ async fn handle_edit_schematic_component(
     }
 
     if !changed.is_empty() {
-        write_atomic(&sch_path, &content)?;
+        let item_id = symbol_item_id(&expected, &reference)?;
+        let command = SchematicCommand::replace_item_from_document(
+            &expected,
+            &content,
+            item_id,
+            format!("Edit {reference}"),
+        )?;
+        commit_command(&sch_path, &command)?;
     }
 
     let mut result = json!({
@@ -907,7 +1015,8 @@ async fn handle_add_component_annotation(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     // Find the symbol block for this reference
     let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
@@ -933,13 +1042,30 @@ async fn handle_add_component_annotation(
     );
 
     let new_content = apply_edits(content, vec![SexpEdit::insert(insert_abs, prop_sexp)]);
-    write_atomic(&sch_path, &new_content)?;
+    let item_id = symbol_item_id(&expected, &reference)?;
+    let command = SchematicCommand::replace_item_from_document(
+        &expected,
+        &new_content,
+        item_id,
+        format!("Add {key} property to {reference}"),
+    )?;
+    commit_command(&sch_path, &command)?;
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
         "added_property": key,
         "value": value
     })))
+}
+
+fn symbol_item_id(content: &str, reference: &str) -> anyhow::Result<ItemId> {
+    let (start, end) = find_symbol_instance_block(content, reference)
+        .ok_or_else(|| anyhow::anyhow!("component '{reference}' not found"))?;
+    let symbol = parse_sexp(&content[start..end])?;
+    let uuid = symbol
+        .find_str("uuid")
+        .ok_or_else(|| anyhow::anyhow!("component '{reference}' has no UUID"))?;
+    Ok(ItemId::new(uuid.to_owned())?)
 }
 
 async fn handle_group_components(
@@ -964,8 +1090,10 @@ async fn handle_group_components(
         return Ok(CallToolResult::error("No references provided"));
     }
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut grouped = Vec::new();
+    let mut item_ids = Vec::new();
 
     for reference in &refs {
         let (sym_start, sym_end) = match find_symbol_instance_block(&content, reference) {
@@ -984,10 +1112,19 @@ async fn handle_group_components(
         );
 
         content = apply_edits(content, vec![SexpEdit::insert(insert_abs, prop_sexp)]);
+        item_ids.push(symbol_item_id(&expected, reference)?);
         grouped.push(reference.clone());
     }
 
-    write_atomic(&sch_path, &content)?;
+    if !item_ids.is_empty() {
+        let command = SchematicCommand::replace_items_from_document(
+            &expected,
+            &content,
+            item_ids,
+            format!("Group components as {group_name}"),
+        )?;
+        commit_command(&sch_path, &command)?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "group_name": group_name,
@@ -1010,7 +1147,8 @@ async fn handle_replace_component(
         Err(e) => return Ok(e),
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     // Find the symbol block for this reference
     let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
@@ -1059,7 +1197,7 @@ async fn handle_replace_component(
     if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id) {
         return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id));
     }
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
@@ -1323,5 +1461,41 @@ mod tests {
         let msg = format!("{:?}", result.content);
         assert!(msg.contains("Device:CP"));
         assert!(msg.contains("no embedded definition"));
+    }
+
+    #[tokio::test]
+    async fn sync_embedded_symbol_replaces_only_cached_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("reviewed.kicad_sym");
+        let schematic = dir.path().join("sync.kicad_sch");
+        std::fs::write(
+            &library,
+            "(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor)\n  (symbol \"PART\"\n    (pin_names (offset 1.016))\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"U\" (at 0 5 0))\n    (property \"Value\" \"PART\" (at 0 -5 0))\n    (symbol \"PART_0_1\" (rectangle (start -2 -2) (end 2 2) (stroke (width 0) (type default)) (fill (type background))))\n  )\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &schematic,
+            "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"reviewed:PART\"\n      (pin_names (offset 0))\n      (in_bom yes)\n      (on_board yes)\n    )\n  )\n  (symbol\n    (lib_id \"reviewed:PART\")\n    (at 100 80 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"U7\" (at 100 75 0))\n    (property \"Value\" \"PART\" (at 100 85 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_sync_embedded_symbol_from_library(
+            &json!({
+                "schematic": schematic.display().to_string(),
+                "lib_id": "reviewed:PART",
+                "library_path": library.display().to_string()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&schematic).unwrap();
+        assert!(after.contains("(symbol \"reviewed:PART\""));
+        assert!(after.contains("(pin_names (offset 1.016))"));
+        assert!(after.contains("(property \"Reference\" \"U7\""));
+        assert!(after.contains("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert_eq!(after.matches("(lib_id \"reviewed:PART\")").count(), 1);
     }
 }

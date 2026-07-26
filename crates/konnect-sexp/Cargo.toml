@@ -13,8 +13,9 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+tempfile = "3"
+fs2.workspace = true
 
 [dev-dependencies]
 pretty_assertions = "1"
 proptest = "1"
-tempfile = "3"

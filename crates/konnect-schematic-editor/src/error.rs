@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -10,6 +11,9 @@ pub enum Error {
 
     #[error("Missing required field '{0}'")]
     MissingField(&'static str),
+
+    #[error("write conflict: '{0}' changed since it was loaded")]
+    Conflict(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

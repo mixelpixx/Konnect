@@ -211,7 +211,9 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
 pub async fn annotate_schematic(_cli: &str, schematic: &Path) -> Result<()> {
     use std::collections::HashMap;
 
-    let content = tokio::fs::read_to_string(schematic).await?;
+    let read_path = schematic.to_path_buf();
+    let content =
+        tokio::task::spawn_blocking(move || konnect_sexp::read_consistent(&read_path)).await??;
     let mut new_content = content.clone();
     let mut counters: HashMap<String, usize> = HashMap::new();
 
@@ -261,7 +263,11 @@ pub async fn annotate_schematic(_cli: &str, schematic: &Path) -> Result<()> {
     }
 
     if new_content != content {
-        tokio::fs::write(schematic, &new_content).await?;
+        let write_path = schematic.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            konnect_sexp::write_atomic_if_unchanged(&write_path, &content, &new_content)
+        })
+        .await??;
     }
 
     Ok(())

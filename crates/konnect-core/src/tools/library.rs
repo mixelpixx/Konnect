@@ -7,7 +7,10 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
 use konnect_sexp::parser::{parse_sexp, SexpNode};
-use konnect_sexp::writer::{find_balanced_block, find_block_starts, write_atomic};
+use konnect_sexp::writer::{
+    find_balanced_block, find_block_starts, read_consistent, write_atomic,
+    write_atomic_if_unchanged,
+};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -222,6 +225,21 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path"]
             }),
             |args, ctx| async move { handle_list_symbols_in_library(args, ctx).await }
+        ),
+        tool!(
+            "normalize_symbol_library",
+            "Normalize a .kicad_sym library with the installed kicad-cli in an isolated \
+             temporary directory. Dry-run is the default; apply=true commits the verified \
+             result atomically only if the source library has not changed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
+                    "apply": { "type": "boolean", "description": "Commit the normalized library atomically", "default": false }
+                },
+                "required": ["library_path"]
+            }),
+            |args, ctx| async move { handle_normalize_symbol_library(args, ctx).await }
         ),
         tool!(
             "register_symbol_library",
@@ -1839,6 +1857,55 @@ async fn handle_list_symbols_in_library(
         }))
         .unwrap(),
     ))
+}
+
+async fn handle_normalize_symbol_library(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let library_path = get_path(args, "library_path")?;
+    if library_path.extension().and_then(|value| value.to_str()) != Some("kicad_sym") {
+        return Ok(CallToolResult::error(
+            "library_path must point to a .kicad_sym file",
+        ));
+    }
+    let apply = args["apply"].as_bool().unwrap_or(false);
+    let expected = read_consistent(&library_path)?;
+    parse_sexp(&expected)
+        .map_err(|error| anyhow::anyhow!("source symbol library is invalid: {error}"))?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.path().join("library.kicad_sym");
+    std::fs::write(&temp_path, &expected)?;
+    let output = tokio::process::Command::new(&ctx.config.kicad_cli)
+        .arg("sym")
+        .arg("upgrade")
+        .arg(&temp_path)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Ok(CallToolResult::error(format!(
+            "kicad-cli symbol-library normalization failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let normalized = std::fs::read_to_string(&temp_path)?;
+    parse_sexp(&normalized)
+        .map_err(|error| anyhow::anyhow!("normalized symbol library is invalid: {error}"))?;
+    let changed = normalized != expected;
+    if apply && changed {
+        write_atomic_if_unchanged(&library_path, &expected, &normalized)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "library_path": library_path,
+        "apply": apply,
+        "changed": changed,
+        "committed": apply && changed,
+        "before_bytes": expected.len(),
+        "after_bytes": normalized.len(),
+        "kicad_stdout": String::from_utf8_lossy(&output.stdout).trim()
+    })))
 }
 
 async fn handle_search_symbols(

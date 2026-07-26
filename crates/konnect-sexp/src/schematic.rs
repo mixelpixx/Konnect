@@ -4,13 +4,23 @@
 
 use crate::geometry::{transform_pin, PinTransform};
 use crate::parser::{parse_sexp, SexpNode};
+use crate::writer::read_consistent;
 use crate::SexpError;
 use std::path::Path;
 
 // ─── Schematic file I/O ───────────────────────────────────────────────────────
 
+/// Create a minimal standalone schematic with a fresh root UUID.
+#[must_use]
+pub fn format_blank_schematic() -> String {
+    format!(
+        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n",
+        crate::writer::new_uuid()
+    )
+}
+
 pub fn read_schematic(path: &Path) -> Result<(String, SexpNode), SexpError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_consistent(path)?;
     let tree = parse_sexp(&content)?;
     Ok((content, tree))
 }
@@ -52,7 +62,16 @@ pub struct Wire {
 /// Extract all wires from a parsed schematic tree.
 /// Handles both KiCAD 8/9 format `(start)(end)` and KiCAD 10 format `(pts (xy)(xy))`.
 pub fn extract_wires(tree: &SexpNode) -> Vec<Wire> {
-    tree.find_all("wire")
+    extract_schematic_lines(tree, "wire")
+}
+
+/// Extract all bus segments using the same point representation as wires.
+pub fn extract_buses(tree: &SexpNode) -> Vec<Wire> {
+    extract_schematic_lines(tree, "bus")
+}
+
+fn extract_schematic_lines(tree: &SexpNode, kind: &str) -> Vec<Wire> {
+    tree.find_all(kind)
         .iter()
         .filter_map(|node| {
             // Try KiCAD 10 format first: (pts (xy X Y) (xy X Y))
@@ -362,10 +381,17 @@ pub fn find_t_junctions(wires: &[Wire], tol: f64) -> Vec<(f64, f64)> {
 // ─── S-expression formatters for new elements ─────────────────────────────────
 
 pub fn format_wire(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+    format_schematic_line("wire", x1, y1, x2, y2)
+}
+
+pub fn format_bus(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+    format_schematic_line("bus", x1, y1, x2, y2)
+}
+
+fn format_schematic_line(kind: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
     let uuid = crate::writer::new_uuid();
     format!(
-        "(wire\n\t\t(pts\n\t\t\t(xy {} {}) (xy {} {})\n\t\t)\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"{}\")\n\t)",
-        x1, y1, x2, y2, uuid
+        "({kind}\n\t\t(pts\n\t\t\t(xy {x1} {y1}) (xy {x2} {y2})\n\t\t)\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"{uuid}\")\n\t)"
     )
 }
 
@@ -376,8 +402,159 @@ pub fn format_junction(x: f64, y: f64) -> String {
     )
 }
 
+pub fn format_no_connect(x: f64, y: f64) -> String {
+    let uuid = crate::writer::new_uuid();
+    format!("\n  (no_connect\n    (at {x} {y})\n    (uuid \"{uuid}\")\n  )")
+}
+
+/// Orientation of a graphical wire-to-bus entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusEntryDirection {
+    DownRight,
+    DownLeft,
+    UpRight,
+    UpLeft,
+}
+
+impl BusEntryDirection {
+    #[must_use]
+    pub const fn size(self) -> (f64, f64) {
+        match self {
+            Self::DownRight => (2.54, 2.54),
+            Self::DownLeft => (-2.54, 2.54),
+            Self::UpRight => (2.54, -2.54),
+            Self::UpLeft => (-2.54, -2.54),
+        }
+    }
+
+    #[must_use]
+    pub const fn rotated_clockwise(self) -> Self {
+        match self {
+            Self::DownRight => Self::DownLeft,
+            Self::DownLeft => Self::UpLeft,
+            Self::UpLeft => Self::UpRight,
+            Self::UpRight => Self::DownRight,
+        }
+    }
+}
+
+pub fn format_bus_entry(x: f64, y: f64, direction: BusEntryDirection) -> String {
+    let uuid = crate::writer::new_uuid();
+    let (width, height) = direction.size();
+    format!(
+        "\n  (bus_entry\n    (at {x} {y})\n    (size {width} {height})\n    (stroke\n      (width 0)\n      (type default)\n    )\n    (uuid \"{uuid}\")\n  )"
+    )
+}
+
+/// Data required for one parent-side hierarchical sheet reference.
+#[derive(Debug, Clone, Copy)]
+pub struct HierarchicalSheetSpec<'a> {
+    pub name: &'a str,
+    pub file: &'a str,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub project_name: &'a str,
+    pub parent_instance_path: &'a str,
+    pub page: &'a str,
+}
+
+pub fn format_hierarchical_sheet(spec: HierarchicalSheetSpec<'_>) -> String {
+    let uuid = crate::writer::new_uuid();
+    let name = escape_quoted_text(spec.name);
+    let file = escape_quoted_text(spec.file);
+    let project_name = escape_quoted_text(spec.project_name);
+    let parent_instance_path = escape_quoted_text(spec.parent_instance_path);
+    let page = escape_quoted_text(spec.page);
+    let name_y = spec.y - 0.635;
+    let file_y = spec.y + spec.height + 0.635;
+    format!(
+        r#"
+  (sheet
+    (at {x} {y})
+    (size {width} {height})
+    (fields_autoplaced yes)
+    (stroke (width 0.1524) (type solid))
+    (fill (color 0 0 0 0.0))
+    (uuid "{uuid}")
+    (property "Sheetname" "{name}"
+      (at {x} {name_y} 0)
+      (effects (font (size 1.27 1.27)) (justify left bottom))
+    )
+    (property "Sheetfile" "{file}"
+      (at {x} {file_y} 0)
+      (effects (font (size 1.27 1.27)) (justify left top))
+    )
+    (instances
+      (project "{project_name}"
+        (path "{parent_instance_path}" (page "{page}"))
+      )
+    )
+  )"#,
+        x = spec.x,
+        y = spec.y,
+        width = spec.width,
+        height = spec.height,
+    )
+}
+
+/// Electrical direction of a hierarchical-sheet pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetPinType {
+    Input,
+    Output,
+    Bidirectional,
+    TriState,
+    Passive,
+}
+
+impl SheetPinType {
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+            Self::Bidirectional => "bidirectional",
+            Self::TriState => "tri_state",
+            Self::Passive => "passive",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Input => Self::Output,
+            Self::Output => Self::Bidirectional,
+            Self::Bidirectional => Self::TriState,
+            Self::TriState => Self::Passive,
+            Self::Passive => Self::Input,
+        }
+    }
+}
+
+pub fn format_sheet_pin(
+    name: &str,
+    pin_type: SheetPinType,
+    x: f64,
+    y: f64,
+    rotation: f64,
+) -> String {
+    let name = escape_quoted_text(name);
+    let uuid = crate::writer::new_uuid();
+    format!(
+        "(pin \"{name}\" {}\n\t(at {x} {y} {rotation})\n\t(uuid \"{uuid}\")\n)",
+        pin_type.keyword()
+    )
+}
+
+fn escape_quoted_text(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     let uuid = crate::writer::new_uuid();
+    let net = escape_quoted_text(net);
     // The tag must be `label`: KiCAD has no `net_label` in its schematic
     // format and refuses to load a file containing one ("Failed to load
     // schematic"), so emitting that made the whole schematic unopenable.
@@ -460,6 +637,86 @@ mod pin_endpoint_tests {
 mod label_tag_tests {
     use super::*;
 
+    #[test]
+    fn format_no_connect_emits_a_parseable_uuid_item() {
+        let sexp = format_no_connect(12.7, 25.4);
+        let tree = parse_sexp(&format!("(kicad_sch{sexp}\n)")).unwrap();
+        let item = tree.find("no_connect").expect("no-connect item");
+        assert_eq!(parse_at(item), Some((12.7, 25.4, 0.0)));
+        assert!(item.find("uuid").is_some());
+    }
+
+    #[test]
+    fn format_bus_entry_uses_typed_direction_and_parseable_geometry() {
+        let sexp = format_bus_entry(10.16, 20.32, BusEntryDirection::UpLeft);
+        let tree = parse_sexp(&format!("(kicad_sch{sexp}\n)")).unwrap();
+        let entry = tree.find("bus_entry").expect("bus entry");
+        assert_eq!(parse_at(entry), Some((10.16, 20.32, 0.0)));
+        let size = entry.find("size").expect("entry size");
+        assert_eq!(size.get_f64(1), Some(-2.54));
+        assert_eq!(size.get_f64(2), Some(-2.54));
+        assert!(entry.find("uuid").is_some());
+    }
+
+    #[test]
+    fn format_bus_emits_a_parseable_uuid_line() {
+        let sexp = format_bus(1.27, 2.54, 25.4, 2.54);
+        let tree = parse_sexp(&format!("(kicad_sch\n\t{sexp}\n)")).unwrap();
+        let bus = tree.find("bus").expect("bus line");
+        assert!(bus.find("pts").is_some());
+        assert!(bus.find("uuid").is_some());
+    }
+
+    #[test]
+    fn format_hierarchical_sheet_positions_fields_and_escapes_metadata() {
+        let sexp = format_hierarchical_sheet(HierarchicalSheetSpec {
+            name: "Power \\\"A\\\"",
+            file: "power_a.kicad_sch",
+            x: 25.4,
+            y: 50.8,
+            width: 76.2,
+            height: 50.8,
+            project_name: "Pack",
+            parent_instance_path: "/root-uuid",
+            page: "2",
+        });
+        let tree = parse_sexp(&format!("(kicad_sch{sexp}\n)")).unwrap();
+        let sheet = tree.find("sheet").expect("sheet");
+        assert_eq!(parse_at(sheet), Some((25.4, 50.8, 0.0)));
+        assert_eq!(sheet.find_all("property").len(), 2);
+        assert!(sheet
+            .find_all("property")
+            .iter()
+            .all(|property| property.find("at").is_some()));
+        assert_eq!(
+            sheet.find_all("property")[0]
+                .get(2)
+                .and_then(SexpNode::as_str),
+            Some("Power \\\"A\\\"")
+        );
+        assert_eq!(
+            sheet
+                .find("instances")
+                .and_then(|instances| instances.find("project"))
+                .and_then(|project| project.find("path"))
+                .and_then(|path| path.find("page"))
+                .and_then(|page| page.get(1))
+                .and_then(SexpNode::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn format_sheet_pin_uses_a_typed_direction_and_escapes_its_name() {
+        let source = format_sheet_pin("DATA \"A\"", SheetPinType::Bidirectional, 10.0, 20.0, 180.0);
+        let pin = parse_sexp(&source).expect("sheet pin parses");
+        assert_eq!(pin.head(), Some("pin"));
+        assert_eq!(pin.get(1).and_then(SexpNode::as_str), Some("DATA \"A\""));
+        assert_eq!(pin.get(2).and_then(SexpNode::as_str), Some("bidirectional"));
+        assert_eq!(parse_at(&pin), Some((10.0, 20.0, 180.0)));
+        assert!(pin.find("uuid").is_some());
+    }
+
     /// KiCAD's schematic format has no `net_label` tag — a file containing one
     /// fails to load outright ("Failed to load schematic" from kicad-cli 10.0.3,
     /// verified against a file identical but for this tag). The plain net label
@@ -489,6 +746,13 @@ mod label_tag_tests {
         assert_eq!(labels[0].y, 50.8);
         assert_eq!(labels[0].rotation, 90.0);
         assert!(labels[0].uuid.is_some());
+    }
+
+    #[test]
+    fn format_net_label_escapes_user_text() {
+        let sch = format!("(kicad_sch{}\n)", format_net_label("A\\\"B", 1.0, 2.0, 0.0));
+        let tree = parse_sexp(&sch).expect("escaped label parses");
+        assert_eq!(extract_labels(&tree)[0].net, "A\\\"B");
     }
 
     #[test]

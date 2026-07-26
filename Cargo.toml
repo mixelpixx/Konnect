@@ -53,6 +53,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Error handling
 anyhow = "1"
 thiserror = "1"
+fs2 = "0.4"
 
 # Logging
 tracing = "0.1"

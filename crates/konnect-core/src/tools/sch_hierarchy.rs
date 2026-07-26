@@ -10,10 +10,14 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    ensure_root_uuid, get_path, opt_f64, opt_str, project_name_for, require_f64, require_str,
-    ToolContext, ToolDef,
+    get_path, opt_f64, opt_str, project_name_for, require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
+use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
+use konnect_sexp::{
+    commit_command, commit_file_transaction, parse_sexp, prepare_command, read_consistent,
+    FileTransition, ItemAnchor, ItemId, SchematicCommand,
+};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -258,9 +262,10 @@ fn parent_dir(sch_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+#[cfg(test)]
 fn create_blank_schematic(path: &Path) -> anyhow::Result<()> {
     let template = crate::tools::blank_schematic_template();
-    konnect_sexp::writer::write_atomic(path, &template)?;
+    konnect_sexp::writer::write_new_atomic(path, &template)?;
     // Round-trip through cse so the file is normalised to its writer's format,
     // matching the existing `create_schematic` tool's behavior.
     let sch = cse::Schematic::load(path)?;
@@ -298,40 +303,80 @@ fn sheet_json(sheet: &cse::Sheet, project_name: &str) -> Value {
     })
 }
 
-/// Insert `sheet` into `parent`. If `patch_existing_symbols` is set, load the
-/// child file and ensure every symbol in it carries an instance path for this
-/// sheet's UUID — needed whenever the child file already has components in it
-/// (a reused file, or a freshly duplicated one).
-fn link_sheet(
-    parent: &mut cse::Schematic,
-    sheet: cse::Sheet,
-    child_path: &Path,
-    project_name: &str,
-    patch_existing_symbols: bool,
-) -> anyhow::Result<usize> {
-    let sheet_uuid = sheet.uuid.clone();
-    let root_uuid = ensure_root_uuid(parent);
-    parent.add_sheet(sheet);
-
-    let mut patched = 0usize;
-    if patch_existing_symbols {
-        let mut child = cse::Schematic::load(child_path)?;
-        // eeschema's path format: "/<root-uuid>/<sheet-symbol-uuid>", no
-        // trailing slash. KiCAD's netlister can't resolve any other shape and
-        // silently drops the symbol from net formation.
-        let hier_path = format!("/{}/{}", root_uuid, sheet_uuid);
-        for sym in child.symbols.iter_mut() {
-            if !sym.has_instance_path(project_name, &hier_path) {
-                let reference = sym.reference().unwrap_or("").to_string();
-                sym.set_instance_path(project_name, &hier_path, &reference, sym.unit);
-                patched += 1;
-            }
-        }
-        if patched > 0 {
-            child.overwrite()?;
-        }
+fn ensure_source_root_uuid(source: &str) -> anyhow::Result<(String, String)> {
+    let tree = parse_sexp(source)?;
+    if let Some(uuid) = tree.find_str("uuid") {
+        return Ok((source.to_owned(), uuid.to_owned()));
     }
-    Ok(patched)
+    let uuid = konnect_sexp::writer::new_uuid();
+    let children = konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch");
+    let anchor = children
+        .iter()
+        .find_map(|(start, end)| {
+            let node = parse_sexp(&source[*start..*end]).ok()?;
+            (!matches!(
+                node.head(),
+                Some("version" | "generator" | "generator_version")
+            ))
+            .then_some(*start)
+        })
+        .ok_or_else(|| anyhow::anyhow!("parent schematic has no UUID insertion anchor"))?;
+    let line_start = source[..anchor]
+        .rfind('\n')
+        .map_or(anchor, |newline| newline + 1);
+    let indent = &source[line_start..anchor];
+    if !indent.chars().all(char::is_whitespace) {
+        anyhow::bail!("parent schematic metadata is not line-oriented");
+    }
+    let replacement = format!("{indent}(uuid \"{uuid}\")\n");
+    let updated = konnect_sexp::writer::apply_edits(
+        source.to_owned(),
+        vec![konnect_sexp::writer::SexpEdit::insert(
+            line_start,
+            replacement,
+        )],
+    );
+    Ok((updated, uuid))
+}
+
+fn replace_source_root_uuid(source: &str, uuid: &str) -> anyhow::Result<String> {
+    let children = konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch");
+    let range = children.iter().find_map(|(start, end)| {
+        parse_sexp(&source[*start..*end])
+            .ok()
+            .is_some_and(|node| node.head() == Some("uuid"))
+            .then_some((*start, *end))
+    });
+    if let Some((start, end)) = range {
+        return Ok(konnect_sexp::writer::apply_edits(
+            source.to_owned(),
+            vec![konnect_sexp::writer::SexpEdit::replace(
+                start,
+                end,
+                format!("(uuid \"{uuid}\")"),
+            )],
+        ));
+    }
+    let (with_uuid, generated) = ensure_source_root_uuid(source)?;
+    replace_source_root_uuid(&with_uuid, uuid)
+        .or_else(|_| anyhow::bail!("could not replace newly inserted schematic UUID {generated}"))
+}
+
+fn commit_edited_sheet_item(
+    path: &Path,
+    before: &str,
+    edited: &cse::Schematic,
+    uuid: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    let command = SchematicCommand::replace_item_from_document(
+        before,
+        &edited.to_source(),
+        ItemId::new(uuid)?,
+        label,
+    )?;
+    commit_command(path, &command)?;
+    Ok(())
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -357,7 +402,32 @@ async fn handle_add_hierarchical_sheet(
     let dir = parent_dir(&parent_path);
     let child_path = dir.join(&sheet_file);
 
-    let mut parent = cse::Schematic::load(&parent_path)?;
+    let relative = Path::new(&sheet_file);
+    let valid_relative = !relative.is_absolute()
+        && relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && relative
+            .extension()
+            .is_some_and(|extension| extension == "kicad_sch");
+    if !valid_relative {
+        return Ok(CallToolResult::error(
+            "sheet_file must be a relative .kicad_sch path without parent traversal",
+        ));
+    }
+    if !child_path.parent().is_some_and(Path::is_dir) {
+        return Ok(CallToolResult::error(
+            "The child sheet directory does not exist",
+        ));
+    }
+    if child_path == parent_path {
+        return Ok(CallToolResult::error(
+            "A hierarchical sheet cannot reference its parent file",
+        ));
+    }
+
+    let parent_before = read_consistent(&parent_path)?;
+    let parent = cse::Schematic::load(&parent_path)?;
 
     if parent.sheets.by_name(&sheet_name).is_some() {
         return Ok(CallToolResult::error(format!(
@@ -367,35 +437,79 @@ async fn handle_add_hierarchical_sheet(
         )));
     }
 
-    let child_existed = child_path.exists();
-    if !child_existed {
-        create_blank_schematic(&child_path)?;
+    let child_existed = child_path.is_file();
+    if child_path.exists() && !child_existed {
+        return Ok(CallToolResult::error(
+            "The child schematic path exists but is not a regular file",
+        ));
     }
-
     let page = next_free_page(&parent, &project_name).to_string();
-    let mut sheet = cse::Sheet::new(
-        sheet_name.as_str(),
-        sheet_file.as_str(),
+    let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let root_path = format!("/{root_uuid}");
+    let block = format_hierarchical_sheet(HierarchicalSheetSpec {
+        name: &sheet_name,
+        file: &sheet_file,
         x,
         y,
         width,
         height,
-    );
-    // Sheet page entries live at the parent's own instance path — for a root
-    // sheet that's "/<root-uuid>", matching what eeschema writes.
-    let root_path = format!("/{}", ensure_root_uuid(&mut parent));
-    sheet.set_page(&project_name, &root_path, &page);
+        project_name: &project_name,
+        parent_instance_path: &root_path,
+        page: &page,
+    });
+    let parent_command = SchematicCommand::insert_item(
+        &parent_base,
+        block,
+        ItemAnchor::BeforeFooter,
+        "Add hierarchical sheet",
+    )?
+    .requiring_unchanged_document();
+    let sheet_uuid = parent_command
+        .changes
+        .first()
+        .map(|change| change.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("sheet insertion produced no item change"))?;
+    let (parent_after, _) = prepare_command(&parent_path, &parent_base, &parent_command)?;
 
-    let patched = link_sheet(
-        &mut parent,
-        sheet,
-        &child_path,
-        &project_name,
-        child_existed,
-    )?;
-    parent.overwrite()?;
+    let child_before = child_path
+        .is_file()
+        .then(|| read_consistent(&child_path))
+        .transpose()?;
+    let mut transitions = vec![FileTransition::replace(
+        &parent_path,
+        parent_before,
+        parent_after,
+    )];
+    let mut patched = 0usize;
+    if let Some(child_before) = child_before {
+        let hierarchy_path = format!("{root_path}/{sheet_uuid}");
+        if let Some(child_command) = SchematicCommand::ensure_symbol_instance_path(
+            &child_before,
+            &project_name,
+            &hierarchy_path,
+            "Link hierarchical child symbols",
+        )? {
+            patched = child_command.changes.len();
+            let (child_after, _) = prepare_command(&child_path, &child_before, &child_command)?;
+            transitions.push(FileTransition::replace(
+                &child_path,
+                child_before,
+                child_after,
+            ));
+        }
+    } else {
+        transitions.push(FileTransition::create(
+            &child_path,
+            konnect_sexp::schematic::format_blank_schematic(),
+        ));
+    }
+    commit_file_transaction(&dir, transitions)?;
 
-    let sheet_ref = parent.sheets.by_name(&sheet_name).expect("just added");
+    let committed = cse::Schematic::load(&parent_path)?;
+    let sheet_ref = committed
+        .sheets
+        .by_name(&sheet_name)
+        .ok_or_else(|| anyhow::anyhow!("committed sheet was not readable"))?;
     Ok(CallToolResult::json(&json!({
         "added": sheet_name,
         "sheet": sheet_json(sheet_ref, &project_name),
@@ -415,6 +529,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         .map(str::to_string)
         .unwrap_or_else(|| project_name_for(&sch_path));
 
+    let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
@@ -425,6 +540,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             )))
         }
     };
+    let sheet_uuid = sheet.uuid.clone();
 
     let mut changed = Vec::new();
     if let Some(new_name) = opt_str(args, "new_name") {
@@ -451,7 +567,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     }
 
     let summary = sheet_json(sheet, &project_name);
-    sch.overwrite()?;
+    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet")?;
     Ok(CallToolResult::json(&json!({
         "edited": sheet_name,
         "changed_fields": changed,
@@ -474,11 +590,13 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         Err(e) => return Ok(e),
     };
 
+    let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
     match sch.sheets.by_name_mut(&sheet_name) {
         Some(sheet) => {
+            let sheet_uuid = sheet.uuid.clone();
             sheet.move_to(x, y);
-            sch.overwrite()?;
+            commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Move sheet")?;
             Ok(CallToolResult::json(
                 &json!({ "moved": sheet_name, "x": x, "y": y }),
             ))
@@ -497,13 +615,20 @@ async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result
         Err(e) => return Ok(e),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    match sch.sheets.remove_by_name(&sheet_name) {
+    let before = read_consistent(&sch_path)?;
+    let sch = cse::Schematic::load(&sch_path)?;
+    match sch.sheets.by_name(&sheet_name) {
         Some(removed) => {
-            sch.overwrite()?;
+            let child_file = removed.file().to_owned();
+            let command = SchematicCommand::delete_item(
+                &before,
+                ItemId::new(removed.uuid.clone())?,
+                "Delete sheet",
+            )?;
+            commit_command(&sch_path, &command)?;
             Ok(CallToolResult::json(&json!({
                 "deleted": sheet_name,
-                "child_file_preserved": removed.file(),
+                "child_file_preserved": child_file,
                 "note": "The child schematic file was not deleted. Remaining sheets' page \
                          numbers may now have a gap — call renumber_sheet_pages if needed."
             })))
@@ -536,7 +661,8 @@ async fn handle_duplicate_sheet(
         .map(str::to_string)
         .unwrap_or_else(|| project_name_for(&sch_path));
 
-    let mut parent = cse::Schematic::load(&sch_path)?;
+    let parent_before = read_consistent(&sch_path)?;
+    let parent = cse::Schematic::load(&sch_path)?;
 
     if parent.sheets.by_name(&new_name).is_some() {
         return Ok(CallToolResult::error(format!(
@@ -562,6 +688,20 @@ async fn handle_duplicate_sheet(
     let source_child = dir.join(&src_file);
     let new_child = dir.join(&new_file);
 
+    let relative = Path::new(&new_file);
+    let valid_relative = !relative.is_absolute()
+        && relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && relative
+            .extension()
+            .is_some_and(|extension| extension == "kicad_sch");
+    if !valid_relative || !new_child.parent().is_some_and(Path::is_dir) {
+        return Ok(CallToolResult::error(
+            "new_file must be a relative .kicad_sch path in an existing project directory",
+        ));
+    }
+
     if new_child.exists() {
         return Ok(CallToolResult::error(format!(
             "'{}' already exists — pick a different file name, or use add_hierarchical_sheet \
@@ -576,33 +716,65 @@ async fn handle_duplicate_sheet(
         )));
     }
 
-    std::fs::copy(&source_child, &new_child)?;
-
-    // Give the copy its own schematic-level identity so KiCAD doesn't see two
-    // files sharing the same internal UUID.
-    {
-        let mut copied = cse::Schematic::load(&new_child)?;
-        copied.uuid = Some(uuid::Uuid::new_v4().to_string());
-        copied.overwrite()?;
-    }
-
     const DUPLICATE_OFFSET_MM: f64 = 20.0;
     let page = next_free_page(&parent, &project_name).to_string();
-    let mut new_sheet = cse::Sheet::new(
-        new_name.as_str(),
-        new_file.as_str(),
-        src_x + DUPLICATE_OFFSET_MM,
-        src_y + DUPLICATE_OFFSET_MM,
-        src_w,
-        src_h,
-    );
-    let root_path = format!("/{}", ensure_root_uuid(&mut parent));
-    new_sheet.set_page(&project_name, &root_path, &page);
+    let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let root_path = format!("/{root_uuid}");
+    let block = format_hierarchical_sheet(HierarchicalSheetSpec {
+        name: &new_name,
+        file: &new_file,
+        x: src_x + DUPLICATE_OFFSET_MM,
+        y: src_y + DUPLICATE_OFFSET_MM,
+        width: src_w,
+        height: src_h,
+        project_name: &project_name,
+        parent_instance_path: &root_path,
+        page: &page,
+    });
+    let parent_command = SchematicCommand::insert_item(
+        &parent_base,
+        block,
+        ItemAnchor::BeforeFooter,
+        "Duplicate hierarchical sheet",
+    )?
+    .requiring_unchanged_document();
+    let sheet_uuid = parent_command
+        .changes
+        .first()
+        .map(|change| change.id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("sheet duplication produced no item change"))?;
+    let (parent_after, _) = prepare_command(&sch_path, &parent_base, &parent_command)?;
 
-    let patched = link_sheet(&mut parent, new_sheet, &new_child, &project_name, true)?;
-    parent.overwrite()?;
+    let source_child_content = read_consistent(&source_child)?;
+    let duplicated_uuid = uuid::Uuid::new_v4().to_string();
+    let duplicated_base = replace_source_root_uuid(&source_child_content, &duplicated_uuid)?;
+    let hierarchy_path = format!("{root_path}/{sheet_uuid}");
+    let (duplicated_after, patched) = if let Some(command) =
+        SchematicCommand::ensure_symbol_instance_path(
+            &duplicated_base,
+            &project_name,
+            &hierarchy_path,
+            "Link duplicated child symbols",
+        )? {
+        let count = command.changes.len();
+        let (after, _) = prepare_command(&new_child, &duplicated_base, &command)?;
+        (after, count)
+    } else {
+        (duplicated_base, 0)
+    };
+    commit_file_transaction(
+        &dir,
+        vec![
+            FileTransition::replace(&sch_path, parent_before, parent_after),
+            FileTransition::create(&new_child, duplicated_after),
+        ],
+    )?;
 
-    let sheet_ref = parent.sheets.by_name(&new_name).expect("just added");
+    let committed = cse::Schematic::load(&sch_path)?;
+    let sheet_ref = committed
+        .sheets
+        .by_name(&new_name)
+        .ok_or_else(|| anyhow::anyhow!("duplicated sheet was not readable"))?;
     Ok(CallToolResult::json(&json!({
         "duplicated_from": source_name,
         "sheet": sheet_json(sheet_ref, &project_name),
@@ -711,24 +883,27 @@ async fn handle_renumber_sheet_pages(
     // Page paths are hierarchical instance paths rooted at the root sheet's
     // UUID ("/<root-uuid>", then "/<root-uuid>/<sheet-uuid>" one level down),
     // matching what eeschema writes.
-    let root_prefix = {
-        let mut root = cse::Schematic::load(&root_path)?;
-        let uuid = ensure_root_uuid(&mut root);
-        root.overwrite()?;
-        format!("/{}", uuid)
-    };
+    let root_before = read_consistent(&root_path)?;
+    let (root_base, root_uuid) = ensure_source_root_uuid(&root_before)?;
+    let root_prefix = format!("/{root_uuid}");
 
     let mut next_page = 2u32; // page 1 is always the root, left untouched
     let mut renumbered = Vec::new();
     let mut visited = HashSet::new();
-    renumber_walk(
+    let mut transitions = Vec::new();
+    collect_renumber_transitions(
         &root_path,
         &root_prefix,
         &project_name,
         &mut next_page,
         &mut renumbered,
         &mut visited,
+        Some((&root_before, &root_base, &root_uuid)),
+        &mut transitions,
     )?;
+    if !transitions.is_empty() {
+        commit_file_transaction(parent_dir(&root_path), transitions)?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "renumbered_count": renumbered.len(),
@@ -736,22 +911,34 @@ async fn handle_renumber_sheet_pages(
     })))
 }
 
-fn renumber_walk(
+#[allow(clippy::too_many_arguments)]
+fn collect_renumber_transitions(
     path: &Path,
     hier_prefix: &str,
     project_name: &str,
     next_page: &mut u32,
     renumbered: &mut Vec<Value>,
     visited: &mut HashSet<PathBuf>,
+    source_override: Option<(&str, &str, &str)>,
+    transitions: &mut Vec<FileTransition>,
 ) -> anyhow::Result<()> {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canon.clone()) {
         return Ok(()); // cycle guard — already on this DFS path, skip
     }
 
+    let loaded_before = source_override
+        .map(|(before, _, _)| before.to_owned())
+        .unwrap_or(read_consistent(path)?);
+    let command_source = source_override
+        .map(|(_, base, _)| base)
+        .unwrap_or(loaded_before.as_str());
     let mut sch = cse::Schematic::load(path)?;
+    if let Some((_, _, root_uuid)) = source_override {
+        sch.uuid = Some(root_uuid.to_owned());
+    }
     let dir = parent_dir(path);
-    let mut changed = false;
+    let mut changed_ids = Vec::new();
 
     // Snapshot the sheet order first: recursing below needs `sch` unborrowed.
     let sheet_order: Vec<(String, String, String)> = sch
@@ -766,7 +953,7 @@ fn renumber_walk(
         if let Some(sheet) = sch.sheets.by_name_mut(name) {
             if sheet.page(project_name) != Some(page.as_str()) {
                 sheet.set_page(project_name, hier_prefix, &page);
-                changed = true;
+                changed_ids.push(ItemId::new(sheet.uuid.clone())?);
             }
         }
         renumbered.push(json!({ "sheet_name": name, "file": file, "page": page }));
@@ -774,19 +961,32 @@ fn renumber_walk(
         let child_path = dir.join(file);
         if child_path.exists() {
             let child_prefix = format!("{}/{}", hier_prefix, sheet_uuid);
-            renumber_walk(
+            collect_renumber_transitions(
                 &child_path,
                 &child_prefix,
                 project_name,
                 next_page,
                 renumbered,
                 visited,
+                None,
+                transitions,
             )?;
         }
     }
 
-    if changed {
-        sch.overwrite()?;
+    let replacement = if changed_ids.is_empty() {
+        command_source.to_owned()
+    } else {
+        let command = SchematicCommand::replace_items_from_document(
+            command_source,
+            &sch.to_source(),
+            changed_ids,
+            "Renumber hierarchical sheets",
+        )?;
+        prepare_command(path, command_source, &command)?.0
+    };
+    if replacement != loaded_before {
+        transitions.push(FileTransition::replace(path, loaded_before, replacement));
     }
     visited.remove(&canon);
     Ok(())
@@ -809,6 +1009,7 @@ async fn handle_import_sheet_pins(
         )));
     }
 
+    let before = read_consistent(&sch_path)?;
     let mut parent = cse::Schematic::load(&sch_path)?;
     let dir = parent_dir(&sch_path);
 
@@ -848,6 +1049,7 @@ async fn handle_import_sheet_pins(
         .sheets
         .by_name_mut(&sheet_name)
         .expect("looked up above");
+    let sheet_uuid = sheet.uuid.clone();
 
     let edge_x = if side == "right" {
         sheet_x + sheet_w
@@ -878,7 +1080,13 @@ async fn handle_import_sheet_pins(
     }
 
     if !imported.is_empty() {
-        parent.overwrite()?;
+        commit_edited_sheet_item(
+            &sch_path,
+            &before,
+            &parent,
+            &sheet_uuid,
+            "Import sheet pins",
+        )?;
     }
 
     Ok(CallToolResult::json(&json!({
@@ -914,6 +1122,7 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         Err(e) => return Ok(e),
     };
 
+    let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
@@ -924,6 +1133,7 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
             )))
         }
     };
+    let sheet_uuid = sheet.uuid.clone();
 
     if sheet.pin_by_name(&pin_name).is_some() {
         return Ok(CallToolResult::error(format!(
@@ -938,7 +1148,7 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         x,
         y,
     ));
-    sch.overwrite()?;
+    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Add sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "added_pin": pin_name,
@@ -965,6 +1175,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         }
     }
 
+    let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
@@ -975,6 +1186,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
             )))
         }
     };
+    let sheet_uuid = sheet.uuid.clone();
     let pin = match sheet.pin_by_name_mut(&pin_name) {
         Some(p) => p,
         None => {
@@ -1009,7 +1221,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let summary = json!({
         "name": pin.name, "pin_type": pin.pin_type, "x": pin.at.x, "y": pin.at.y
     });
-    sch.overwrite()?;
+    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "edited_pin": pin_name,
@@ -1033,6 +1245,7 @@ async fn handle_delete_sheet_pin(
         Err(e) => return Ok(e),
     };
 
+    let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
@@ -1043,6 +1256,7 @@ async fn handle_delete_sheet_pin(
             )))
         }
     };
+    let sheet_uuid = sheet.uuid.clone();
 
     if !sheet.remove_pin(&pin_name) {
         return Ok(CallToolResult::error(format!(
@@ -1050,7 +1264,7 @@ async fn handle_delete_sheet_pin(
             pin_name, sheet_name
         )));
     }
-    sch.overwrite()?;
+    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Delete sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "deleted_pin": pin_name,

@@ -28,13 +28,13 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "sch_components",
         description: "Add, edit, move, rotate, and delete schematic symbols",
         category: "schematic",
-        tool_count: 17,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "sch_wiring",
         description: "Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections",
         category: "schematic",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "sch_analysis",
@@ -88,7 +88,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "library",
         description: "Symbol libraries, footprint libraries, search and registration",
         category: "library",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "integration",

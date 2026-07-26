@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **185 registered tools** + **6 always-visible meta-tools** = **191 total**
+- **188 registered tools** + **6 always-visible meta-tools** = **194 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -55,7 +55,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Schematic
 
-### `sch_components` · 17 tools
+### `sch_components` · 18 tools
 **Purpose:** Add, edit, move, rotate, and delete schematic symbols.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
@@ -77,9 +77,10 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_component_annotation` | Add a custom property (annotation) to a symbol instance. |
 | `group_components` | Add a group property to multiple components in the schematic. |
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
+| `sync_embedded_symbol_from_library` | Refresh one embedded symbol definition from its authoritative `.kicad_sym` copy without changing instances, fields, wires, or nets. |
 | `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
 
-### `sch_wiring` · 19 tools
+### `sch_wiring` · 20 tools
 **Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
 **Source:** [`crates/konnect-core/src/tools/sch_wiring.rs`](crates/konnect-core/src/tools/sch_wiring.rs)
 
@@ -101,6 +102,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
+| `normalize_schematic_junctions` | Atomically remove stale/duplicate junctions and recreate exactly the unique junctions required by current wire geometry. |
 | `connect_to_net` | Connect a pin endpoint to a named net by adding a short wire stub + net label. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
@@ -261,7 +263,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Library
 
-### `library` · 14 tools
+### `library` · 15 tools
 **Purpose:** Symbol libraries, footprint libraries, search and registration.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -274,6 +276,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
+| `normalize_symbol_library` | Normalize a `.kicad_sym` through kicad-cli in an isolated temporary directory; dry-run by default and atomically commit with `apply=true`. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |

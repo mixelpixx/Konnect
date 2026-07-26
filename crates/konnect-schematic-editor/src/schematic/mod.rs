@@ -6,7 +6,7 @@ pub mod wire;
 
 use std::path::{Path, PathBuf};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::sexp::{atom, parser, qstr, tagged, writer, SexpNode};
 use crate::types::{At, ChangeSet};
 
@@ -67,6 +67,7 @@ impl<'a> LocatedElement<'a> {
 /// ```
 pub struct Schematic {
     filepath: PathBuf,
+    original_source: String,
 
     pub version: Option<u32>,
     pub generator: Option<String>,
@@ -94,21 +95,35 @@ impl Schematic {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path).map_err(Error::Io)?;
+        let content = konnect_sexp::read_consistent(path).map_err(map_sexp_error)?;
         let root = parser::parse(&content)?;
-        Self::from_sexp(root, path.to_path_buf())
+        Self::from_sexp(root, path.to_path_buf(), content)
     }
 
-    /// Save to a new file path using atomic write (write to .tmp → fsync → rename).
-    /// This is safe with the Tauri schematic viewer's file-watcher.
+    /// Save to a new file path atomically, refusing to replace an existing file.
+    /// Saving to the loaded path instead performs a revision-checked commit.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
         let text = writer::write(&self.to_sexp());
-        atomic_write(path.as_ref(), &text)
+        if path == self.filepath {
+            atomic_write_revision(path, &self.original_source, &text)
+        } else {
+            atomic_create(path, &text)
+        }
     }
 
     /// Save back to the original file (atomic write).
     pub fn overwrite(&self) -> Result<()> {
         self.save(&self.filepath)
+    }
+
+    /// Serialize the current in-memory schematic without writing it.
+    ///
+    /// This is intended for revision-aware callers that prepare UUID-targeted
+    /// commands from an edited candidate and commit through `konnect-sexp`.
+    #[must_use]
+    pub fn to_source(&self) -> String {
+        writer::write(&self.to_sexp())
     }
 
     pub fn filepath(&self) -> &Path {
@@ -335,7 +350,7 @@ impl Schematic {
 
     // ---- internal -----------------------------------------------------------
 
-    fn from_sexp(root: SexpNode, filepath: PathBuf) -> Result<Self> {
+    fn from_sexp(root: SexpNode, filepath: PathBuf, original_source: String) -> Result<Self> {
         let mut version = None;
         let mut generator = None;
         let mut generator_version = None;
@@ -416,6 +431,7 @@ impl Schematic {
 
         Ok(Schematic {
             filepath,
+            original_source,
             version,
             generator,
             generator_version,
@@ -536,16 +552,19 @@ fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Write content to file atomically: write to .tmp → fsync → rename.
-/// This ensures the schematic viewer's file-watcher sees a complete file.
-fn atomic_write(path: &Path, content: &str) -> crate::error::Result<()> {
-    use std::io::Write;
-    let tmp_path = path.with_extension("kicad_sch.tmp");
-    let mut f = std::fs::File::create(&tmp_path).map_err(crate::error::Error::Io)?;
-    f.write_all(content.as_bytes())
-        .map_err(crate::error::Error::Io)?;
-    f.sync_all().map_err(crate::error::Error::Io)?;
-    drop(f);
-    std::fs::rename(&tmp_path, path).map_err(crate::error::Error::Io)?;
-    Ok(())
+/// Create a save-as target atomically without replacing another document.
+fn atomic_create(path: &Path, content: &str) -> crate::error::Result<()> {
+    konnect_sexp::writer::write_new_atomic(path, content).map_err(map_sexp_error)
+}
+
+fn atomic_write_revision(path: &Path, expected: &str, content: &str) -> crate::error::Result<()> {
+    konnect_sexp::writer::write_atomic_if_unchanged(path, expected, content).map_err(map_sexp_error)
+}
+
+fn map_sexp_error(error: konnect_sexp::SexpError) -> crate::error::Error {
+    match error {
+        konnect_sexp::SexpError::Io(error) => crate::error::Error::Io(error),
+        konnect_sexp::SexpError::Conflict { path } => crate::error::Error::Conflict(path),
+        error => crate::error::Error::Io(std::io::Error::other(error)),
+    }
 }

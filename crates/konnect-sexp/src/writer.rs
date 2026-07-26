@@ -8,19 +8,22 @@
 //! # Usage Pattern (all handlers must follow this)
 //!
 //! ```rust,ignore
-//! let content = std::fs::read_to_string(&path)?;
+//! let content = read_consistent(&path)?;
 //! let mut edits = Vec::new();
 //! edits.push(SexpEdit::insert_before_closing(parent_close_offset, new_sexp));
 //! edits.push(SexpEdit::replace_span(start, end, new_value));
 //! let new_content = apply_edits(content, edits);
-//! write_atomic(&path, &new_content)?;
+//! write_atomic_if_unchanged(&path, &content, &new_content)?;
 //! ```
 //!
 //! Edits **must** be applied in **reverse byte-offset order** so that earlier
 //! offsets are not invalidated by later insertions.
 
 use crate::SexpError;
-use std::io::Write;
+use fs2::FileExt;
+use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 // ─── Edit Types ───────────────────────────────────────────────────────────────
@@ -100,10 +103,20 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 /// can itself fail on a locked or read-only directory, and a write already
 /// failing is the wrong moment to start reporting a second error.
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
+    let lock = open_document_lock(path)?;
+    FileExt::lock_exclusive(&lock)?;
+    write_atomic_unlocked(path, content)
+}
+
+pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
     let (tmp_path, mut file) = create_scratch_file(path)?;
 
     // Remove the scratch file unless the rename below succeeds.
     let mut cleanup = ScratchGuard(Some(tmp_path.clone()));
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        file.set_permissions(metadata.permissions())?;
+    }
 
     file.write_all(content.as_bytes())?;
     file.flush()?;
@@ -112,6 +125,120 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
+    sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(())
+}
+
+/// Atomically replace `path` only when it still contains `expected`.
+///
+/// A stable sibling lock serializes participating writers. The exact source
+/// comparison also catches changes made by applications that do not honor the
+/// advisory lock, including KiCad itself.
+pub fn write_atomic_if_unchanged(
+    path: &Path,
+    expected: &str,
+    content: &str,
+) -> Result<(), SexpError> {
+    let lock = open_document_lock(path)?;
+    FileExt::lock_exclusive(&lock)?;
+
+    let current = read_string_unlocked(path)?;
+    if current != expected {
+        return Err(SexpError::Conflict {
+            path: path.to_path_buf(),
+        });
+    }
+
+    write_atomic_unlocked(path, content)?;
+    if std::fs::read_to_string(path)? != content {
+        return Err(SexpError::Conflict {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Apply a read/modify/write transaction while holding the document lock.
+pub fn transact_atomic<T>(
+    path: &Path,
+    update: impl FnOnce(&str) -> Result<(String, T), SexpError>,
+) -> Result<T, SexpError> {
+    let lock = open_document_lock(path)?;
+    FileExt::lock_exclusive(&lock)?;
+    let current = read_string_unlocked(path)?;
+    let (next, result) = update(&current)?;
+
+    if next != current {
+        write_atomic_unlocked(path, &next)?;
+        if std::fs::read_to_string(path)? != next {
+            return Err(SexpError::Conflict {
+                path: path.to_path_buf(),
+            });
+        }
+    }
+
+    Ok(result)
+}
+
+/// Read a complete document while participating in the document lock.
+pub fn read_consistent(path: &Path) -> Result<String, SexpError> {
+    let lock = open_document_lock(path)?;
+    FileExt::lock_shared(&lock)?;
+    read_string_unlocked(path)
+}
+
+pub(crate) fn read_string_unlocked(path: &Path) -> Result<String, SexpError> {
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len().min(usize::MAX as u64) as usize;
+    let mut content = String::with_capacity(size);
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError> {
+    Ok(OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(sibling_lock_path(path))?)
+}
+
+fn sibling_lock_path(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .map_or_else(|| OsString::from("document"), OsString::from);
+    let mut lock_name = OsString::from(".");
+    lock_name.push(filename);
+    lock_name.push(".konnect-write-lock");
+    path.with_file_name(lock_name)
+}
+
+/// Atomically create a new file without replacing an existing destination.
+pub fn write_new_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
+    let lock = open_document_lock(path)?;
+    FileExt::lock_exclusive(&lock)?;
+    write_new_atomic_unlocked(path, content)
+}
+
+pub(crate) fn write_new_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".konnect-")
+        .tempfile_in(parent)?;
+    temporary.write_all(content.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| SexpError::Io(error.error))?;
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+pub(crate) fn sync_parent_directory(_parent: &Path) -> Result<(), SexpError> {
+    #[cfg(unix)]
+    std::fs::File::open(_parent)?.sync_all()?;
     Ok(())
 }
 
@@ -835,5 +962,91 @@ mod atomic_write_tests {
         assert_eq!(std::fs::read_to_string(&pcb).unwrap(), pcb_content);
         assert_eq!(std::fs::read_to_string(&sch).unwrap(), sch_content);
         assert!(!leftover_scratch_files(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_replaces_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("board.kicad_pcb");
+        std::fs::write(&target, "keep me").unwrap();
+        symlink(&target, &path).unwrap();
+
+        write_atomic(&path, "new board").unwrap();
+
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new board");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn atomic_create_never_overwrites_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("project.kicad_pro");
+        std::fs::write(&path, "user project").unwrap();
+
+        let error = write_new_atomic(&path, "replacement").unwrap_err();
+
+        assert!(matches!(error, SexpError::Io(_)));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user project");
+    }
+
+    #[test]
+    fn conditional_write_rejects_a_stale_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "newer").unwrap();
+
+        let error = write_atomic_if_unchanged(&path, "older", "my edit").unwrap_err();
+
+        assert!(matches!(error, SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "newer");
+    }
+
+    #[test]
+    fn conditional_write_commits_a_matching_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "expected").unwrap();
+
+        write_atomic_if_unchanged(&path, "expected", "edited").unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "edited");
+    }
+
+    #[test]
+    fn concurrent_conditional_writes_have_exactly_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "expected").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let handles = ["first", "second"].map(|content| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                write_atomic_if_unchanged(&path, "expected", content)
+            })
+        });
+        barrier.wait();
+        let results = handles.map(|handle| handle.join().unwrap());
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(SexpError::Conflict { .. })))
+                .count(),
+            1
+        );
+        let final_content = std::fs::read_to_string(path).unwrap();
+        assert!(final_content == "first" || final_content == "second");
     }
 }

@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
-use konnect_sexp::writer::{new_uuid, write_atomic};
+use konnect_sexp::writer::{new_uuid, read_consistent, write_atomic_if_unchanged};
 use serde_json::json;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -413,7 +413,8 @@ async fn handle_apply_template(
         }
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     // Determine starting reference numbers by scanning existing components
     let ref_start = args["ref_start"]
@@ -494,7 +495,7 @@ async fn handle_apply_template(
     }
 
     // Write the updated schematic
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
     info!(
         template_id = %template_id,

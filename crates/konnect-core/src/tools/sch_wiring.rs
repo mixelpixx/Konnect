@@ -18,10 +18,12 @@ use konnect_sexp::{
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
-        find_direct_child_blocks, find_enclosing_block, write_atomic, SexpEdit,
+        find_direct_child_blocks, find_enclosing_block, read_consistent, write_atomic_if_unchanged,
+        SexpEdit,
     },
 };
 use serde_json::json;
+use std::collections::HashSet;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -293,6 +295,19 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_batch_add_junction(args, ctx).await }
         ),
         tool!(
+            "normalize_schematic_junctions",
+            "Atomically remove stale/duplicate junction dots and recreate exactly the unique \
+             T-junctions required by the current wire geometry.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_normalize_junctions(args, ctx).await }
+        ),
+        tool!(
             "connect_to_net",
             "Connect a pin endpoint to a named net by adding a short wire stub and a net label.",
             json!({
@@ -496,22 +511,32 @@ async fn handle_batch_add_wire(
         let (x1, y1) = snap_point(x1, y1, 1.27);
         let (x2, y2) = snap_point(x2, y2, 1.27);
 
-        // T-junction detection for each wire added incrementally
-        let mut existing_wires = cse_wires_to_sexp(&sch);
-        existing_wires.push(konnect_sexp::schematic::Wire {
-            x1,
-            y1,
-            x2,
-            y2,
-            uuid: None,
-        });
-        let junctions = find_t_junctions(&existing_wires, 0.01);
-
         sch.add_wire(x1, y1, x2, y2);
-        for (jx, jy) in &junctions {
-            sch.add_junction(*jx, *jy);
-        }
         added += 1;
+    }
+
+    // Compute the final topology once.  Recomputing after each segment used to
+    // append every previously found junction repeatedly, producing thousands
+    // of duplicate/stale dots in a single batch.
+    let required = find_t_junctions(&cse_wires_to_sexp(&sch), 0.01);
+    let mut existing: HashSet<(i64, i64)> = sch
+        .junctions
+        .iter()
+        .map(|junction| {
+            (
+                (junction.x * 1_000_000.0).round() as i64,
+                (junction.y * 1_000_000.0).round() as i64,
+            )
+        })
+        .collect();
+    for (jx, jy) in required {
+        let point = (
+            (jx * 1_000_000.0).round() as i64,
+            (jy * 1_000_000.0).round() as i64,
+        );
+        if existing.insert(point) {
+            sch.add_junction(jx, jy);
+        }
     }
 
     sch.overwrite()?;
@@ -523,7 +548,8 @@ async fn handle_delete_wire(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     let delete_range = if let Some(uuid) = opt_str(args, "uuid") {
         let search = format!(r#"(uuid "{uuid}")"#);
@@ -568,7 +594,7 @@ async fn handle_delete_wire(
 
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::text("Wire deleted."))
 }
 
@@ -584,7 +610,8 @@ async fn handle_batch_delete_wire(
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut errors = Vec::new();
 
     // Collect all delete ranges first, then apply in reverse order
@@ -617,7 +644,7 @@ async fn handle_batch_delete_wire(
         .map(|(s, e)| SexpEdit::delete(s, e))
         .collect();
     let content = apply_edits(content, edits);
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "deleted": deleted,
         "errors": errors
@@ -716,13 +743,14 @@ async fn handle_split_wire_at_point(
         return Ok(delete_result);
     }
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let w1 = format_wire(w.x1, w.y1, px, py);
     let w2 = format_wire(px, py, w.x2, w.y2);
     let junc = format_junction(px, py);
     let insert = format!("{w1}{w2}{junc}");
     let new_content = insert_before_close(&content, &insert);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "split_at": { "x": px, "y": py },
@@ -803,7 +831,8 @@ async fn handle_delete_net_label(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     let labels = find_label_blocks(&content);
     let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
@@ -858,7 +887,7 @@ async fn handle_delete_net_label(
     let kind = label.kind;
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::json(&json!({
         "deleted_label": net,
         "type": kind,
@@ -946,7 +975,8 @@ async fn handle_rotate_label(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     let labels = find_label_blocks(&content);
     let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
@@ -1039,7 +1069,7 @@ async fn handle_rotate_label(
     }
 
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::json(&json!({
         "rotated_label": net,
         "type": label.kind,
@@ -1219,7 +1249,8 @@ async fn handle_delete_no_connect(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let search = format!("(no_connect (at {x} {y})");
     let pos = match content.find(&search) {
         Some(p) => p,
@@ -1233,7 +1264,7 @@ async fn handle_delete_no_connect(
         .ok_or_else(|| anyhow::anyhow!("Cannot parse no_connect block"))?;
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::text("No-connect deleted."))
 }
 
@@ -1292,6 +1323,55 @@ async fn handle_batch_add_junction(
     }
     sch.overwrite()?;
     Ok(CallToolResult::json(&json!({ "added": positions.len() })))
+}
+
+async fn handle_normalize_junctions(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let (content, tree) = read_schematic(&sch_path)?;
+    let expected = content.clone();
+    let wires = extract_wires(&tree);
+    let mut required = find_t_junctions(&wires, 0.01);
+    required.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+    required.dedup_by(|left, right| {
+        (left.0 - right.0).abs() <= 0.01 && (left.1 - right.1).abs() <= 0.01
+    });
+
+    let mut edits = Vec::new();
+    let mut removed = 0usize;
+    for (start, end) in find_direct_child_blocks(&content, "kicad_sch") {
+        if content[start..end].starts_with("(junction") {
+            if let Some((delete_start, delete_end)) =
+                find_block_with_leading_whitespace(&content, start)
+            {
+                edits.push(SexpEdit::delete(delete_start, delete_end));
+                removed += 1;
+            }
+        }
+    }
+    let cleaned = apply_edits(content, edits);
+    let junction_text = required
+        .iter()
+        .map(|(x, y)| format_junction(*x, *y))
+        .collect::<String>();
+    let normalized = if junction_text.is_empty() {
+        cleaned
+    } else {
+        insert_before_close(&cleaned, &junction_text)
+    };
+    write_atomic_if_unchanged(&sch_path, &expected, &normalized)?;
+
+    Ok(CallToolResult::json(&json!({
+        "removed": removed,
+        "required_unique": required.len(),
+        "changed": removed != required.len()
+    })))
 }
 
 async fn handle_connect_to_net(
@@ -1393,6 +1473,7 @@ async fn handle_connect_pins(
 
     // Parse the schematic tree
     let (content, tree) = read_schematic(&sch_path)?;
+    let expected = content.clone();
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
         .find("lib_symbols")
@@ -1417,7 +1498,7 @@ async fn handle_connect_pins(
         new_content = insert_wire_with_junctions(new_content, mid_x, mid_y, x2, y2);
     }
 
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected": {
@@ -1475,7 +1556,8 @@ async fn handle_add_schematic_connection(
         Err(e) => return Ok(e),
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
         // Already axis-aligned: single wire
@@ -1488,7 +1570,7 @@ async fn handle_add_schematic_connection(
         content = insert_wire_with_junctions(content, mid_x, mid_y, x2, y2);
     }
 
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
@@ -1886,5 +1968,30 @@ mod wire_delete_tests {
         assert_eq!(wires.len(), 2);
         assert!(after.contains("(junction"));
         assert!(!wires.iter().any(|wire| wire.x1 == 0.0 && wire.x2 == 10.0));
+    }
+
+    #[tokio::test]
+    async fn normalize_junctions_removes_duplicates_and_stale_dots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("junction-normalize.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (wire (pts (xy 0 0) (xy 10 0)) (uuid \"11111111-1111-1111-1111-111111111111\"))\n  (wire (pts (xy 5 0) (xy 5 5)) (uuid \"22222222-2222-2222-2222-222222222222\"))\n  (junction (at 5 0) (diameter 0) (uuid \"33333333-3333-3333-3333-333333333333\"))\n  (junction (at 5 0) (diameter 0) (uuid \"44444444-4444-4444-4444-444444444444\"))\n  (junction (at 8 8) (diameter 0) (uuid \"55555555-5555-5555-5555-555555555555\"))\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_normalize_junctions(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("(junction").count(), 1);
+        assert!(after.contains("(at 5 0)"));
+        assert!(!after.contains("(at 8 8)"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
     }
 }

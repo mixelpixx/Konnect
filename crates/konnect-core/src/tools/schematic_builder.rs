@@ -13,13 +13,14 @@
 //!   6. Labels (net_label, global_label, hierarchical_label)
 //!   7. Symbol instances (ALWAYS LAST)
 
-use konnect_sexp::writer::write_atomic;
-use std::path::Path;
+use konnect_sexp::writer::{read_consistent, write_atomic, write_atomic_if_unchanged};
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Structured representation of a .kicad_sch file.
 /// Each section holds raw S-expression strings that are written in order.
 pub struct SchematicBuilder {
+    source_revision: Option<(PathBuf, String)>,
     /// Everything before lib_symbols: version, generator, uuid, paper, title_block
     pub header: String,
     /// Contents inside (lib_symbols ...) — each entry is a complete (symbol "Lib:Name" ...) block
@@ -53,6 +54,7 @@ impl SchematicBuilder {
     pub fn new() -> Self {
         let uuid = konnect_sexp::writer::new_uuid();
         SchematicBuilder {
+            source_revision: None,
             header: format!(
                 "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")",
                 uuid
@@ -71,13 +73,16 @@ impl SchematicBuilder {
 
     /// Parse an existing .kicad_sch file into structured sections.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        Self::parse(&content)
+        let content = read_consistent(path)?;
+        let mut builder = Self::parse(&content)?;
+        builder.source_revision = Some((path.to_path_buf(), content));
+        Ok(builder)
     }
 
     /// Parse schematic content into structured sections.
     pub fn parse(content: &str) -> anyhow::Result<Self> {
         let mut builder = SchematicBuilder {
+            source_revision: None,
             header: String::new(),
             lib_symbols: Vec::new(),
             junctions: Vec::new(),
@@ -382,6 +387,12 @@ impl SchematicBuilder {
     /// Write to file atomically (write to .tmp, fsync, rename).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let content = self.to_string();
+        if let Some((source_path, expected)) = &self.source_revision {
+            if source_path == path {
+                write_atomic_if_unchanged(path, expected, &content)?;
+                return Ok(());
+            }
+        }
         write_atomic(path, &content)?;
         Ok(())
     }

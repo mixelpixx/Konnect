@@ -1,6 +1,6 @@
 use konnect_schematic_editor::{
     sexp::{parser, writer},
-    Schematic,
+    Error, Schematic,
 };
 
 // ---- S-expression parser round-trip ----------------------------------------
@@ -324,6 +324,27 @@ fn add_label_and_save() {
 
     let sch2 = Schematic::load(tmp.path()).unwrap();
     assert!(sch2.labels.value_contains("GND").len() > 0);
+}
+
+#[test]
+fn overwrite_rejects_a_stale_loaded_revision() {
+    let tmp = fresh_minimal_file();
+    let mut schematic = Schematic::load(tmp.path()).unwrap();
+    let external_revision = minimal_sch().replace("10k", "22k");
+    std::fs::write(tmp.path(), &external_revision).unwrap();
+    schematic
+        .symbols
+        .by_reference_mut("R1")
+        .unwrap()
+        .set_value_str("4.7k");
+
+    let error = schematic.overwrite().unwrap_err();
+
+    assert!(matches!(error, Error::Conflict(_)));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        external_revision
+    );
 }
 
 #[test]

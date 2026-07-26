@@ -308,10 +308,7 @@ pub fn project_name_for(sch_path: &std::path::Path) -> String {
 /// The root UUID is mandatory: KiCAD's netlister resolves symbol instance
 /// paths against it and silently forms no wire-only nets when it's missing.
 pub fn blank_schematic_template() -> String {
-    format!(
-        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n",
-        konnect_sexp::writer::new_uuid()
-    )
+    konnect_sexp::schematic::format_blank_schematic()
 }
 
 /// Root UUID of a loaded schematic, assigning a fresh one when the file

@@ -7,4 +7,5 @@ crates/schematic-viewer/target/
 *.dylib
 *.tmp
 *.bak
+*.konnect-write-lock
 dist/

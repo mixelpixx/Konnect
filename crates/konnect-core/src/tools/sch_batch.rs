@@ -18,7 +18,7 @@ use konnect_sexp::{
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
-        new_uuid, write_atomic, SexpEdit,
+        new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit,
     },
 };
 use serde_json::json;
@@ -343,10 +343,11 @@ async fn handle_batch_connect_to_net(
     }
 
     if !inserts.is_empty() {
+        let expected = content.clone();
         let close_pos = content.rfind(')').unwrap_or(content.len());
         let edits = vec![SexpEdit::insert(close_pos, inserts)];
         let new_content = apply_edits(content, edits);
-        write_atomic(&sch_path, &new_content)?;
+        write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
     Ok(CallToolResult::json(&json!({
@@ -362,7 +363,8 @@ async fn handle_batch_delete(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     let mut edits: Vec<SexpEdit> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
@@ -430,7 +432,7 @@ async fn handle_batch_delete(
     }
 
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "deleted_count": deleted.len(),
@@ -483,7 +485,8 @@ async fn handle_bulk_move(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut edits: Vec<SexpEdit> = Vec::new();
     let mut moved: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -546,7 +549,7 @@ async fn handle_bulk_move(
     }
 
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
@@ -566,7 +569,8 @@ async fn handle_batch_edit(
         None => return Ok(CallToolResult::error("Missing 'edits' array")),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut file_edits: Vec<SexpEdit> = Vec::new();
     let mut changed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -622,7 +626,7 @@ async fn handle_batch_edit(
     }
 
     let new_content = apply_edits(content, file_edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "updated_count": changed.len(),
@@ -641,7 +645,8 @@ async fn handle_batch_delete_components(
         None => return Ok(CallToolResult::error("Missing 'references' array")),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut edits: Vec<SexpEdit> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -661,7 +666,7 @@ async fn handle_batch_delete_components(
     }
 
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "deleted_count": deleted.len(),
@@ -701,14 +706,15 @@ async fn handle_connect_passthrough(
     let wire_sexp = format_wire(x, y, wire_end_x, wire_end_y);
     let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, label_rot);
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let edits = vec![SexpEdit::insert(
         close_pos,
         format!("{wire_sexp}{label_sexp}"),
     )];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "net": net_name,
@@ -740,19 +746,26 @@ async fn handle_add_schematic_text(
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let uuid = new_uuid();
 
-    // Escape quotes in text content
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    // KiCad S-expression strings are single-line tokens.  Preserve deliberate
+    // schematic line breaks with the escaped `\\n` representation; emitting a
+    // literal newline inside quotes makes kicad-cli reject the whole sheet.
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
 
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
          (effects (font (size {size} {size})))\n    (uuid \"{uuid}\")\n  )"
     );
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let edits = vec![SexpEdit::insert(close_pos, text_sexp)];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added": text,
@@ -1071,6 +1084,67 @@ mod batch_delete_tests {
         assert!(after.contains("(uuid \"root\")"));
         assert!(after.contains("keep me"));
         assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_delete_uuid_removes_top_level_text_but_preserves_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch-delete-text.kicad_sch");
+        let text_uuid = "22222222-2222-2222-2222-222222222222";
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n  (text \"obsolete caption\"\n    (at 5 5 0)\n    (effects (font (size 1.27 1.27)))\n    (uuid \"{text_uuid}\")\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n"
+            ),
+        )
+        .unwrap();
+
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": [text_uuid]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("obsolete caption"));
+        assert!(after.contains("(uuid \"root\")"));
+        assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn schematic_text_escapes_multiline_content_for_kicad() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multiline-text.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_text(
+            &json!({
+                "schematic": path.display().to_string(),
+                "text": "PRIMARY GAUGE\nBQ40Z80 cell sensing",
+                "x": 60.0,
+                "y": 50.0,
+                "size": 1.5
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("PRIMARY GAUGE\\nBQ40Z80 cell sensing"));
+        assert!(!after.contains("\"PRIMARY GAUGE\nBQ40Z80"));
         assert!(konnect_sexp::parse_sexp(&after).is_ok());
     }
 }

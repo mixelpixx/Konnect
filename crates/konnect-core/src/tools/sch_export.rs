@@ -13,7 +13,9 @@ use konnect_sexp::{
         extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, pin_endpoint,
         read_schematic,
     },
-    writer::{apply_edits, find_block_with_leading_whitespace, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_block_with_leading_whitespace, write_atomic_if_unchanged, SexpEdit,
+    },
 };
 use serde_json::json;
 
@@ -419,9 +421,11 @@ async fn handle_fix_connectivity(
         }
     }
 
-    if !dry_run && !file_edits.is_empty() {
+    let applied_count = if dry_run { 0 } else { file_edits.len() };
+    if applied_count > 0 {
+        let expected = content.clone();
         let new_content = apply_edits(content, file_edits);
-        write_atomic(&sch_path, &new_content)?;
+        write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
     Ok(CallToolResult::json(&json!({

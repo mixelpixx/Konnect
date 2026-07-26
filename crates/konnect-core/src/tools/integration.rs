@@ -17,6 +17,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use konnect_sexp::writer::{read_consistent, write_atomic_if_unchanged};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -572,7 +573,8 @@ async fn handle_enrich_datasheets(
     let sch_path = get_path(args, "schematic")?;
     let overwrite = args["overwrite_existing"].as_bool().unwrap_or(false);
 
-    let content = tokio::fs::read_to_string(&sch_path).await?;
+    let read_path = sch_path.clone();
+    let content = tokio::task::spawn_blocking(move || read_consistent(&read_path)).await??;
 
     // Find all LCSC property values in the schematic
     let mut lcsc_ids: Vec<String> = Vec::new();
@@ -658,7 +660,7 @@ async fn handle_enrich_datasheets(
 
     // Write back if anything changed
     if enriched > 0 {
-        konnect_sexp::writer::write_atomic(&sch_path, &new_content)?;
+        write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
     }
 
     Ok(CallToolResult::text(
