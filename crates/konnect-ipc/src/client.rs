@@ -65,6 +65,15 @@ pub struct KiCadIpcClient {
     client_name: String,
 }
 
+/// What KiCAD actually did with a `ParseAndCreateItemsFromString` payload.
+#[derive(Debug, Default)]
+pub struct CreateOutcome {
+    /// Items KiCAD reported as genuinely created.
+    pub created: usize,
+    /// Per-item rejections, as `code: message`, for the ones it did not.
+    pub failures: Vec<String>,
+}
+
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
     /// If empty, tries KICAD_API_SOCKET environment variable.
@@ -653,14 +662,23 @@ impl KiCadIpcClient {
     }
 
     /// Paste a fully-formed S-expression into the open board, the way the
-    /// editor's Paste action does, and report how many items KiCAD created.
+    /// editor's Paste action does, and report what KiCAD made of it.
     ///
     /// KiCAD answers with a `CreateItemsResponse` whose own documentation warns
     /// that the overall status "may return IRS_OK even if no items were
     /// created", so the per-item results are the only trustworthy signal. An
     /// unparseable payload therefore looks like a success at the transport
     /// level and must be caught by inspecting `created_items`.
-    pub fn parse_and_create_items(&self, contents: &str) -> Result<usize> {
+    ///
+    /// `created_items` is not a list of successes, though: the field is
+    /// documented as "status of each item **to be** created", so a rejected
+    /// item still occupies a slot, carrying a code like `ISC_INVALID_DATA` and
+    /// no `item`. Counting the vector's length would therefore call a wholesale
+    /// rejection a success — the very phantom-success this API exists to
+    /// prevent. Only `ISC_OK` entries count.
+    pub fn parse_and_create_items(&self, contents: &str) -> Result<CreateOutcome> {
+        use kiapi::common::commands::ItemStatusCode;
+
         let doc = self.get_board_document()?;
         let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
             document: Some(doc),
@@ -673,14 +691,46 @@ impl KiCadIpcClient {
             anyhow::bail!("KiCAD returned no response to ParseAndCreateItemsFromString");
         };
         let resp: kiapi::common::commands::CreateItemsResponse = unpack_any(&any)?;
+
+        let mut outcome = CreateOutcome::default();
+        for result in &resp.created_items {
+            let code = result.status.as_ref().map(|s| s.code);
+            // A missing status with an item attached is treated as created:
+            // some paths populate the item and leave the status defaulted.
+            let ok = code == Some(ItemStatusCode::IscOk as i32)
+                || (code.is_none_or(|c| c == ItemStatusCode::IscUnknown as i32)
+                    && result.item.is_some());
+            if ok {
+                outcome.created += 1;
+            } else {
+                let message = result
+                    .status
+                    .as_ref()
+                    .map(|s| {
+                        let name = ItemStatusCode::try_from(s.code)
+                            .map(|c| format!("{c:?}"))
+                            .unwrap_or_else(|_| format!("code {}", s.code));
+                        if s.error_message.is_empty() {
+                            name
+                        } else {
+                            format!("{name}: {}", s.error_message)
+                        }
+                    })
+                    .unwrap_or_else(|| "no status reported".to_string());
+                outcome.failures.push(message);
+            }
+        }
+
         tracing::debug!(
             type_url = %any.type_url,
             body_len = any.value.len(),
             status = resp.status,
-            created = resp.created_items.len(),
+            results = resp.created_items.len(),
+            created = outcome.created,
+            failures = ?outcome.failures,
             "ParseAndCreateItemsFromString response"
         );
-        Ok(resp.created_items.len())
+        Ok(outcome)
     }
 
     /// Place a footprint on the open board from a fully-formed `(footprint …)`
@@ -695,15 +745,19 @@ impl KiCadIpcClient {
     /// This is the same failure the `(via …)` path had before it moved to a
     /// typed message — see [`add_via`](Self::add_via).
     pub fn place_footprint(&self, footprint_sexp: &str) -> Result<usize> {
-        let created = self.parse_and_create_items(footprint_sexp)?;
-        if created == 0 {
+        let outcome = self.parse_and_create_items(footprint_sexp)?;
+        if outcome.created == 0 {
+            let why = if outcome.failures.is_empty() {
+                "its parser produced no items at all".to_string()
+            } else {
+                format!("KiCAD rejected it — {}", outcome.failures.join("; "))
+            };
             anyhow::bail!(
-                "KiCAD accepted the request but created no footprint — the S-expression was \
-                 rejected by its parser. This usually means the library footprint could not be \
-                 read or is not valid for this KiCAD version."
+                "KiCAD accepted the request but created no footprint: {why}. This usually means \
+                 the library footprint could not be read or is not valid for this KiCAD version."
             );
         }
-        Ok(created)
+        Ok(outcome.created)
     }
 
     /// Get board extents (bounding box of all items).

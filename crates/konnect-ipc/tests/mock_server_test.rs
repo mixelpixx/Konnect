@@ -174,3 +174,125 @@ fn wedged_server_times_out_instead_of_hanging() {
         "expected ~30s recv timeout, got {elapsed:?}"
     );
 }
+
+// ─── ParseAndCreateItemsFromString outcome handling ───────────────────────────
+
+/// A mock KiCAD with one board open that answers every paste with `results`.
+///
+/// `place_footprint` first asks for the open document, so the mock has to
+/// answer two different commands.
+fn spawn_mock_pasting(results: Vec<kiapi::common::commands::ItemCreationResult>) -> MockKicad {
+    spawn_mock(move |req| {
+        let msg = req.message.expect("request must pack a command");
+        let body = if msg.type_url.ends_with("GetOpenDocuments") {
+            pack(
+                &kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: vec![kiapi::common::types::DocumentSpecifier::default()],
+                },
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )
+        } else {
+            pack(
+                &kiapi::common::commands::CreateItemsResponse {
+                    header: None,
+                    // IRS_OK even though nothing was created — the response
+                    // shape the proto explicitly warns about.
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: results.clone(),
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            )
+        };
+        Some(kiapi::common::ApiResponse {
+            message: Some(body),
+            ..ok_response()
+        })
+    })
+}
+
+fn pack<M: Message>(msg: &M, type_name: &str) -> prost_types::Any {
+    prost_types::Any {
+        type_url: format!("type.googleapis.com/{type_name}"),
+        value: msg.encode_to_vec(),
+    }
+}
+
+fn result_with(
+    code: kiapi::common::commands::ItemStatusCode,
+    message: &str,
+) -> kiapi::common::commands::ItemCreationResult {
+    kiapi::common::commands::ItemCreationResult {
+        status: Some(kiapi::common::commands::ItemStatus {
+            code: code as i32,
+            error_message: message.to_string(),
+        }),
+        item: None,
+    }
+}
+
+#[test]
+fn a_rejected_item_is_not_counted_as_created() {
+    // The regression this guards: created_items is documented as "status of
+    // each item TO BE created", so a rejection still occupies a slot. Counting
+    // the vector's length would call this a success and put the phantom back.
+    let mock = spawn_mock_pasting(vec![result_with(
+        kiapi::common::commands::ItemStatusCode::IscInvalidData,
+        "footprint has no pads",
+    )]);
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let err = client
+        .place_footprint("(footprint \"Lib:Fp\")")
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("created no footprint"),
+        "must report failure: {err}"
+    );
+    // The per-item reason is what makes this diagnosable.
+    assert!(
+        err.contains("IscInvalidData") && err.contains("footprint has no pads"),
+        "must surface KiCAD's own reason: {err}"
+    );
+}
+
+#[test]
+fn an_empty_result_list_still_reports_failure() {
+    // KiCAD 10.0's actual behaviour: an empty CreateItemsResponse.
+    let mock = spawn_mock_pasting(vec![]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let err = client
+        .place_footprint("(footprint \"Lib:Fp\")")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("created no footprint"), "unexpected: {err}");
+    assert!(err.contains("no items at all"), "unexpected: {err}");
+}
+
+#[test]
+fn a_created_item_counts() {
+    let mock = spawn_mock_pasting(vec![result_with(
+        kiapi::common::commands::ItemStatusCode::IscOk,
+        "",
+    )]);
+    let client = KiCadIpcClient::new(&mock.url);
+    assert_eq!(client.place_footprint("(footprint \"Lib:Fp\")").unwrap(), 1);
+}
+
+#[test]
+fn a_mixed_response_counts_only_the_successes() {
+    let mock = spawn_mock_pasting(vec![
+        result_with(kiapi::common::commands::ItemStatusCode::IscOk, ""),
+        result_with(
+            kiapi::common::commands::ItemStatusCode::IscInvalidData,
+            "bad",
+        ),
+    ]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let outcome = client
+        .parse_and_create_items("(footprint \"Lib:Fp\")")
+        .unwrap();
+    assert_eq!(outcome.created, 1);
+    assert_eq!(outcome.failures.len(), 1);
+}

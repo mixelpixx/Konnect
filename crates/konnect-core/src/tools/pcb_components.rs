@@ -1049,13 +1049,36 @@ async fn handle_duplicate_component(
         Err(msg) => return Ok(CallToolResult::error(msg)),
     };
 
-    ipc!(ctx, |c| c.place_footprint(&sexp));
-    Ok(CallToolResult::json(&json!({
+    // Same IPC-then-file strategy as place_component. Without it this tool
+    // would be the one place that still hard-fails on KiCAD 10.0, whose
+    // ParseAndCreateItemsFromString creates nothing — and unlike the other two,
+    // reaching here already proves KiCAD is running, since the source footprint
+    // was read over IPC above.
+    let sexp_ipc = sexp.clone();
+    let ipc_result = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        c.place_footprint(&sexp_ipc)
+    })
+    .await?;
+
+    let mut out = json!({
         "duplicated_from": reference,
         "new_reference": new_reference,
         "footprint": src.footprint,
-        "x": x, "y": y, "rotation": src.rotation, "layer": src.layer
-    })))
+        "x": x, "y": y, "rotation": src.rotation, "layer": src.layer,
+        "source": if ipc_result.is_ok() { "ipc" } else { "file" }
+    });
+
+    if ipc_result.is_err() {
+        let board_path = get_path(args, "board")?;
+        insert_into_board(&board_path, std::slice::from_ref(&sexp))?;
+        out["warning"] = json!(
+            "KiCAD is running but could not duplicate this over IPC (KiCAD 10.0's \
+             ParseAndCreateItemsFromString does nothing), so the board file was edited \
+             directly. If this board is open in the PCB editor, close it without saving \
+             and reopen it — otherwise KiCAD will overwrite this change."
+        );
+    }
+    Ok(CallToolResult::json(&out))
 }
 
 async fn handle_get_board_2d_view(
