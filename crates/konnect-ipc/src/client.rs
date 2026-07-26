@@ -695,11 +695,14 @@ impl KiCadIpcClient {
         let mut outcome = CreateOutcome::default();
         for result in &resp.created_items {
             let code = result.status.as_ref().map(|s| s.code);
-            // A missing status with an item attached is treated as created:
-            // some paths populate the item and leave the status defaulted.
-            let ok = code == Some(ItemStatusCode::IscOk as i32)
-                || (code.is_none_or(|c| c == ItemStatusCode::IscUnknown as i32)
-                    && result.item.is_some());
+            // ISC_OK is the real signal. A status that is absent *or* left at
+            // the ISC_UNKNOWN zero value counts too, but only when an item is
+            // attached: some paths populate the item and never set the status,
+            // and protobuf cannot tell "unset" from "explicitly zero" anyway.
+            // Without an item there is nothing to have created, so it is a
+            // failure regardless.
+            let unset = code.is_none_or(|c| c == ItemStatusCode::IscUnknown as i32);
+            let ok = code == Some(ItemStatusCode::IscOk as i32) || (unset && result.item.is_some());
             if ok {
                 outcome.created += 1;
             } else {

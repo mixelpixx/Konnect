@@ -281,6 +281,38 @@ fn a_created_item_counts() {
 }
 
 #[test]
+fn a_defaulted_status_counts_only_when_an_item_came_back() {
+    // Protobuf cannot distinguish "unset" from "explicitly zero", so an
+    // ISC_UNKNOWN status is only evidence of success if an item is attached.
+    let with_item = kiapi::common::commands::ItemCreationResult {
+        status: None,
+        item: Some(prost_types::Any::default()),
+    };
+    let mock = spawn_mock_pasting(vec![with_item]);
+    let client = KiCadIpcClient::new(&mock.url);
+    assert_eq!(
+        client.place_footprint("(footprint \"Lib:Fp\")").unwrap(),
+        1,
+        "an item with a defaulted status was still created"
+    );
+
+    // The same defaulted status with nothing attached created nothing.
+    let without_item = kiapi::common::commands::ItemCreationResult {
+        status: Some(kiapi::common::commands::ItemStatus {
+            code: kiapi::common::commands::ItemStatusCode::IscUnknown as i32,
+            error_message: String::new(),
+        }),
+        item: None,
+    };
+    let mock = spawn_mock_pasting(vec![without_item]);
+    let client = KiCadIpcClient::new(&mock.url);
+    assert!(
+        client.place_footprint("(footprint \"Lib:Fp\")").is_err(),
+        "a bare ISC_UNKNOWN with no item must not count as created"
+    );
+}
+
+#[test]
 fn a_mixed_response_counts_only_the_successes() {
     let mock = spawn_mock_pasting(vec![
         result_with(kiapi::common::commands::ItemStatusCode::IscOk, ""),
