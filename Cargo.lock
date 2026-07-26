@@ -898,7 +898,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
  "toml",
@@ -924,7 +924,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "usvg",
@@ -943,7 +943,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
@@ -954,7 +954,7 @@ version = "0.2.0"
 dependencies = [
  "konnect-sexp",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "uuid",
 ]
 
@@ -969,7 +969,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "uuid",
 ]
 
