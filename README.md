@@ -203,17 +203,95 @@ A standalone viewer that auto-refreshes as the schematic file changes:
 schematic-viewer.exe path\to\your\root_schematic.kicad_sch
 ```
 
-Point it at the root sheet of a hierarchical design and every sub-sheet is rendered
-too, with a depth-indented sheet selector in the toolbar. Edits saved from KiCAD (or
-made by the AI through the schematic tools) re-render only the sheets that changed
-and refresh the view live — rendering runs against temp-folder snapshots, so the
-viewer never blocks KiCAD from saving. Pan with click-drag, zoom with the wheel,
-`0` to fit, `R` to refresh, drag-and-drop to open a different file. Also launchable
-by the AI via the `open_schematic_viewer` tool.
+Point it at the root sheet of a hierarchical design and every sub-sheet is available
+in a live thumbnail filmstrip along the bottom. Click a thumbnail—or use the
+left/right arrow keys—to open that page. Pan with click-drag, zoom with the wheel,
+use `0` to fit and `R` to refresh. It can also be launched through the
+`open_schematic_viewer` tool.
 
-Needs the WebView2 runtime (pre-installed on Windows 10/11) and a KiCAD install for
-`kicad-cli` (auto-discovered, or pass `--kicad-cli <path>`). Built separately from
-the main workspace — see [DEV.md](DEV.md) for build steps.
+The native editor uses a compact vector-icon rail with hover guidance and an
+action-icon timeline. Its text-selection mode supports UI character ranges and
+all rendered schematic text, copied through the native platform clipboard.
+Its complete local/external change log remains scrollable for the lifetime of
+the Schematic Studio process.
+It opens read-only: enable the explicit Edit mode checkbox to stage changes in
+memory, then use Commit to write every dirty sheet as one exact-precondition
+transaction or Discard to restore the durable source.
+
+The viewer has two mutually exclusive compile-time renderer modes:
+
+| Feature | Status | Render path | Runtime requirements |
+|---|---|---|---|
+| `renderer-kicad-cli` | Default, compatibility | KiCad exports SVG; Tauri displays it | KiCad plus WebView2 (Windows), WKWebView (macOS), or GTK3 + WebKitGTK 4.1 (Linux) |
+| `renderer-vello` | Native preview | Konnect parses `.kicad_sch` and Vello draws the semantic scene directly | A wgpu-supported graphics backend; no KiCad CLI or WebKit runtime |
+
+```bash
+cd crates/schematic-viewer
+
+# Compatibility renderer (default)
+cargo build --release
+
+# Direct native renderer
+cargo build --release --no-default-features --features renderer-vello
+```
+
+Both modes watch the complete hierarchy and update only changed or newly discovered
+sheets. Compatibility mode uses temporary snapshots so it never blocks KiCad from
+saving and remains the fidelity reference. Native mode avoids the SVG/WebView path,
+keeps parsed geometry cached, and repaints immediately. It renders schematic text
+with KiCad's Newstroke geometry and has a headless golden-image comparison path.
+Light mode follows KiCad's palette and default worksheet; dark mode uses
+role-distinct high-contrast colors. The supported primitive set is pixel-identical
+to KiCad's exported scene when both are rasterized by Vello;
+unsupported or less-common schematic primitives are why native mode remains
+opt-in.
+
+Compatibility exports also populate an atomic per-user cache under
+`$XDG_CACHE_HOME/konnect/schematic-viewer` (or the platform-equivalent user cache).
+When a cache entry is newer than its schematic, native mode reuses only its symbol
+paint-order metadata so compiler- and KiCad-build-specific unstable ties match the
+installed KiCad renderer. Geometry still comes directly from `.kicad_sch`; stale or
+missing entries fall back to Konnect's deterministic KiCad-source ordering. Nothing
+is written into the project tree.
+
+Native mode provides revision-aware editing for symbols and wiring primitives,
+including selection, drag/nudge, rotate, mirror, duplicate, delete, properties,
+wire and label placement, undo/redo, search, and live connectivity warnings.
+Commands safely rebase across unrelated changes and report an explicit conflict
+when the same KiCad item changed. See
+[the viewer/editor architecture and shortcut reference](docs/SCHEMATIC_VIEWER.md)
+for the complete interaction and transaction model.
+
+To compare the native pixels against the installed KiCad version, run:
+
+```bash
+scripts/compare-schematic-renderers.sh path/to/sheet.kicad_sch render-diff.png
+KONNECT_VELLO_SVG_ORACLE=1 KONNECT_MAX_SEMANTIC_RMSE=0 \
+  scripts/compare-schematic-renderers.sh path/to/sheet.kicad_sch
+scripts/compare-schematic-project.sh path/to/kicad-project
+KONNECT_VELLO_SVG_ORACLE=1 scripts/compare-schematic-renderers.sh path/to/sheet.kicad_sch
+scripts/test-schematic-renderer-goldens.sh
+```
+
+The second form is the strict pixel-identical semantic gate. The first reports
+normalized cross-rasterizer RMSE and writes a visual diff; librsvg and Vello use
+different antialiasing coverage, so that metric is useful for visual regressions
+but is not the semantic parity result.
+
+The optional same-Vello oracle renders KiCad's exported SVG and Konnect's
+semantic scene through the identical Vello area-AA backend. This separates
+semantic geometry, color, and ordering errors from librsvg/Vello coverage
+differences. The comparison script supplies that fresh SVG as the paint-order
+oracle for the native render. Headless renders use Vello's deterministic CPU path;
+the live viewer remains GPU-accelerated. `KONNECT_MAX_SEMANTIC_RMSE` sets the
+independent parity gate.
+The golden test script enforces zero same-Vello semantic RMSE for the minimal
+page and wire fixtures, so exact primitives cannot silently regress while
+broader schematic coverage is being completed.
+
+On Linux, both modes select native Wayland or X11 from the desktop session. The
+compatibility mode disables WebKitGTK's failure-prone DMA-BUF renderer by default;
+an explicit `WEBKIT_DISABLE_DMABUF_RENDERER` value is respected.
 
 ## Requirements
 

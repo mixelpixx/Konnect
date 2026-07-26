@@ -12,9 +12,12 @@ cargo check                          # verify everything compiles (~15s)
 cargo test --workspace --lib --tests # all tests
 cargo build --release -p konnect # build the MCP server binary
 
-# Build the schematic viewer (separate crate)
+# Build the default KiCad SVG/WebView viewer (separate crate)
 cd crates/schematic-viewer
 cargo build --release
+
+# Or build the direct Vello renderer without Tauri/WebKit
+cargo build --release --no-default-features --features renderer-vello
 ```
 
 Schematic-viewer build notes (Windows):
@@ -23,6 +26,14 @@ Schematic-viewer build notes (Windows):
   `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`
 - Close any running viewer window before rebuilding — Windows locks a running
   `.exe`, so the link step fails while the app is open.
+
+Schematic-viewer build notes (Linux):
+
+- The default renderer needs GTK3, WebKitGTK 4.1, and librsvg development
+  packages; see [docs/LINUX.md](docs/LINUX.md). The `renderer-vello` build does
+  not link GTK or WebKitGTK.
+- The viewer is intentionally built outside the root workspace, so run both its
+  tests and release build explicitly.
 
 ## Architecture
 
@@ -88,11 +99,13 @@ Konnect/
 │   │       ├── builders.rs           # Protobuf message construction helpers (mm→nm conversion)
 │   │       └── types.rs              # Public types (IpcFootprint, IpcTrack, etc.)
 │   │
-│   └── schematic-viewer/            # Tauri desktop app (separate from workspace)
+│   └── schematic-viewer/            # Feature-gated desktop viewer (separate from workspace)
 │       ├── tauri.conf.json
 │       ├── capabilities/default.json # Tauri 2 ACL grant (core:default) — without it event.listen() is silently denied
-│       ├── src/main.rs               # Multi-sheet watcher + snapshot-isolated incremental kicad-cli SVG rendering + Tauri commands, 20 unit tests
-│       └── frontend/index.html       # Pan/zoom SVG viewer, sheet selector, auto-refresh
+│       ├── src/webview.rs            # Snapshot-isolated incremental kicad-cli SVG rendering + Tauri commands
+│       ├── src/native_scene.rs       # Backend-neutral semantic schematic scene and targeted edits
+│       ├── src/vello_app.rs          # Native winit/Vello renderer, watcher, filmstrip, interaction
+│       └── frontend/index.html       # Compatibility-mode pan/zoom SVG viewer and filmstrip
 │
 ├── plugin/                           # Python thin launcher (runs inside KiCAD)
 │   ├── __init__.py                   # pcbnew.ActionPlugin — settings dialog (PCB Editor only)
@@ -120,7 +133,10 @@ Konnect/
 - Direct read/write of `.kicad_sch` files
 - Symbol definitions auto-embedded from KiCAD 10's `.kicad_symdir` format
 - Power symbols (VCC, GND) embedded from `power.kicad_symdir`
-- All edits use `write_atomic` (write to .tmp → fsync → rename)
+- All existing-file edits read under a shared document lock and commit through
+  `write_atomic_if_unchanged` (exclusive sibling lock → exact revision check →
+  unique temporary file → fsync → atomic replace). Concurrent stale edits return
+  a conflict instead of silently overwriting a newer viewer or Konnect revision.
 
 ### kicad-cli v10 (Subprocess)
 - Verified commands: `sch erc`, `sch export svg/pdf/bom/netlist`, `pcb drc`, `pcb export gerbers/drill/pdf/svg/step/vrml/pos/ipcd356`, `pcb render`
@@ -211,9 +227,12 @@ The router is defined in `crates/konnect-core/src/router/mod.rs`.
 - For schematic-viewer (built separately from the workspace — see Quick Start):
   - Rust toolchain on PATH (Windows: `set PATH=%PATH%;%USERPROFILE%\.cargo\bin` if `cargo`
     isn't recognized in the shell)
-  - Tauri 2 prerequisites: WebView2 runtime on Windows (usually pre-installed on Win 10/11)
-  - At runtime it discovers `kicad-cli` from the standard KiCAD install paths, then PATH;
-    override with `--kicad-cli <path>`
+  - Default `renderer-kicad-cli`: Tauri 2 prerequisites and WebView2 on Windows
+    (usually pre-installed on Win 10/11). At runtime it discovers `kicad-cli`
+    from standard KiCad install paths, then PATH; override with
+    `--kicad-cli <path>`.
+  - Optional `renderer-vello`: no Tauri, browser engine, or KiCad CLI at runtime;
+    it needs a graphics backend supported by wgpu.
   - Rebuilds fail while a viewer window is open (Windows locks the running `.exe`) — close
     the app before `cargo build`
 
@@ -229,14 +248,60 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `konnect-schematic-editor` tests | Typed schematic model + round-tripping |
 
 `schematic-viewer` is **excluded from the workspace** (`Cargo.toml`'s `[workspace] exclude`) since
-it's a Tauri app built separately — `cargo test --workspace` never touches it, and neither does
-CI (`.github/workflows/ci.yml` runs everything with `--workspace`). Run its tests explicitly:
-`cd crates/schematic-viewer && cargo test`. Its 20 unit tests cover the pure sheet-tree-walking,
+it's a Tauri app built separately — `cargo test --workspace` never touches it. Run its tests explicitly:
+`cd crates/schematic-viewer && cargo test`. The default-mode tests cover sheet-tree-walking,
 watch-directory, render-snapshot, event-debounce, and incremental-render-selection logic
 (`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`, `drain_until_quiet`,
 `files_needing_render`, `render_all`'s error handling) — the actual `kicad-cli` subprocess call
 and Tauri command/event plumbing stay thin and untested, matching this codebase's existing
-convention for other `kicad-cli`-calling code.
+convention for other `kicad-cli`-calling code. CI tests compatibility mode on
+Windows and the native Vello mode on Ubuntu; release packaging continues to build
+the platform compatibility binary.
+
+Run the native renderer tests separately:
+
+```bash
+cd crates/schematic-viewer
+cargo test --no-default-features --features renderer-vello
+```
+
+They cover semantic parsing, stable UUID hit-testing, targeted symbol edits, geometry
+conversion, KiCad Newstroke metrics, and headless rendering. Revision-checked
+concurrent-write tests live in `konnect-sexp` and run with the workspace suite.
+
+Use `scripts/compare-schematic-renderers.sh <sheet.kicad_sch> [diff.png]` to export
+the KiCad SVG reference, rasterize it at the native renderer's golden resolution,
+render Vello headlessly, and report normalized RMSE. Set
+`KONNECT_MAX_RENDER_RMSE` to guard the cross-rasterizer visual metric. Do not
+interpret zero as the semantic parity requirement because librsvg and Vello use
+different antialiasing coverage.
+
+Use `scripts/compare-schematic-project.sh <project-directory>` to apply the
+same gate to every top-level sheet. Reference dimensions follow each sheet's
+paper size, and headless rendering uses the live viewer's Vello area-AA mode.
+
+Set `KONNECT_VELLO_SVG_ORACLE=1` to additionally render the KiCad SVG through
+the feature-gated `golden-svg-reference` backend. This reports a same-Vello
+semantic RMSE; set `KONNECT_MAX_SEMANTIC_RMSE` to gate it independently. The
+SVG integration is excluded from production renderer features. The comparison
+script also supplies the just-exported SVG as `KONNECT_SVG_ORDER_ORACLE`, avoiding
+false ordering failures from KiCad/libstdc++ comparator-equivalent symbols.
+Headless comparisons use Vello's deterministic CPU path to avoid a possible
+one-channel, one-pixel GPU race at primitive overlaps. Use
+`KONNECT_MAX_SEMANTIC_RMSE=0` for the strict pixel-identical semantic gate.
+
+## CI and release gates
+
+- `.github/workflows/ci.yml` checks the workspace on Linux, Windows, and macOS,
+  tests the compatibility viewer on Windows, and tests, lints, formats, and
+  documents the native Vello renderer on Ubuntu.
+- `.github/workflows/e2e-kicad.yml` runs on pull requests, weekly, release tags,
+  and manual dispatch. It installs KiCad 10, its standard libraries, and demos on
+  Ubuntu, then runs the real CLI design loop, 115-file demo conformance,
+  Unix-socket IPC transport regressions, and live PCB Editor IPC tests under Xvfb.
+- `.github/workflows/release.yml` builds the Linux server and viewer on Debian 12,
+  validates the Linux PCM package, and gates the ELF binaries with
+  `packaging/check-linux-compat.sh`.
 
 ## Adding a New Tool
 
