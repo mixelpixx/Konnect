@@ -6,7 +6,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::library::resolve_footprint_path;
+use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{
@@ -46,9 +46,11 @@ fn board_footprint_sexp(
     })?;
 
     // Board footprints carry the full library id, not the bare footprint name.
+    // The declared name is the span without its surrounding quotes.
+    let declared = &content[name_span.start + 1..name_span.end - 1];
     let mut out = String::with_capacity(content.len() + 128);
     out.push_str(&content[..name_span.start]);
-    out.push_str(&escape_sexp_string(lib_id));
+    out.push_str(&escape_sexp_string(&board_lib_id(lib_id, &path, declared)));
     out.push_str(&format!(
         "\n\t(at {x} {y} {rotation})\n\t(uuid \"{}\")",
         new_uuid()
@@ -66,6 +68,68 @@ fn board_footprint_sexp(
     }
 
     Ok(out)
+}
+
+/// The name a board entry should carry for a footprint read from `path`.
+///
+/// `resolve_footprint_path` also accepts a bare filesystem path, which is
+/// convenient for a caller holding a `.kicad_mod` directly. That path must not
+/// reach the board file: `(footprint "C:\…\R_0805_2012Metric.kicad_mod")` is
+/// not a library identifier, and KiCad reports the placed part as a broken
+/// library link. This function is therefore total — every branch returns
+/// something that is not a path.
+///
+/// Preference order, most authoritative first:
+///
+/// 1. The caller already gave a `Library:Footprint` id — use it verbatim.
+/// 2. The fp-lib-table maps a nickname to the containing directory. Only the
+///    table can answer this: KiCad lets any nickname point at any path, so
+///    `MyParts` may well live in `vendor.pretty`, and guessing from the
+///    directory would silently mislink the part.
+/// 3. The conventional `<nickname>.pretty/` layout. The library is not
+///    registered, so the link will be broken either way, but this is the
+///    nickname the user gets when they do register it.
+/// 4. Neither — fall back to a bare footprint name, which links to nothing but
+///    is at least a valid name. The library file's own is used when it is not
+///    itself path-like; otherwise the file stem, which cannot contain a
+///    separator.
+fn board_lib_id(reference: &str, path: &std::path::Path, declared: &str) -> String {
+    if is_lib_id(reference) {
+        return reference.to_string();
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    if let Some(dir) = path.parent() {
+        if let Some(nick) = footprint_lib_nickname_for_dir(dir) {
+            return format!("{nick}:{stem}");
+        }
+        if let Some(nick) = pretty_dir_nickname(dir) {
+            return format!("{nick}:{stem}");
+        }
+    }
+
+    if declared.is_empty() || declared.contains('/') || declared.contains('\\') {
+        stem
+    } else {
+        declared.to_string()
+    }
+}
+
+/// The nickname a conventional `<nickname>.pretty` directory implies.
+///
+/// Matched case-insensitively: KiCad's own libraries are lowercase `.pretty`,
+/// but Windows and macOS filesystems are case-insensitive, so a `.Pretty` on
+/// disk is the same directory to KiCad and should not change the answer.
+fn pretty_dir_nickname(dir: &std::path::Path) -> Option<String> {
+    let name = dir.file_name()?.to_string_lossy().into_owned();
+    let cut = name.len().checked_sub(".pretty".len())?;
+    name[cut..]
+        .eq_ignore_ascii_case(".pretty")
+        .then(|| name[..cut].to_string())
+        .filter(|nick| !nick.is_empty())
 }
 
 /// Fold the footprint's placement rotation into its pads and text items.
@@ -509,11 +573,7 @@ async fn handle_place_component(
         .err()
         .is_some_and(|e| e.contains("created no footprint"));
 
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let block = format!("\n{}", indent_block(sexp.trim_end(), "\t"));
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, block)]);
-    write_atomic(&board_path, &new_content)?;
+    insert_into_board(&board_path, std::slice::from_ref(&sexp))?;
 
     let mut out = json!({
         "placed": reference.unwrap_or_default(),
@@ -530,6 +590,69 @@ async fn handle_place_component(
         );
     }
     Ok(CallToolResult::json(&out))
+}
+
+/// Insert `blocks` just inside the board's closing paren and write it back,
+/// refusing to write anything that is not one complete `(kicad_pcb …)` form.
+///
+/// The insert point is `rfind(')')`, which is only the right place if the file
+/// really is a single closed form. Checking the result before committing it
+/// means a board that was already truncated — or a footprint block that was —
+/// fails loudly instead of being written back over the user's file in a state
+/// KiCad can no longer open.
+///
+/// Like the rest of `konnect-sexp`, this treats parens as syntax everywhere: a
+/// `#`-commented paren would be miscounted. KiCad does not write comments into
+/// `.kicad_pcb`, and no reader in this workspace understands them either, so
+/// the assumption is at least consistent.
+fn insert_into_board(board_path: &std::path::Path, blocks: &[String]) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(board_path)?;
+    let close_pos = content.rfind(')').unwrap_or(content.len());
+    let joined: String = blocks
+        .iter()
+        .map(|b| format!("\n{}", indent_block(b.trim_end(), "\t")))
+        .collect();
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, joined)]);
+
+    if let Err(why) = check_single_board_form(&new_content) {
+        anyhow::bail!(
+            "Refusing to write {}: {}. The board file was left untouched.",
+            board_path.display(),
+            why
+        );
+    }
+
+    write_atomic(board_path, &new_content)?;
+    Ok(())
+}
+
+/// Verify `content` is exactly one `(kicad_pcb …)` form and nothing else.
+///
+/// Checking only that *a* balanced block exists is too weak to back the promise
+/// above: `find_balanced_block` skips whatever precedes the first paren, so
+/// leading garbage would pass, as would a well-formed form that is not a board
+/// at all.
+fn check_single_board_form(content: &str) -> Result<(), String> {
+    let trimmed = content.trim();
+    let (start, end) = find_balanced_block(trimmed, 0)
+        .ok_or_else(|| "the result is not a balanced S-expression".to_string())?;
+
+    if start != 0 {
+        return Err(format!(
+            "{} bytes of content precede the opening paren",
+            start
+        ));
+    }
+    if end != trimmed.len() {
+        return Err(format!(
+            "{} bytes of content follow the closing paren",
+            trimmed.len() - end
+        ));
+    }
+    if !trimmed[1..].trim_start().starts_with("kicad_pcb") {
+        return Err("the root expression is not (kicad_pcb …)".to_string());
+    }
+    Ok(())
 }
 
 /// Prefix every non-empty line with `indent`.
@@ -829,14 +952,7 @@ async fn handle_place_array(
         .err()
         .is_some_and(|e| e.contains("created no footprint"));
 
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let joined: String = blocks
-        .iter()
-        .map(|b| format!("\n{}", indent_block(b.trim_end(), "\t")))
-        .collect();
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, joined)]);
-    write_atomic(&board_path, &new_content)?;
+    insert_into_board(&board_path, &blocks)?;
 
     let mut out = json!({
         "placed_count": placed.len(), "components": placed, "source": "file"
@@ -978,6 +1094,7 @@ async fn handle_get_board_2d_view(
 #[cfg(test)]
 mod footprint_sexp_tests {
     use super::*;
+    use std::path::Path;
 
     /// A library footprint in the exact shape KiCad ships: TAB-indented, name
     /// without a library prefix, `REF**` placeholder, no `(at …)`.
@@ -1031,8 +1148,16 @@ mod footprint_sexp_tests {
 ";
 
     /// Write a library footprint and an empty board into `dir`.
+    /// A `.pretty` library holding one footprint, plus an empty board.
+    ///
+    /// The footprint lives in `Resistor_SMD.pretty/` the way KiCad lays
+    /// libraries out, so passing its path exercises the same nickname
+    /// derivation a real `Resistor_SMD:R_0805_2012Metric` id would produce —
+    /// while still skipping the fp-lib-table, which keeps these tests hermetic.
     fn fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        let modfile = dir.join("R_0805_2012Metric.kicad_mod");
+        let pretty = dir.join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let modfile = pretty.join("R_0805_2012Metric.kicad_mod");
         std::fs::write(&modfile, library_footprint()).unwrap();
         let board = dir.join("b.kicad_pcb");
         std::fs::write(&board, EMPTY_BOARD).unwrap();
@@ -1080,11 +1205,139 @@ mod footprint_sexp_tests {
         );
         assert!(out.contains("(size 1.025 1.4)"), "pad geometry missing");
         assert!(out.contains("(uuid \""), "board items need a uuid");
+        // The board must name a library, not the file it was read from.
+        assert!(
+            out.contains("(footprint \"Resistor_SMD:R_0805_2012Metric\""),
+            "board should carry a Library:Footprint id:
+{out}"
+        );
+        assert!(
+            !out.contains(".kicad_mod"),
+            "a filesystem path leaked into the board:
+{out}"
+        );
         assert_eq!(
             count_parens(&out),
             0,
             "board is no longer balanced:
 {out}"
+        );
+    }
+
+    /// `board_lib_id` for a path, with the library file's declared name.
+    fn id_for(path: &str, declared: &str) -> String {
+        board_lib_id(path, Path::new(path), declared)
+    }
+
+    #[test]
+    fn board_lib_id_never_yields_a_filesystem_path() {
+        // A Library:Footprint id is already what the board wants.
+        assert_eq!(
+            board_lib_id("Resistor_SMD:R_0805", Path::new("/ignored"), "R_0805"),
+            "Resistor_SMD:R_0805"
+        );
+        // A path in a .pretty library takes the nickname from its directory.
+        assert_eq!(
+            id_for(
+                "/usr/share/kicad/footprints/Resistor_SMD.pretty/R_0805.kicad_mod",
+                "R_0805"
+            ),
+            "Resistor_SMD:R_0805"
+        );
+        // Loose file: no nickname to recover, so it keeps the name the library
+        // file declares — unlinked, but a valid name rather than a path.
+        assert_eq!(
+            id_for("/tmp/scratch/R_0805.kicad_mod", "R_0805_2012Metric"),
+            "R_0805_2012Metric"
+        );
+    }
+
+    #[test]
+    fn a_path_like_declared_name_falls_back_to_the_file_stem() {
+        // A malformed library file naming itself with a path must not smuggle
+        // that path into the board through the fallback branch.
+        assert_eq!(
+            id_for("/tmp/scratch/R_0805.kicad_mod", "/tmp/other/R.kicad_mod"),
+            "R_0805"
+        );
+        assert_eq!(
+            id_for("/tmp/scratch/R_0805.kicad_mod", r"C:\x\R.kicad_mod"),
+            "R_0805"
+        );
+        // An empty declared name is no better than a path.
+        assert_eq!(id_for("/tmp/scratch/R_0805.kicad_mod", ""), "R_0805");
+    }
+
+    #[test]
+    fn windows_paths_are_not_mistaken_for_library_ids() {
+        // The drive letter's colon is why is_lib_id cannot just look for one.
+        assert_eq!(
+            id_for(
+                r"C:\KiCad\footprints\Resistor_SMD.pretty\R_0805.kicad_mod",
+                "R_0805"
+            ),
+            "Resistor_SMD:R_0805"
+        );
+    }
+
+    #[test]
+    fn pretty_suffix_matching_ignores_case() {
+        // Windows and macOS filesystems are case-insensitive, so Foo.Pretty and
+        // Foo.pretty are the same directory to KiCad.
+        assert_eq!(
+            pretty_dir_nickname(Path::new("/libs/Resistor_SMD.Pretty")),
+            Some("Resistor_SMD".into())
+        );
+        assert_eq!(
+            pretty_dir_nickname(Path::new("/libs/Resistor_SMD.pretty")),
+            Some("Resistor_SMD".into())
+        );
+        // A bare ".pretty" leaves no nickname behind.
+        assert_eq!(pretty_dir_nickname(Path::new("/libs/.pretty")), None);
+        assert_eq!(pretty_dir_nickname(Path::new("/libs/plain")), None);
+    }
+
+    #[test]
+    fn a_board_edit_must_stay_one_kicad_pcb_form() {
+        assert!(check_single_board_form("(kicad_pcb (version 20241229))").is_ok());
+        assert!(check_single_board_form("\n  (kicad_pcb (version 1))\n\n").is_ok());
+
+        // Truncated — the bug this guard exists for.
+        assert!(check_single_board_form("(kicad_pcb (version 1)").is_err());
+        // Leading garbage would otherwise be skipped by find_balanced_block.
+        assert!(check_single_board_form("garbage(kicad_pcb (version 1))").is_err());
+        // A second form after the root is not one board.
+        assert!(check_single_board_form("(kicad_pcb (version 1))(extra)").is_err());
+        // Well-formed, but not a board.
+        assert!(check_single_board_form("(not_a_board (version 1))").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_truncated_board_is_refused_rather_than_rewritten() {
+        // rfind(')') picks the insert point, so a board that is not one closed
+        // (kicad_pcb …) form would silently gain a footprint outside the root
+        // expression. Nothing should be written in that case.
+        let tmp = tempfile::tempdir().unwrap();
+        let (modfile, board) = fixture(tmp.path());
+        let truncated = "(kicad_pcb (version 20241229) (generator \"test\")";
+        std::fs::write(&board, truncated).unwrap();
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": modfile.to_string_lossy(),
+            "reference": "R1", "x": 1.0, "y": 2.0,
+        });
+        let err = handle_place_component(&args, &test_ctx())
+            .await
+            .expect_err("a malformed board must not be written back");
+        assert!(
+            err.to_string().contains("balanced"),
+            "error should explain why: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            truncated,
+            "board must be left exactly as it was"
         );
     }
 

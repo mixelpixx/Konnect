@@ -1002,6 +1002,31 @@ pub(crate) fn is_lib_id(reference: &str) -> bool {
     !(nick.len() == 1 && nick.as_bytes()[0].is_ascii_alphabetic())
 }
 
+/// The nickname the fp-lib-table gives to the library living in `dir`, if any.
+///
+/// This is the inverse of `resolve_footprint_path` and exists because a
+/// nickname is *not* derivable from the directory name: KiCad lets a table map
+/// any nickname to any path, so `MyParts` may well point at `vendor.pretty`,
+/// and two nicknames may share one directory. Only the table can answer it.
+///
+/// Paths are compared canonicalised so a symlinked or non-normalised entry
+/// still matches, falling back to a literal comparison when canonicalisation
+/// fails (a directory that no longer exists, say).
+pub(crate) fn footprint_lib_nickname_for_dir(dir: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(dir).ok();
+    let same = |candidate: &Path| -> bool {
+        match (&canonical, std::fs::canonicalize(candidate).ok()) {
+            (Some(a), Some(b)) => a == &b,
+            _ => candidate == dir,
+        }
+    };
+
+    read_flat_lib_table(&global_fp_lib_table())
+        .into_iter()
+        .find(|lib| lib["path"].as_str().is_some_and(|p| same(Path::new(p))))
+        .and_then(|lib| lib["nickname"].as_str().map(str::to_string))
+}
+
 /// Resolve a footprint reference to an on-disk `.kicad_mod` path.
 ///
 /// Accepts either a direct filesystem path or KiCad's `Library:Footprint`
