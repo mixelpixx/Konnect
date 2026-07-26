@@ -291,7 +291,8 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" }
+                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
+                    "project": { "type": "string", "description": "Path to .kicad_pro, so project-registered libraries resolve too (optional)" }
                 },
                 "required": ["footprint_path"]
             }),
@@ -1030,9 +1031,21 @@ pub(crate) fn footprint_lib_nickname_for_dir(dir: &Path) -> Option<String> {
 /// Resolve a footprint reference to an on-disk `.kicad_mod` path.
 ///
 /// Accepts either a direct filesystem path or KiCad's `Library:Footprint`
-/// form, which is looked up in the global fp-lib-table. Returns a
-/// human-readable message on failure so callers can surface it verbatim.
-pub(crate) fn resolve_footprint_path(reference: &str) -> Result<PathBuf, String> {
+/// form. Returns a human-readable message on failure so callers can surface it
+/// verbatim.
+///
+/// A lib id is looked up in `project_dir`'s fp-lib-table first, then the global
+/// one. Project-first matches KiCad, where a project entry shadows a global one
+/// of the same nickname, and it is the only order that makes
+/// `register_footprint_library` useful — it writes to the project table by
+/// default, so a global-only lookup cannot see anything it registers.
+///
+/// (`resolve_symbol_lib_path` still searches global-first for symbols; that
+/// asymmetry is pre-existing and noted on that function.)
+pub(crate) fn resolve_footprint_path(
+    reference: &str,
+    project_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
     if !is_lib_id(reference) {
         // Check here rather than leaving it to the caller's read: an unchecked
         // path reaches the reader as a bare io::Error, which surfaces as
@@ -1050,15 +1063,25 @@ pub(crate) fn resolve_footprint_path(reference: &str) -> Result<PathBuf, String>
     }
 
     let (nick, fp_name) = reference.split_once(':').expect("checked above");
-    let table = global_fp_lib_table();
-    if !table.exists() {
+
+    let global = global_fp_lib_table();
+    let project = project_dir.map(|d| d.join("fp-lib-table"));
+    if !global.exists() && project.as_ref().is_none_or(|p| !p.exists()) {
         return Err(format!(
-            "Global fp-lib-table not found at {}",
-            table.display()
+            "No fp-lib-table found (looked for {}{})",
+            global.display(),
+            project
+                .map(|p| format!(" and {}", p.display()))
+                .unwrap_or_default()
         ));
     }
 
-    let libs = read_flat_lib_table(&table);
+    let mut libs = Vec::new();
+    if let Some(project) = &project {
+        libs.extend(read_flat_lib_table(project));
+    }
+    libs.extend(read_flat_lib_table(&global));
+
     let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) else {
         let known: Vec<&str> = libs
             .iter()
@@ -1865,8 +1888,13 @@ async fn handle_get_footprint_info(
     let fp_path_str =
         require_str(args, "footprint_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    // Resolve "Library:Footprint" form via global fp-lib-table
-    let path = match resolve_footprint_path(fp_path_str) {
+    // Resolve "Library:Footprint" against the project's fp-lib-table as well as
+    // the global one, when the caller says which project they mean.
+    let project_dir = args["project"]
+        .as_str()
+        .map(PathBuf::from)
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let path = match resolve_footprint_path(fp_path_str, project_dir.as_deref()) {
         Ok(p) => p,
         Err(msg) => return Ok(CallToolResult::error(msg)),
     };
@@ -2311,6 +2339,32 @@ mod tests {
         assert!(!is_lib_id("R_0402.kicad_mod"));
     }
 
+    #[tokio::test]
+    async fn a_project_registered_library_resolves() {
+        // register_footprint_library writes to the project fp-lib-table by
+        // default, so a global-only lookup could not see anything it
+        // registered — the default workflow resolved to "library not found".
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("MyProjLib.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join("Foo.kicad_mod"), "(footprint \"Foo\")").unwrap();
+        std::fs::write(
+            tmp.path().join("fp-lib-table"),
+            kicad_style_table(
+                "fp_lib_table",
+                &[("MyProjLib", "KiCad", &pretty.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_footprint_path("MyProjLib:Foo", Some(tmp.path())).unwrap(),
+            pretty.join("Foo.kicad_mod")
+        );
+        // Without the project dir it is invisible, which is the bug.
+        assert!(resolve_footprint_path("MyProjLib:Foo", None).is_err());
+    }
+
     #[test]
     fn a_windows_drive_relative_path_is_not_a_library_id() {
         // `C:R.kicad_mod` means R.kicad_mod in drive C's current directory. It
@@ -2374,7 +2428,7 @@ mod tests {
         // point of the test.
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope.kicad_mod");
-        let err = resolve_footprint_path(&missing.to_string_lossy())
+        let err = resolve_footprint_path(&missing.to_string_lossy(), None)
             .expect_err("a nonexistent path must not resolve");
         assert!(err.contains("nope.kicad_mod"), "must name the file: {err}");
         assert!(
@@ -2388,7 +2442,7 @@ mod tests {
         // is_file, not exists — a .pretty directory would otherwise resolve and
         // fail confusingly at read time.
         let tmp = tempfile::tempdir().unwrap();
-        assert!(resolve_footprint_path(&tmp.path().to_string_lossy()).is_err());
+        assert!(resolve_footprint_path(&tmp.path().to_string_lossy(), None).is_err());
     }
 
     #[test]
@@ -2397,7 +2451,7 @@ mod tests {
         let file = tmp.path().join("R_0805.kicad_mod");
         std::fs::write(&file, "(footprint \"R_0805\")").unwrap();
         assert_eq!(
-            resolve_footprint_path(&file.to_string_lossy()).unwrap(),
+            resolve_footprint_path(&file.to_string_lossy(), None).unwrap(),
             file
         );
     }

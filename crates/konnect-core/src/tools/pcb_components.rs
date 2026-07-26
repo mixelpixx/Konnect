@@ -33,8 +33,9 @@ fn board_footprint_sexp(
     rotation: f64,
     layer: &str,
     reference: Option<&str>,
+    project_dir: Option<&std::path::Path>,
 ) -> Result<String, String> {
-    let path = resolve_footprint_path(lib_id)?;
+    let path = resolve_footprint_path(lib_id, project_dir)?;
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read footprint {}: {}", path.display(), e))?;
 
@@ -538,8 +539,17 @@ async fn handle_place_component(
     let reference = args["reference"].as_str().map(str::to_string);
 
     let board_path = get_path(args, "board")?;
-    let sexp = match board_footprint_sexp(&footprint, x, y, rotation, &layer, reference.as_deref())
-    {
+    // The board's own directory is the project, so a library registered with
+    // register_footprint_library's default project scope resolves here.
+    let sexp = match board_footprint_sexp(
+        &footprint,
+        x,
+        y,
+        rotation,
+        &layer,
+        reference.as_deref(),
+        board_path.parent(),
+    ) {
         Ok(s) => s,
         Err(msg) => return Ok(CallToolResult::error(msg)),
     };
@@ -933,7 +943,15 @@ async fn handle_place_array(
             let x = start_x + col as f64 * spacing_x;
             let y = start_y + row as f64 * spacing_y;
             let reference = format!("{prefix}{n}");
-            match board_footprint_sexp(&footprint, x, y, 0.0, "F.Cu", Some(&reference)) {
+            match board_footprint_sexp(
+                &footprint,
+                x,
+                y,
+                0.0,
+                "F.Cu",
+                Some(&reference),
+                board_path.parent(),
+            ) {
                 Ok(s) => blocks.push(s),
                 Err(msg) => return Ok(CallToolResult::error(msg)),
             }
@@ -1048,6 +1066,7 @@ async fn handle_duplicate_component(
             .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", ref_ipc))
     });
 
+    let board_path = get_path(args, "board")?;
     let sexp = match board_footprint_sexp(
         &src.footprint,
         x,
@@ -1055,6 +1074,7 @@ async fn handle_duplicate_component(
         src.rotation,
         &src.layer,
         Some(&new_reference),
+        board_path.parent(),
     ) {
         Ok(s) => s,
         Err(msg) => return Ok(CallToolResult::error(msg)),
