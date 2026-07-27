@@ -34,7 +34,7 @@ tokio-stream = "0.1"
 axum = { version = "0.7", features = ["macros"] }
 
 # S-expression parsing
-nom = "7"
+nom = "8"
 
 # NNG for KiCAD 10 IPC (nanomsg-next-gen, replaces ZeroMQ)
 nng = "1"
