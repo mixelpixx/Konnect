@@ -118,6 +118,25 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_schematic_component(args, ctx).await }
         ),
         tool!(
+            "prune_unused_lib_symbols",
+            "Remove cached lib_symbols definitions no placed instance references. \
+             Orphans accumulate whenever a symbol is renamed or swapped — eeschema \
+             never prunes them and kicad-cli preserves them verbatim. Netlist-neutral.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Report what would be removed without writing."
+                    }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_prune_unused_lib_symbols(args, ctx).await }
+        ),
+        tool!(
             "edit_schematic_component",
             "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component.",
             json!({
@@ -1416,6 +1435,89 @@ async fn handle_delete_schematic_component(
         "junctions_pruned_uuids": outcome.pruned_junctions
     })))
 }
+
+/// Remove `lib_symbols` definitions that no placed instance references.
+///
+/// A schematic embeds a copy of every symbol it uses. Rename a library symbol,
+/// swap a component to a different lib_id, or delete the last instance of one,
+/// and the old cached definition is left behind: eeschema does not prune on
+/// save and `kicad-cli sch upgrade` preserves the section verbatim, so nothing
+/// in the toolchain removes them. They are inert — invisible to the netlist,
+/// BOM and PCB — but they accumulate, and a stale definition sharing a name
+/// with a live one is a genuine trap when reading the raw file.
+///
+/// Edits are surgical byte deletions rather than a parse/serialise round-trip,
+/// so the rest of the file keeps its formatting exactly.
+async fn handle_prune_unused_lib_symbols(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let dry_run = args
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
+
+    // lib_ids actually placed on the sheet.
+    let (_, tree) = read_schematic(&sch_path)?;
+    let used: std::collections::HashSet<String> = extract_symbol_instances(&tree)
+        .iter()
+        .map(|s| s.lib_id.clone())
+        .collect();
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut edits: Vec<SexpEdit> = Vec::new();
+
+    for (start, _end) in konnect_sexp::writer::find_direct_child_blocks(&content, "lib_symbols") {
+        // Each child is (symbol "Lib:Name" ...); anything else is left alone.
+        let head = &content[start..content.len().min(start + 256)];
+        if !head.starts_with("(symbol") {
+            continue;
+        }
+        let Some(name) = head
+            .find('"')
+            .and_then(|q| head[q + 1..].find('"').map(|e| &head[q + 1..q + 1 + e]))
+        else {
+            continue;
+        };
+        // Unit sub-symbols ("Name_0_1") are nested inside their parent, never
+        // direct children here, so a bare name means a top-level definition.
+        if used.contains(name) {
+            continue;
+        }
+        let Some((del_start, del_end)) =
+            konnect_sexp::writer::find_block_with_leading_whitespace(&content, start)
+        else {
+            continue;
+        };
+        removed.push(name.to_string());
+        edits.push(SexpEdit::delete(del_start, del_end));
+    }
+
+    if removed.is_empty() {
+        return Ok(CallToolResult::json(&json!({
+            "schematic": sch_path.display().to_string(),
+            "removed": [],
+            "note": "no orphaned lib_symbols definitions"
+        })));
+    }
+
+    if !dry_run {
+        let updated = apply_edits(content, edits);
+        write_atomic_if_unchanged(&sch_path, &expected, &updated)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "schematic": sch_path.display().to_string(),
+        "removed": removed,
+        "count": removed.len(),
+        "dry_run": dry_run,
+    })))
+}
+
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedSchematicItem {
@@ -4970,6 +5072,78 @@ mod tests {
             detail.contains("pin 2") && detail.contains("removed"),
             "{detail}"
         );
+    }
+
+    /// Renaming or swapping a symbol leaves its old cached definition behind:
+    /// eeschema does not prune on save and kicad-cli preserves the section
+    /// verbatim, so nothing in the toolchain removes them.
+    #[tokio::test]
+    async fn prune_removes_only_unreferenced_definitions() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(),
+                     "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Forge an orphan alongside the live definition, mimicking a rename.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        let anchor = text.find("(lib_symbols").expect("lib_symbols") + "(lib_symbols".len();
+        text.insert_str(
+            anchor,
+            "\n\t\t(symbol \"Device:R_OLD\"\n\t\t\t(property \"Reference\" \"R\")\n\t\t)",
+        );
+        std::fs::write(&path, &text).unwrap();
+
+        // dry_run must report without touching the file.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let res = handle_prune_unused_lib_symbols(
+            &json!({ "schematic": path.display().to_string(), "dry_run": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error);
+        assert!(format!("{res:?}").contains("Device:R_OLD"), "{res:?}");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(&path).unwrap(),
+            "dry_run wrote"
+        );
+
+        // Real run removes the orphan and keeps the one in use.
+        handle_prune_unused_lib_symbols(&json!({ "schematic": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("Device:R_OLD"), "orphan survived:\n{after}");
+        assert!(
+            after.contains(r#"(symbol "Device:R""#),
+            "live definition removed:\n{after}"
+        );
+
+        // The placed instance is untouched and still resolves.
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert_eq!(sch.symbols.iter().count(), 1);
+        assert_eq!(sch.symbols.iter().next().unwrap().lib_id, "Device:R");
+
+        // Idempotent.
+        let again = handle_prune_unused_lib_symbols(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(format!("{again:?}").contains("no orphaned"), "{again:?}");
     }
 }
 
