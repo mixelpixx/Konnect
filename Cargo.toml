@@ -67,7 +67,7 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.23"
 
 # Platform directories (home dir, config dir)
-dirs = "5"
+dirs = "6"
 
 # SVG parsing (import_svg_logo)
 usvg = "0.47"
