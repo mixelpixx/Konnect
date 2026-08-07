@@ -244,10 +244,18 @@ The router is defined in `crates/konnect-core/src/router/mod.rs`.
   version IS the MSRV: bump it deliberately, in its own commit, after running the full
   local gate on the new version.
 - `protoc` binary (for protobuf code generation in konnect-ipc crate)
-  - Set `PROTOC` environment variable, or leave it unset and `konnect-ipc/build.rs`
-    falls back to `protoc` found on PATH
-  - Well-known-type includes are derived from `<PROTOC>/../../include` (i.e. a standard
-    protoc release layout with `bin/protoc` next to `include/`) when that directory exists
+  - Set `PROTOC` to the binary, or leave it unset and `konnect-ipc/build.rs` resolves
+    `protoc` from PATH
+  - Well-known-type includes (`google/protobuf/any.proto`) are derived from
+    `<protoc>/../../include` after the binary is resolved to an absolute path. This
+    covers both the upstream release layout (`bin/protoc` beside `include/`) and system
+    packages (`/usr/bin/protoc` → `/usr/include`). Set `PROTOC_INCLUDE` to override when
+    the binary and its protos live in unrelated prefixes — notably Chocolatey and scoop,
+    whose shared shim directory is not the package prefix.
+  - Some distributions ship the well-known `.proto` files separately from the compiler.
+    Debian/Ubuntu need `protobuf-compiler` **and** `libprotobuf-dev`; Fedora needs
+    `protobuf-compiler` and `protobuf-devel`. Missing them fails the build with
+    `google/protobuf/any.proto: File not found`.
   - Download: https://github.com/protocolbuffers/protobuf/releases
 - For schematic-viewer (built separately from the workspace — see Quick Start):
   - Rust toolchain on PATH (Windows: `set PATH=%PATH%;%USERPROFILE%\.cargo\bin` if `cargo`

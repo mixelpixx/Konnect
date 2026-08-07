@@ -16,8 +16,12 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
 ## Development setup
 
 ```bash
-# protoc is required for protobuf code generation (kicad-ipc crate)
-# Windows: choco install protoc   /   macOS: brew install protobuf   /   Linux: apt install protobuf-compiler
+# protoc is required for protobuf code generation (konnect-ipc crate). The build also
+# needs protobuf's well-known .proto files, which some distributions package separately.
+# Windows: choco install protoc   (shim installs may also need PROTOC_INCLUDE — see DEV.md)
+# macOS:   brew install protobuf
+# Debian:  sudo apt install protobuf-compiler libprotobuf-dev
+# Fedora:  sudo dnf install protobuf-compiler protobuf-devel
 
 cargo check --workspace
 cargo test --workspace --lib --tests
