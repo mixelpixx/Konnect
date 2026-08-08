@@ -438,6 +438,8 @@ async fn handle_batch_place_components(
     let mut sch = cse::Schematic::load(&sch_path)?;
     let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
     let project_name = project_name_for(&sch_path);
+    // Built once: the lib-table parse is memoised across the whole batch.
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
 
     let mut placed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -467,6 +469,7 @@ async fn handle_batch_place_components(
             reference,
             value,
             unit,
+            &src,
         ) {
             Ok(v) => placed.push(v),
             Err(e) => errors.push(error_text(&e)),

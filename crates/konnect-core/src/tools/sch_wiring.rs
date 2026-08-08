@@ -1265,8 +1265,9 @@ async fn handle_add_power_symbol(
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
-    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
 
     // Build the Symbol struct

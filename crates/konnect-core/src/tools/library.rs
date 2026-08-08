@@ -838,6 +838,73 @@ fn global_sym_lib_table() -> PathBuf {
     super::kicad_config_dir().join("sym-lib-table")
 }
 
+/// Symbol libraries resolved as KiCad does: project `sym-lib-table` (shadowing
+/// same-nickname global entries), then global, then the conventional
+/// `<nickname>.kicad_symdir` / `.kicad_sym` layout. Same order as
+/// [`resolve_footprint_path`]; the last step covers a missing global table.
+///
+/// Both the flattened tables and the install dirs are memoised: placing one
+/// component asks for candidates at least twice, and the default global table
+/// is a `(type "Table")` indirection to ~200 bundled entries, each of which
+/// re-probes the install roots when `${KICAD*_DIR}` is unset.
+pub(crate) struct KiCadSymbolSource {
+    project_dir: Option<PathBuf>,
+    tables: std::sync::OnceLock<Vec<serde_json::Value>>,
+    install_dirs: std::sync::OnceLock<Vec<PathBuf>>,
+}
+
+impl KiCadSymbolSource {
+    pub(crate) fn new(project_dir: Option<PathBuf>) -> Self {
+        Self {
+            project_dir,
+            tables: std::sync::OnceLock::new(),
+            install_dirs: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// For a `.kicad_sch` or `.kicad_pcb` — `sym-lib-table` sits beside it.
+    pub(crate) fn for_file(file: &Path) -> Self {
+        Self::new(file.parent().map(Path::to_path_buf))
+    }
+
+    /// Project entries first so they shadow same-nickname global ones.
+    fn tables(&self) -> &[serde_json::Value] {
+        self.tables.get_or_init(|| {
+            let mut libs = Vec::new();
+            if let Some(dir) = &self.project_dir {
+                libs.extend(read_flat_lib_table(&dir.join("sym-lib-table")));
+            }
+            libs.extend(read_flat_lib_table(&global_sym_lib_table()));
+            libs
+        })
+    }
+}
+
+impl konnect_schematic_editor::library::SymbolLibrarySource for KiCadSymbolSource {
+    fn candidates(&self, nickname: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+
+        for lib in self
+            .tables()
+            .iter()
+            .filter(|l| l["nickname"].as_str() == Some(nickname))
+        {
+            if let Some(path) = lib["path"].as_str() {
+                out.push(PathBuf::from(path));
+            }
+        }
+
+        let install_dirs = self
+            .install_dirs
+            .get_or_init(|| super::find_kicad_library_dirs("symbols"));
+        for base in install_dirs {
+            out.push(base.join(format!("{}.kicad_symdir", nickname)));
+            out.push(base.join(format!("{}.kicad_sym", nickname)));
+        }
+        out
+    }
+}
+
 /// Parse a lib-table S-expression and return list of (nickname, uri, type) tuples.
 ///
 /// Indentation-agnostic: KiCad's own writers emit tab-indented, CRLF-terminated
@@ -1075,8 +1142,8 @@ pub(crate) fn footprint_lib_nickname_for_dir(dir: &Path) -> Option<String> {
 /// registers. The `.pretty` fallback covers a stock install whose global
 /// table is missing or unreadable.
 ///
-/// (`resolve_symbol_lib_path` still searches global-first for symbols; that
-/// asymmetry is pre-existing and noted on that function.)
+/// Symbols resolve the same way and in the same order, via
+/// [`KiCadSymbolSource`] and `resolve_symbol_lib_path`.
 pub(crate) fn resolve_footprint_path(
     reference: &str,
     project_dir: Option<&Path>,
@@ -1185,26 +1252,18 @@ async fn handle_register_footprint_library(
     let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let scope = args["scope"].as_str().unwrap_or("project");
 
-    let table_path = if scope == "global" {
-        global_fp_lib_table()
-    } else if let Some(proj) = args["project"].as_str() {
-        PathBuf::from(proj)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("fp-lib-table")
-    } else {
-        return Ok(CallToolResult::error(
-            "For project scope, provide 'project' path to .kicad_pro file",
-        ));
+    let (table_path, uri) = match lib_table_target(
+        scope,
+        args["project"].as_str(),
+        &lib_path,
+        global_fp_lib_table(),
+        "fp-lib-table",
+    ) {
+        Ok(target) => target,
+        Err(e) => return Ok(e),
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1260,6 +1319,56 @@ async fn handle_list_footprint_libraries(
     ))
 }
 
+/// A lib-table URI for `lib_path`: `${KIPRJMOD}/…` when it lives inside the
+/// project, so the project survives being moved or cloned. Anything outside
+/// keeps its absolute path.
+fn project_relative_uri(lib_path: &Path, table_dir: &Path) -> String {
+    let absolute_uri = || lib_path.to_string_lossy().into_owned();
+    // Both must canonicalise: `strip_prefix("")` succeeds and returns the whole
+    // path, which would emit a `${KIPRJMOD}//abs/path` that resolves nowhere.
+    let (Ok(lib), Ok(dir)) = (
+        std::fs::canonicalize(lib_path),
+        std::fs::canonicalize(table_dir),
+    ) else {
+        return absolute_uri();
+    };
+    match lib.strip_prefix(dir) {
+        // Forward slashes: KiCad writes URIs this way on Windows too.
+        Ok(rel) => format!("${{KIPRJMOD}}/{}", rel.to_string_lossy().replace('\\', "/")),
+        Err(_) => absolute_uri(),
+    }
+}
+
+/// Which lib-table a `register_*` call writes to, and the URI it records.
+///
+/// Shared by the symbol and footprint registrars so the two cannot drift: both
+/// need the same `${KIPRJMOD}` portability and the same empty-parent guard.
+fn lib_table_target(
+    scope: &str,
+    project: Option<&str>,
+    lib_path: &Path,
+    global_table: PathBuf,
+    table_filename: &str,
+) -> Result<(PathBuf, String), CallToolResult> {
+    if scope == "global" {
+        return Ok((global_table, lib_path.to_string_lossy().into_owned()));
+    }
+    let Some(proj) = project else {
+        return Err(CallToolResult::error(
+            "For project scope, provide 'project' path to .kicad_pro file",
+        ));
+    };
+    // `Path::new("board.kicad_pro").parent()` is Some("") — an empty path, not
+    // None — so the `.` default needs an explicit emptiness check.
+    let table_dir = PathBuf::from(proj)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let uri = project_relative_uri(lib_path, &table_dir);
+    Ok((table_dir.join(table_filename), uri))
+}
+
 async fn handle_register_symbol_library(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1268,33 +1377,26 @@ async fn handle_register_symbol_library(
     let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let scope = args["scope"].as_str().unwrap_or("project");
 
-    let table_path = if scope == "global" {
-        global_sym_lib_table()
-    } else if let Some(proj) = args["project"].as_str() {
-        PathBuf::from(proj)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("sym-lib-table")
-    } else {
-        return Ok(CallToolResult::error(
-            "For project scope, provide 'project' path to .kicad_pro file",
-        ));
+    let (table_path, uri) = match lib_table_target(
+        scope,
+        args["project"].as_str(),
+        &lib_path,
+        global_sym_lib_table(),
+        "sym-lib-table",
+    ) {
+        Ok(target) => target,
+        Err(e) => return Ok(e),
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
-            "table": table_path.to_str().unwrap_or("")
+            "table": table_path.to_str().unwrap_or(""),
+            "uri": uri
         }))
         .unwrap(),
     ))
@@ -2377,33 +2479,21 @@ fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-/// Resolve a symbol library nickname to an on-disk `.kicad_sym` path.
-///
-/// Checks the **global** sym-lib-table first, then the **project** table at
-/// `project_dir/sym-lib-table` (if a project dir is supplied). Returns the first
-/// entry whose nickname matches and whose URI resolved to a path at all. Both
-/// tables are read with `read_flat_lib_table`, so nested `(type "Table")`
-/// references are followed and `${KICAD*_DIR}` URIs are expanded.
-///
-/// The returned path is *not* guaranteed to exist: `expand_lib_uri` checks
-/// existence only for `${KICAD*_DIR}` expansions, and takes a plain URI as
-/// written. A stale global entry therefore still shadows a working project one
-/// with the same nickname, and the caller's read is what discovers it.
-async fn resolve_symbol_lib_path(nick: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
-    let mut tables = vec![global_sym_lib_table()];
-    if let Some(pd) = project_dir {
-        tables.push(pd.join("sym-lib-table"));
-    }
-    for table in tables {
-        for lib in read_flat_lib_table(&table) {
-            if lib["nickname"].as_str() == Some(nick) {
-                if let Some(path) = lib["path"].as_str() {
-                    return Some(PathBuf::from(path));
-                }
-            }
-        }
-    }
-    None
+/// The `.kicad_sym` file defining `nick:sym_name`, found exactly the way symbol
+/// placement finds it — via [`KiCadSymbolSource`], so a lookup here and a
+/// placement of the same lib_id can never disagree.
+fn resolve_symbol_lib_path(
+    nick: &str,
+    sym_name: &str,
+    project_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    use konnect_schematic_editor::library::SymbolLibrarySource;
+    KiCadSymbolSource::new(project_dir.map(Path::to_path_buf))
+        .candidates(nick)
+        .iter()
+        .find_map(|candidate| {
+            konnect_schematic_editor::library::symbol_file_in(candidate, sym_name)
+        })
 }
 
 /// Recursively collect every descendant `SexpNode::List` whose head matches
@@ -2726,12 +2816,13 @@ async fn handle_get_symbol_info(
         .map(PathBuf::from)
         .or_else(|| ctx.config.project_dir.clone());
 
-    let lib_path = match resolve_symbol_lib_path(lib_nick, project_dir.as_deref()).await {
+    let lib_path = match resolve_symbol_lib_path(lib_nick, sym_name, project_dir.as_deref()) {
         Some(p) => p,
         None => {
             return Ok(CallToolResult::error(format!(
-                "Library '{}' not found in global or project sym-lib-table, or its uri uses an unresolved env var",
-                lib_nick
+                "Symbol '{}' not found: no library '{}' in the project or global \
+                 sym-lib-table, nor in the installed KiCad symbol libraries",
+                lib_id, lib_nick
             )));
         }
     };
@@ -4417,6 +4508,170 @@ mod tests {
         assert!(
             rc.contains("(name \"IN\" (effects (font (size 1.27 1.27))))"),
             "rectangle pin names keep the default 1.27 font:\n{rc}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod symbol_source_tests {
+    use super::*;
+    use konnect_schematic_editor::library::SymbolLibrarySource;
+
+    /// The bug this fixes: a library registered in the project table was
+    /// invisible to placement, which only scanned the KiCad install dirs.
+    #[test]
+    fn project_table_entry_is_offered_before_the_install_dirs() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let file = lib.join("vendor-parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n  (lib (name \"MyParts\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                file.display()
+            ),
+        )
+        .unwrap();
+
+        let src = KiCadSymbolSource::new(Some(proj.path().to_path_buf()));
+        let candidates = src.candidates("MyParts");
+
+        assert_eq!(
+            candidates.first(),
+            Some(&file),
+            "the project table entry must be tried first, got {candidates:?}"
+        );
+    }
+
+    /// `${KIPRJMOD}` resolves against the table's own directory, not the env.
+    #[test]
+    fn kiprjmod_uri_resolves_against_the_project_dir() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let file = lib.join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Proj\") (type \"KiCad\") (uri \"${KIPRJMOD}/lib/parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let src = KiCadSymbolSource::new(Some(proj.path().to_path_buf()));
+        assert!(
+            src.candidates("Proj").contains(&file),
+            "${{KIPRJMOD}} must expand to the project dir"
+        );
+    }
+
+    /// A stock install keeps working with no table entry at all. Points
+    /// KICAD10_SYMBOL_DIR at a tempdir rather than asserting against whatever
+    /// KiCad is installed — CI has none, so the fallback would have no
+    /// directory to derive from and the assertion would be vacuous at best.
+    #[test]
+    fn unregistered_nickname_falls_back_to_the_conventional_layout() {
+        let _env = crate::tools::KICAD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let install = tempfile::tempdir().unwrap();
+        std::env::set_var("KICAD10_SYMBOL_DIR", install.path());
+
+        let src = KiCadSymbolSource::new(None);
+        let candidates = src.candidates("Device");
+        assert!(
+            candidates.contains(&install.path().join("Device.kicad_symdir")),
+            "expected the symdir fallback, got {candidates:?}"
+        );
+        assert!(
+            candidates.contains(&install.path().join("Device.kicad_sym")),
+            "expected the single-file fallback, got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn project_scoped_registration_writes_a_portable_uri() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let file = lib.join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        assert_eq!(
+            project_relative_uri(&file, proj.path()),
+            "${KIPRJMOD}/lib/parts.kicad_sym"
+        );
+    }
+
+    /// `Path::new("board.kicad_pro").parent()` is `Some("")`, and
+    /// `strip_prefix("")` returns the whole path — which would emit
+    /// `${KIPRJMOD}//abs/path`, resolving nowhere on read.
+    #[test]
+    fn an_empty_table_dir_does_not_produce_a_rooted_kiprjmod_uri() {
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let uri = project_relative_uri(&file, Path::new(""));
+        assert!(
+            !uri.contains("KIPRJMOD"),
+            "empty project dir must fall back to an absolute uri: {uri}"
+        );
+        assert_eq!(uri, file.to_string_lossy());
+    }
+
+    /// Both registrars share one target helper, so footprints get the same
+    /// portable URI and the same empty-parent guard as symbols.
+    #[test]
+    fn both_registrars_agree_on_the_project_table_target() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let sym = lib.join("parts.kicad_sym");
+        std::fs::write(&sym, "(kicad_symbol_lib)\n").unwrap();
+        let fp = lib.join("parts.pretty");
+        std::fs::create_dir_all(&fp).unwrap();
+
+        let proj_file = proj.path().join("board.kicad_pro");
+        let proj_arg = proj_file.to_str();
+
+        let (sym_table, sym_uri) = lib_table_target(
+            "project",
+            proj_arg,
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("symbol target");
+        let (fp_table, fp_uri) = lib_table_target(
+            "project",
+            proj_arg,
+            &fp,
+            global_fp_lib_table(),
+            "fp-lib-table",
+        )
+        .expect("footprint target");
+
+        assert_eq!(sym_uri, "${KIPRJMOD}/lib/parts.kicad_sym");
+        assert_eq!(fp_uri, "${KIPRJMOD}/lib/parts.pretty");
+        assert_eq!(sym_table, proj.path().join("sym-lib-table"));
+        assert_eq!(fp_table, proj.path().join("fp-lib-table"));
+    }
+
+    #[test]
+    fn a_library_outside_the_project_keeps_its_absolute_uri() {
+        let proj = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("shared.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let uri = project_relative_uri(&file, proj.path());
+        assert!(
+            !uri.contains("KIPRJMOD"),
+            "nothing portable to say about an out-of-project library: {uri}"
         );
     }
 }

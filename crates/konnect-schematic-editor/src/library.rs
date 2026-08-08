@@ -1,99 +1,92 @@
-//! Library symbol resolution — loads symbol definitions from KiCAD's installed libraries.
+//! Library symbol resolution — loads symbol definitions from KiCad libraries.
 //!
-//! KiCAD 10 stores symbols in `.kicad_symdir` directories:
-//! ```text
-//! C:\KiCad\10.0\share\kicad\symbols\Device.kicad_symdir\R.kicad_sym
-//! C:\KiCad\10.0\share\kicad\symbols\power.kicad_symdir\VCC.kicad_sym
-//! ```
-//!
-//! This module resolves a `lib_id` like `"Device:R"` to the full symbol S-expression
-//! definition, and can inject it into a Schematic's `lib_symbols` section.
+//! Resolves a `lib_id` like `"Device:R"` to its full symbol S-expression and
+//! can inject it into a Schematic's `lib_symbols` section. *Where* a library
+//! lives is supplied by a [`SymbolLibrarySource`]; this module reads whatever
+//! paths it is given, in either the KiCad 10 symdir layout
+//! (`Device.kicad_symdir/R.kicad_sym`) or a single-file `Device.kicad_sym`.
 
 use crate::sexp::{parser, SexpNode};
 use crate::Schematic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Locates the on-disk libraries that may define a library nickname.
+///
+/// Keeps KiCad-config knowledge (install paths, `sym-lib-table`) in
+/// konnect-core, which already owns it for footprints.
+pub trait SymbolLibrarySource {
+    /// Candidate locations for `nickname`, highest priority first: either a
+    /// `.kicad_symdir` directory or a `.kicad_sym` file. Full paths, since a
+    /// table may map a nickname to any filename. Missing entries are skipped
+    /// by callers.
+    fn candidates(&self, nickname: &str) -> Vec<PathBuf>;
+}
+
+impl<F> SymbolLibrarySource for F
+where
+    F: Fn(&str) -> Vec<PathBuf>,
+{
+    fn candidates(&self, nickname: &str) -> Vec<PathBuf> {
+        self(nickname)
+    }
+}
+
+/// The `.kicad_sym` file that would define `symbol_name` at `candidate`.
+/// A symdir holds one file per symbol; a single-file library holds them all.
+pub fn symbol_file_in(candidate: &Path, symbol_name: &str) -> Option<PathBuf> {
+    if candidate.is_dir() {
+        let file = candidate.join(format!("{}.kicad_sym", symbol_name));
+        return file.is_file().then_some(file);
+    }
+    candidate.is_file().then(|| candidate.to_path_buf())
+}
+
+/// Prefix a symbol block's name with its library, as an embedded `lib_symbols`
+/// entry must be. Unit sub-symbols (`Name_0_1`) stay unprefixed — eeschema
+/// refuses to load a schematic whose units carry the prefix.
+fn prefix_symbol_block(block: &str, library_name: &str, symbol_name: &str) -> String {
+    let mut renamed = block.replacen(
+        &format!("(symbol \"{}\"", symbol_name),
+        &format!("(symbol \"{}:{}\"", library_name, symbol_name),
+        1,
+    );
+    // `(extends "Parent")` names a sibling; qualify it into a lib_id.
+    if let Some(ext_pos) = renamed.find("(extends \"") {
+        let after = &renamed[ext_pos + 10..];
+        if let Some(end) = after.find('"') {
+            let parent = after[..end].to_string();
+            renamed = renamed.replace(
+                &format!("(extends \"{}\")", parent),
+                &format!("(extends \"{}:{}\")", library_name, parent),
+            );
+        }
+    }
+    renamed
+}
 
 /// Resolve a lib_id (e.g. "Device:R") to the full symbol S-expression string.
 /// The returned string is the raw content of the `(symbol "R" ...)` block,
 /// with the name prefixed as `"Device:R"`.
-pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
-    let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let (library_name, symbol_name) = (parts[0], parts[1]);
+pub fn resolve_lib_symbol(lib_id: &str, src: &dyn SymbolLibrarySource) -> Option<String> {
+    let (library_name, symbol_name) = lib_id.split_once(':')?;
 
-    for base_dir in find_symbol_dirs() {
-        // KiCAD 10: Library.kicad_symdir/SymbolName.kicad_sym
-        let symdir = base_dir.join(format!("{}.kicad_symdir", library_name));
-        let sym_file = symdir.join(format!("{}.kicad_sym", symbol_name));
-
-        if sym_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&sym_file) {
-                if let Some(block) = extract_symbol_block(&content, symbol_name) {
-                    // Rename symbol to include library prefix
-                    let mut renamed = block.replacen(
-                        &format!("(symbol \"{}\"", symbol_name),
-                        &format!("(symbol \"{}:{}\"", library_name, symbol_name),
-                        1,
-                    );
-                    // Also fix (extends "ParentName") to use prefixed name
-                    if let Some(ext_pos) = renamed.find("(extends \"") {
-                        let after = &renamed[ext_pos + 10..];
-                        if let Some(end) = after.find('"') {
-                            let parent = after[..end].to_string();
-                            renamed = renamed.replace(
-                                &format!("(extends \"{}\")", parent),
-                                &format!("(extends \"{}:{}\")", library_name, parent),
-                            );
-                        }
-                    }
-                    // Unit sub-symbols ("Name_0_1", "Name_1_1") must stay
-                    // UNPREFIXED: eeschema names only the outer symbol with
-                    // the library prefix and refuses to load a schematic
-                    // whose units carry it ("Failed to load schematic" —
-                    // verified against kicad-cli 10.0 and the KiCAD demo
-                    // corpus, which embeds units without the prefix).
-                    return Some(renamed);
-                }
-            }
-        }
-
-        // Fallback: KiCAD 8/9 format — single Library.kicad_sym file
-        let legacy = base_dir.join(format!("{}.kicad_sym", library_name));
-        if legacy.exists() {
-            if let Ok(content) = std::fs::read_to_string(&legacy) {
-                if let Some(block) = extract_symbol_block(&content, symbol_name) {
-                    let mut renamed = block.replacen(
-                        &format!("(symbol \"{}\"", symbol_name),
-                        &format!("(symbol \"{}:{}\"", library_name, symbol_name),
-                        1,
-                    );
-                    if let Some(ext_pos) = renamed.find("(extends \"") {
-                        let after = &renamed[ext_pos + 10..];
-                        if let Some(end) = after.find('"') {
-                            let parent = after[..end].to_string();
-                            renamed = renamed.replace(
-                                &format!("(extends \"{}\")", parent),
-                                &format!("(extends \"{}:{}\")", library_name, parent),
-                            );
-                        }
-                    }
-                    // Unit sub-symbols stay UNPREFIXED here too — same rule
-                    // as the symdir branch above (eeschema refuses prefixed
-                    // unit names; hit in CI where KiCAD ships single-file
-                    // libraries and this legacy branch handles the embed).
-                    return Some(renamed);
-                }
-            }
+    for candidate in src.candidates(library_name) {
+        let Some(file) = symbol_file_in(&candidate, symbol_name) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        if let Some(block) = extract_symbol_block(&content, symbol_name) {
+            return Some(prefix_symbol_block(&block, library_name, symbol_name));
         }
     }
     None
 }
 
 /// Resolve a lib_id to a parsed SexpNode tree.
-pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
-    let raw = resolve_lib_symbol(lib_id)?;
+pub fn resolve_lib_symbol_node(lib_id: &str, src: &dyn SymbolLibrarySource) -> Option<SexpNode> {
+    let raw = resolve_lib_symbol(lib_id, src)?;
     parser::parse(&raw).ok()
 }
 
@@ -110,8 +103,11 @@ pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
 /// kicad-cli cannot resolve — the netlist gets a pinless libpart — and one
 /// eeschema never writes. A missing/broken parent stops the walk gracefully,
 /// returning the partially flattened child.
-pub fn resolve_lib_symbol_flattened_node(lib_id: &str) -> Option<SexpNode> {
-    let mut node = resolve_lib_symbol_node(lib_id)?;
+pub fn resolve_lib_symbol_flattened_node(
+    lib_id: &str,
+    src: &dyn SymbolLibrarySource,
+) -> Option<SexpNode> {
+    let mut node = resolve_lib_symbol_node(lib_id, src)?;
     let child_base = lib_id.split_once(':')?.1.to_string();
 
     let mut parent_id = node.get_value("extends").map(str::to_string);
@@ -128,7 +124,7 @@ pub fn resolve_lib_symbol_flattened_node(lib_id: &str) -> Option<SexpNode> {
         if !visited.insert(pid.clone()) {
             break; // cyclic extends: stop, keep what we have
         }
-        let Some(parent) = resolve_lib_symbol_node(&pid) else {
+        let Some(parent) = resolve_lib_symbol_node(&pid, src) else {
             break; // broken library (dangling parent): keep what we have
         };
         let parent_base = pid
@@ -143,8 +139,8 @@ pub fn resolve_lib_symbol_flattened_node(lib_id: &str) -> Option<SexpNode> {
 
 /// Serialized form of [`resolve_lib_symbol_flattened_node`], for callers that
 /// splice raw text into a schematic's `lib_symbols` section.
-pub fn resolve_lib_symbol_flattened(lib_id: &str) -> Option<String> {
-    resolve_lib_symbol_flattened_node(lib_id).map(|n| crate::sexp::writer::write(&n))
+pub fn resolve_lib_symbol_flattened(lib_id: &str, src: &dyn SymbolLibrarySource) -> Option<String> {
+    resolve_lib_symbol_flattened_node(lib_id, src).map(|n| crate::sexp::writer::write(&n))
 }
 
 /// Copy one parent level into a derived symbol: unit sub-symbols renamed to
@@ -243,7 +239,11 @@ fn unit_suffix_of<'a>(name: &'a str, base: &str) -> Option<&'a str> {
 /// without an embedded definition is invisible to KiCAD's netlister and
 /// yields empty pin lists downstream (#34).
 #[must_use]
-pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) -> bool {
+pub fn ensure_lib_symbol(
+    schematic: &mut Schematic,
+    lib_id: &str,
+    src: &dyn SymbolLibrarySource,
+) -> bool {
     // Check if already present
     let check_name = format!("\"{}\"", lib_id);
     let already_present = schematic.raw_other.iter().any(|node| {
@@ -259,7 +259,7 @@ pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) -> bool {
     }
 
     // Resolve and embed the symbol, flattening any extends chain.
-    let sym_node = match resolve_lib_symbol_flattened_node(lib_id) {
+    let sym_node = match resolve_lib_symbol_flattened_node(lib_id, src) {
         Some(n) => n,
         None => return false,
     };
@@ -293,11 +293,11 @@ pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) -> bool {
 /// own (#35). The count is the maximum `N >= 1` over `Name_N_M` sub-symbol
 /// names; symbols with only a `_0_1` body (or none) count as 1. Returns
 /// `None` when `lib_id` cannot be resolved at all.
-pub fn symbol_unit_count(lib_id: &str) -> Option<u32> {
+pub fn symbol_unit_count(lib_id: &str, src: &dyn SymbolLibrarySource) -> Option<u32> {
     let mut current = lib_id.to_string();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     while visited.insert(current.clone()) {
-        let node = resolve_lib_symbol_node(&current)?;
+        let node = resolve_lib_symbol_node(&current, src)?;
         let max_unit = node
             .find_all("symbol")
             .iter()
@@ -317,20 +317,19 @@ pub fn symbol_unit_count(lib_id: &str) -> Option<u32> {
     Some(1) // cyclic extends: treat as single-unit rather than erroring
 }
 
-/// Whether `library_name` (e.g. "Device") exists in any installed symbol dir,
-/// in either the KiCAD 10 symdir layout or the legacy single-file one.
-pub fn library_exists(library_name: &str) -> bool {
-    find_symbol_dirs().iter().any(|base| {
-        base.join(format!("{}.kicad_symdir", library_name)).is_dir()
-            || base.join(format!("{}.kicad_sym", library_name)).is_file()
-    })
+/// Whether any library `src` offers for `library_name` is actually on disk,
+/// in either the KiCad 10 symdir layout or the single-file one.
+pub fn library_exists(library_name: &str, src: &dyn SymbolLibrarySource) -> bool {
+    src.candidates(library_name)
+        .iter()
+        .any(|p| p.is_dir() || p.is_file())
 }
 
 /// Symbol names similar to the one in `lib_id`, for did-you-mean hints when a
 /// lib_id doesn't resolve (#34: LLM callers habitually reach for KiCAD ≤9
 /// names like `Device:CP` that KiCAD 10 renamed). Returns full `Library:Name`
 /// ids, closest first, at most `limit`.
-pub fn suggest_symbols(lib_id: &str, limit: usize) -> Vec<String> {
+pub fn suggest_symbols(lib_id: &str, limit: usize, src: &dyn SymbolLibrarySource) -> Vec<String> {
     let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
     if parts.len() != 2 {
         return Vec::new();
@@ -339,9 +338,10 @@ pub fn suggest_symbols(lib_id: &str, limit: usize) -> Vec<String> {
     let wanted = symbol_name.to_lowercase();
 
     let mut candidates: Vec<String> = Vec::new();
-    for base in find_symbol_dirs() {
-        let symdir = base.join(format!("{}.kicad_symdir", library_name));
-        if let Ok(entries) = std::fs::read_dir(&symdir) {
+    for base in src.candidates(library_name) {
+        // symdir layout: one .kicad_sym per symbol, so the file stems are the
+        // symbol names.
+        if let Ok(entries) = std::fs::read_dir(&base) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("kicad_sym") {
@@ -351,9 +351,8 @@ pub fn suggest_symbols(lib_id: &str, limit: usize) -> Vec<String> {
                 }
             }
         }
-        // Legacy single-file library: scan top-level (symbol "NAME" entries.
-        let legacy = base.join(format!("{}.kicad_sym", library_name));
-        if let Ok(content) = std::fs::read_to_string(&legacy) {
+        // Single-file library: scan top-level (symbol "NAME" entries.
+        if let Ok(content) = std::fs::read_to_string(&base) {
             let mut from = 0usize;
             while let Some(rel) = content[from..].find("(symbol \"") {
                 let start = from + rel + 9;
@@ -473,68 +472,6 @@ fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
     }
 }
 
-/// Find directories where KiCAD symbol libraries are stored.
-pub fn find_symbol_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Ok(dir) = std::env::var("KICAD10_SYMBOL_DIR") {
-        let p = PathBuf::from(&dir);
-        if p.is_dir() {
-            dirs.push(p);
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let candidates = [
-            r"C:\KiCad\10.0\share\kicad\symbols",
-            r"C:\Program Files\KiCad\10.0\share\kicad\symbols",
-            r"C:\KiCad\9.0\share\kicad\symbols",
-            r"C:\Program Files\KiCad\9.0\share\kicad\symbols",
-        ];
-        for c in &candidates {
-            let p = PathBuf::from(c);
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // KiCad on macOS ships its libraries inside the app bundle.
-        let mut candidates = vec![
-            PathBuf::from("/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
-            PathBuf::from("/usr/local/share/kicad/symbols"),
-        ];
-        if let Ok(home) = std::env::var("HOME") {
-            // Per-user install (KiCad.app dragged into ~/Applications)
-            candidates.push(
-                PathBuf::from(home)
-                    .join("Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
-            );
-        }
-        for p in candidates {
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let candidates = ["/usr/share/kicad/symbols", "/usr/local/share/kicad/symbols"];
-        for c in &candidates {
-            let p = PathBuf::from(c);
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
-
-    dirs
-}
-
 #[cfg(test)]
 mod suggestion_tests {
     use super::*;
@@ -606,7 +543,10 @@ mod suggestion_tests {
             "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"NE5532\"\n\t\t(extends \"LM2904\")\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"NE5532\" (at 0 0 0))\n\t)\n)\n",
         )
         .unwrap();
-        std::env::set_var("KICAD10_SYMBOL_DIR", libdir.path());
+        // Explicit source, not KICAD10_SYMBOL_DIR: env vars are process-wide
+        // and force the test to be serialised.
+        let root = libdir.path().to_path_buf();
+        let src = move |nick: &str| vec![root.join(format!("{}.kicad_symdir", nick))];
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flat.kicad_sch");
@@ -616,7 +556,7 @@ mod suggestion_tests {
         )
         .unwrap();
         let mut sch = Schematic::load(&path).unwrap();
-        assert!(ensure_lib_symbol(&mut sch, "Amp:NE5532"));
+        assert!(ensure_lib_symbol(&mut sch, "Amp:NE5532", &src));
         sch.overwrite().unwrap();
         let out = std::fs::read_to_string(&path).unwrap();
 
@@ -660,9 +600,58 @@ mod suggestion_tests {
         .unwrap();
         let mut sch = Schematic::load(&path).unwrap();
         // No library named like this exists anywhere.
+        let empty = |_: &str| Vec::<PathBuf>::new();
         assert!(!ensure_lib_symbol(
             &mut sch,
-            "Definitely_Not_A_Library_xyzzy:Nope"
+            "Definitely_Not_A_Library_xyzzy:Nope",
+            &empty
         ));
+    }
+
+    /// A project library is one `.kicad_sym` file under a nickname that need
+    /// not match the filename. The old directory scan could not express that.
+    #[test]
+    fn resolves_a_single_file_library_whose_name_differs_from_its_nickname() {
+        let libdir = tempfile::tempdir().unwrap();
+        let file = libdir.path().join("vendor-parts.kicad_sym");
+        std::fs::write(
+            &file,
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"CH347T\"\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"CH347T\" (at 0 0 0))\n\t\t(symbol \"CH347T_1_1\"\n\t\t\t(pin bidirectional line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"TMS\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"5\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+
+        // What a project sym-lib-table entry resolves to.
+        let target = file.clone();
+        let src = move |nick: &str| {
+            if nick == "MyParts" {
+                vec![target.clone()]
+            } else {
+                Vec::new()
+            }
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"test\")\n\t(lib_symbols\n\t)\n)\n",
+        )
+        .unwrap();
+        let mut sch = Schematic::load(&path).unwrap();
+
+        assert!(ensure_lib_symbol(&mut sch, "MyParts:CH347T", &src));
+        assert_eq!(symbol_unit_count("MyParts:CH347T", &src), Some(1));
+        assert!(library_exists("MyParts", &src));
+
+        sch.overwrite().unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains("(symbol \"MyParts:CH347T\""),
+            "symbol embedded under its lib_id:\n{out}"
+        );
+        assert!(
+            out.contains("(number \"5\""),
+            "pins must come with it — a definition-less instance netlists empty (#34):\n{out}"
+        );
     }
 }

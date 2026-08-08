@@ -54,7 +54,7 @@ Konnect/
 │   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
 │   │       │   └── meta_tools.rs    # 6 always-visible meta-tools
 │   │       └── tools/
-│   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir(), resolve_lib_symbol()
+│   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
 │   │           ├── project.rs        # 6 tools (incl. open_schematic_viewer)
