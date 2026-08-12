@@ -1,8 +1,10 @@
 //! `pcb_board` toolset — board setup, layers, outlines, zones, and board-level items.
 //!
 //! Most operations use S-expression file manipulation so they work without a running
-//! KiCAD instance. `get_board_extents` tries the IPC API first, falling back to
-//! parsing the file for coordinate bounds.
+//! KiCad instance. `get_board_info` and `get_board_extents` try the IPC API first,
+//! falling back to parsing the file, and report which they used as `source` —
+//! the file is the last save, so it disagrees with the IPC-backed writers here
+//! whenever KiCad holds unsaved edits.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -326,7 +328,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_board_info",
             "Return metadata about the PCB: title, revision, company, layer count, paper size, \
-             and the number of distinct nets (excluding the unconnected pseudo-net).",
+             and the number of distinct nets (excluding the unconnected pseudo-net). \
+             Reads the board open in KiCad when it is reachable, else the file — \
+             'source' says which. Paper size always comes from the file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -548,11 +552,60 @@ async fn handle_set_board_size(
     })))
 }
 
+/// The page size, which is only ever read from the file: KiCad's API exposes
+/// no page settings, so even the live path answers this one field from disk.
+fn paper_from_file(board_path: &std::path::Path) -> String {
+    let Ok(content) = std::fs::read_to_string(board_path) else {
+        return "A4".to_string();
+    };
+    let Ok(tree) = parse_sexp(&content) else {
+        return "A4".to_string();
+    };
+    tree.find("paper")
+        .and_then(|n| n.get(1))
+        .and_then(|n| n.as_str())
+        .unwrap_or("A4")
+        .to_string()
+}
+
 async fn handle_get_board_info(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+
+    // The board open in KiCad first. Reading only the file reported the state
+    // of the last save — on a board with unsaved edits it disagreed with the
+    // IPC-backed writers in this toolset, most visibly as layer_count 0 /
+    // net_count 0 on a board KiCad was showing fully populated.
+    let ipc_board = board_path.clone();
+    if let Ok((title_block, enabled, nets)) = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        let document = c.find_open_board(&ipc_board)?;
+        Ok((
+            c.get_title_block_in(document.clone())?,
+            c.get_enabled_layers_in(document.clone())?,
+            c.get_nets_in(document)?.len(),
+        ))
+    })
+    .await?
+    {
+        // The copper count is KiCad's own field, not a tally of layer names
+        // ending in `.Cu` — the two agree on an ordinary stackup, and that is
+        // the kind of agreement that stops holding on an unusual one.
+        return Ok(CallToolResult::json(&json!({
+            "file": board_path.display().to_string(),
+            "title": title_block.title,
+            "date": title_block.date,
+            "revision": title_block.revision,
+            "company": title_block.company,
+            "paper": paper_from_file(&board_path),
+            "layer_count": enabled.layers.len(),
+            "copper_layer_count": enabled.copper_layer_count,
+            "net_count": nets,
+            "source": "ipc"
+        })));
+    }
+
     let content = std::fs::read_to_string(&board_path)?;
     let tree = parse_sexp(&content)?;
 
@@ -607,7 +660,8 @@ async fn handle_get_board_info(
         "paper": paper,
         "layer_count": layer_count,
         "copper_layer_count": copper_layer_count,
-        "net_count": net_count
+        "net_count": net_count,
+        "source": "file"
     })))
 }
 
@@ -617,11 +671,13 @@ async fn handle_get_board_extents(
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
 
-    // Try IPC first; fall through to file-based computation on error
-    let requested = board_path.clone();
+    // Try IPC first; fall through to file-based computation on error.
+    // Addressed to the requested board, not the first open one — with two
+    // boards open, first-document targeting silently measures the other, and
+    // ensure_board_is_active only checks it is open somewhere.
+    let ipc_board = board_path.clone();
     if let Ok(ext) = with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.ensure_board_is_active(&requested)?;
-        c.get_board_extents()
+        c.get_board_extents_in(c.find_open_board(&ipc_board)?)
     })
     .await?
     {
@@ -1785,5 +1841,174 @@ mod zone_net_format_tests {
         let (result, after) = zone(LEGACY, "PWR").await;
         assert!(result.is_error, "{}", text_of(&result));
         assert_eq!(after, LEGACY);
+    }
+}
+
+/// `get_board_info` used to read only the file — the last save — while every
+/// writer in this toolset acts on the board KiCad holds. On a board with
+/// unsaved edits the two disagreed completely, most visibly as layer_count 0
+/// and net_count 0 for a board KiCad was showing fully populated.
+#[cfg(test)]
+mod board_info_source_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::Arc;
+
+    /// A board saved before anything was placed on it: the empty stub the
+    /// file-only reader kept reporting.
+    const EMPTY_STUB: &str = "(kicad_pcb\n\t(version 20260206)\n\t(paper \"A3\")\n)\n";
+
+    fn ctx_talking_to(address: String) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A rep0 endpoint playing a KiCad holding `board` open with `layers`
+    /// enabled, `copper` of them copper, and `nets` named — none of it saved
+    /// to the file.
+    fn spawn_kicad_holding(
+        board: &std::path::Path,
+        layers: usize,
+        copper: u32,
+        nets: usize,
+    ) -> String {
+        use nng::options::Options;
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+
+        let board = board.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            while let Ok(message) = socket.recv() {
+                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                project: None,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board.clone(),
+                                    ),
+                                ),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("GetTitleBlockInfo") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::types::TitleBlockInfo {
+                            title: "Live title".to_string(),
+                            revision: "B".to_string(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.types.TitleBlockInfo",
+                    ))
+                } else if command.type_url.ends_with("GetBoardEnabledLayers") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardEnabledLayersResponse {
+                            copper_layer_count: copper,
+                            layers: (0..layers as i32).collect(),
+                        },
+                        "kiapi.board.commands.BoardEnabledLayersResponse",
+                    ))
+                } else if command.type_url.ends_with("GetNets") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::NetsResponse {
+                            nets: (0..nets)
+                                .map(|index| kiapi::board::types::Net {
+                                    code: None,
+                                    name: format!("N{index}"),
+                                })
+                                .collect(),
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    ))
+                } else {
+                    None
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    async fn board_info(board: &std::path::Path, ctx: &ToolContext) -> serde_json::Value {
+        let result = handle_get_board_info(&json!({ "board": board.to_str().unwrap() }), ctx)
+            .await
+            .expect("handler should succeed");
+        assert!(!result.is_error, "{:?}", result.content);
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_board_is_reported_instead_of_the_last_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_STUB).unwrap();
+        // Six copper layers among 27 enabled. Ids 3..26 are all `*.Cu`, so a
+        // tally of layer names would say 24 — the response field says 6.
+        let address = spawn_kicad_holding(&board, 27, 6, 99);
+
+        let info = board_info(&board, &ctx_talking_to(address)).await;
+
+        assert_eq!(info["source"], json!("ipc"));
+        assert_eq!(info["layer_count"], json!(27));
+        assert_eq!(info["copper_layer_count"], json!(6));
+        assert_eq!(info["net_count"], json!(99));
+        assert_eq!(info["title"], json!("Live title"));
+        assert_eq!(info["revision"], json!("B"));
+        // Page size has no IPC equivalent, so it stays a file reading.
+        assert_eq!(info["paper"], json!("A3"));
+    }
+
+    #[tokio::test]
+    async fn an_offline_session_still_reads_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_STUB).unwrap();
+
+        let info = board_info(&board, &ctx_talking_to(String::new())).await;
+
+        assert_eq!(info["source"], json!("file"));
+        assert_eq!(info["net_count"], json!(0));
+        assert_eq!(info["paper"], json!("A3"));
     }
 }

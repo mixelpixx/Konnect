@@ -206,7 +206,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `set_board_size` | Set the PCB board outline to a rectangle on the Edge.Cuts layer. |
-| `get_board_info` | Return metadata about the PCB: title, revision, company, paper size, `layer_count`, `copper_layer_count`, and `net_count` (counted from the tree, so KiCad 10 boards report real numbers instead of 0). |
+| `get_board_info` | Return metadata about the PCB: title, revision, company, paper size, `layer_count`, `copper_layer_count`, and `net_count` (IPC, falls back to a file parse that counts from the tree, so KiCad 10 boards report real numbers instead of 0). |
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
 | `get_layer_list` | Return all layers defined in the board: `id`, `name`, `type`, plus the optional `user_name` label and a `copper` flag. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
@@ -232,7 +232,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
 | `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
-| `get_component_pads` | Return pad positions and net assignments for a footprint. A pad whose net node is present but unreadable reports `null` rather than an empty string, so "no net" stays distinguishable from "could not read it". |
+| `get_component_pads` | Return pad positions and net assignments for a footprint (IPC, falls back to file parse). A pad whose net node is present but unreadable reports `null` rather than an empty string, so "no net" stays distinguishable from "could not read it". |
 | `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |

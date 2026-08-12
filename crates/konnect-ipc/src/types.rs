@@ -16,6 +16,29 @@ pub struct IpcFootprint {
     pub layer: String,
 }
 
+/// A pad of a footprint placed on the board, read back from KiCad.
+///
+/// Coordinates are absolute board millimetres: KiCad serializes a
+/// `FootprintInstance`'s children in board space (see the `transform` module),
+/// so no anchor or rotation transform is applied on the way out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcPad {
+    pub number: String,
+    pub x: f64,
+    pub y: f64,
+    /// Net name, empty when the pad carries no net.
+    pub net: String,
+}
+
+/// The document's title block, which the board file also carries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IpcTitleBlock {
+    pub title: String,
+    pub date: String,
+    pub revision: String,
+    pub company: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct IpcPadDefinition {
     pub number: String,
@@ -164,6 +187,17 @@ pub struct IpcLayer {
     pub name: String,
     pub id: i32,
     pub kind: String,
+}
+
+/// The enabled layer set as KiCad reports it.
+///
+/// `copper_layer_count` is the response's own field, not a count of `layers`
+/// whose name ends in `.Cu` — the two agree on an ordinary stackup, and that
+/// agreement is exactly what stops holding on an unusual one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcEnabledLayers {
+    pub copper_layer_count: u32,
+    pub layers: Vec<IpcLayer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
