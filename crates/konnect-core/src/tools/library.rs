@@ -1198,19 +1198,20 @@ async fn handle_register_footprint_library(
         ));
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    let table_dir = if scope == "global" {
+        None
+    } else {
+        table_path.parent()
+    };
+    let uri = format_lib_uri(&lib_path, table_dir);
+    register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
+            "uri": uri,
             "table": table_path.to_str().unwrap_or("")
         }))
         .unwrap(),
@@ -1281,19 +1282,20 @@ async fn handle_register_symbol_library(
         ));
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    let table_dir = if scope == "global" {
+        None
+    } else {
+        table_path.parent()
+    };
+    let uri = format_lib_uri(&lib_path, table_dir);
+    register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
+            "uri": uri,
             "table": table_path.to_str().unwrap_or("")
         }))
         .unwrap(),
@@ -1363,6 +1365,57 @@ fn table_root_element(table_path: &Path) -> &'static str {
 
 /// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
 /// Creates the file with minimal scaffolding if it doesn't exist.
+/// Format a library path as a lib-table URI the way KiCad writes it: forward
+/// slashes always, and — for a library inside the project directory —
+/// relative to `${KIPRJMOD}`.
+///
+/// KiCad does not reliably load absolute back-slash URIs written by other
+/// tools, and an absolute path breaks as soon as the project is moved.
+/// `expand_lib_uri` already *reads* `${KIPRJMOD}` entries (that is what KiCad
+/// itself writes for project-scoped libraries), so registering one keeps the
+/// round-trip consistent.
+///
+/// `table_dir` is the directory the lib-table lives in: the project folder for
+/// project scope, or None for global scope (never relativized).
+fn format_lib_uri(lib_path: &Path, table_dir: Option<&Path>) -> String {
+    let fwd = |p: &Path| p.to_string_lossy().replace('\\', "/");
+
+    if let Some(dir) = table_dir {
+        // Prefer canonicalized paths so ".." and symlinks don't defeat the
+        // prefix match; fall back to a lexical strip when the library does
+        // not exist yet (canonicalize would fail on it).
+        if let (Ok(abs_lib), Ok(abs_dir)) = (
+            std::fs::canonicalize(lib_path).map(|p| strip_unc(&p)),
+            std::fs::canonicalize(dir).map(|p| strip_unc(&p)),
+        ) {
+            if let Ok(rel) = abs_lib.strip_prefix(&abs_dir) {
+                let rel = fwd(rel);
+                if !rel.is_empty() {
+                    return format!("${{KIPRJMOD}}/{rel}");
+                }
+            }
+        }
+        if let Ok(rel) = lib_path.strip_prefix(dir) {
+            let rel = fwd(rel);
+            if !rel.is_empty() {
+                return format!("${{KIPRJMOD}}/{rel}");
+            }
+        }
+    }
+
+    fwd(lib_path)
+}
+
+/// Strip the Windows `\\?\` verbatim prefix that `canonicalize` adds, so
+/// `strip_prefix` matches and the written URI stays clean.
+fn strip_unc(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => p.to_path_buf(),
+    }
+}
+
 async fn register_in_lib_table(
     table_path: &Path,
     nickname: &str,
@@ -3257,6 +3310,58 @@ mod tests {
         // Without a project context (direct call, no table), it must not
         // resolve rather than guess.
         assert_eq!(expand_lib_uri("${KIPRJMOD}/MyParts.pretty", None), None);
+    }
+
+    #[test]
+    fn project_scoped_uri_is_written_as_kiprjmod() {
+        // A library inside the project directory must be registered as
+        // ${KIPRJMOD}/… so the project stays portable — and so it matches
+        // what KiCad's own library manager writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        let lib = proj.join("footprints").join("MyParts.pretty");
+        std::fs::create_dir_all(&lib).unwrap();
+
+        let uri = format_lib_uri(&lib, Some(proj));
+        assert_eq!(uri, "${KIPRJMOD}/footprints/MyParts.pretty", "got: {uri}");
+        assert!(!uri.contains('\\'), "must not contain backslashes: {uri}");
+    }
+
+    #[test]
+    fn written_project_uri_round_trips_through_expand_lib_uri() {
+        // The write side and the read side must agree: what register_*_library
+        // writes has to resolve back to the same directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        let lib = proj.join("MyParts.pretty");
+        std::fs::create_dir_all(&lib).unwrap();
+
+        let uri = format_lib_uri(&lib, Some(proj));
+        let resolved = expand_lib_uri(&uri, Some(proj));
+        assert_eq!(
+            resolved.map(|p| p.canonicalize().unwrap()),
+            Some(lib.canonicalize().unwrap()),
+            "URI {uri} must resolve back to the registered library"
+        );
+    }
+
+    #[test]
+    fn uri_outside_the_project_stays_absolute_with_forward_slashes() {
+        // Not relativizable, but KiCad still does not reliably load
+        // back-slash URIs, so those are normalized too.
+        let uri = format_lib_uri(
+            Path::new(r"E:\KiCAD\shared\MyParts.pretty"),
+            Some(Path::new(r"C:\proj")),
+        );
+        assert_eq!(uri, "E:/KiCAD/shared/MyParts.pretty", "got: {uri}");
+        assert!(!uri.contains('\\'));
+    }
+
+    #[test]
+    fn global_scope_is_never_relativized() {
+        let uri = format_lib_uri(Path::new(r"E:\KiCAD\shared\MyParts.pretty"), None);
+        assert_eq!(uri, "E:/KiCAD/shared/MyParts.pretty");
+        assert!(!uri.contains("KIPRJMOD"));
     }
 
     #[test]
