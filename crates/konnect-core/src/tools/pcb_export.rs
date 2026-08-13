@@ -316,9 +316,9 @@ async fn handle_export_gerber(
     cli::export_gerber(cli, &board, &output_dir).await?;
 
     if drill {
-        // kicad-cli also has a dedicated drill export
-        let drill_path = output_dir.join("drill.drl");
-        let _ = cli::export_drill(cli, &board, &drill_path).await; // best-effort
+        // Dedicated drill export. --output is the directory; KiCAD names the
+        // .drl file(s) after the board and writes them inside it.
+        let _ = cli::export_drill(cli, &board, &output_dir).await; // best-effort
     }
 
     // List produced files

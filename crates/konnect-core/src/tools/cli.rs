@@ -374,18 +374,45 @@ pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<(
     Ok(())
 }
 
-/// KiCAD 10: `pcb export drill --output <dir> <input>`
-pub async fn export_drill(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+/// KiCAD 10: `pcb export drill --output <dir>` writes Excellon file(s) *into*
+/// `output_dir`, named after the board (e.g. `MyBoard.drl`, or `-PTH`/`-NPTH`
+/// when separated). `--output` is therefore a DIRECTORY, not a file — passing
+/// a filename like `drill.drl` makes KiCAD create a directory by that name and
+/// hide the real `.drl` inside it. `output_dir` is created if missing and is
+/// passed with a trailing separator so KiCAD treats it as a directory. Returns
+/// the `.drl` file(s) produced.
+pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
+    tokio::fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("Cannot create drill output dir {}", output_dir.display()))?;
+
+    // KiCAD keys "directory vs file" off a trailing path separator.
+    let mut dir_arg = output_dir.to_string_lossy().to_string();
+    if !dir_arg.ends_with(['/', '\\']) {
+        dir_arg.push(std::path::MAIN_SEPARATOR);
+    }
+
     let args = [
         "pcb",
         "export",
         "drill",
         "--output",
-        output.to_str().unwrap(),
+        &dir_arg,
         pcb.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    Ok(())
+
+    // Collect the .drl file(s) KiCAD wrote into the directory.
+    let mut drills = Vec::new();
+    let mut rd = tokio::fs::read_dir(output_dir).await?;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("drl") {
+            drills.push(path);
+        }
+    }
+    drills.sort();
+    Ok(drills)
 }
 
 /// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`

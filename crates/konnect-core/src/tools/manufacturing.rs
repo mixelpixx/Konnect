@@ -140,15 +140,17 @@ async fn handle_export_manufacturing_package(
         }
     }
 
-    // 2. Export drill files
-    let drill_path = output_dir.join("drill.drl");
-    match cli::export_drill(cli_path, &board, &drill_path).await {
-        Ok(()) => {
-            info!("[BETA] Drill export succeeded");
-            files_generated.push(json!({
-                "type": "drill",
-                "path": drill_path.to_str().unwrap_or("")
-            }));
+    // 2. Export drill files. --output is a directory; KiCAD names the file(s)
+    // after the board and writes them inside it.
+    match cli::export_drill(cli_path, &board, &output_dir).await {
+        Ok(drills) => {
+            info!(count = drills.len(), "[BETA] Drill export succeeded");
+            for drill_path in drills {
+                files_generated.push(json!({
+                    "type": "drill",
+                    "path": drill_path.to_str().unwrap_or("")
+                }));
+            }
         }
         Err(e) => {
             warn!(error = %e, "[BETA] Drill export failed (may be included in gerbers)");
