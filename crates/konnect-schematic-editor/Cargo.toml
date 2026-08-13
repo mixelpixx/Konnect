@@ -11,6 +11,7 @@ description = "Typed KiCAD schematic parser and manipulator with lossless round-
 thiserror.workspace = true
 uuid.workspace = true
 konnect-sexp.workspace = true  # For geometry (pin transforms, snap, T-junction detection)
+serde_json.workspace = true    # Reading KiCad's kicad_common.json path variables
 
 [dev-dependencies]
 tempfile = "3"
