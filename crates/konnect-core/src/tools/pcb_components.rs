@@ -949,6 +949,46 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_find_component(args, ctx).await }
         ),
         tool!(
+            "list_board_footprint_graphics",
+            "List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Points are footprint-local millimetres, as the .kicad_mod shows them. Each item reports 'editable', plus 'outlines' and 'holes' for polygons: 'points' covers the first outline only, so an item with more than one outline or any holes is reported but cannot be edited here. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. 'J2'" },
+                    "layer":     { "type": "string", "description": "Only list items on this layer, e.g. 'F.SilkS' (optional)" }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_list_board_footprint_graphics(args, ctx).await }
+        ),
+        tool!(
+            "edit_board_footprint_graphic",
+            "Replace the vertices of a polygon inside a footprint placed on the board, selected by UUID. Points are footprint-local millimetres, as the .kicad_mod shows them. Use this to bring one placed instance in line with a library change without re-placing the part. Only a single-outline polygon with no holes can be replaced; anything else is refused by name rather than flattened. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. 'J2'" },
+                    "uuid":      { "type": "string", "description": "UUID of the graphic item, from list_board_footprint_graphics" },
+                    "points": {
+                        "type": "array",
+                        "description": "Replacement vertices in footprint-local millimetres; at least 3.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "number" },
+                                "y": { "type": "number" }
+                            },
+                            "required": ["x", "y"]
+                        }
+                    }
+                },
+                "required": ["board", "reference", "uuid", "points"]
+            }),
+            |args, ctx| async move { handle_edit_board_footprint_graphic(args, ctx).await }
+        ),
+        tool!(
             "get_component_pads",
             "Return the pad positions and net assignments for a footprint. \
              A pad's 'net' is its net name, \"\" if the pad carries no net node \
@@ -1204,6 +1244,71 @@ async fn handle_move_component(
     Ok(CallToolResult::json(
         &json!({ "moved": reference, "x": x, "y": y }),
     ))
+}
+
+async fn handle_list_board_footprint_graphics(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let layer_filter = args["layer"].as_str().map(|s| s.to_string());
+
+    let ref_ipc = reference.clone();
+    let graphics: Vec<konnect_ipc::types::IpcFootprintGraphic> =
+        ipc!(ctx, args, |c| c.list_footprint_graphics(&ref_ipc));
+
+    let graphics: Vec<_> = graphics
+        .into_iter()
+        .filter(|g| layer_filter.as_deref().is_none_or(|l| g.layer == l))
+        .collect();
+
+    Ok(CallToolResult::json(&json!({
+        "count": graphics.len(),
+        "reference": reference,
+        "graphics": graphics,
+    })))
+}
+
+async fn handle_edit_board_footprint_graphic(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let points: Vec<(f64, f64)> = args["points"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("'points' must be an array of {{x, y}}"))?
+        .iter()
+        .map(|p| {
+            let x = p["x"]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("each point needs a numeric 'x'"))?;
+            let y = p["y"]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("each point needs a numeric 'y'"))?;
+            Ok::<_, anyhow::Error>((x, y))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let (ref_ipc, uuid_ipc, pts) = (reference.clone(), uuid.clone(), points.clone());
+    let kind: String = ipc!(ctx, args, |c| c
+        .set_footprint_graphic_points(&ref_ipc, &uuid_ipc, &pts));
+
+    Ok(CallToolResult::json(&json!({
+        "edited": reference,
+        "uuid": uuid,
+        "kind": kind,
+        "points": points.len(),
+    })))
 }
 
 async fn handle_rotate_component(

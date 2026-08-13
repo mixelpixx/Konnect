@@ -104,6 +104,29 @@ pub struct IpcTrack {
     pub end: IpcVector2,
 }
 
+/// A graphic item inside a placed footprint — silkscreen, fabrication, or
+/// courtyard artwork, not a pad.
+///
+/// `points` are footprint-local millimetres, matching what the `.kicad_mod`
+/// shows, even though KiCad carries them in absolute board coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcFootprintGraphic {
+    pub uuid: String,
+    pub kind: String,
+    pub layer: String,
+    pub points: Vec<IpcVector2>,
+    /// How many outlines a polygon's `PolySet` carries, and how many holes
+    /// across them; `0` for every other kind. `points` reports the first
+    /// outline only, so anything above `1` outline or above `0` holes means
+    /// this listing is not the whole shape — hence stating it rather than
+    /// letting the caller infer a simple triangle from three points.
+    pub outlines: usize,
+    pub holes: usize,
+    /// Whether `edit_board_footprint_graphic` can address this item: a
+    /// single-outline polygon with no holes, carrying a UUID.
+    pub editable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcNet {
     pub name: String,

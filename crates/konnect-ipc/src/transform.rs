@@ -31,7 +31,7 @@ pub enum Xform {
 }
 
 impl Xform {
-    fn point(&self, x: i64, y: i64) -> (i64, i64) {
+    pub(crate) fn point(&self, x: i64, y: i64) -> (i64, i64) {
         match *self {
             Xform::Translate { dx_nm, dy_nm } => (x + dx_nm, y + dy_nm),
             Xform::Rotate {

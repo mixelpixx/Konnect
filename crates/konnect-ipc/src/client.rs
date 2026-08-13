@@ -46,6 +46,89 @@ fn layer_enum_to_name(layer: i32) -> &'static str {
     }
 }
 
+/// A placed footprint's anchor in board nanometres, and its orientation in
+/// degrees.
+///
+/// KiCad keeps a footprint's children in absolute board coordinates, so this
+/// is the frame that turns them back into the footprint-local numbers a
+/// `.kicad_mod` shows, and back again.
+fn footprint_frame(fp: &kiapi::board::types::FootprintInstance) -> ((i64, i64), f64) {
+    let pos = fp.position.unwrap_or_default();
+    let angle = fp
+        .orientation
+        .as_ref()
+        .map(|a| a.value_degrees)
+        .unwrap_or(0.0);
+    ((pos.x_nm, pos.y_nm), angle)
+}
+
+/// The shape family of a graphic geometry, named as the tool schemas name it.
+fn geometry_kind(geometry: &kiapi::common::types::graphic_shape::Geometry) -> &'static str {
+    use kiapi::common::types::graphic_shape::Geometry;
+    match geometry {
+        Geometry::Segment(_) => "segment",
+        Geometry::Rectangle(_) => "rectangle",
+        Geometry::Arc(_) => "arc",
+        Geometry::Circle(_) => "circle",
+        Geometry::Polygon(_) => "polygon",
+        Geometry::Bezier(_) => "bezier",
+    }
+}
+
+/// How many outlines a polygon's `PolySet` carries and how many holes across
+/// them. `(0, 0)` for any other geometry.
+///
+/// `geometry_points` reports the first outline only, and the edit path rebuilds
+/// the shape from a single outline — so a footprint carrying a cutout would read
+/// back looking correct and be flattened on the next write. Counting them is
+/// what lets both ends say so.
+fn polygon_extent(geometry: &kiapi::common::types::graphic_shape::Geometry) -> (usize, usize) {
+    use kiapi::common::types::graphic_shape::Geometry;
+    match geometry {
+        Geometry::Polygon(ps) => (
+            ps.polygons.len(),
+            ps.polygons.iter().map(|p| p.holes.len()).sum(),
+        ),
+        _ => (0, 0),
+    }
+}
+
+/// The defining vertices of a graphic geometry, in absolute board nanometres.
+fn geometry_points(geometry: &kiapi::common::types::graphic_shape::Geometry) -> Vec<(i64, i64)> {
+    use kiapi::common::types::graphic_shape::Geometry;
+    // An absent vertex yields nothing rather than the origin. Substituting
+    // (0, 0) would report a shape that looks well-formed and is silently in the
+    // wrong place; a short list is visibly wrong at the point of use.
+    let pt = |v: &Option<kiapi::common::types::Vector2>| v.map(|p| (p.x_nm, p.y_nm));
+    let pts = |vs: [&Option<kiapi::common::types::Vector2>; 4], n: usize| {
+        vs[..n].iter().filter_map(|v| pt(v)).collect::<Vec<_>>()
+    };
+    let none = &None;
+    match geometry {
+        Geometry::Segment(s) => pts([&s.start, &s.end, none, none], 2),
+        Geometry::Rectangle(r) => pts([&r.top_left, &r.bottom_right, none, none], 2),
+        Geometry::Arc(a) => pts([&a.start, &a.mid, &a.end, none], 3),
+        Geometry::Circle(c) => pts([&c.center, &c.radius_point, none, none], 2),
+        Geometry::Bezier(b) => pts([&b.start, &b.control1, &b.control2, &b.end], 4),
+        Geometry::Polygon(ps) => ps
+            .polygons
+            .first()
+            .and_then(|p| p.outline.as_ref())
+            .map(|o| {
+                o.nodes
+                    .iter()
+                    .filter_map(|n| match n.geometry.as_ref() {
+                        Some(kiapi::common::types::poly_line_node::Geometry::Point(p)) => {
+                            Some((p.x_nm, p.y_nm))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 /// Wrap a protobuf message into a prost_types::Any with the correct type_url.
 fn pack_any<M: Message>(msg: &M, type_name: &str) -> prost_types::Any {
     let mut buf = Vec::new();
@@ -946,6 +1029,205 @@ impl KiCadIpcClient {
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
                     self.update_items(vec![any])?;
                     return Ok(());
+                }
+            }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// List the graphic items inside a placed footprint.
+    ///
+    /// Points come back in footprint-local millimetres — the coordinates the
+    /// `.kicad_mod` shows — not the absolute board coordinates KiCad carries
+    /// them in over IPC. See `set_footprint_graphic_points` for why.
+    pub fn list_footprint_graphics(&self, reference: &str) -> Result<Vec<IpcFootprintGraphic>> {
+        let (fp, _) = self.find_footprint_instance(reference)?;
+        let (anchor, angle) = footprint_frame(&fp);
+        let to_local = crate::transform::Xform::Rotate {
+            cx_nm: anchor.0,
+            cy_nm: anchor.1,
+            delta_deg: -angle,
+        };
+
+        let mut out = Vec::new();
+        for any in &fp
+            .definition
+            .as_ref()
+            .map(|d| d.items.clone())
+            .unwrap_or_default()
+        {
+            let Ok(shape) = kiapi::board::types::BoardGraphicShape::decode(any.value.as_slice())
+            else {
+                continue;
+            };
+            let Some(geometry) = shape.shape.as_ref().and_then(|s| s.geometry.as_ref()) else {
+                continue;
+            };
+            let uuid = shape
+                .id
+                .as_ref()
+                .map(|k| k.value.clone())
+                .unwrap_or_default();
+            let kind = geometry_kind(geometry).to_string();
+            let (outlines, holes) = polygon_extent(geometry);
+            out.push(IpcFootprintGraphic {
+                editable: kind == "polygon" && outlines == 1 && holes == 0 && !uuid.is_empty(),
+                uuid,
+                kind,
+                outlines,
+                holes,
+                layer: layer_enum_to_name(shape.layer).to_string(),
+                points: geometry_points(geometry)
+                    .into_iter()
+                    .map(|(x, y)| {
+                        let (lx, ly) = to_local.point(x, y);
+                        IpcVector2 {
+                            x: nm_to_mm(lx - anchor.0),
+                            y: nm_to_mm(ly - anchor.1),
+                        }
+                    })
+                    .collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Replace the vertices of one graphic item inside a placed footprint.
+    ///
+    /// `points_mm` are footprint-local, matching what the `.kicad_mod` shows.
+    /// KiCad carries a footprint's children in absolute board coordinates over
+    /// IPC and re-creates them verbatim on update (the same reason
+    /// `move_footprint` has to shift them), so they are rotated by the
+    /// instance's orientation and translated onto its position here rather
+    /// than making every caller redo that arithmetic against the wrong frame.
+    pub fn set_footprint_graphic_points(
+        &self,
+        reference: &str,
+        uuid: &str,
+        points_mm: &[(f64, f64)],
+    ) -> Result<String> {
+        let (mut fp, _) = self.find_footprint_instance(reference)?;
+        let (anchor, angle) = footprint_frame(&fp);
+        let to_board = crate::transform::Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: angle,
+        };
+
+        let definition = fp
+            .definition
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("footprint '{}' carries no definition", reference))?;
+
+        for any in definition.items.iter_mut() {
+            let Ok(mut shape) =
+                kiapi::board::types::BoardGraphicShape::decode(any.value.as_slice())
+            else {
+                continue;
+            };
+            if shape.id.as_ref().map(|k| k.value.as_str()) != Some(uuid) {
+                continue;
+            }
+
+            let kind = shape
+                .shape
+                .as_ref()
+                .and_then(|s| s.geometry.as_ref())
+                .map(geometry_kind)
+                .unwrap_or("unknown");
+            if kind != "polygon" {
+                anyhow::bail!(
+                    "graphic '{}' on '{}' is a {}; only polygons take a vertex list",
+                    uuid,
+                    reference,
+                    kind
+                );
+            }
+            if points_mm.len() < 3 {
+                anyhow::bail!("a polygon needs at least 3 points, got {}", points_mm.len());
+            }
+            // The rebuild below emits one outline with no holes. Rejecting a
+            // shape that carries more is the difference between refusing the
+            // edit and silently deleting a cutout the caller never mentioned.
+            let (outlines, holes) = shape
+                .shape
+                .as_ref()
+                .and_then(|s| s.geometry.as_ref())
+                .map(polygon_extent)
+                .unwrap_or((0, 0));
+            if outlines > 1 || holes > 0 {
+                anyhow::bail!(
+                    "polygon '{}' on '{}' carries {} outline(s) and {} hole(s); this tool \
+                     replaces a single outline and would discard the rest, so it will not \
+                     write it — edit this one in KiCad",
+                    uuid,
+                    reference,
+                    outlines,
+                    holes
+                );
+            }
+
+            let nodes = points_mm
+                .iter()
+                .map(|&(x, y)| {
+                    let (rx, ry) =
+                        to_board.point(crate::builders::mm_to_nm(x), crate::builders::mm_to_nm(y));
+                    kiapi::common::types::PolyLineNode {
+                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                            kiapi::common::types::Vector2 {
+                                x_nm: anchor.0 + rx,
+                                y_nm: anchor.1 + ry,
+                            },
+                        )),
+                    }
+                })
+                .collect();
+
+            if let Some(s) = shape.shape.as_mut() {
+                s.geometry = Some(kiapi::common::types::graphic_shape::Geometry::Polygon(
+                    kiapi::common::types::PolySet {
+                        polygons: vec![kiapi::common::types::PolygonWithHoles {
+                            outline: Some(kiapi::common::types::PolyLine {
+                                nodes,
+                                closed: true,
+                            }),
+                            holes: vec![],
+                        }],
+                    },
+                ));
+            }
+
+            *any = pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
+            let packed = pack_any(&fp, "kiapi.board.types.FootprintInstance");
+            self.update_items(vec![packed])?;
+            return Ok(kind.to_string());
+        }
+
+        anyhow::bail!(
+            "graphic '{}' not found on footprint '{}' — call list_board_footprint_graphics \
+             for the UUIDs it does have",
+            uuid,
+            reference
+        )
+    }
+
+    /// The placed footprint carrying `reference`, and its index among items.
+    fn find_footprint_instance(
+        &self,
+        reference: &str,
+    ) -> Result<(kiapi::board::types::FootprintInstance, usize)> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for (i, item) in items.iter().enumerate() {
+            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
+                let ref_text = fp
+                    .reference_field
+                    .as_ref()
+                    .and_then(|f| f.text.as_ref())
+                    .and_then(|bt| bt.text.as_ref())
+                    .map(|t| t.text.as_str())
+                    .unwrap_or("");
+                if ref_text == reference {
+                    return Ok((fp, i));
                 }
             }
         }
@@ -1892,6 +2174,197 @@ mod footprint_graphics_tests {
             assert_normal_padstack_is_unpackable(
                 decoded.pad_stack.as_ref().expect("pad_stack"),
                 &format!("build_footprint_item pad on {layer}"),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod footprint_graphic_tests {
+    use super::*;
+    use crate::builders;
+    use crate::transform::Xform;
+
+    /// A footprint at (100, 100) rotated `angle` degrees, carrying `items`.
+    fn instance(
+        angle: f64,
+        items: Vec<prost_types::Any>,
+    ) -> kiapi::board::types::FootprintInstance {
+        kiapi::board::types::FootprintInstance {
+            position: Some(builders::vec2(100.0, 100.0)),
+            orientation: Some(kiapi::common::types::Angle {
+                value_degrees: angle,
+            }),
+            definition: Some(kiapi::board::types::Footprint {
+                items,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn frame_reports_anchor_and_orientation() {
+        let ((x, y), angle) = footprint_frame(&instance(90.0, vec![]));
+        assert_eq!(
+            (x, y),
+            (builders::mm_to_nm(100.0), builders::mm_to_nm(100.0))
+        );
+        assert_eq!(angle, 90.0);
+    }
+
+    #[test]
+    fn frame_defaults_to_the_origin_unrotated() {
+        let fp = kiapi::board::types::FootprintInstance::default();
+        assert_eq!(footprint_frame(&fp), ((0, 0), 0.0));
+    }
+
+    #[test]
+    fn geometry_kind_names_each_shape() {
+        use kiapi::common::types::graphic_shape::Geometry;
+        let poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(0.0, 0.0)]]);
+        let seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0);
+        let of = |s: &kiapi::board::types::BoardGraphicShape| -> &'static str {
+            geometry_kind(s.shape.as_ref().unwrap().geometry.as_ref().unwrap())
+        };
+        assert_eq!(of(&poly), "polygon");
+        assert_eq!(of(&seg), "segment");
+        // Exhaustiveness is enforced by the match, not by listing every arm here.
+        let _ = |g: &Geometry| geometry_kind(g);
+    }
+
+    #[test]
+    fn geometry_points_reads_a_polygon_outline_in_order() {
+        let poly = builders::board_polygon(
+            "F.SilkS",
+            0.1,
+            true,
+            &[vec![(13.9, -0.5), (13.9, 0.5), (13.0, 0.0)]],
+        );
+        let pts = geometry_points(poly.shape.as_ref().unwrap().geometry.as_ref().unwrap());
+        assert_eq!(
+            pts,
+            vec![
+                (builders::mm_to_nm(13.9), builders::mm_to_nm(-0.5)),
+                (builders::mm_to_nm(13.9), builders::mm_to_nm(0.5)),
+                (builders::mm_to_nm(13.0), builders::mm_to_nm(0.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn geometry_points_reads_a_segment_as_start_then_end() {
+        let seg = builders::board_segment("F.SilkS", 0.1, -19.0, 0.0, -17.0, 0.0);
+        let pts = geometry_points(seg.shape.as_ref().unwrap().geometry.as_ref().unwrap());
+        assert_eq!(
+            pts,
+            vec![
+                (builders::mm_to_nm(-19.0), builders::mm_to_nm(0.0)),
+                (builders::mm_to_nm(-17.0), builders::mm_to_nm(0.0)),
+            ]
+        );
+    }
+
+    /// A vertex KiCad did not populate is dropped, not reported as the origin.
+    /// (0, 0) is a plausible-looking coordinate, so substituting it turns a
+    /// malformed shape into a well-formed one in the wrong place.
+    #[test]
+    fn geometry_points_omits_a_missing_vertex() {
+        let mut seg = builders::board_segment("F.SilkS", 0.1, -19.0, 0.0, -17.0, 0.0);
+        match seg
+            .shape
+            .as_mut()
+            .and_then(|s| s.geometry.as_mut())
+            .unwrap()
+        {
+            kiapi::common::types::graphic_shape::Geometry::Segment(s) => s.end = None,
+            other => panic!("expected a segment, got {other:?}"),
+        }
+
+        let pts = geometry_points(seg.shape.as_ref().unwrap().geometry.as_ref().unwrap());
+        assert_eq!(
+            pts,
+            vec![(builders::mm_to_nm(-19.0), builders::mm_to_nm(0.0))],
+            "the absent end is missing from the list, not reported as (0, 0)"
+        );
+    }
+
+    /// A polygon carrying a cutout or a second outline must be countable, since
+    /// both the read and the write path only handle the first outline.
+    #[test]
+    fn polygon_extent_counts_outlines_and_holes() {
+        let simple = builders::board_polygon(
+            "F.SilkS",
+            0.1,
+            true,
+            &[vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]],
+        );
+        let geom = |s: &kiapi::board::types::BoardGraphicShape| {
+            s.shape.as_ref().unwrap().geometry.as_ref().unwrap().clone()
+        };
+        assert_eq!(polygon_extent(&geom(&simple)), (1, 0));
+
+        let two = builders::board_polygon(
+            "F.SilkS",
+            0.1,
+            true,
+            &[
+                vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
+            ],
+        );
+        assert_eq!(polygon_extent(&geom(&two)), (2, 0));
+
+        // A hole on the first outline — what board_polygon never builds.
+        let mut holed = simple.clone();
+        if let kiapi::common::types::graphic_shape::Geometry::Polygon(ps) = holed
+            .shape
+            .as_mut()
+            .and_then(|s| s.geometry.as_mut())
+            .unwrap()
+        {
+            ps.polygons[0].holes.push(kiapi::common::types::PolyLine {
+                nodes: vec![],
+                closed: true,
+            });
+        }
+        assert_eq!(polygon_extent(&geom(&holed)), (1, 1));
+
+        // Every other kind reports nothing rather than a misleading 1.
+        let seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0);
+        assert_eq!(polygon_extent(&geom(&seg)), (0, 0));
+    }
+
+    /// The arithmetic both new methods stand on: a footprint-local point
+    /// pushed into board space and read back must land where it started, at a
+    /// rotation where getting the sign wrong is visible.
+    #[test]
+    fn local_to_board_and_back_round_trips_under_rotation() {
+        let fp = instance(90.0, vec![]);
+        let (anchor, angle) = footprint_frame(&fp);
+
+        let to_board = Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: angle,
+        };
+        let to_local = Xform::Rotate {
+            cx_nm: anchor.0,
+            cy_nm: anchor.1,
+            delta_deg: -angle,
+        };
+
+        for &(x_mm, y_mm) in &[(13.5, -0.5), (13.5, 0.5), (12.7, 0.0), (-19.0, 3.25)] {
+            let (rx, ry) = to_board.point(builders::mm_to_nm(x_mm), builders::mm_to_nm(y_mm));
+            let (bx, by) = (anchor.0 + rx, anchor.1 + ry);
+            let (lx, ly) = to_local.point(bx, by);
+            assert_eq!(
+                (
+                    builders::nm_to_mm(lx - anchor.0),
+                    builders::nm_to_mm(ly - anchor.1)
+                ),
+                (x_mm, y_mm),
+                "round trip lost ({x_mm}, {y_mm})"
             );
         }
     }

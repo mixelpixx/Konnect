@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **189 registered tools** + **6 always-visible meta-tools** = **195 total**
+- **191 registered tools** + **6 always-visible meta-tools** = **197 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -200,7 +200,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 13 tools
+### `pcb_components` · 15 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
@@ -212,6 +212,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
 | `find_component` | Find a footprint by reference designator and return its position. |
+| `list_board_footprint_graphics` | List the graphic items inside a placed footprint — silkscreen, fabrication, courtyard — with the UUID needed to edit one. Points are footprint-local mm. |
+| `edit_board_footprint_graphic` | Replace the vertices of a polygon inside a placed footprint, selected by UUID, via KiCAD IPC. Brings one instance in line with a library change without re-placing the part. |
 | `get_component_pads` | Return pad positions and net assignments for a footprint. A pad whose net node is present but unreadable reports `null` rather than an empty string, so "no net" stays distinguishable from "could not read it". |
 | `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
