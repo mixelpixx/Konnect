@@ -117,6 +117,46 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_edit_footprint_pad(args, ctx).await }
         ),
         tool!(
+            "list_footprint_graphics",
+            "List the graphic items in a .kicad_mod footprint — silkscreen, fabrication, and courtyard outlines — with the UUID needed to edit one.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file" },
+                    "layer": { "type": "string", "description": "Only list items on this layer, e.g. 'F.SilkS' (optional)" }
+                },
+                "required": ["footprint_path"]
+            }),
+            |args, ctx| async move { handle_list_footprint_graphics(args, ctx).await }
+        ),
+        tool!(
+            "edit_footprint_graphic",
+            "Edit the geometry, layer, or stroke width of one graphic item in an existing .kicad_mod footprint, selected by UUID. Covers fp_line, fp_rect, fp_circle, fp_arc, and fp_poly; pads are edited with edit_footprint_pad.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file" },
+                    "uuid": { "type": "string", "description": "UUID of the graphic item, as reported by list_footprint_graphics" },
+                    "points": {
+                        "type": "array",
+                        "description": "Replacement vertices in millimetres, in the order KiCad stores them: 2 for fp_line and fp_rect (start, end), 2 for fp_circle (center, then a point on the circumference), 3 for fp_arc (start, mid, end), 3 or more for fp_poly. Omit to leave the geometry unchanged.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "number" },
+                                "y": { "type": "number" }
+                            },
+                            "required": ["x", "y"]
+                        }
+                    },
+                    "layer": { "type": "string", "description": "New layer, e.g. 'F.SilkS' (optional)" },
+                    "width_mm": { "type": "number", "description": "New stroke width in mm (optional)" }
+                },
+                "required": ["footprint_path", "uuid"]
+            }),
+            |args, ctx| async move { handle_edit_footprint_graphic(args, ctx).await }
+        ),
+        tool!(
             "register_footprint_library",
             "Register a local footprint library directory in the KiCAD global or project library table.",
             json!({
@@ -821,6 +861,270 @@ async fn handle_edit_footprint_pad(
         serde_json::to_string(&json!({
             "success": true,
             "pad": pad_number
+        }))
+        .unwrap(),
+    ))
+}
+
+// ─── Footprint graphics ───────────────────────────────────────────────────────
+
+/// The graphic item tags a footprint can carry, and the sub-blocks that hold
+/// each one's vertices, in the order KiCad writes them.
+///
+/// `fp_text` is deliberately absent: its position is a single `(at x y angle)`
+/// carrying a rotation these tools have no way to express, and its size lives
+/// in `(effects (font …))` rather than in a stroke.
+const GRAPHIC_KINDS: [(&str, &[&str]); 5] = [
+    ("fp_line", &["start", "end"]),
+    ("fp_rect", &["start", "end"]),
+    ("fp_circle", &["center", "end"]),
+    ("fp_arc", &["start", "mid", "end"]),
+    ("fp_poly", &[]), // vertices live in (pts (xy …) …) instead
+];
+
+/// Byte range of the first direct `(tag …)` block inside `block`.
+fn find_child_block(block: &str, tag: &str) -> Option<(usize, usize)> {
+    find_block_starts(block, tag)
+        .into_iter()
+        .find_map(|s| find_balanced_block(block, s))
+}
+
+/// Every graphic item in `content`, as (kind, block_start, block_end).
+///
+/// Sorted by position so that callers see them in file order, which is the
+/// order KiCad's own editor lists them in.
+fn graphic_blocks(content: &str) -> Vec<(&'static str, usize, usize)> {
+    let mut out = Vec::new();
+    for (kind, _) in GRAPHIC_KINDS {
+        for start in find_block_starts(content, kind) {
+            if let Some((s, e)) = find_balanced_block(content, start) {
+                out.push((kind, s, e));
+            }
+        }
+    }
+    out.sort_by_key(|&(_, s, _)| s);
+    out
+}
+
+/// The vertices of one graphic block, in KiCad's storage order.
+fn graphic_points(kind: &str, block: &str) -> Vec<(f64, f64)> {
+    let node = match parse_sexp(block) {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    if kind == "fp_poly" {
+        return node
+            .find("pts")
+            .map(|pts| {
+                pts.find_all("xy")
+                    .into_iter()
+                    .filter_map(|xy| Some((xy.get_f64(1)?, xy.get_f64(2)?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    GRAPHIC_KINDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, tags)| {
+            tags.iter()
+                .filter_map(|tag| {
+                    let n = node.find(tag)?;
+                    Some((n.get_f64(1)?, n.get_f64(2)?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Formats a millimetre coordinate the way KiCad does: no trailing zeros, and
+/// no `-0`, which KiCad never writes and a reviewer would flag as a diff.
+fn fmt_mm(v: f64) -> String {
+    let v = if v == 0.0 { 0.0 } else { v };
+    let s = format!("{}", v);
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
+}
+
+async fn handle_list_footprint_graphics(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = get_path(args, "footprint_path")?;
+    let layer_filter = args["layer"].as_str();
+
+    let content = tokio::fs::read_to_string(&path).await?;
+
+    let mut graphics = Vec::new();
+    for (kind, s, e) in graphic_blocks(&content) {
+        let block = &content[s..e];
+        let node = match parse_sexp(block) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let layer = node.find_str("layer").unwrap_or("").to_string();
+        if let Some(want) = layer_filter {
+            if layer != want {
+                continue;
+            }
+        }
+        let width_mm = node.find("stroke").and_then(|s| s.find_f64("width"));
+        graphics.push(json!({
+            "uuid": node.find_str("uuid").unwrap_or(""),
+            "kind": kind,
+            "layer": layer,
+            "width_mm": width_mm,
+            "points": graphic_points(kind, block)
+                .into_iter()
+                .map(|(x, y)| json!({ "x": x, "y": y }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "count": graphics.len(),
+            "graphics": graphics,
+            "path": path.to_str().unwrap_or(""),
+        }))
+        .unwrap(),
+    ))
+}
+
+async fn handle_edit_footprint_graphic(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = get_path(args, "footprint_path")?;
+    let uuid = require_str(args, "uuid").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let content = tokio::fs::read_to_string(&path).await?;
+
+    // Locate the item by UUID rather than by index: a footprint's graphics are
+    // reordered whenever KiCad rewrites the file, so an index would address a
+    // different outline after any unrelated edit.
+    let (kind, block_start, block_end) = graphic_blocks(&content)
+        .into_iter()
+        .find(|&(_, s, e)| {
+            parse_sexp(&content[s..e])
+                .ok()
+                .and_then(|n| n.find_str("uuid").map(|u| u == uuid))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "graphic item '{}' not found in footprint '{}' — call \
+                 list_footprint_graphics for the UUIDs it does have",
+                uuid,
+                path.display()
+            )
+        })?;
+
+    let block = &content[block_start..block_end];
+    let mut edits: Vec<konnect_sexp::writer::SexpEdit> = Vec::new();
+
+    if let Some(points) = args["points"].as_array() {
+        let pts: Vec<(f64, f64)> = points
+            .iter()
+            .map(|p| {
+                let x = p["x"]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("each point needs a numeric 'x'"))?;
+                let y = p["y"]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("each point needs a numeric 'y'"))?;
+                Ok::<_, anyhow::Error>((x, y))
+            })
+            .collect::<Result<_, _>>()?;
+
+        if kind == "fp_poly" {
+            if pts.len() < 3 {
+                anyhow::bail!(
+                    "an fp_poly needs at least 3 points, got {} — a 2-point \
+                     outline is an fp_line",
+                    pts.len()
+                );
+            }
+            let (ps, pe) = find_child_block(block, "pts")
+                .ok_or_else(|| anyhow::anyhow!("fp_poly '{}' has no (pts …) block", uuid))?;
+            let body = pts
+                .iter()
+                .map(|&(x, y)| format!("(xy {} {})", fmt_mm(x), fmt_mm(y)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            edits.push(konnect_sexp::writer::SexpEdit::replace(
+                block_start + ps,
+                block_start + pe,
+                format!("(pts {})", body),
+            ));
+        } else {
+            let tags = GRAPHIC_KINDS
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .map(|(_, t)| *t)
+                .unwrap_or(&[]);
+            if pts.len() != tags.len() {
+                anyhow::bail!(
+                    "an {} needs exactly {} points ({}), got {}",
+                    kind,
+                    tags.len(),
+                    tags.join(", "),
+                    pts.len()
+                );
+            }
+            for (tag, &(x, y)) in tags.iter().zip(pts.iter()) {
+                let (ts, te) = find_child_block(block, tag).ok_or_else(|| {
+                    anyhow::anyhow!("{} '{}' has no ({} …) block", kind, uuid, tag)
+                })?;
+                edits.push(konnect_sexp::writer::SexpEdit::replace(
+                    block_start + ts,
+                    block_start + te,
+                    format!("({} {} {})", tag, fmt_mm(x), fmt_mm(y)),
+                ));
+            }
+        }
+    }
+
+    if let Some(layer) = args["layer"].as_str() {
+        let (ls, le) = find_child_block(block, "layer")
+            .ok_or_else(|| anyhow::anyhow!("{} '{}' has no (layer …) block", kind, uuid))?;
+        edits.push(konnect_sexp::writer::SexpEdit::replace(
+            block_start + ls,
+            block_start + le,
+            format!("(layer \"{}\")", layer),
+        ));
+    }
+
+    if let Some(width) = args["width_mm"].as_f64() {
+        // The width lives inside (stroke …); a bare search would also match a
+        // (width …) that a future format revision puts elsewhere in the item.
+        let (ss, se) = find_child_block(block, "stroke")
+            .ok_or_else(|| anyhow::anyhow!("{} '{}' has no (stroke …) block", kind, uuid))?;
+        let stroke = &block[ss..se];
+        let (ws, we) = find_child_block(stroke, "width")
+            .ok_or_else(|| anyhow::anyhow!("{} '{}' has no stroke width", kind, uuid))?;
+        edits.push(konnect_sexp::writer::SexpEdit::replace(
+            block_start + ss + ws,
+            block_start + ss + we,
+            format!("(width {})", fmt_mm(width)),
+        ));
+    }
+
+    if edits.is_empty() {
+        anyhow::bail!("nothing to change — pass points, layer, or width_mm");
+    }
+
+    let edited = konnect_sexp::writer::apply_edits(content, edits);
+    write_atomic(&path, &edited)?;
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "success": true,
+            "uuid": uuid,
+            "kind": kind,
         }))
         .unwrap(),
     ))
@@ -4417,6 +4721,280 @@ mod tests {
         assert!(
             rc.contains("(name \"IN\" (effects (font (size 1.27 1.27))))"),
             "rectangle pin names keep the default 1.27 font:\n{rc}"
+        );
+    }
+
+    // ─── Footprint graphics ───────────────────────────────────────────────
+
+    /// A footprint in the shape KiCad 10 writes one: tab-indented, each graphic
+    /// carrying a stroke and a uuid. The polygon is a pin-1 marker sitting hard
+    /// against the part's right edge, which is the case these tools were added
+    /// for.
+    fn footprint_with_graphics() -> String {
+        [
+            "(footprint \"Marked_Part\"",
+            "\t(version 20260206)",
+            "\t(generator \"pcbnew\")",
+            "\t(layer \"F.Cu\")",
+            "\t(fp_poly",
+            "\t\t(pts",
+            "\t\t\t(xy 13.9 -0.5) (xy 13.9 0.5) (xy 13 0)",
+            "\t\t)",
+            "\t\t(stroke",
+            "\t\t\t(width 0.1)",
+            "\t\t\t(type default)",
+            "\t\t)",
+            "\t\t(fill yes)",
+            "\t\t(layer \"F.SilkS\")",
+            "\t\t(uuid \"11111111-1111-1111-1111-111111111111\")",
+            "\t)",
+            "\t(fp_line",
+            "\t\t(start -19 0)",
+            "\t\t(end -17 0)",
+            "\t\t(stroke",
+            "\t\t\t(width 0.08)",
+            "\t\t\t(type default)",
+            "\t\t)",
+            "\t\t(layer \"Dwgs.User\")",
+            "\t\t(uuid \"22222222-2222-2222-2222-222222222222\")",
+            "\t)",
+            "\t(fp_circle",
+            "\t\t(center 0 0)",
+            "\t\t(end 2 0)",
+            "\t\t(stroke",
+            "\t\t\t(width 0.05)",
+            "\t\t\t(type default)",
+            "\t\t)",
+            "\t\t(fill none)",
+            "\t\t(layer \"F.CrtYd\")",
+            "\t\t(uuid \"33333333-3333-3333-3333-333333333333\")",
+            "\t)",
+            ")",
+        ]
+        .join("\n")
+    }
+
+    fn write_footprint(dir: &Path) -> PathBuf {
+        let path = dir.join("Marked_Part.kicad_mod");
+        std::fs::write(&path, footprint_with_graphics()).unwrap();
+        path
+    }
+
+    /// The JSON body of a tool result, which these tools return as text.
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected a text result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_footprint_graphics_reports_uuid_layer_and_points() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_footprint(tmp.path());
+
+        let out = handle_list_footprint_graphics(
+            &json!({ "footprint_path": path.to_string_lossy() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let v = result_json(&out);
+
+        assert_eq!(v["count"], 3, "one entry per graphic item: {v}");
+        // File order, not tag order: the polygon is written first.
+        assert_eq!(v["graphics"][0]["kind"], "fp_poly");
+        assert_eq!(
+            v["graphics"][0]["uuid"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(v["graphics"][0]["layer"], "F.SilkS");
+        assert_eq!(v["graphics"][0]["width_mm"], 0.1);
+        assert_eq!(v["graphics"][0]["points"][0]["x"], 13.9);
+        assert_eq!(v["graphics"][0]["points"][2]["y"], 0.0);
+        // An fp_circle reports (center, circumference point), in that order.
+        assert_eq!(v["graphics"][2]["kind"], "fp_circle");
+        assert_eq!(v["graphics"][2]["points"][1]["x"], 2.0);
+    }
+
+    #[tokio::test]
+    async fn list_footprint_graphics_filters_by_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_footprint(tmp.path());
+
+        let out = handle_list_footprint_graphics(
+            &json!({ "footprint_path": path.to_string_lossy(), "layer": "F.SilkS" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let v = result_json(&out);
+
+        assert_eq!(v["count"], 1, "only the silkscreen item: {v}");
+        assert_eq!(v["graphics"][0]["kind"], "fp_poly");
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_graphic_moves_a_polygon_and_leaves_the_rest_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_footprint(tmp.path());
+
+        handle_edit_footprint_graphic(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "points": [{"x": 13.5, "y": -0.5}, {"x": 13.5, "y": 0.5}, {"x": 12.7, "y": 0}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(pts (xy 13.5 -0.5) (xy 13.5 0.5) (xy 12.7 0))"),
+            "the polygon takes the new vertices:\n{after}"
+        );
+        assert!(
+            after.contains("(fill yes)") && after.contains("(width 0.1)"),
+            "fill and stroke survive a geometry-only edit:\n{after}"
+        );
+        assert!(
+            after.contains("(start -19 0)") && after.contains("(center 0 0)"),
+            "the other two items are untouched:\n{after}"
+        );
+        assert!(
+            after.contains("(uuid \"11111111-1111-1111-1111-111111111111\")"),
+            "the item keeps its identity:\n{after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_graphic_sets_the_width_inside_the_stroke() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_footprint(tmp.path());
+
+        handle_edit_footprint_graphic(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "uuid": "22222222-2222-2222-2222-222222222222",
+                "width_mm": 0.12
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(width 0.12)"),
+            "the line's stroke width is updated:\n{after}"
+        );
+        assert!(
+            after.contains("(width 0.1)") && after.contains("(width 0.05)"),
+            "the polygon's and circle's widths are untouched:\n{after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_graphic_rejects_a_polygon_of_two_points() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_footprint(tmp.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = handle_edit_footprint_graphic(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "points": [{"x": 0, "y": 0}, {"x": 1, "y": 1}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("at least 3 points"),
+            "explains the arity: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a rejected edit leaves the footprint byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_graphic_rejects_an_arc_of_two_points() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Arced.kicad_mod");
+        std::fs::write(
+            &path,
+            "(footprint \"Arced\"\n\t(fp_arc\n\t\t(start 0 0)\n\t\t(mid 1 1)\n\t\t(end 2 0)\n\t\t(stroke\n\t\t\t(width 0.1)\n\t\t\t(type default)\n\t\t)\n\t\t(layer \"F.SilkS\")\n\t\t(uuid \"44444444-4444-4444-4444-444444444444\")\n\t)\n)",
+        )
+        .unwrap();
+
+        let err = handle_edit_footprint_graphic(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "uuid": "44444444-4444-4444-4444-444444444444",
+                "points": [{"x": 0, "y": 0}, {"x": 2, "y": 0}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("exactly 3 points") && err.contains("start, mid, end"),
+            "names the vertices an arc needs: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_graphic_reports_an_unknown_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_footprint(tmp.path());
+
+        let err = handle_edit_footprint_graphic(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "uuid": "99999999-9999-9999-9999-999999999999",
+                "layer": "F.SilkS"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("not found") && err.contains("list_footprint_graphics"),
+            "points at the tool that lists the real UUIDs: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_graphic_needs_something_to_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_footprint(tmp.path());
+
+        let err = handle_edit_footprint_graphic(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "uuid": "11111111-1111-1111-1111-111111111111"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("nothing to change"),
+            "says what is missing: {err}"
         );
     }
 }

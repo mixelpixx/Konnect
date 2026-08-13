@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **187 registered tools** + **6 always-visible meta-tools** = **193 total**
+- **189 registered tools** + **6 always-visible meta-tools** = **195 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -263,7 +263,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Library
 
-### `library` · 14 tools
+### `library` · 16 tools
 **Purpose:** Symbol libraries, footprint libraries, search and registration.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -271,6 +271,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 |------|-------------|
 | `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
 | `edit_footprint_pad` | Edit the size, shape, or position of a pad in an existing `.kicad_mod`. |
+| `list_footprint_graphics` | List the graphic items in a `.kicad_mod` — silkscreen, fabrication, and courtyard outlines — with the UUID needed to edit one. |
+| `edit_footprint_graphic` | Edit the geometry, layer, or stroke width of one graphic item in an existing `.kicad_mod`, selected by UUID. |
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
