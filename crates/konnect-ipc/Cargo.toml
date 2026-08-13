@@ -20,5 +20,13 @@ nng.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 
+# Bounded probing of KiCad's unix socket, and the euid it must be owned by.
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
+libc = "0.2"
+
 [build-dependencies]
 prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

@@ -38,10 +38,27 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
         use crate::config::{Config, TransportMode};
         use konnect_core::mcp::handler::McpHandler;
 
-        let config = match config_path_str.as_deref() {
-            Some(p) => Config::load_from(std::path::Path::new(p)).unwrap_or_default(),
-            None => Config::load().unwrap_or_default(),
-        };
+        // KiCad loads this cdylib with KICAD_API_SOCKET set, so this path needs
+        // the same ipc_address resolution the standalone server does.
+        let (config, ipc_source) =
+            Config::load_resolved(config_path_str.as_deref().map(std::path::Path::new))
+                .unwrap_or_else(|_| {
+                    let mut config = Config::default();
+                    let ipc_source = config.resolve_ipc_address();
+                    (config, ipc_source)
+                });
+        // `main.rs` installs a subscriber before reporting the resolution.
+        // This entry point installed none, so the report — including the
+        // warning that names every candidate probed — was written into
+        // nothing. `try_init` leaves a subscriber the host already installed
+        // alone, which is the case that matters when KiCad loads this cdylib.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.log_level));
+        let _ = tracing_subscriber::fmt::Subscriber::builder()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .try_init();
+        ipc_source.log(&config.ipc_address);
         let server_config = konnect_core::tools::ServerConfig {
             kicad_cli: config.kicad_cli.clone(),
             kicad_binary: config.kicad_binary.clone(),

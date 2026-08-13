@@ -120,15 +120,7 @@ async fn main() -> Result<()> {
         .and_then(|pos| args.get(pos + 1))
         .map(std::path::PathBuf::from);
 
-    let config = if let Some(ref path) = config_path {
-        // KiCAD launches the server this way (with KICAD_API_SOCKET set), so
-        // the env fallback for a blank ipc_address must apply here too (#39).
-        let mut c = Config::load_from(path)?;
-        c.apply_env_fallbacks();
-        c
-    } else {
-        Config::load()?
-    };
+    let (config, ipc_source) = Config::load_resolved(config_path.as_deref())?;
 
     // ─── Initialize tracing (stderr only — stdout is MCP protocol) ──
     let filter =
@@ -140,6 +132,7 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
+    ipc_source.log(&config.ipc_address);
 
     let server_config = konnect_core::tools::ServerConfig {
         kicad_cli: config.kicad_cli.clone(),

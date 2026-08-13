@@ -304,9 +304,9 @@ macro_rules! tool {
 ///
 /// This is the typed gate for the file-editing fallback — never a text match
 /// on the error message — and it is shared rather than copied per toolset:
-/// the toolsets' plain `with_ipc` helpers have already drifted from each
-/// other, and this is the one decision (is it safe to edit a board file behind
-/// a live KiCad?) whose copies must not.
+/// this is the one decision (is it safe to edit a board file behind a live
+/// KiCad?) whose copies must not drift, as the per-toolset `with_ipc` helpers
+/// this and `with_ipc` replaced had.
 pub async fn with_ipc_classified<T, F>(
     address: String,
     f: F,
@@ -316,8 +316,10 @@ where
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     match tokio::task::spawn_blocking(move || {
-        f(&konnect_ipc::client::KiCadIpcClient::new(&address))
-            .map_err(konnect_ipc::IpcFailure::from_error)
+        f(&konnect_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
+            warn_if_ipc_unreachable(&address, &error);
+            konnect_ipc::IpcFailure::from_error(error)
+        })
     })
     .await
     {
@@ -348,6 +350,50 @@ where
         f(client)
     })
     .await
+}
+
+/// Run `f` against KiCad's IPC API, reporting a failure as its message.
+///
+/// Callers that edit board files when this fails want
+/// [`with_ipc_classified`] instead: only the classification says whether a
+/// live KiCad could be holding the board.
+pub(crate) async fn with_ipc<T, F>(address: String, f: F) -> anyhow::Result<Result<T, String>>
+where
+    T: Send + 'static,
+    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        f(&konnect_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
+            warn_if_ipc_unreachable(&address, &error);
+            format!("{error:#}")
+        })
+    })
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
+    }
+}
+
+/// Warn that an IPC call never reached KiCad, naming the address it tried.
+///
+/// Nothing else records this: a tool that then reads the project files reports
+/// a plain success, and one that fails closed reports an error the user may
+/// read as "KiCad said no" rather than "Konnect never got through". KiCad
+/// *rejected* the call is a different thing, and is not warned about here.
+fn warn_if_ipc_unreachable(address: &str, error: &anyhow::Error) {
+    if !konnect_ipc::is_transport_unreachable(error) {
+        return;
+    }
+    tracing::warn!(
+        ipc_address = if address.is_empty() {
+            "<unset>"
+        } else {
+            address
+        },
+        // Formatted inside the macro so a filtered-out WARN costs nothing.
+        "KiCad IPC unreachable, so the live board was not consulted: {error:#}"
+    );
 }
 
 // ─── Argument helpers ─────────────────────────────────────────────────────────

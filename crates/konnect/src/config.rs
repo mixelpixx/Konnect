@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -16,8 +17,9 @@ pub struct Config {
     #[serde(default)]
     pub project_dir: Option<PathBuf>,
 
-    /// KiCAD IPC socket path (NNG). Auto-detected from KICAD_API_SOCKET env var if empty.
-    #[serde(default = "default_ipc_address")]
+    /// KiCad IPC socket path (NNG). When empty, resolved at startup from the
+    /// KICAD_API_SOCKET env var, then from the platform's default socket path.
+    #[serde(default)]
     #[serde(alias = "ipc_socket_path")]
     pub ipc_address: String,
 
@@ -67,6 +69,46 @@ pub enum TransportMode {
     Both,
 }
 
+/// Where the effective `ipc_address` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcAddressSource {
+    /// Set explicitly in a config file.
+    Config,
+    /// Taken from `KICAD_API_SOCKET` (set for plugins KiCad launches itself).
+    Environment,
+    /// Probed from the platform's default KiCad socket path.
+    Detected,
+    /// Nothing found — IPC tools will report the socket as unconfigured, and
+    /// the ones with a file path will quietly use it.
+    Unresolved,
+}
+
+impl IpcAddressSource {
+    /// Report the resolution once tracing is initialized.
+    pub fn log(self, address: &str) {
+        let source = match self {
+            IpcAddressSource::Config => "config",
+            IpcAddressSource::Environment => "KICAD_API_SOCKET",
+            IpcAddressSource::Detected => "auto-detection",
+            IpcAddressSource::Unresolved => {
+                warn!(
+                    "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
+                     Live-KiCad tools will fail and file-backed ones will edit the \
+                     project on disk instead. Enable Edit > Preferences > Plugins > \
+                     'Enable KiCad API' in KiCad, or set ipc_address in your config.",
+                    konnect_ipc::candidate_socket_paths()
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return;
+            }
+        };
+        info!("KiCad IPC address from {source}: {address}");
+    }
+}
+
 fn default_kicad_cli() -> String {
     if cfg!(target_os = "windows") {
         "kicad-cli.exe".to_string()
@@ -83,11 +125,6 @@ fn default_kicad_binary() -> String {
     }
 }
 
-fn default_ipc_address() -> String {
-    // Empty = auto-detect from KICAD_API_SOCKET env var at runtime
-    std::env::var("KICAD_API_SOCKET").unwrap_or_default()
-}
-
 fn default_http_address() -> String {
     "127.0.0.1:3000".to_string()
 }
@@ -97,8 +134,26 @@ fn default_log_level() -> String {
 }
 
 impl Config {
-    /// Load config from the default search path.
-    pub fn load() -> Result<Self> {
+    /// Load from `path` when given, else from the default search path, with
+    /// `ipc_address` resolved either way.
+    ///
+    /// Every entry point loads through here. Resolution used to be the
+    /// caller's job, and each caller that forgot it was a bug: #39 for
+    /// `main.rs`, and `ffi.rs` silently ignoring KICAD_API_SOCKET until the
+    /// same fix reached it.
+    pub fn load_resolved(path: Option<&std::path::Path>) -> Result<(Self, IpcAddressSource)> {
+        match path {
+            Some(path) => {
+                let mut config = Self::load_from(path)?;
+                let ipc_source = config.resolve_ipc_address();
+                Ok((config, ipc_source))
+            }
+            None => Self::load(),
+        }
+    }
+
+    /// Load config from the default search path, with `ipc_address` resolved.
+    pub fn load() -> Result<(Self, IpcAddressSource)> {
         let mut config_paths = vec![
             PathBuf::from("konnect.toml"),
             PathBuf::from("settings.json"),
@@ -115,20 +170,41 @@ impl Config {
         }
 
         let mut config = config.unwrap_or_default();
-        config.apply_env_fallbacks();
-        Ok(config)
+        let ipc_source = config.resolve_ipc_address();
+        Ok((config, ipc_source))
     }
 
-    /// Env var wins over an unset/blank ipc_address either way. Must run on
-    /// every load path — including `--config <file>`, which is how KiCAD
-    /// itself launches the server (with KICAD_API_SOCKET in the environment).
-    pub fn apply_env_fallbacks(&mut self) {
-        if self.ipc_address.is_empty() {
-            if let Ok(sock) = std::env::var("KICAD_API_SOCKET") {
-                if !sock.is_empty() {
-                    self.ipc_address = sock;
-                }
+    /// Fill in a blank `ipc_address`: env var first, then the platform default
+    /// KiCad listens on. Must run on every load path — including
+    /// `--config <file>`, which is how KiCad itself launches the server (with
+    /// KICAD_API_SOCKET in the environment).
+    ///
+    /// Returns where the address came from so the caller can log it once
+    /// tracing is up; a session that will silently fall back to file editing
+    /// says so at startup rather than at the first confusing tool result.
+    pub fn resolve_ipc_address(&mut self) -> IpcAddressSource {
+        self.resolve_ipc_address_with(konnect_ipc::detect_ipc_address)
+    }
+
+    fn resolve_ipc_address_with(
+        &mut self,
+        detect_ipc_address: impl FnOnce() -> Option<String>,
+    ) -> IpcAddressSource {
+        if !self.ipc_address.is_empty() {
+            return IpcAddressSource::Config;
+        }
+        if let Ok(sock) = std::env::var("KICAD_API_SOCKET") {
+            if !sock.is_empty() {
+                self.ipc_address = sock;
+                return IpcAddressSource::Environment;
             }
+        }
+        match detect_ipc_address() {
+            Some(address) => {
+                self.ipc_address = address;
+                IpcAddressSource::Detected
+            }
+            None => IpcAddressSource::Unresolved,
         }
     }
 
@@ -157,7 +233,8 @@ impl Default for Config {
             kicad_cli: default_kicad_cli(),
             kicad_binary: default_kicad_binary(),
             project_dir: None,
-            ipc_address: default_ipc_address(),
+            // Blank until `resolve_ipc_address` fills it in.
+            ipc_address: String::new(),
             transport: TransportMode::default(),
             http_address: default_http_address(),
             jlcpcb_db_path: None,
@@ -305,7 +382,8 @@ mod tests {
     fn empty_ipc_address_falls_back_to_env_var_when_no_config_found() {
         let _guard = ENV_GUARD.lock().unwrap();
         std::env::set_var("KICAD_API_SOCKET", "ipc://env-fallback.sock");
-        let c = Config::default();
+        let mut c = Config::default();
+        assert_eq!(c.resolve_ipc_address(), IpcAddressSource::Environment);
         assert_eq!(c.ipc_address, "ipc://env-fallback.sock");
         std::env::remove_var("KICAD_API_SOCKET");
     }
@@ -321,16 +399,68 @@ mod tests {
         let mut c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.ipc_address, "", "sanity: file's blank value loaded as-is");
 
-        c.apply_env_fallbacks();
+        c.resolve_ipc_address();
         assert_eq!(c.ipc_address, "ipc://env-wins.sock");
 
         // But an explicit file value must out-rank the env var.
         let f = write_temp("json", r#"{"ipc_socket_path": "ipc://file-wins.sock"}"#);
         let mut c = Config::load_from(f.path()).unwrap();
-        c.apply_env_fallbacks();
+        assert_eq!(c.resolve_ipc_address(), IpcAddressSource::Config);
         assert_eq!(c.ipc_address, "ipc://file-wins.sock");
 
         std::env::remove_var("KICAD_API_SOCKET");
+    }
+
+    // Auto-detection: only reached when neither the file nor the env var
+    // names an address.
+
+    #[test]
+    fn blank_address_and_no_env_var_falls_back_to_the_detected_socket() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("KICAD_API_SOCKET");
+
+        let mut c = Config::default();
+        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+        assert_eq!(source, IpcAddressSource::Detected);
+        assert_eq!(c.ipc_address, "ipc:///tmp/kicad/api.sock");
+    }
+
+    #[test]
+    fn env_var_out_ranks_the_detected_socket() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("KICAD_API_SOCKET", "ipc://env-wins.sock");
+
+        let mut c = Config::default();
+        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+        assert_eq!(source, IpcAddressSource::Environment);
+        assert_eq!(c.ipc_address, "ipc://env-wins.sock");
+
+        std::env::remove_var("KICAD_API_SOCKET");
+    }
+
+    #[test]
+    fn config_value_out_ranks_the_detected_socket_and_is_not_probed() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("KICAD_API_SOCKET");
+
+        let f = write_temp("json", r#"{"ipc_socket_path": "ipc://file-wins.sock"}"#);
+        let mut c = Config::load_from(f.path()).unwrap();
+        let source = c.resolve_ipc_address_with(|| panic!("must not probe a configured address"));
+        assert_eq!(source, IpcAddressSource::Config);
+        assert_eq!(c.ipc_address, "ipc://file-wins.sock");
+    }
+
+    #[test]
+    fn nothing_found_leaves_the_address_empty() {
+        // Empty keeps the "socket path not configured" guidance in the tools'
+        // errors instead of a dial failure against a guessed address.
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("KICAD_API_SOCKET");
+
+        let mut c = Config::default();
+        let source = c.resolve_ipc_address_with(|| None);
+        assert_eq!(source, IpcAddressSource::Unresolved);
+        assert_eq!(c.ipc_address, "");
     }
 
     #[test]
