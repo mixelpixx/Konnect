@@ -274,6 +274,27 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_replace_component(args, ctx).await }
         ),
         tool!(
+            "update_symbols_from_library",
+            "Refresh the schematic's embedded lib_symbols definitions from the on-disk \
+             libraries — the equivalent of eeschema's Tools > Update Symbols from Library. \
+             Use after editing a symbol in its library: placing or replacing a component \
+             reuses the copy already embedded in the schematic, so library edits are \
+             otherwise invisible. Refuses any symbol whose pins moved, because existing \
+             wires and labels sit at the old pin coordinates and would be silently \
+             orphaned; pass allow_pin_moves to override and re-check connectivity after.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "lib_id": { "type": "string", "description": "Only update this Library:Symbol. Omit to update every embedded symbol." },
+                    "dry_run": { "type": "boolean", "description": "Report what would change without writing. Default false.", "default": false },
+                    "allow_pin_moves": { "type": "boolean", "description": "Update even when pin positions changed. Connectivity will need re-checking. Default false.", "default": false }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_update_symbols_from_library(args, ctx).await }
+        ),
+        tool!(
             "get_schematic_view",
             "Render the schematic to a PNG image (base64-encoded) via kicad-cli.",
             json!({
@@ -1807,5 +1828,267 @@ mod tests {
             !val_sexp.contains("hide"),
             "Value stays visible: {val_sexp}"
         );
+    }
+}
+
+// ─── update_symbols_from_library ─────────────────────────────────────────────
+
+/// Byte range of the `(lib_symbols …)` block, and of each top-level
+/// `(symbol "LIB:NAME" …)` inside it.
+fn lib_symbol_blocks(content: &str) -> Vec<(String, usize, usize)> {
+    let Some(ls_start) = content.find("(lib_symbols") else {
+        return Vec::new();
+    };
+    // End of the lib_symbols block, by paren balance.
+    let mut depth = 0i32;
+    let mut ls_end = content.len();
+    for (i, ch) in content[ls_start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    ls_end = ls_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let section = &content[ls_start..ls_end];
+    let mut out = Vec::new();
+    // Top-level entries are `(symbol "LIB:NAME"` at depth 1 within the section.
+    let mut d = 0i32;
+    let mut i = 0usize;
+    let bytes = section.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                if d == 1 && section[i..].starts_with("(symbol \"") {
+                    let name_start = i + "(symbol \"".len();
+                    if let Some(rel) = section[name_start..].find('"') {
+                        let lib_id = section[name_start..name_start + rel].to_string();
+                        // balance this symbol block
+                        let mut sd = 0i32;
+                        let mut j = i;
+                        while j < bytes.len() {
+                            match bytes[j] {
+                                b'(' => sd += 1,
+                                b')' => {
+                                    sd -= 1;
+                                    if sd == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        out.push((lib_id, ls_start + i, ls_start + j + 1));
+                        d += 1;
+                        i = j + 1;
+                        d -= 1;
+                        continue;
+                    }
+                }
+                d += 1;
+            }
+            b')' => d -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Pin anchors of a symbol definition as `(x, y, angle)`, sorted, so two
+/// definitions can be compared for geometry drift.
+fn pin_anchors(sym_block: &str) -> Vec<(String, String, String)> {
+    let mut v: Vec<(String, String, String)> = regex_lite_pin_at(sym_block);
+    v.sort();
+    v
+}
+
+/// `(at X Y A)` immediately following a `(pin ` opener.
+fn regex_lite_pin_at(s: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find("(pin ") {
+        let start = from + rel;
+        if let Some(at_rel) = s[start..].find("(at ") {
+            let at = start + at_rel + "(at ".len();
+            if let Some(close) = s[at..].find(')') {
+                let parts: Vec<&str> = s[at..at + close].split_whitespace().collect();
+                if parts.len() >= 2 {
+                    out.push((
+                        parts[0].to_string(),
+                        parts[1].to_string(),
+                        parts.get(2).unwrap_or(&"0").to_string(),
+                    ));
+                }
+            }
+        }
+        from = start + 5;
+    }
+    out
+}
+
+async fn handle_update_symbols_from_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let only = opt_str(args, "lib_id");
+    let dry_run = args
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let allow_pin_moves = args
+        .get("allow_pin_moves")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
+    let blocks = lib_symbol_blocks(&content);
+    if blocks.is_empty() {
+        return Ok(CallToolResult::json(&json!({
+            "updated": [], "unchanged": [], "skipped": [],
+            "note": "schematic has no lib_symbols section"
+        })));
+    }
+
+    let mut updated = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut skipped = Vec::new();
+    let mut edits: Vec<SexpEdit> = Vec::new();
+
+    for (lib_id, start, end) in blocks {
+        if let Some(want) = only {
+            if want != lib_id {
+                continue;
+            }
+        }
+        let embedded = &content[start..end];
+
+        // The library copy is stored under its bare symbol name; the embedded
+        // copy is prefixed with the library nickname. Resolve, then re-prefix
+        // so the two are comparable and the replacement stays valid.
+        let Some(fresh) = konnect_schematic_editor::library::resolve_lib_symbol_flattened(&lib_id)
+        else {
+            skipped.push(json!({ "lib_id": lib_id, "reason": "not found in any library" }));
+            continue;
+        };
+
+        if fresh.trim() == embedded.trim() {
+            unchanged.push(lib_id);
+            continue;
+        }
+
+        let before = pin_anchors(embedded);
+        let after = pin_anchors(&fresh);
+        if before != after && !allow_pin_moves {
+            skipped.push(json!({
+                "lib_id": lib_id,
+                "reason": "pin positions changed — wires and labels sit at the old \
+                           coordinates and would be orphaned",
+                "pins_before": before.len(),
+                "pins_after": after.len(),
+                "hint": "pass allow_pin_moves=true to update anyway, then re-run \
+                         validate_component_connections and run_erc",
+            }));
+            continue;
+        }
+
+        updated.push(json!({
+            "lib_id": lib_id,
+            "pins_moved": before != after,
+        }));
+        if !dry_run {
+            edits.push(SexpEdit::replace(start, end, fresh));
+        }
+    }
+
+    if !dry_run && !edits.is_empty() {
+        let new_content = apply_edits(content, edits);
+        write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "dry_run": dry_run,
+        "updated": updated,
+        "unchanged": unchanged,
+        "skipped": skipped,
+    })))
+}
+
+#[cfg(test)]
+mod update_symbols_tests {
+    use super::*;
+
+    const SCH: &str = r#"(kicad_sch
+	(version 20241209)
+	(lib_symbols
+		(symbol "Lib:Part"
+			(pin passive line (at -11.43 2.54 0) (length 5.08)
+				(name "A" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+		(symbol "Lib:Other"
+			(pin passive line (at 5.08 0 180) (length 2.54)
+				(name "B" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+)
+"#;
+
+    #[test]
+    fn finds_each_top_level_lib_symbol_block() {
+        let blocks = lib_symbol_blocks(SCH);
+        let ids: Vec<&str> = blocks.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["Lib:Part", "Lib:Other"]);
+        // ranges must isolate whole, balanced blocks
+        for (id, a, b) in &blocks {
+            let blk = &SCH[*a..*b];
+            assert!(
+                blk.starts_with(&format!("(symbol \"{id}\"")),
+                "block: {blk}"
+            );
+            assert_eq!(
+                blk.matches('(').count(),
+                blk.matches(')').count(),
+                "unbalanced block for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_lib_symbols_section_yields_no_blocks() {
+        assert!(lib_symbol_blocks("(kicad_sch (version 20241209))").is_empty());
+    }
+
+    /// The guard that matters: pin anchors are what wires and labels attach to,
+    /// so a definition whose pins moved must be detectable.
+    #[test]
+    fn pin_anchors_detect_geometry_drift() {
+        let narrow = r#"(symbol "X" (pin passive line (at -11.43 2.54 0) (length 5.08)))"#;
+        let same = r#"(symbol "X" (pin passive line (at -11.43 2.54 0) (length 1.27)))"#;
+        let moved = r#"(symbol "X" (pin passive line (at -20.32 2.54 0) (length 1.27)))"#;
+
+        // Body/length changes alone leave the anchor put — that is the safe case
+        // exploited when widening a symbol without disturbing wiring.
+        assert_eq!(pin_anchors(narrow), pin_anchors(same));
+        assert_ne!(pin_anchors(narrow), pin_anchors(moved));
+    }
+
+    #[test]
+    fn pin_anchors_are_order_independent() {
+        let a = r#"(pin (at 1 2 0)) (pin (at 3 4 90))"#;
+        let b = r#"(pin (at 3 4 90)) (pin (at 1 2 0))"#;
+        assert_eq!(pin_anchors(a), pin_anchors(b));
     }
 }
