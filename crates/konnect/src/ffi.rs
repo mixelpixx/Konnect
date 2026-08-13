@@ -75,6 +75,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
         match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {
+                    handler.enable_stdio_reload();
                     let _ = crate::transport::stdio::run_stdio(handler).await;
                 }
                 TransportMode::Http => {

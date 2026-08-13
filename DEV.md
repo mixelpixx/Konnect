@@ -77,7 +77,7 @@ Konnect/
 │   │       ├── router/
 │   │       │   ├── mod.rs           # ToolRouter: load/unload toolsets
 │   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
-│   │       │   └── meta_tools.rs    # 7 always-visible meta-tools
+│   │       │   └── meta_tools.rs    # 7 baseline meta-tools + Unix stdio reload
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
@@ -396,6 +396,7 @@ convention for other `kicad-cli`-calling code.
 ## Current Stats
 
 - **21 toolsets, 226 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- Unix stdio adds one conditional maintenance meta-tool, `reload_server`; it is not registered for HTTP, mixed transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
 - Full-catalog `tools/list` (all loaded): 233 tools (226 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)

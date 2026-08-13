@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
 
     match config.transport {
         TransportMode::Stdio => {
+            handler.enable_stdio_reload();
             transport::stdio::run_stdio(handler).await?;
         }
         TransportMode::Http => {

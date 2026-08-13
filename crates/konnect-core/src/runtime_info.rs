@@ -228,6 +228,20 @@ async fn probe_command_version(path: &Path, command_kind: VersionCommand) -> Ver
     }
 }
 
+/// Probe a Konnect executable for the version it reports. Reload validation
+/// uses the same parser and timeout as installation diagnostics so the two
+/// paths cannot disagree about whether a candidate is runnable.
+#[cfg(unix)]
+pub(crate) async fn probe_konnect_version(path: &Path) -> Result<String, &'static str> {
+    let probe = probe_command_version(path, VersionCommand::Konnect).await;
+    probe.version.ok_or(probe.status)
+}
+
+#[cfg(unix)]
+pub(crate) fn compare_konnect_versions(candidate: &str, running: &str) -> Option<Ordering> {
+    stable_version_cmp(candidate, running)
+}
+
 fn parse_konnect_version(line: &str) -> Option<&str> {
     let version = line.strip_prefix("konnect ")?.trim();
     (!version.is_empty() && !version.chars().any(char::is_whitespace)).then_some(version)

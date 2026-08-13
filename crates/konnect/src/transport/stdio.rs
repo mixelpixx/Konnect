@@ -76,6 +76,23 @@ pub async fn run_stdio(handler: McpHandler) -> Result<()> {
             stdout.write_all(json.as_bytes()).await?;
             stdout.flush().await?;
         }
+
+        // The handler only queues a reload; the stdio transport owns the
+        // irreversible step. Reaching this point proves the response and all
+        // synchronous notifications were flushed, and we exec before reading
+        // another request. That closes the old timer window where a second
+        // mutation could be interrupted before its guards were dropped.
+        #[cfg(unix)]
+        if let Some(plan) = handler.take_reload_request() {
+            use std::os::unix::process::CommandExt;
+            let error = std::process::Command::new(&plan.executable)
+                .args(&plan.arguments)
+                .exec();
+            return Err(anyhow::anyhow!(
+                "reload_server failed to exec {}: {error}",
+                plan.executable.display()
+            ));
+        }
     }
 
     Ok(())
