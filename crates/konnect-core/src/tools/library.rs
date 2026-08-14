@@ -1169,13 +1169,29 @@ fn global_sym_lib_table() -> PathBuf {
 ///
 /// The project file is found by scanning for the extension rather than by name:
 /// a sheet's filename says nothing about what the project is called.
+///
+/// A library table sitting beside `file` ends the search before it starts. The
+/// ancestor walk is unbounded, so without that it can leave the file's own
+/// directory and latch onto an unrelated `.kicad_pro` further up — a project
+/// nested inside another project's folder, or a stray file in a shared parent —
+/// and then resolve every library against the wrong `KIPRJMOD`. A directory
+/// carrying its own `sym-lib-table` or `fp-lib-table` is stating where its
+/// libraries come from, and that is the more specific answer.
 fn project_root_for(file: &Path) -> Option<PathBuf> {
     let start = file.parent()?;
+    if holds_lib_table(start) {
+        return Some(start.to_path_buf());
+    }
     start
         .ancestors()
         .find(|dir| holds_kicad_pro(dir))
         .map(Path::to_path_buf)
         .or_else(|| Some(start.to_path_buf()))
+}
+
+/// Whether `dir` carries a library table of its own.
+fn holds_lib_table(dir: &Path) -> bool {
+    dir.join("sym-lib-table").is_file() || dir.join("fp-lib-table").is_file()
 }
 
 /// Whether `dir` contains a `.kicad_pro`. An unreadable directory holds none.
@@ -5822,6 +5838,49 @@ mod symbol_source_tests {
         assert!(
             candidates.contains(&file),
             "a projectless schematic must still use the table beside it, got {candidates:?}"
+        );
+    }
+
+    /// The walk is unbounded, so an unrelated `.kicad_pro` in any ancestor used
+    /// to capture the search and send every lookup to the wrong `KIPRJMOD`. A
+    /// project nested inside another project's folder is the realistic case;
+    /// the one that actually bit was a stray `.kicad_pro` in the system temp
+    /// directory, which quietly defeated the hermetic fixtures of two tests —
+    /// they passed on CI, where temp is clean, and failed on any machine that
+    /// had accumulated one.
+    ///
+    /// A table beside the file is the more specific statement and must win.
+    #[test]
+    fn a_table_beside_the_file_beats_an_unrelated_project_further_up() {
+        let outer = tempfile::tempdir().unwrap();
+        // An unrelated project sitting above — the interloper.
+        std::fs::write(outer.path().join("Unrelated.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(
+            outer.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Shared\") (type \"KiCad\") (uri \"${KIPRJMOD}/wrong.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let inner = outer.path().join("nested");
+        std::fs::create_dir(&inner).unwrap();
+        let want = inner.join("right.kicad_sym");
+        std::fs::write(&want, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(
+            inner.join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Shared\") (type \"KiCad\") (uri \"${KIPRJMOD}/right.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+        let sch = inner.join("nested.kicad_sch");
+        std::fs::write(&sch, "(kicad_sch)\n").unwrap();
+
+        let candidates = KiCadSymbolSource::for_file(&sch).candidates("Shared");
+        assert!(
+            candidates.contains(&want),
+            "the table beside the schematic must win, got {candidates:?}"
+        );
+        assert!(
+            !candidates.contains(&outer.path().join("wrong.kicad_sym")),
+            "the outer project's table must not be consulted, got {candidates:?}"
         );
     }
 
