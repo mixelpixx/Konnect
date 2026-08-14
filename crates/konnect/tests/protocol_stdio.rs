@@ -295,7 +295,7 @@ fn load_toolset_batch_form_loads_all_and_notifies_once() {
         .expect("expected a tools/call result")["result"]
         .clone();
     let body = McpProcess::tool_body(&r);
-    assert_eq!(body["tools_added"].as_u64(), Some(36));
+    assert_eq!(body["tools_added"].as_u64(), Some(37));
     // tools items are {name, description} objects, matching the legacy
     // single-name result shape -- not bare name strings.
     let tools = body["tools"].as_array().expect("tools array");

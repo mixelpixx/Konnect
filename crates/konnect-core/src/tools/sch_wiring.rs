@@ -264,6 +264,29 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_batch_delete_no_connect(args, ctx).await }
         ),
         tool!(
+            "batch_add_no_connect",
+            "Add multiple no-connect flags in a single file read/write cycle. Marking the unused \
+             pins of one MCU is routinely 15-20 flags, which is 15-20 round trips through \
+             add_no_connect.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "positions": {
+                        "type": "array",
+                        "description": "Pin endpoints to flag, as {x, y}",
+                        "items": {
+                            "type": "object",
+                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                            "required": ["x", "y"]
+                        }
+                    }
+                },
+                "required": ["schematic", "positions"]
+            }),
+            |args, ctx| async move { handle_batch_add_no_connect(args, ctx).await }
+        ),
+        tool!(
             "add_junction",
             "Add a junction dot at a point where wires cross or T-intersect, or where \
              a pin lands mid-wire. A junction alone connects a mid-wire pin; \
@@ -1337,6 +1360,38 @@ async fn handle_add_no_connect(
     Ok(CallToolResult::json(
         &json!({ "added_no_connect": { "x": x, "y": y } }),
     ))
+}
+
+async fn handle_batch_add_no_connect(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let positions = match args["positions"].as_array() {
+        Some(a) => a.clone(),
+        None => return Ok(CallToolResult::error("Missing 'positions' array")),
+    };
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let mut added: Vec<serde_json::Value> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, p) in positions.iter().enumerate() {
+        match (p["x"].as_f64(), p["y"].as_f64()) {
+            (Some(x), Some(y)) => {
+                sch.add_no_connect(x, y);
+                added.push(json!({ "x": x, "y": y }));
+            }
+            _ => errors.push(format!("Position {i}: needs numeric x and y")),
+        }
+    }
+    sch.overwrite()?;
+
+    Ok(CallToolResult::json(&json!({
+        "added_count": added.len(),
+        "added": added,
+        "errors": errors
+    })))
 }
 
 async fn handle_delete_no_connect(
@@ -2471,5 +2526,70 @@ mod no_connect_delete_tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(!after.contains("nc-1"));
         assert!(after.contains("nc-2"));
+    }
+}
+
+#[cfg(test)]
+mod batch_no_connect_tests {
+    use super::tools;
+    use crate::tools::ToolContext;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    const SCH: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n  (paper \"A4\")\n  (lib_symbols)\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    async fn run(positions: serde_json::Value) -> (String, serde_json::Value) {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "batch_add_no_connect")
+            .unwrap();
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+        };
+        let ctx = Arc::new(ToolContext::new(
+            cfg,
+            Arc::new(crate::router::ToolRouter::new()),
+        ));
+        let args = json!({ "schematic": f.path().to_str().unwrap(), "positions": positions });
+        let res = (def.handler)(&args, ctx).await.unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &res.content[0] else {
+            panic!("expected text content")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        (std::fs::read_to_string(f.path()).unwrap(), body)
+    }
+
+    #[tokio::test]
+    async fn writes_every_flag_in_one_pass() {
+        let (out, body) = run(json!([{"x": 10.0, "y": 20.0}, {"x": 30.0, "y": 40.0}])).await;
+        assert_eq!(body["added_count"], 2);
+        assert_eq!(out.matches("(no_connect").count(), 2);
+    }
+
+    /// A malformed entry must not abort the rest — the useful failure mode when
+    /// flagging twenty pins is "nineteen landed and one is reported".
+    #[tokio::test]
+    async fn a_bad_entry_is_reported_without_losing_the_others() {
+        let (out, body) =
+            run(json!([{"x": 10.0, "y": 20.0}, {"x": "nope"}, {"x": 1.0, "y": 2.0}])).await;
+        assert_eq!(body["added_count"], 2);
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(out.matches("(no_connect").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_list_is_a_no_op() {
+        let (out, body) = run(json!([])).await;
+        assert_eq!(body["added_count"], 0);
+        assert_eq!(out.matches("(no_connect").count(), 0);
     }
 }

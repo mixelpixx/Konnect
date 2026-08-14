@@ -34,7 +34,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "sch_wiring",
         description: "Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections",
         category: "schematic",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "sch_bus",
