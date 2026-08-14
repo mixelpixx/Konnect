@@ -1944,90 +1944,6 @@ mod tests {
     }
 }
 
-<<<<<<< HEAD
-#[cfg(test)]
-mod page_tests {
-    use super::{tools, PAPER_SIZES};
-    use crate::tools::ToolContext;
-    use serde_json::json;
-    use std::io::Write;
-    use std::sync::Arc;
-
-    async fn set_page(body: &str, size: &str, portrait: bool) -> String {
-        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        f.flush().unwrap();
-        let def = tools()
-            .into_iter()
-            .find(|t| t.name == "set_schematic_page")
-            .unwrap();
-        let cfg = crate::tools::ServerConfig {
-            kicad_cli: String::new(),
-            kicad_binary: String::new(),
-            ipc_address: String::new(),
-            project_dir: None,
-            jlcpcb_db_path: None,
-            auto_load_toolsets: false,
-        };
-        let ctx = Arc::new(ToolContext::new(
-            cfg,
-            Arc::new(crate::router::ToolRouter::new()),
-        ));
-        let args = json!({
-            "schematic": f.path().to_str().unwrap(),
-            "size": size, "portrait": portrait
-        });
-        (def.handler)(&args, ctx).await.unwrap();
-        std::fs::read_to_string(f.path()).unwrap()
-    }
-
-    const WITH_PAPER: &str =
-        "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (paper \"A4\")\n  (symbol)\n)\n";
-    const NO_PAPER: &str = "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (symbol)\n)\n";
-
-    #[tokio::test]
-    async fn replaces_an_existing_paper_node() {
-        let out = set_page(WITH_PAPER, "A2", false).await;
-        assert!(out.contains("(paper \"A2\")"), "got {out}");
-        assert!(!out.contains("A4"), "old size must be gone: {out}");
-        assert_eq!(out.matches("(paper").count(), 1);
-    }
-
-    /// A blank sheet from `create_schematic` has no paper node at all; the new
-    /// one has to land in the header, before any element.
-    #[tokio::test]
-    async fn inserts_when_absent_and_stays_in_the_header() {
-        let out = set_page(NO_PAPER, "A3", false).await;
-        assert!(out.contains("(paper \"A3\")"), "got {out}");
-        assert!(out.find("(paper").unwrap() < out.find("(symbol").unwrap());
-    }
-
-    #[tokio::test]
-    async fn portrait_is_marked_on_the_node() {
-        let out = set_page(WITH_PAPER, "A3", true).await;
-        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
-    }
-
-    #[tokio::test]
-    async fn unknown_size_leaves_the_file_alone() {
-        let out = set_page(WITH_PAPER, "A9", false).await;
-        assert!(
-            out.contains("(paper \"A4\")"),
-            "must not have written: {out}"
-        );
-    }
-
-    #[test]
-    fn paper_table_is_landscape_and_unique() {
-        let mut names: Vec<_> = PAPER_SIZES.iter().map(|(n, _, _)| *n).collect();
-        let count = names.len();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), count, "duplicate paper size name");
-        for (n, w, h) in PAPER_SIZES {
-            assert!(w > h, "{n} is listed portrait; the table is landscape");
-        }
-=======
 // ─── update_symbols_from_library ─────────────────────────────────────────────
 
 /// Byte range of the `(lib_symbols …)` block, and of each top-level
@@ -2287,6 +2203,91 @@ mod update_symbols_tests {
         let a = r#"(pin (at 1 2 0)) (pin (at 3 4 90))"#;
         let b = r#"(pin (at 3 4 90)) (pin (at 1 2 0))"#;
         assert_eq!(pin_anchors(a), pin_anchors(b));
->>>>>>> up/update-symbols
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod page_tests {
+    use super::{tools, PAPER_SIZES};
+    use crate::tools::ToolContext;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    async fn set_page(body: &str, size: &str, portrait: bool) -> String {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "set_schematic_page")
+            .unwrap();
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+        };
+        let ctx = Arc::new(ToolContext::new(
+            cfg,
+            Arc::new(crate::router::ToolRouter::new()),
+        ));
+        let args = json!({
+            "schematic": f.path().to_str().unwrap(),
+            "size": size, "portrait": portrait
+        });
+        (def.handler)(&args, ctx).await.unwrap();
+        std::fs::read_to_string(f.path()).unwrap()
+    }
+
+    const WITH_PAPER: &str =
+        "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (paper \"A4\")\n  (symbol)\n)\n";
+    const NO_PAPER: &str = "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (symbol)\n)\n";
+
+    #[tokio::test]
+    async fn replaces_an_existing_paper_node() {
+        let out = set_page(WITH_PAPER, "A2", false).await;
+        assert!(out.contains("(paper \"A2\")"), "got {out}");
+        assert!(!out.contains("A4"), "old size must be gone: {out}");
+        assert_eq!(out.matches("(paper").count(), 1);
+    }
+
+    /// A blank sheet from `create_schematic` has no paper node at all; the new
+    /// one has to land in the header, before any element.
+    #[tokio::test]
+    async fn inserts_when_absent_and_stays_in_the_header() {
+        let out = set_page(NO_PAPER, "A3", false).await;
+        assert!(out.contains("(paper \"A3\")"), "got {out}");
+        assert!(out.find("(paper").unwrap() < out.find("(symbol").unwrap());
+    }
+
+    #[tokio::test]
+    async fn portrait_is_marked_on_the_node() {
+        let out = set_page(WITH_PAPER, "A3", true).await;
+        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn unknown_size_leaves_the_file_alone() {
+        let out = set_page(WITH_PAPER, "A9", false).await;
+        assert!(
+            out.contains("(paper \"A4\")"),
+            "must not have written: {out}"
+        );
+    }
+
+    #[test]
+    fn paper_table_is_landscape_and_unique() {
+        let mut names: Vec<_> = PAPER_SIZES.iter().map(|(n, _, _)| *n).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate paper size name");
+        for (n, w, h) in PAPER_SIZES {
+            assert!(w > h, "{n} is listed portrait; the table is landscape");
+        }
     }
 }

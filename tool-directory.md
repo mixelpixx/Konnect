@@ -10,13 +10,13 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **191 registered tools** + **6 always-visible meta-tools** = **197 total**
+- **195 registered tools** + **7 always-visible meta-tools** = **202 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
 ## Meta-tools (always visible)
 
-Six tools, grouped into *discovery/routing* and *observability*.
+Seven tools, grouped into *discovery/routing* and *observability*.
 
 ### Discovery / routing
 
@@ -33,12 +33,13 @@ Six tools, grouped into *discovery/routing* and *observability*.
 |------|---------|
 | `get_recent_calls` | Last N tool calls (newest first) — `call_id`, tool, toolset, duration, status (ok/error/not_found), `error_kind`. The LLM's debug log. Default limit 20, max 100. |
 | `server_stats` | Uptime, total/error call counts, per-tool totals + errors, and the JSONL log path. |
+| `reload_server` | Restart the server in place from the binary on disk. `exec`s the process image (same PID, same stdio pipes) so the MCP connection survives; the new binary is verified first. Unix only. |
 
 ---
 
 ## Project
 
-### `project` · 6 tools
+### `project` · 7 tools
 **Purpose:** Create, open, save, snapshot KiCAD projects, and launch the live schematic viewer.
 **Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
 
@@ -48,6 +49,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `open_project` | Check whether a KiCAD project is currently open in the running KiCAD UI. Returns the active project path and whether KiCAD IPC is available. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified times. |
+| `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming files alone makes KiCad treat the design as unannotated, losing every reference designator. Supports `dry_run`. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
@@ -55,13 +57,14 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Schematic
 
-### `sch_components` · 17 tools
+### `sch_components` · 19 tools
 **Purpose:** Add, edit, move, rotate, and delete schematic symbols.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
 | Tool | Description |
 |------|-------------|
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file. |
+| `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
 | `edit_schematic_component` | Update fields (Reference, Value, Footprint, custom properties) of a symbol instance. |
@@ -78,8 +81,9 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `group_components` | Add a group property to multiple components in the schematic. |
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
 | `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
+| `update_symbols_from_library` | Refresh the schematic's embedded `lib_symbols` from the on-disk libraries — eeschema's *Update Symbols from Library*. Refuses any symbol whose pins moved, since wires and labels sit at the old coordinates. |
 
-### `sch_wiring` · 19 tools
+### `sch_wiring` · 20 tools
 **Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
 **Source:** [`crates/konnect-core/src/tools/sch_wiring.rs`](crates/konnect-core/src/tools/sch_wiring.rs)
 
@@ -99,6 +103,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
+| `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
 | `connect_to_net` | Connect a pin endpoint to a named net by adding a short wire stub + net label. |
