@@ -66,6 +66,25 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_save_project(args, ctx).await }
         ),
         tool!(
+            "rename_project",
+            "Rename a KiCAD project: renames the .kicad_pro/.kicad_sch/.kicad_pcb/.kicad_prl \
+             files and rewrites the internal references that carry the old name. Renaming the \
+             files alone is NOT enough — every symbol instance stores (project \"name\"), and \
+             a mismatch there makes KiCAD treat the design as unannotated, losing every \
+             reference designator. Equivalent to eeschema's File > Save As. Use dry_run first.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Path to the existing .kicad_pro file" },
+                    "new_name": { "type": "string", "description": "New project name, without extension" },
+                    "rename_directory": { "type": "boolean", "description": "Also rename the containing folder when it matches the old project name. Default false.", "default": false },
+                    "dry_run": { "type": "boolean", "description": "Report the planned changes without touching anything. Default false.", "default": false }
+                },
+                "required": ["project", "new_name"]
+            }),
+            |args, ctx| async move { handle_rename_project(args, ctx).await }
+        ),
+        tool!(
             "get_project_info",
             "Read project metadata from a .kicad_pro file. Returns the project name, \
              schematic and PCB paths, and last modified times.",
@@ -544,4 +563,151 @@ mod tests {
             Some("file_not_found")
         );
     }
+}
+
+// ─── rename_project ──────────────────────────────────────────────────────────
+
+/// Project files that carry the project name, in the order they are renamed.
+const PROJECT_EXTS: [&str; 4] = ["kicad_pro", "kicad_sch", "kicad_pcb", "kicad_prl"];
+
+async fn handle_rename_project(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let pro_path = get_path(args, "project")?;
+    let new_name = match require_str(args, "new_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let dry_run = args
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let rename_dir = args
+        .get("rename_directory")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if !pro_path.exists() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: pro_path.display().to_string(),
+            },
+            format!("Project file not found: {}", pro_path.display()),
+        ));
+    }
+    let Some(dir) = pro_path.parent().map(std::path::Path::to_path_buf) else {
+        return Ok(CallToolResult::error(
+            "project path has no parent directory",
+        ));
+    };
+    let Some(old_name) = pro_path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(CallToolResult::error("project path has no file stem"));
+    };
+    let old_name = old_name.to_string();
+
+    if new_name == old_name {
+        return Ok(CallToolResult::json(&json!({
+            "renamed": false, "note": "new_name matches the current name"
+        })));
+    }
+    // A name with a path separator would move the project, not rename it.
+    if new_name.contains('/') || new_name.contains('\\') {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "new_name".to_string(),
+                reason: "must be a bare name, not a path".to_string(),
+            },
+            "new_name must not contain a path separator.",
+        ));
+    }
+
+    let mut planned_files = Vec::new();
+    let mut collisions = Vec::new();
+    for ext in PROJECT_EXTS {
+        let from = dir.join(format!("{old_name}.{ext}"));
+        if !from.exists() {
+            continue;
+        }
+        let to = dir.join(format!("{new_name}.{ext}"));
+        if to.exists() {
+            collisions.push(to.display().to_string());
+        }
+        planned_files.push((from, to));
+    }
+    if !collisions.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Refusing to rename: these target files already exist: {}",
+            collisions.join(", ")
+        )));
+    }
+
+    // Rewriting content is what keeps annotations attached: each symbol
+    // instance in the schematic stores `(project "NAME"`, and the .kicad_pro
+    // and .kicad_prl embed their own filenames.
+    let mut rewritten = Vec::new();
+    if !dry_run {
+        for (from, to) in &planned_files {
+            std::fs::rename(from, to)?;
+        }
+        for (_, to) in &planned_files {
+            let text = std::fs::read_to_string(to)?;
+            if text.contains(&old_name) {
+                let hits = text.matches(&old_name).count();
+                let updated = text.replace(&old_name, &new_name);
+                konnect_sexp::writer::write_atomic(to, &updated)?;
+                rewritten.push(json!({
+                    "file": to.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                    "references_updated": hits,
+                }));
+            }
+        }
+    } else {
+        for (from, to) in &planned_files {
+            let text = std::fs::read_to_string(from).unwrap_or_default();
+            rewritten.push(json!({
+                "file": to.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                "references_updated": text.matches(&old_name).count(),
+            }));
+        }
+    }
+
+    // The auto-backup folder is named after the project too.
+    let backups_from = dir.join(format!("{old_name}-backups"));
+    let mut backups = serde_json::Value::Null;
+    if backups_from.is_dir() {
+        let backups_to = dir.join(format!("{new_name}-backups"));
+        if !dry_run && !backups_to.exists() {
+            std::fs::rename(&backups_from, &backups_to)?;
+        }
+        backups = json!(backups_to.file_name().and_then(|s| s.to_str()));
+    }
+
+    let mut directory = serde_json::Value::Null;
+    if rename_dir && dir.file_name().and_then(|s| s.to_str()) == Some(old_name.as_str()) {
+        if let Some(parent) = dir.parent() {
+            let new_dir = parent.join(&new_name);
+            if !new_dir.exists() {
+                if !dry_run {
+                    std::fs::rename(&dir, &new_dir)?;
+                }
+                directory = json!(new_dir.display().to_string());
+            }
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "dry_run": dry_run,
+        "old_name": old_name,
+        "new_name": new_name,
+        "files": planned_files.iter()
+            .map(|(f, t)| json!({
+                "from": f.file_name().and_then(|s| s.to_str()),
+                "to": t.file_name().and_then(|s| s.to_str())
+            }))
+            .collect::<Vec<_>>(),
+        "content_rewrites": rewritten,
+        "backups_folder": backups,
+        "directory": directory,
+    })))
 }
