@@ -9,8 +9,8 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 
 ## Overview
 
-- **18 toolsets** organized into 10 categories
-- **187 registered tools** + **6 always-visible meta-tools** = **193 total**
+- **19 toolsets** organized into 10 categories
+- **191 registered tools** + **6 always-visible meta-tools** = **197 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -22,7 +22,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 18 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 19 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -104,6 +104,17 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `connect_to_net` | Connect a pin endpoint to a named net by adding a short wire stub + net label. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
+
+### `sch_bus` · 4 tools
+**Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
+**Source:** [`crates/konnect-core/src/tools/sch_bus.rs`](crates/konnect-core/src/tools/sch_bus.rs)
+
+| Tool | Description |
+|---|---|
+| `add_bus` | Add a bus segment. Geometrically a wire; KiCad treats it as a bus, carrying the members named by the bus label (`NAME[1..6]` or `{A B C}`). Wires join it only through a bus entry. |
+| `batch_add_bus` | Add multiple bus segments in one file read/write cycle. |
+| `add_bus_entry` | Add the 45° tick that connects a wire to a bus. Required — a wire and bus that merely touch are *not* connected. `at` is the wire-side end; `dx`/`dy` give the signed offset to the bus side. |
+| `connect_pins_to_bus` | Fan a set of pins onto a bus: wire stub + bus entry + member label per pin. Bus membership is by name, so the label is part of the connection, not decoration. |
 
 ### `sch_analysis` · 15 tools
 **Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
