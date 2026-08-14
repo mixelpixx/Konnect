@@ -1690,6 +1690,7 @@ name = "konnect-schematic-editor"
 version = "0.2.2"
 dependencies = [
  "konnect-sexp",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]
