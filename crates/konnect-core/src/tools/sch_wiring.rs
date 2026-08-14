@@ -369,7 +369,7 @@ pub fn tools() -> Vec<ToolDef> {
 // So wires and labels must be inserted before the first (symbol block,
 // NOT at the end of the file.
 
-fn insert_before_close(content: &str, new_sexp: &str) -> String {
+pub(crate) fn insert_before_close(content: &str, new_sexp: &str) -> String {
     // Find the first top-level (symbol block — insert before it
     let insert_pos = find_first_symbol_instance(content)
         .unwrap_or_else(|| content.rfind(')').unwrap_or(content.len()));

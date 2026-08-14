@@ -970,7 +970,16 @@ async fn handle_add_schematic_text(
     let uuid = new_uuid();
 
     // Escape quotes in text content
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    // Escape for a KiCad quoted string. Newlines and tabs must become their
+    // two-character escapes: KiCad's reader rejects a literal newline inside
+    // quotes, and it fails at the *file* level — a multi-line annotation makes
+    // the whole schematic unloadable with only "Failed to load schematic".
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
 
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
@@ -979,9 +988,10 @@ async fn handle_add_schematic_text(
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let edits = vec![SexpEdit::insert(close_pos, text_sexp)];
-    let new_content = apply_edits(content, edits);
+    // Before the first symbol instance, not at the end of the file: KiCad 10
+    // requires symbol instances to come last and refuses to load a schematic
+    // with a `(text …)` after them.
+    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &text_sexp);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
@@ -1824,5 +1834,81 @@ mod multi_unit_field_tests {
         for w in blocks.windows(2) {
             assert!(w[0].1 <= w[1].0, "blocks overlap: {:?} {:?}", w[0], w[1]);
         }
+    }
+}
+
+#[cfg(test)]
+mod add_text_placement_tests {
+    use super::tools;
+    use crate::tools::ToolContext;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    const SCH: &str = "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\")\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(uuid \"u1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 100 75 0)\n\t\t)\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
+
+    async fn add_text(text: &str) -> String {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "add_schematic_text")
+            .unwrap();
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+        };
+        let router = Arc::new(crate::router::ToolRouter::new());
+        let ctx = Arc::new(ToolContext::new(cfg, router));
+        let args = json!({
+            "schematic": f.path().to_str().unwrap(),
+            "text": text, "x": 30.0, "y": 114.3
+        });
+        (def.handler)(&args, ctx).await.unwrap();
+        std::fs::read_to_string(f.path()).unwrap()
+    }
+
+    /// The regression: the text was spliced in at the file's last `)`, which
+    /// puts it *after* the symbol instances and `sheet_instances`. KiCad 10
+    /// requires instances last and rejects the whole file — "Failed to load
+    /// schematic", with no hint as to which element is misplaced.
+    #[tokio::test]
+    async fn text_goes_before_the_symbol_instances() {
+        let out = add_text("hello").await;
+        let text_at = out.find("(text \"hello\"").expect("text written");
+        let sym_at = out.find("(symbol\n\t\t(lib_id").expect("instance present");
+        let sheets_at = out
+            .find("(sheet_instances")
+            .expect("sheet_instances present");
+        assert!(
+            text_at < sym_at && text_at < sheets_at,
+            "text must precede symbol instances (text {text_at}, symbol {sym_at})"
+        );
+        // and it must land after lib_symbols, not inside it
+        assert!(text_at > out.find("(lib_symbols").unwrap());
+    }
+
+    /// The other half of the same incident: the content was written with the
+    /// newline as a literal byte inside the quoted string. KiCad wants the
+    /// two-character escape and refuses the file otherwise.
+    #[tokio::test]
+    async fn multiline_text_escapes_its_newlines() {
+        let out = add_text("line one\nline two").await;
+        let text_at = out
+            .find(r#"(text "line one\nline two""#)
+            .expect("newline must be written as an escape, not a raw byte");
+        assert!(text_at < out.find("(symbol\n\t\t(lib_id").unwrap());
+    }
+
+    #[tokio::test]
+    async fn quotes_backslashes_and_tabs_are_escaped() {
+        let out = add_text("a \"b\" c\\d\te").await;
+        assert!(out.contains(r#"(text "a \"b\" c\\d\te""#), "got:\n{out}");
     }
 }
