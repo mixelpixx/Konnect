@@ -41,6 +41,32 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_create_schematic(args, ctx).await }
         ),
         tool!(
+            "set_schematic_page",
+            "Set the sheet's paper size (A0-A5, A-E, USLetter, USLegal, USLedger) and \
+             orientation. Content outside the frame still exports and still nets up, so a \
+             too-small page is a silent defect — check the layout extents against the size.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "size": {
+                        "type": "string",
+                        "description": "Paper size, e.g. 'A4', 'A3', 'A2', 'USLetter'",
+                        "enum": ["A0", "A1", "A2", "A3", "A4", "A5",
+                                 "A", "B", "C", "D", "E",
+                                 "USLetter", "USLegal", "USLedger"]
+                    },
+                    "portrait": {
+                        "type": "boolean",
+                        "description": "Portrait instead of the default landscape",
+                        "default": false
+                    }
+                },
+                "required": ["schematic", "size"]
+            }),
+            |args, ctx| async move { handle_set_page(args, ctx).await }
+        ),
+        tool!(
             "add_schematic_component",
             "Add a symbol from a KiCAD library to the schematic. The symbol is snapped \
              to the 1.27mm schematic grid. Specify position in schematic mm coordinates.",
@@ -305,6 +331,93 @@ async fn handle_create_schematic(
     Ok(CallToolResult::json(
         &json!({ "created": path.display().to_string() }),
     ))
+}
+
+/// Paper sizes KiCad accepts in a `(paper …)` node, with their landscape
+/// dimensions in mm — reported back so the caller can sanity-check the layout
+/// against the frame instead of discovering the overflow at print time.
+const PAPER_SIZES: &[(&str, f64, f64)] = &[
+    ("A0", 1189.0, 841.0),
+    ("A1", 841.0, 594.0),
+    ("A2", 594.0, 420.0),
+    ("A3", 420.0, 297.0),
+    ("A4", 297.0, 210.0),
+    ("A5", 210.0, 148.0),
+    ("A", 279.4, 215.9),
+    ("B", 431.8, 279.4),
+    ("C", 558.8, 431.8),
+    ("D", 863.6, 558.8),
+    ("E", 1117.6, 863.6),
+    ("USLetter", 279.4, 215.9),
+    ("USLegal", 355.6, 215.9),
+    ("USLedger", 431.8, 279.4),
+];
+
+async fn handle_set_page(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let size = match require_str(args, "size") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let portrait = args["portrait"].as_bool().unwrap_or(false);
+
+    let dims = match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
+        Some(&(_, w, h)) => (w, h),
+        None => {
+            let valid = PAPER_SIZES
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "size".into(),
+                    reason: format!("unknown paper size '{size}'; valid: {valid}"),
+                },
+                format!("Argument 'size' is invalid: unknown paper size '{size}'; valid: {valid}"),
+            ));
+        }
+    };
+    let (w, h) = if portrait { (dims.1, dims.0) } else { dims };
+
+    let node = if portrait {
+        format!("(paper \"{size}\" portrait)")
+    } else {
+        format!("(paper \"{size}\")")
+    };
+
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
+    match content.find("(paper ") {
+        Some(start) => {
+            let end = start
+                + content[start..]
+                    .find(')')
+                    .map(|p| p + 1)
+                    .unwrap_or(content.len() - start);
+            content.replace_range(start..end, &node);
+        }
+        None => {
+            // A freshly created blank sheet has no paper node; it belongs in
+            // the header, right after the uuid.
+            let anchor = content
+                .find("(uuid ")
+                .and_then(|p| content[p..].find(')').map(|q| p + q + 1))
+                .unwrap_or_else(|| content.find('\n').map(|p| p + 1).unwrap_or(0));
+            content.insert_str(anchor, &format!("\n  {node}"));
+        }
+    }
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "size": size,
+        "portrait": portrait,
+        "width_mm": w,
+        "height_mm": h
+    })))
 }
 
 async fn handle_add_schematic_component(
@@ -1807,5 +1920,90 @@ mod tests {
             !val_sexp.contains("hide"),
             "Value stays visible: {val_sexp}"
         );
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::{tools, PAPER_SIZES};
+    use crate::tools::ToolContext;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    async fn set_page(body: &str, size: &str, portrait: bool) -> String {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "set_schematic_page")
+            .unwrap();
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+        };
+        let ctx = Arc::new(ToolContext::new(
+            cfg,
+            Arc::new(crate::router::ToolRouter::new()),
+        ));
+        let args = json!({
+            "schematic": f.path().to_str().unwrap(),
+            "size": size, "portrait": portrait
+        });
+        (def.handler)(&args, ctx).await.unwrap();
+        std::fs::read_to_string(f.path()).unwrap()
+    }
+
+    const WITH_PAPER: &str =
+        "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (paper \"A4\")\n  (symbol)\n)\n";
+    const NO_PAPER: &str = "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (symbol)\n)\n";
+
+    #[tokio::test]
+    async fn replaces_an_existing_paper_node() {
+        let out = set_page(WITH_PAPER, "A2", false).await;
+        assert!(out.contains("(paper \"A2\")"), "got {out}");
+        assert!(!out.contains("A4"), "old size must be gone: {out}");
+        assert_eq!(out.matches("(paper").count(), 1);
+    }
+
+    /// A blank sheet from `create_schematic` has no paper node at all; the new
+    /// one has to land in the header, before any element.
+    #[tokio::test]
+    async fn inserts_when_absent_and_stays_in_the_header() {
+        let out = set_page(NO_PAPER, "A3", false).await;
+        assert!(out.contains("(paper \"A3\")"), "got {out}");
+        assert!(out.find("(paper").unwrap() < out.find("(symbol").unwrap());
+    }
+
+    #[tokio::test]
+    async fn portrait_is_marked_on_the_node() {
+        let out = set_page(WITH_PAPER, "A3", true).await;
+        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn unknown_size_leaves_the_file_alone() {
+        let out = set_page(WITH_PAPER, "A9", false).await;
+        assert!(
+            out.contains("(paper \"A4\")"),
+            "must not have written: {out}"
+        );
+    }
+
+    #[test]
+    fn paper_table_is_landscape_and_unique() {
+        let mut names: Vec<_> = PAPER_SIZES.iter().map(|(n, _, _)| *n).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate paper size name");
+        for (n, w, h) in PAPER_SIZES {
+            assert!(w > h, "{n} is listed portrait; the table is landscape");
+        }
     }
 }

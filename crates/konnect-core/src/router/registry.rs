@@ -26,9 +26,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_components",
-        description: "Add, edit, move, rotate, and delete schematic symbols",
+        description: "Add, edit, move, rotate, and delete schematic symbols, and set the page size",
         category: "schematic",
-        tool_count: 17,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "sch_wiring",
