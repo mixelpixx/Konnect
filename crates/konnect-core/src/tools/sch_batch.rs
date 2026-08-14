@@ -8,15 +8,15 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_symbol_instance_block, get_path, opt_str, project_name_for, require_f64, require_str,
+    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_f64, require_str,
     ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires,
-        format_net_label, format_wire, pin_endpoint, read_schematic,
+        extract_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_symbol_instances,
+        extract_wires, format_net_label, format_wire, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -300,28 +300,39 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
-/// Find the `(symbol ...)` block for a reference designator, plus its leading
-/// whitespace so deletion leaves clean formatting.
+/// Find every `(symbol ...)` block for a reference designator, each with its
+/// leading whitespace so deletion leaves clean formatting.
+///
+/// One entry per unit: deleting a multi-unit part means deleting all of them.
 /// Returns `(block_start, block_end)` byte offsets in `content`.
-fn find_symbol_block(content: &str, reference: &str) -> Option<(usize, usize)> {
-    let (sym_start, _) = find_symbol_instance_block(content, reference)?;
-    find_block_with_leading_whitespace(content, sym_start)
+fn find_symbol_blocks(content: &str, reference: &str) -> Vec<(usize, usize)> {
+    find_all_symbol_instance_blocks(content, reference)
+        .into_iter()
+        .filter_map(|(sym_start, _)| find_block_with_leading_whitespace(content, sym_start))
+        .collect()
 }
 
 /// Return `(val_start, val_end)` byte offsets in `content` for the *value* portion
-/// of a `(property "FieldName" "VALUE" ...)` node within the symbol identified by
+/// of a `(property "FieldName" "VALUE" ...)` node, once per placed instance of
 /// `reference`. Only the bytes inside the opening quote are included (i.e. the
 /// replacement does NOT need to include surrounding quotes).
-fn field_value_range(content: &str, reference: &str, field: &str) -> Option<(usize, usize)> {
-    let (sym_start, sym_end) = find_symbol_instance_block(content, reference)?;
-    let sym_block = &content[sym_start..sym_end];
+///
+/// Multi-unit parts repeat their fields in every unit's block and KiCad expects
+/// those copies to agree, so a field edit has to rewrite all of them.
+fn field_value_ranges(content: &str, reference: &str, field: &str) -> Vec<(usize, usize)> {
+    find_all_symbol_instance_blocks(content, reference)
+        .into_iter()
+        .filter_map(|(sym_start, sym_end)| {
+            let sym_block = &content[sym_start..sym_end];
 
-    let field_search = format!(r#"(property "{field}" ""#);
-    let field_rel = sym_block.find(&field_search)?;
-    let val_start = sym_start + field_rel + field_search.len();
-    // find the closing quote of the current value
-    let val_end = val_start + content[val_start..].find('"')?;
-    Some((val_start, val_end))
+            let field_search = format!(r#"(property "{field}" ""#);
+            let field_rel = sym_block.find(&field_search)?;
+            let val_start = sym_start + field_rel + field_search.len();
+            // find the closing quote of the current value
+            let val_end = val_start + content[val_start..].find('"')?;
+            Some((val_start, val_end))
+        })
+        .collect()
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -367,20 +378,25 @@ async fn handle_batch_connect_to_net(
             }
         };
 
-        let inst = match instances.iter().find(|i| i.reference == reference) {
-            Some(i) => i,
-            None => {
-                errors.push(format!("Component '{}' not found", reference));
-                continue;
-            }
-        };
-
-        let lib_sym = lib_syms
+        // A multi-unit symbol is placed as one instance PER UNIT, all sharing
+        // the reference. The requested pin lives in exactly one of them and
+        // must be transformed by *that* instance's placement. Taking the first
+        // instance and transforming every pin by it puts the label on unit 1's
+        // pin instead — silently shorting two nets together, with no error.
+        let candidates: Vec<_> = instances
             .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+            .filter(|i| i.reference == reference)
+            .collect();
+        if candidates.is_empty() {
+            errors.push(format!("Component '{}' not found", reference));
+            continue;
+        }
 
-        let pin_ep = lib_sym.and_then(|sym| {
-            extract_lib_pins(sym)
+        let pin_ep = candidates.iter().find_map(|inst| {
+            let sym = lib_syms
+                .iter()
+                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
+            extract_lib_pins_for_unit(sym, inst.unit)
                 .into_iter()
                 .find(|p| p.number == pin_number)
                 .map(|p| pin_endpoint(&p, inst.pin_transform()))
@@ -607,14 +623,21 @@ async fn handle_batch_delete(
                 Some(r) => r,
                 None => continue,
             };
-            match find_symbol_block(&content, reference) {
-                Some((del_start, del_end)) => {
-                    if delete_ranges.insert((del_start, del_end)) {
-                        edits.push(SexpEdit::delete(del_start, del_end));
-                        deleted.push(reference.to_string());
-                    }
+            let blocks = find_symbol_blocks(&content, reference);
+            if blocks.is_empty() {
+                errors.push(format!("Component '{}' not found", reference));
+                continue;
+            }
+            // Every unit of a multi-unit part, or the whole component is not gone.
+            let mut any = false;
+            for (del_start, del_end) in blocks {
+                if delete_ranges.insert((del_start, del_end)) {
+                    edits.push(SexpEdit::delete(del_start, del_end));
+                    any = true;
                 }
-                None => errors.push(format!("Component '{}' not found", reference)),
+            }
+            if any {
+                deleted.push(reference.to_string());
             }
         }
     }
@@ -685,55 +708,64 @@ async fn handle_bulk_move(
             None => continue,
         };
 
-        // Locate symbol block for this reference
-        let (sym_start, sym_end) = match find_symbol_instance_block(&content, reference) {
-            Some(r) => r,
-            None => {
-                errors.push(format!("'{}' not found", reference));
-                continue;
-            }
-        };
+        // Every placement of this reference — a multi-unit part has one block
+        // per unit, and shifting only the first would tear the part apart.
+        let blocks = find_all_symbol_instance_blocks(&content, reference);
+        if blocks.is_empty() {
+            errors.push(format!("'{}' not found", reference));
+            continue;
+        }
 
-        // Find first (at X Y [ROT]) inside this symbol block
-        let sym_block = &content[sym_start..sym_end];
-        let at_pat = "(at ";
-        let at_rel = match sym_block.find(at_pat) {
-            Some(r) => r,
-            None => {
-                errors.push(format!("No (at) in symbol '{}'", reference));
-                continue;
-            }
-        };
-        let at_abs = sym_start + at_rel + at_pat.len();
-        let close_rel = sym_block[at_rel..].find(')').unwrap_or(0);
-        let at_end = sym_start + at_rel + close_rel;
+        let mut placements: Vec<serde_json::Value> = Vec::new();
+        for (sym_start, sym_end) in blocks {
+            // Find first (at X Y [ROT]) inside this symbol block
+            let sym_block = &content[sym_start..sym_end];
+            let at_pat = "(at ";
+            let at_rel = match sym_block.find(at_pat) {
+                Some(r) => r,
+                None => {
+                    errors.push(format!("No (at) in symbol '{}'", reference));
+                    continue;
+                }
+            };
+            let at_abs = sym_start + at_rel + at_pat.len();
+            let close_rel = sym_block[at_rel..].find(')').unwrap_or(0);
+            let at_end = sym_start + at_rel + close_rel;
 
-        let at_str = &content[at_abs..at_end];
-        let parts: Vec<&str> = at_str.split_whitespace().collect();
-        let x = parts
-            .first()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let y = parts
-            .get(1)
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let rot = parts
-            .get(2)
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
+            let at_str = &content[at_abs..at_end];
+            let parts: Vec<&str> = at_str.split_whitespace().collect();
+            let x = parts
+                .first()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let y = parts
+                .get(1)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let rot = parts
+                .get(2)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
 
-        let (new_x, new_y) = snap_point(x + dx, y + dy, 1.27);
-        edits.push(SexpEdit::replace(
-            at_abs,
-            at_end,
-            format!("{new_x} {new_y} {rot}"),
-        ));
-        moved.push(json!({
-            "reference": reference,
-            "old_x": x, "old_y": y,
-            "new_x": new_x, "new_y": new_y
-        }));
+            let (new_x, new_y) = snap_point(x + dx, y + dy, 1.27);
+            edits.push(SexpEdit::replace(
+                at_abs,
+                at_end,
+                format!("{new_x} {new_y} {rot}"),
+            ));
+            placements.push(json!({
+                "old_x": x, "old_y": y,
+                "new_x": new_x, "new_y": new_y
+            }));
+        }
+
+        if !placements.is_empty() {
+            moved.push(json!({
+                "reference": reference,
+                "units": placements.len(),
+                "placements": placements
+            }));
+        }
     }
 
     let new_content = apply_edits(content, edits);
@@ -774,35 +806,35 @@ async fn handle_batch_edit(
 
         let mut component_changes: Vec<String> = Vec::new();
 
-        // Standard fields
-        for (field, key) in &[("Value", "value"), ("Footprint", "footprint")] {
-            if let Some(new_val) = edit_spec[key].as_str() {
-                match field_value_range(&content, reference, field) {
-                    Some((start, end)) => {
-                        file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
-                        component_changes.push(format!("{} → {}", field, new_val));
-                    }
-                    None => errors.push(format!("Field '{}' not found on '{}'", field, reference)),
-                }
-            }
-        }
+        // Standard fields, then arbitrary extra fields from the "fields" object.
+        // Each is rewritten in every unit's block, which is where a multi-unit
+        // part keeps its copies of the value.
+        let extra = edit_spec["fields"].as_object();
+        let specs = [("Value", "value"), ("Footprint", "footprint")]
+            .into_iter()
+            .filter_map(|(field, key)| Some((field.to_string(), edit_spec[key].as_str()?)))
+            .chain(
+                extra
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(name, val)| Some((name.clone(), val.as_str()?))),
+            );
 
-        // Arbitrary extra fields from "fields" object
-        if let Some(fields_obj) = edit_spec["fields"].as_object() {
-            for (field_name, field_val) in fields_obj {
-                if let Some(new_val) = field_val.as_str() {
-                    match field_value_range(&content, reference, field_name) {
-                        Some((start, end)) => {
-                            file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
-                            component_changes.push(format!("{} → {}", field_name, new_val));
-                        }
-                        None => errors.push(format!(
-                            "Field '{}' not found on '{}'",
-                            field_name, reference
-                        )),
-                    }
-                }
+        for (field, new_val) in specs {
+            let ranges = field_value_ranges(&content, reference, &field);
+            if ranges.is_empty() {
+                errors.push(format!("Field '{}' not found on '{}'", field, reference));
+                continue;
             }
+            let units = ranges.len();
+            for (start, end) in ranges {
+                file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
+            }
+            component_changes.push(if units > 1 {
+                format!("{} → {} ({} units)", field, new_val, units)
+            } else {
+                format!("{} → {}", field, new_val)
+            });
         }
 
         if !component_changes.is_empty() {
@@ -844,13 +876,16 @@ async fn handle_batch_delete_components(
             Some(r) => r,
             None => continue,
         };
-        match find_symbol_block(&content, reference) {
-            Some((del_start, del_end)) => {
-                edits.push(SexpEdit::delete(del_start, del_end));
-                deleted.push(reference.to_string());
-            }
-            None => errors.push(format!("Component '{}' not found", reference)),
+        let blocks = find_symbol_blocks(&content, reference);
+        if blocks.is_empty() {
+            errors.push(format!("Component '{}' not found", reference));
+            continue;
         }
+        // Every unit of a multi-unit part, or the whole component is not gone.
+        for (del_start, del_end) in blocks {
+            edits.push(SexpEdit::delete(del_start, del_end));
+        }
+        deleted.push(reference.to_string());
     }
 
     let new_content = apply_edits(content, edits);
@@ -1563,6 +1598,231 @@ mod midwire_pin_tests {
                 Some(expect_valid),
                 "with_junction={with_junction}: {body}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod multi_unit_pin_tests {
+    use crate::tools::sch_batch::tools;
+    use konnect_sexp::schematic::{
+        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
+    };
+    use std::io::Write;
+
+    /// Two units of one symbol, placed 15.24mm apart. Unit 1 owns pin 1, unit 2
+    /// owns pin 3; both sit at local x = -7.62 in their own unit's drawing.
+    const SCH: &str = r#"(kicad_sch
+	(version 20241209)
+	(lib_symbols
+		(symbol "74xx:74HC14"
+			(symbol "74HC14_1_1"
+				(pin input line (at -7.62 0 0) (length 2.54)
+					(name "A" (effects (font (size 1.27 1.27))))
+					(number "1" (effects (font (size 1.27 1.27))))
+				)
+			)
+			(symbol "74HC14_2_1"
+				(pin input line (at -7.62 0 0) (length 2.54)
+					(name "A" (effects (font (size 1.27 1.27))))
+					(number "3" (effects (font (size 1.27 1.27))))
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "74xx:74HC14")
+		(at 100 100 0)
+		(unit 1)
+		(property "Reference" "U1" (at 100 100 0))
+		(property "Value" "74HC14" (at 100 100 0))
+	)
+	(symbol
+		(lib_id "74xx:74HC14")
+		(at 100 115.24 0)
+		(unit 2)
+		(property "Reference" "U1" (at 100 115.24 0))
+		(property "Value" "74HC14" (at 100 115.24 0))
+	)
+)
+"#;
+
+    /// The regression: resolving a pin used the FIRST instance with a matching
+    /// reference, so every pin of a multi-unit part was transformed by unit 1's
+    /// placement. Two nets then landed on one coordinate and were silently
+    /// shorted — no error, no warning.
+    #[test]
+    fn each_unit_resolves_its_own_pin_position() {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let (_c, tree) = read_schematic(f.path()).unwrap();
+        let instances = extract_symbol_instances(&tree);
+        let lib_syms = tree
+            .find("lib_symbols")
+            .map(|n| n.find_all("symbol"))
+            .unwrap_or_default();
+
+        let resolve = |number: &str| -> Option<(f64, f64)> {
+            instances
+                .iter()
+                .filter(|i| i.reference == "U1")
+                .find_map(|inst| {
+                    let sym = lib_syms
+                        .iter()
+                        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
+                    extract_lib_pins_for_unit(sym, inst.unit)
+                        .into_iter()
+                        .find(|p| p.number == number)
+                        .map(|p| pin_endpoint(&p, inst.pin_transform()))
+                })
+        };
+
+        let p1 = resolve("1").expect("unit 1 pin 1");
+        let p3 = resolve("3").expect("unit 2 pin 3");
+
+        assert!(
+            (p1.1 - p3.1).abs() > 1.0,
+            "unit 1 and unit 2 pins must not land on the same point \
+             (got {p1:?} and {p3:?}) — that is the short this guards against"
+        );
+        assert!(
+            (p1.1 - 100.0).abs() < 0.01,
+            "unit 1 pin should sit at y=100, got {p1:?}"
+        );
+        assert!(
+            (p3.1 - 115.24).abs() < 0.01,
+            "unit 2 pin should sit at y=115.24, got {p3:?}"
+        );
+    }
+
+    #[test]
+    fn batch_connect_to_net_is_registered() {
+        assert!(tools().iter().any(|t| t.name == "batch_connect_to_net"));
+    }
+}
+
+#[cfg(test)]
+mod multi_unit_field_tests {
+    use super::{field_value_ranges, find_symbol_blocks};
+    use konnect_sexp::writer::{apply_edits, SexpEdit};
+
+    /// A 3-unit part plus an unrelated single-unit part. Every unit repeats the
+    /// reference and carries its own copy of the shared fields, which is how
+    /// eeschema writes them.
+    const SCH: &str = r#"(kicad_sch
+	(version 20241209)
+	(lib_symbols
+		(symbol "74xx:74HC14"
+			(property "Reference" "U")
+			(property "Footprint" "")
+		)
+	)
+	(symbol
+		(lib_id "74xx:74HC14")
+		(at 100 100 0)
+		(unit 1)
+		(property "Reference" "U6" (at 100 100 0))
+		(property "Value" "74HC14" (at 100 100 0))
+		(property "Footprint" "" (at 100 100 0))
+	)
+	(symbol
+		(lib_id "74xx:74HC14")
+		(at 100 115.24 0)
+		(unit 2)
+		(property "Reference" "U6" (at 100 115.24 0))
+		(property "Value" "74HC14" (at 100 115.24 0))
+		(property "Footprint" "" (at 100 115.24 0))
+	)
+	(symbol
+		(lib_id "74xx:74HC14")
+		(at 100 130.48 0)
+		(unit 7)
+		(property "Reference" "U6" (at 100 130.48 0))
+		(property "Value" "74HC14" (at 100 130.48 0))
+		(property "Footprint" "" (at 100 130.48 0))
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 200 100 0)
+		(unit 1)
+		(property "Reference" "R1" (at 200 100 0))
+		(property "Value" "10k" (at 200 100 0))
+		(property "Footprint" "" (at 200 100 0))
+	)
+)
+"#;
+
+    /// The regression: field lookup stopped at the first instance, so assigning
+    /// a footprint to a multi-unit part left units 2..n blank. KiCad then had
+    /// one part claiming two different footprints.
+    #[test]
+    fn field_edit_reaches_every_unit() {
+        let ranges = field_value_ranges(SCH, "U6", "Footprint");
+        assert_eq!(
+            ranges.len(),
+            3,
+            "expected one Footprint per unit: {ranges:?}"
+        );
+
+        let edits = ranges
+            .iter()
+            .map(|&(s, e)| SexpEdit::replace(s, e, "Package_SO:SOIC-14".to_string()))
+            .collect();
+        let out = apply_edits(SCH.to_string(), edits);
+        assert_eq!(
+            out.matches(r#"(property "Footprint" "Package_SO:SOIC-14""#)
+                .count(),
+            3
+        );
+        // The neighbouring single-unit part must be untouched.
+        assert!(out.contains(r#"(property "Reference" "R1" (at 200 100 0))"#));
+        assert_eq!(
+            out.matches(r#"(property "Footprint" "" (at 200"#).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn single_unit_part_still_edits_once() {
+        let ranges = field_value_ranges(SCH, "R1", "Value");
+        assert_eq!(ranges.len(), 1);
+    }
+
+    #[test]
+    fn missing_field_yields_no_ranges() {
+        assert!(field_value_ranges(SCH, "U6", "Datasheet").is_empty());
+        assert!(field_value_ranges(SCH, "U99", "Value").is_empty());
+    }
+
+    /// Deleting one unit's block used to leave the other six behind as orphans
+    /// referencing a component the caller believes is gone.
+    #[test]
+    fn delete_removes_every_unit() {
+        let blocks = find_symbol_blocks(SCH, "U6");
+        assert_eq!(blocks.len(), 3, "expected one block per unit: {blocks:?}");
+
+        let edits = blocks
+            .iter()
+            .map(|&(s, e)| SexpEdit::delete(s, e))
+            .collect();
+        let out = apply_edits(SCH.to_string(), edits);
+        assert!(
+            !out.contains(r#""Reference" "U6""#),
+            "no U6 unit should survive:\n{out}"
+        );
+        assert!(out.contains(r#""Reference" "R1""#), "R1 must survive");
+        // The lib_symbols definition is not an instance and must stay.
+        assert!(out.contains(r#"(symbol "74xx:74HC14""#));
+    }
+
+    /// The blocks must not overlap, or apply_edits would splice the file wrong.
+    #[test]
+    fn unit_blocks_are_disjoint_and_ordered() {
+        let blocks = find_symbol_blocks(SCH, "U6");
+        for w in blocks.windows(2) {
+            assert!(w[0].1 <= w[1].0, "blocks overlap: {:?} {:?}", w[0], w[1]);
         }
     }
 }

@@ -472,7 +472,24 @@ pub(crate) fn positioned_property(
 /// a hand-authored library sets) but never a `lib_id`. Only placed instances
 /// have one, so that's the discriminator.
 pub fn find_symbol_instance_block(content: &str, reference: &str) -> Option<(usize, usize)> {
+    find_all_symbol_instance_blocks(content, reference)
+        .into_iter()
+        .next()
+}
+
+/// Byte ranges of *every* placed `(symbol …)` block whose Reference property is
+/// `reference`, in file order.
+///
+/// A multi-unit part is placed as one instance **per unit**, and every instance
+/// repeats the same reference — a 74HC14 is seven `U6` blocks. Anything the
+/// units share rather than own (a field value, the part's very existence) has to
+/// be applied to all of them: eeschema writes a field edit into every unit, and
+/// deleting one unit's block leaves the rest behind as orphans. Use this rather
+/// than [`find_symbol_instance_block`] wherever the operation is about the
+/// *component*; the singular form is for operations about one placement.
+pub fn find_all_symbol_instance_blocks(content: &str, reference: &str) -> Vec<(usize, usize)> {
     let ref_search = format!(r#"(property "Reference" "{reference}""#);
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut from = 0usize;
 
     while let Some(rel) = content[from..].find(&ref_search) {
@@ -480,13 +497,16 @@ pub fn find_symbol_instance_block(content: &str, reference: &str) -> Option<(usi
         if let Some((start, end)) =
             konnect_sexp::writer::find_enclosing_block(content, "symbol", ref_pos)
         {
-            if content[start..end].contains("(lib_id ") {
-                return Some((start, end));
+            // Skip lib_symbols definitions: they carry a Reference property of
+            // their own but never a lib_id.
+            if content[start..end].contains("(lib_id ") && !blocks.iter().any(|&(s, _)| s == start)
+            {
+                blocks.push((start, end));
             }
         }
         from = ref_pos + ref_search.len();
     }
-    None
+    blocks
 }
 
 #[cfg(test)]
