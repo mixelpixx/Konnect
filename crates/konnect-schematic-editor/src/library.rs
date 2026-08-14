@@ -11,7 +11,34 @@
 
 use crate::sexp::{parser, SexpNode};
 use crate::Schematic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Prefix a symbol block's outer name with its library, as eeschema expects
+/// in an embedded `lib_symbols` entry, and prefix any `(extends "PARENT")`
+/// to match.
+///
+/// Unit sub-symbols ("Name_0_1", "Name_1_1") deliberately stay UNPREFIXED:
+/// eeschema names only the outer symbol with the library prefix and refuses
+/// to load a schematic whose units carry it ("Failed to load schematic" —
+/// verified against kicad-cli 10.0 and the KiCAD demo corpus).
+fn prefix_symbol_block(block: &str, library_name: &str, symbol_name: &str) -> String {
+    let mut renamed = block.replacen(
+        &format!("(symbol \"{}\"", symbol_name),
+        &format!("(symbol \"{}:{}\"", library_name, symbol_name),
+        1,
+    );
+    if let Some(ext_pos) = renamed.find("(extends \"") {
+        let after = &renamed[ext_pos + 10..];
+        if let Some(end) = after.find('"') {
+            let parent = after[..end].to_string();
+            renamed = renamed.replace(
+                &format!("(extends \"{}\")", parent),
+                &format!("(extends \"{}:{}\")", library_name, parent),
+            );
+        }
+    }
+    renamed
+}
 
 /// Resolve a lib_id (e.g. "Device:R") to the full symbol S-expression string.
 /// The returned string is the raw content of the `(symbol "R" ...)` block,
@@ -22,6 +49,18 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
         return None;
     }
     let (library_name, symbol_name) = (parts[0], parts[1]);
+
+    // sym-lib-table first: it is what KiCad itself uses, so it is the only
+    // source that knows about user libraries and about installs sitting
+    // outside the hardcoded paths in `find_symbol_dirs`. It also carries the
+    // nickname → file mapping, which a directory scan has to guess.
+    if let Some(path) = symbol_lib_path(library_name) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Some(block) = extract_symbol_block(&content, symbol_name) {
+                return Some(prefix_symbol_block(&block, library_name, symbol_name));
+            }
+        }
+    }
 
     for base_dir in find_symbol_dirs() {
         // KiCAD 10: Library.kicad_symdir/SymbolName.kicad_sym
@@ -473,7 +512,165 @@ fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
     }
 }
 
+// ─── KiCad library-table resolution ──────────────────────────────────────────
+//
+// KiCad finds a symbol library by nickname through `sym-lib-table`, not by
+// scanning directories for a file named after the nickname. Resolving by
+// directory scan alone misses two whole classes of library:
+//
+//   * every user library, wherever it lives on disk;
+//   * KiCad's own, whenever it is installed outside the hardcoded paths
+//     below (a macOS bundle dragged anywhere but /Applications, say).
+//
+// It also assumes nickname == filename, which KiCad never requires: a table
+// may register `.../TM16xx.kicad_sym` under the nickname `JY-TM16xx`.
+//
+// The table is therefore consulted first, and the directory scan kept as a
+// fallback for setups with no table at all.
+
+/// KiCad's per-user configuration directory, where `sym-lib-table` and
+/// `kicad_common.json` live. Newest supported version wins.
+fn kicad_config_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = PathBuf::from(std::env::var("APPDATA").ok()?).join("kicad");
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var("HOME").ok()?).join("Library/Preferences/kicad");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = PathBuf::from(std::env::var("HOME").ok()?).join(".config/kicad");
+
+    for ver in ["10.0", "9.0", "8.0"] {
+        let d = base.join(ver);
+        if d.is_dir() {
+            return Some(d);
+        }
+    }
+    base.is_dir().then_some(base)
+}
+
+/// Path variables the user defined in KiCad's Preferences → Configure Paths.
+///
+/// These live in `kicad_common.json`, not the process environment, so a plain
+/// `std::env::var` lookup never sees them — yet they are the normal way to
+/// write a portable library table (`${MY_LIB}/parts.kicad_sym`).
+fn kicad_user_path_vars() -> Vec<(String, String)> {
+    let Some(cfg) = kicad_config_dir() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(cfg.join("kicad_common.json")) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    json.get("environment")
+        .and_then(|e| e.get("vars"))
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Expand a lib-table URI to a filesystem path.
+///
+/// `table_dir` is the directory of the table the URI came from: it is the
+/// expansion base for `${KIPRJMOD}` (KiCad's per-project variable), and the
+/// anchor for the `${KICAD*_SYMBOL_DIR}` fallback — KiCad's bundled table sits
+/// in `<share>/template` with the symbols beside it in `<share>/symbols`, so
+/// the install root is recoverable from the table's own location even when the
+/// variable is unset.
+fn expand_lib_uri(uri: &str, table_dir: Option<&Path>) -> Option<PathBuf> {
+    let Some(rest) = uri.strip_prefix("${") else {
+        return (!uri.is_empty()).then(|| PathBuf::from(uri));
+    };
+    let close = rest.find('}')?;
+    let var = &rest[..close];
+    let tail = rest[close + 1..].trim_start_matches(['/', '\\']);
+
+    if var == "KIPRJMOD" {
+        return table_dir.map(|d| d.join(tail));
+    }
+
+    if let Some(base) = std::env::var_os(var) {
+        return Some(PathBuf::from(base).join(tail));
+    }
+
+    for (k, v) in kicad_user_path_vars() {
+        if k == var {
+            return Some(PathBuf::from(v).join(tail));
+        }
+    }
+
+    // KiCad's own ${KICAD<n>_SYMBOL_DIR}, unset in our environment.
+    if var.ends_with("_SYMBOL_DIR") {
+        if let Some(d) = table_dir.and_then(|d| d.parent()) {
+            let p = d.join("symbols").join(tail);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        return find_symbol_dirs()
+            .into_iter()
+            .map(|d| d.join(tail))
+            .find(|p| p.exists());
+    }
+
+    None
+}
+
+/// Every `(lib …)` entry of a sym-lib-table as `(nickname, path)`, following
+/// `(type "Table")` indirection. `depth` bounds a table that references itself.
+fn read_sym_lib_table(path: &Path, depth: usize) -> Vec<(String, PathBuf)> {
+    if depth > 4 {
+        return Vec::new();
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let dir = path.parent();
+    let mut out = Vec::new();
+
+    for line in content.lines() {
+        let Some(name) = field(line, "name") else {
+            continue;
+        };
+        let Some(uri) = field(line, "uri") else {
+            continue;
+        };
+        let Some(resolved) = expand_lib_uri(&uri, dir) else {
+            continue;
+        };
+        if field(line, "type").as_deref() == Some("Table") {
+            out.extend(read_sym_lib_table(&resolved, depth + 1));
+        } else {
+            out.push((name, resolved));
+        }
+    }
+    out
+}
+
+/// Value of `(<key> "…")` on a lib-table line, if present.
+fn field(line: &str, key: &str) -> Option<String> {
+    let pat = format!("({key} \"");
+    let start = line.find(&pat)? + pat.len();
+    let end = line[start..].find('"')? + start;
+    Some(line[start..end].to_string())
+}
+
+/// On-disk `.kicad_sym` for a library nickname, via the global sym-lib-table.
+fn symbol_lib_path(nickname: &str) -> Option<PathBuf> {
+    let table = kicad_config_dir()?.join("sym-lib-table");
+    read_sym_lib_table(&table, 0)
+        .into_iter()
+        .find(|(nick, _)| nick == nickname)
+        .map(|(_, p)| p)
+}
+
 /// Find directories where KiCAD symbol libraries are stored.
+///
+/// Fallback only: `sym-lib-table` is authoritative and is consulted first.
 pub fn find_symbol_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
@@ -664,5 +861,139 @@ mod suggestion_tests {
             &mut sch,
             "Definitely_Not_A_Library_xyzzy:Nope"
         ));
+    }
+}
+
+#[cfg(test)]
+mod lib_table_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        p
+    }
+
+    /// A plain URI is taken as written.
+    #[test]
+    fn expand_lib_uri_passes_through_a_plain_path() {
+        assert_eq!(
+            expand_lib_uri("/libs/parts.kicad_sym", None),
+            Some(PathBuf::from("/libs/parts.kicad_sym"))
+        );
+        assert_eq!(expand_lib_uri("", None), None);
+    }
+
+    /// ${KIPRJMOD} resolves against the table's own directory, because KiCad
+    /// sets it per open project — an exported value could name another project.
+    #[test]
+    fn expand_lib_uri_resolves_kiprjmod_from_the_table_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            expand_lib_uri("${KIPRJMOD}/local.kicad_sym", Some(dir.path())),
+            Some(dir.path().join("local.kicad_sym"))
+        );
+        // No table dir to anchor against: unresolvable rather than guessed.
+        assert_eq!(expand_lib_uri("${KIPRJMOD}/local.kicad_sym", None), None);
+    }
+
+    /// An exported environment variable is honoured.
+    #[test]
+    fn expand_lib_uri_expands_an_exported_env_var() {
+        std::env::set_var("KONNECT_TEST_LIBDIR", "/opt/parts");
+        assert_eq!(
+            expand_lib_uri("${KONNECT_TEST_LIBDIR}/x.kicad_sym", None),
+            Some(PathBuf::from("/opt/parts/x.kicad_sym"))
+        );
+        std::env::remove_var("KONNECT_TEST_LIBDIR");
+    }
+
+    /// An unknown variable fails rather than silently dropping the prefix and
+    /// producing a wrong relative path.
+    #[test]
+    fn expand_lib_uri_rejects_an_unknown_variable() {
+        assert_eq!(
+            expand_lib_uri("${NO_SUCH_VAR_HERE}/x.kicad_sym", None),
+            None
+        );
+    }
+
+    /// The regression this exists for: a nickname that does not match the
+    /// filename. KiCad allows it; resolving by directory scan cannot.
+    #[test]
+    fn table_maps_a_nickname_that_differs_from_the_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "TM16xx.kicad_sym", "(kicad_symbol_lib)");
+        let table = write(
+            dir.path(),
+            "sym-lib-table",
+            &format!(
+                "(sym_lib_table\n\t(version 7)\n\t(lib (name \"JY-TM16xx\") (type \"KiCad\") (uri \"{}/TM16xx.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+                dir.path().display()
+            ),
+        );
+        let entries = read_sym_lib_table(&table, 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "JY-TM16xx");
+        assert!(entries[0].1.ends_with("TM16xx.kicad_sym"));
+    }
+
+    /// `(type "Table")` indirection is followed, which is how KiCad references
+    /// its own bundled libraries and how a shared master table is wired in.
+    #[test]
+    fn nested_table_indirection_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_dir = dir.path().join("inner");
+        write(&inner_dir, "Parts.kicad_sym", "(kicad_symbol_lib)");
+        write(
+            &inner_dir,
+            "sym-lib-table",
+            &format!(
+                "(sym_lib_table\n\t(lib (name \"Inner\") (type \"KiCad\") (uri \"{}/Parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+                inner_dir.display()
+            ),
+        );
+        let outer = write(
+            dir.path(),
+            "sym-lib-table",
+            &format!(
+                "(sym_lib_table\n\t(lib (name \"Group\") (type \"Table\") (uri \"{}/sym-lib-table\") (options \"\") (descr \"\"))\n)\n",
+                inner_dir.display()
+            ),
+        );
+        let entries = read_sym_lib_table(&outer, 0);
+        assert_eq!(entries.len(), 1, "the nested table's entry should surface");
+        assert_eq!(entries[0].0, "Inner");
+    }
+
+    /// A table that references itself must terminate rather than recurse away.
+    #[test]
+    fn self_referencing_table_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sym-lib-table");
+        write(
+            dir.path(),
+            "sym-lib-table",
+            &format!(
+                "(sym_lib_table\n\t(lib (name \"Loop\") (type \"Table\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                p.display()
+            ),
+        );
+        let _ = read_sym_lib_table(&p, 0); // must return, not hang or overflow
+    }
+
+    #[test]
+    fn field_extracts_quoted_values() {
+        let line =
+            r#"(lib (name "A B") (type "KiCad") (uri "/x/y.kicad_sym") (options "") (descr ""))"#;
+        assert_eq!(field(line, "name").as_deref(), Some("A B"));
+        assert_eq!(field(line, "type").as_deref(), Some("KiCad"));
+        assert_eq!(field(line, "uri").as_deref(), Some("/x/y.kicad_sym"));
+        assert_eq!(field(line, "missing"), None);
     }
 }
