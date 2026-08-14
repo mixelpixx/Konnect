@@ -745,7 +745,10 @@ async fn handle_edit_footprint_pad(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "footprint_path")?;
-    let pad_number = require_str(args, "pad_number").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let pad_number = match require_str(args, "pad_number") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let content = tokio::fs::read_to_string(&path).await?;
 
@@ -1660,7 +1663,10 @@ async fn handle_register_footprint_library(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let nickname = match require_str(args, "nickname") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let scope = args["scope"].as_str().unwrap_or("project");
 
     let (table_path, uri) = match lib_table_target(
@@ -1817,7 +1823,10 @@ async fn handle_register_symbol_library(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let nickname = match require_str(args, "nickname") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let scope = args["scope"].as_str().unwrap_or("project");
 
     let (table_path, uri) = match lib_table_target(
@@ -3056,7 +3065,10 @@ async fn handle_delete_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let symbol_name = require_str(args, "symbol_name").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
@@ -3312,8 +3324,10 @@ async fn handle_list_library_footprints(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let library_path_str =
-        require_str(args, "library_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let library_path_str = match require_str(args, "library_path") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let lib_dir = PathBuf::from(library_path_str);
 
     if !lib_dir.is_dir() {
@@ -3348,8 +3362,10 @@ async fn handle_get_footprint_info(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let fp_path_str =
-        require_str(args, "footprint_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let fp_path_str = match require_str(args, "footprint_path") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     // Resolve "Library:Footprint" against the project's fp-lib-table as well
     // as the global one, when the caller says which project they mean.
@@ -3450,7 +3466,10 @@ async fn handle_get_symbol_info(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let lib_id = require_str(args, "lib_id").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let lib_id = match require_str(args, "lib_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
     if parts.len() != 2 {
