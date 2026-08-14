@@ -1,10 +1,13 @@
-//! The 6 always-visible meta-tools.
+//! The 7 always-visible meta-tools.
 //!
 //! Discovery / routing:
 //!   list_toolboxes()          — show all 18 toolsets with descriptions and load state
 //!   load_toolset(name)        — activate a toolset, expose its tools in tools/list
 //!   unload_toolset(name)      — deactivate a toolset, remove its tools from tools/list
 //!   get_active_toolsets()     — list currently loaded toolsets
+//!
+//! Maintenance:
+//!   reload_server(confirm)    — exec into the binary on disk, keeping the connection
 //!
 //! Observability:
 //!   get_recent_calls(limit?)  — last N tool calls (newest first) with timing + status
@@ -19,7 +22,7 @@ use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
 use serde_json::{json, Value};
 
-/// Return the 6 meta-tool MCP descriptions (always in the tools/list response).
+/// Return the 7 meta-tool MCP descriptions (always in the tools/list response).
 pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
     vec![
         McpToolDescription {
@@ -120,6 +123,26 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
                 "required": []
             }),
         },
+        McpToolDescription {
+            name: "reload_server".to_string(),
+            description: "Restart the server in place from the binary on disk, so a freshly built \
+                 Konnect takes effect without restarting the MCP client. The process image \
+                 is replaced (same PID, same stdio pipes), so the connection survives. The \
+                 new binary is verified before the switch, and the call is refused if it \
+                 does not run. Loaded toolsets reset to the starter kit afterwards — reload \
+                 the ones you need. Unix only."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true. Guards against an accidental reload mid-task."
+                    }
+                },
+                "required": ["confirm"]
+            }),
+        },
     ]
 }
 
@@ -136,7 +159,123 @@ pub async fn handle_meta_tool(
         "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
         "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
         "server_stats" => Some(handle_server_stats(ctx).await),
+        "reload_server" => Some(handle_reload_server(args).await),
         _ => None,
+    }
+}
+
+/// Replace this process with a fresh copy of the binary on disk.
+///
+/// A stdio MCP server cannot meaningfully "restart itself": the client owns the
+/// process, and exiting just drops the transport — the client does not respawn
+/// it mid-session. `exec` sidesteps that. It replaces the process *image* while
+/// keeping the PID and, crucially, the inherited stdin/stdout pipes, so the
+/// client's connection is never broken and it goes on talking to what is now
+/// the new build.
+///
+/// Two things the caller should know:
+///
+/// * Router state does not survive. The new image starts at the starter kit, so
+///   previously loaded toolsets must be loaded again. A call to a tool that was
+///   loaded before returns the usual `toolset_not_loaded` error naming its
+///   toolset, so recovery is one hop.
+/// * The reply is written before the switch. `exec` never returns on success,
+///   so the response has to reach the client first; a short delay covers the
+///   transport's flush.
+async fn handle_reload_server(args: &Value) -> CallToolResult {
+    if !args
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "confirm".to_string(),
+                reason: "must be true — reload_server restarts the server in place".to_string(),
+            },
+            "reload_server requires confirm=true.",
+        );
+    }
+
+    #[cfg(not(unix))]
+    {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::HandlerError {
+                reason: "exec-in-place is Unix only".to_string(),
+            },
+            "reload_server is not supported on this platform: replacing the process image \
+             while keeping the stdio pipes requires exec(), which Windows has no equivalent \
+             for. Restart the MCP client instead.",
+        )
+    }
+
+    #[cfg(unix)]
+    {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                return CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::HandlerError {
+                        reason: format!("cannot determine current executable: {e}"),
+                    },
+                    format!("reload_server could not find its own binary: {e}"),
+                );
+            }
+        };
+
+        // Verify before switching. `exec` is a one-way door: if the binary on
+        // disk is broken — a half-written copy, a build that fails to link, an
+        // unsigned binary macOS will kill — the server is simply gone and the
+        // client has nothing to talk to. Running it once first turns that into
+        // a refused call.
+        match std::process::Command::new(&exe).arg("--version").output() {
+            Ok(out) if out.status.success() => {
+                let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                tracing::info!(exe = %exe.display(), %version, "reload_server: exec into new image");
+
+                let exe_for_task = exe.clone();
+                tokio::spawn(async move {
+                    // Let the transport flush this call's reply before the
+                    // process image is replaced.
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    use std::os::unix::process::CommandExt;
+                    let err = std::process::Command::new(&exe_for_task).exec();
+                    // exec only returns on failure.
+                    tracing::error!(error = %err, "reload_server: exec failed; server still running old image");
+                });
+
+                CallToolResult::json(&json!({
+                    "reloading": true,
+                    "binary": exe.display().to_string(),
+                    "version": version,
+                    "note": "Server is replacing its process image. The connection survives \
+                             (same PID, same pipes). Loaded toolsets reset to the starter kit — \
+                             call load_toolset again for the ones you need.",
+                }))
+            }
+            Ok(out) => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::HandlerError {
+                    reason: format!("binary exited with {}", out.status),
+                },
+                format!(
+                    "Refusing to reload: {} does not run cleanly (exit {}). \
+                     stderr: {}",
+                    exe.display(),
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            ),
+            Err(e) => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::HandlerError {
+                    reason: format!("cannot execute binary: {e}"),
+                },
+                format!(
+                    "Refusing to reload: {} could not be executed ({e}). On macOS a freshly \
+                     copied binary needs re-signing: codesign --force -s - <path>",
+                    exe.display()
+                ),
+            ),
+        }
     }
 }
 
@@ -316,4 +455,75 @@ async fn handle_get_active_toolsets(ctx: &std::sync::Arc<ToolContext>) -> CallTo
             .filter_map(|t| t["tool_count"].as_u64())
             .sum::<u64>()
     }))
+}
+
+#[cfg(test)]
+mod meta_tool_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+
+    /// The meta-tool count is quoted in DEV.md, README.md and tool-directory.md
+    /// ("187 registered + 6 meta = 193"). Pin it so adding one forces those to
+    /// be updated in the same commit rather than drifting.
+    #[test]
+    fn meta_tool_count_is_pinned() {
+        let names: Vec<String> = meta_tool_descriptions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(
+            names.len(),
+            7,
+            "meta-tool count changed — update DEV.md, README.md and tool-directory.md too. \
+             Current: {names:?}"
+        );
+    }
+
+    /// Every meta-tool advertised in tools/list must actually dispatch, or the
+    /// model sees a tool it cannot call.
+    #[tokio::test]
+    async fn every_advertised_meta_tool_dispatches() {
+        use crate::router::ToolRouter;
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+
+        for desc in meta_tool_descriptions() {
+            // reload_server would replace the process; check dispatch only, with
+            // confirm omitted so it returns the InvalidArgument guard instead.
+            let args = json!({});
+            let handled = handle_meta_tool(&desc.name, &args, &ctx).await;
+            assert!(
+                handled.is_some(),
+                "meta-tool '{}' is advertised but not dispatched",
+                desc.name
+            );
+        }
+    }
+
+    /// The guard exists so a stray call cannot restart the server mid-task.
+    #[tokio::test]
+    async fn reload_server_refuses_without_confirm() {
+        let result = handle_reload_server(&json!({})).await;
+        assert!(result.is_error);
+
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(
+            text.contains("confirm"),
+            "error should name the missing confirm flag, got: {text}"
+        );
+    }
 }

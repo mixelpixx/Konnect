@@ -10,13 +10,13 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **187 registered tools** + **6 always-visible meta-tools** = **193 total**
+- **187 registered tools** + **7 always-visible meta-tools** = **194 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
 ## Meta-tools (always visible)
 
-Six tools, grouped into *discovery/routing* and *observability*.
+Seven tools, grouped into *discovery/routing* and *observability*.
 
 ### Discovery / routing
 
@@ -33,6 +33,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 |------|---------|
 | `get_recent_calls` | Last N tool calls (newest first) — `call_id`, tool, toolset, duration, status (ok/error/not_found), `error_kind`. The LLM's debug log. Default limit 20, max 100. |
 | `server_stats` | Uptime, total/error call counts, per-tool totals + errors, and the JSONL log path. |
+| `reload_server` | Restart the server in place from the binary on disk, so a freshly built Konnect takes effect without restarting the MCP client. `exec`s the process image (same PID, same stdio pipes) so the connection survives; the new binary is verified first and the call is refused if it does not run. Unix only. |
 
 ---
 
