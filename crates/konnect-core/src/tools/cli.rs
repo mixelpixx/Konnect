@@ -136,6 +136,31 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// An export command returning success is necessary but not sufficient: KiCad
+/// can exit successfully without creating the path a caller asked for. Every
+/// path Konnect reports as an artifact passes this check first (#252).
+async fn verify_nonempty_file(path: &Path, artifact: &str) -> Result<u64> {
+    let metadata = tokio::fs::metadata(path).await.with_context(|| {
+        format!(
+            "{artifact} export reported success but did not create {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "{artifact} export reported success but {} is not a file",
+            path.display()
+        );
+    }
+    if metadata.len() == 0 {
+        anyhow::bail!(
+            "{artifact} export reported success but created an empty file at {}",
+            path.display()
+        );
+    }
+    Ok(metadata.len())
+}
+
 // ─── ERC ─────────────────────────────────────────────────────────────────────
 
 /// Run ERC on a schematic and return parsed violations.
@@ -367,7 +392,9 @@ pub async fn export_schematic_svg(
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
-    Ok(output_dir.join(format!("{}.svg", stem)))
+    let output = output_dir.join(format!("{}.svg", stem));
+    verify_nonempty_file(&output, "schematic SVG").await?;
+    Ok(output)
 }
 
 /// KiCAD 10: `sch export pdf --output <path> <input>`
@@ -381,6 +408,7 @@ pub async fn export_schematic_pdf(cli: &str, schematic: &Path, output: &Path) ->
         schematic.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    verify_nonempty_file(output, "schematic PDF").await?;
     Ok(())
 }
 
@@ -447,6 +475,7 @@ pub async fn export_bom(
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    verify_nonempty_file(output, "BOM").await?;
     Ok(())
 }
 
@@ -505,7 +534,7 @@ pub async fn export_gerber(
     pcb: &Path,
     output_dir: &Path,
     layers: &[&str],
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     let layers_csv = layers.join(",");
     let args = gerber_args(
         output_dir.to_str().unwrap_or(""),
@@ -513,7 +542,40 @@ pub async fn export_gerber(
         &layers_csv,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    Ok(())
+
+    let board_stem = pcb.file_stem().unwrap_or_default().to_string_lossy();
+    let mut files = Vec::new();
+    let mut entries = tokio::fs::read_dir(output_dir).await.with_context(|| {
+        format!(
+            "Gerber export reported success but output directory {} is missing",
+            output_dir.display()
+        )
+    })?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_gerber = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.to_ascii_lowercase().starts_with('g'));
+        if name.starts_with(board_stem.as_ref()) && is_gerber {
+            verify_nonempty_file(&path, "Gerber").await?;
+            files.push(path);
+        }
+    }
+    files.sort();
+    let plot_count = files
+        .iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) != Some("gbrjob"))
+        .count();
+    if plot_count < layers.len().max(1) {
+        anyhow::bail!(
+            "Gerber export reported success but produced {plot_count} non-empty plot file(s) for {} requested layer(s) in {}",
+            layers.len(),
+            output_dir.display()
+        );
+    }
+    Ok(files)
 }
 
 /// `--output` for a drill export names a *directory*, and some kicad-cli
@@ -575,18 +637,43 @@ pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Ve
     let dir_arg = drill_output_dir_arg(output_dir.to_str().unwrap_or(""));
     let args = drill_args(&dir_arg, pcb.to_str().unwrap_or(""));
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    Ok(drill_files_in(output_dir).await)
+    let files = drill_files_in(output_dir).await;
+    if files.is_empty() {
+        anyhow::bail!(
+            "drill export reported success but produced no .drl files in {}",
+            output_dir.display()
+        );
+    }
+    for file in &files {
+        verify_nonempty_file(file, "drill").await?;
+    }
+    Ok(files)
 }
 
-/// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`
-pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
-    let mut args = vec!["pcb", "export", "pdf", "--output", output.to_str().unwrap()];
-    for layer in layers {
+fn pcb_pdf_args<'a>(output: &'a str, pcb: &'a str, layers_csv: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["pcb", "export", "pdf", "--output", output];
+    if !layers_csv.is_empty() {
         args.push("--layers");
-        args.push(layer);
+        args.push(layers_csv);
     }
-    args.push(pcb.to_str().unwrap());
+    // Without an explicit mode KiCad may treat --output as a directory. The
+    // MCP contract names one PDF file, so make that interpretation explicit.
+    args.push("--mode-single");
+    args.push(pcb);
+    args
+}
+
+/// KiCad 10: `pcb export pdf --output <path> [--layers <csv>] --mode-single
+/// <input>`
+pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+    let layers_csv = layers.join(",");
+    let args = pcb_pdf_args(
+        output.to_str().unwrap_or(""),
+        pcb.to_str().unwrap_or(""),
+        &layers_csv,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    verify_nonempty_file(output, "PCB PDF").await?;
     Ok(())
 }
 
@@ -677,6 +764,7 @@ pub async fn export_position_file(
         side,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    verify_nonempty_file(output, "position file").await?;
     Ok(())
 }
 
@@ -982,6 +1070,54 @@ mod erc_parse_tests {
 }
 
 #[cfg(test)]
+mod artifact_verification_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_and_empty_artifacts_are_not_successes() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.pdf");
+        let error = verify_nonempty_file(&missing, "test PDF")
+            .await
+            .expect_err("missing file must fail");
+        assert!(error.to_string().contains("did not create"));
+
+        let empty = dir.path().join("empty.pdf");
+        std::fs::write(&empty, []).unwrap();
+        let error = verify_nonempty_file(&empty, "test PDF")
+            .await
+            .expect_err("empty file must fail");
+        assert!(error.to_string().contains("empty file"));
+
+        let real = dir.path().join("real.pdf");
+        std::fs::write(&real, b"%PDF-test").unwrap();
+        assert_eq!(verify_nonempty_file(&real, "test PDF").await.unwrap(), 9);
+    }
+
+    #[test]
+    fn pcb_pdf_uses_one_csv_layer_argument_and_one_file_mode() {
+        let args = pcb_pdf_args(
+            "/out/board.pdf",
+            "/tmp/board.kicad_pcb",
+            "F.Cu,B.Cu,F.SilkS,B.SilkS,Edge.Cuts",
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|argument| **argument == "--layers")
+                .count(),
+            1
+        );
+        let layers = args
+            .iter()
+            .position(|argument| *argument == "--layers")
+            .map(|index| args[index + 1]);
+        assert_eq!(layers, Some("F.Cu,B.Cu,F.SilkS,B.SilkS,Edge.Cuts"));
+        assert!(args.contains(&"--mode-single"));
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+}
+
+#[cfg(test)]
 mod gerber_export_tests {
     use super::*;
 
@@ -1082,7 +1218,7 @@ mod drill_export_tests {
     async fn drill_files_are_collected_sorted_and_filtered_by_extension() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["board-PTH.drl", "board-NPTH.drl", "board-drl_map.pdf"] {
-            std::fs::write(dir.path().join(name), "").unwrap();
+            std::fs::write(dir.path().join(name), "non-empty").unwrap();
         }
         let files = drill_files_in(dir.path()).await;
         let names: Vec<_> = files

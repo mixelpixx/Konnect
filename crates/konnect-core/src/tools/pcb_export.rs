@@ -427,7 +427,7 @@ async fn handle_export_gerber(
     tokio::fs::create_dir_all(&output_dir).await?;
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_gerber(cli, &board, &output_dir, &layer_refs).await?;
+    let mut verified_files = cli::export_gerber(cli, &board, &output_dir, &layer_refs).await?;
 
     if drill {
         // kicad-cli also has a dedicated drill export. Its --output is a
@@ -436,16 +436,16 @@ async fn handle_export_gerber(
         // `output_dir.join("drill.drl")` made KiCad create a *directory*
         // called drill.drl and bury the drill files inside it, where the
         // listing below never saw them.
-        let _ = cli::export_drill(cli, &board, &output_dir).await; // best-effort
+        verified_files.extend(cli::export_drill(cli, &board, &output_dir).await?);
     }
 
-    // List produced files
-    let mut files = Vec::new();
-    if let Ok(mut rd) = tokio::fs::read_dir(&output_dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            files.push(entry.file_name().to_string_lossy().to_string());
-        }
-    }
+    // Report only files that this export path verified as regular and
+    // non-empty; never echo a directory listing containing stale artifacts.
+    let mut files = verified_files
+        .iter()
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
     files.sort();
 
     Ok(CallToolResult::text(
