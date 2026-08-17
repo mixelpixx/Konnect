@@ -16,6 +16,19 @@ pub struct IpcFootprint {
     pub layer: String,
 }
 
+/// Complete target placement for one existing footprint.
+///
+/// Keeping the four values together lets the IPC client transform all selected
+/// footprints from one board snapshot and publish them in one undoable update,
+/// instead of issuing a move and a rotation as separate round trips.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcFootprintPlacement {
+    pub reference: String,
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct IpcPadDefinition {
     pub number: String,
