@@ -325,6 +325,8 @@ pub fn find_lib_symbol<'a>(
 pub struct LibPin {
     pub number: String,
     pub name: String,
+    /// KiCad electrical pin type (`input`, `power_in`, `no_connect`, ...).
+    pub electrical_type: String,
     /// Position in symbol-local Y-up space (mm).
     pub local_x: f64,
     pub local_y: f64,
@@ -399,6 +401,11 @@ fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
 
 fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
     let (x, y, rotation) = parse_at(node)?;
+    let electrical_type = node
+        .get(1)
+        .and_then(|pin_type| pin_type.as_str())
+        .unwrap_or("unspecified")
+        .to_string();
     let length = node
         .find("length")
         .and_then(|l| l.get_f64(1))
@@ -418,6 +425,7 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
     Some(LibPin {
         number,
         name,
+        electrical_type,
         local_x: x,
         local_y: y,
         rotation,
@@ -774,6 +782,24 @@ mod unit_pin_tests {
     }
 
     #[test]
+    fn extraction_preserves_the_electrical_pin_type() {
+        let root = parse_sexp(
+            r#"(kicad_symbol_lib
+  (symbol "TEST"
+    (pin no_connect line (at 0 0 0) (length 0)
+      (name "NC" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27)))))))"#,
+        )
+        .unwrap();
+        let pin = extract_lib_pins(root.find("symbol").unwrap())
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(pin.electrical_type, "no_connect");
+    }
+
+    #[test]
     fn underscored_base_names_parse_their_unit_suffix() {
         assert_eq!(parse_subsymbol_unit("R_Small_1_1"), Some(1));
         assert_eq!(parse_subsymbol_unit("OP_DUAL_2_1"), Some(2));
@@ -796,6 +822,7 @@ mod pin_endpoint_tests {
         LibPin {
             number: number.to_string(),
             name: "~".to_string(),
+            electrical_type: "passive".to_string(),
             local_x: 0.0,
             local_y,
             rotation,
@@ -1030,6 +1057,7 @@ mod pin_label_rotation_tests {
         LibPin {
             number: "1".into(),
             name: "PIN".into(),
+            electrical_type: "passive".into(),
             // Tip sits 10 mm out from the origin, opposite the way it points.
             local_x: -10.0 * rad.cos(),
             local_y: -10.0 * rad.sin(),
