@@ -1333,6 +1333,113 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// Set the complete placement of several footprints in one KiCad undo
+    /// transaction and one `UpdateItems` request.
+    ///
+    /// KiCad serializes footprint children in absolute board coordinates, so
+    /// every child must receive the same rigid transform as its parent. Doing
+    /// that from one board snapshot also avoids the transient state and the
+    /// two IPC round trips produced by a separate move followed by a rotate.
+    pub fn set_footprint_placements(&self, placements: &[IpcFootprintPlacement]) -> Result<()> {
+        if placements.is_empty() {
+            return Ok(());
+        }
+
+        let mut requested = std::collections::HashSet::new();
+        for placement in placements {
+            if !requested.insert(placement.reference.as_str()) {
+                anyhow::bail!(
+                    "placement request contains duplicate footprint reference '{}'",
+                    placement.reference
+                );
+            }
+        }
+
+        self.run_commit("Set component placements", |client| {
+            let items = client.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+            let mut matched = std::collections::HashSet::new();
+            let mut updates = Vec::with_capacity(placements.len());
+
+            for item in items {
+                if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+                    continue;
+                }
+                let mut footprint =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+                let reference = footprint
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .map(|text| text.text.as_str())
+                    .unwrap_or("");
+                let Some(target) = placements
+                    .iter()
+                    .find(|placement| placement.reference == reference)
+                else {
+                    continue;
+                };
+                if !matched.insert(reference.to_string()) {
+                    anyhow::bail!(
+                        "footprint reference '{}' appears more than once on the board",
+                        reference
+                    );
+                }
+
+                let old_position = footprint.position.unwrap_or_default();
+                let old_rotation = footprint
+                    .orientation
+                    .as_ref()
+                    .map(|angle| angle.value_degrees)
+                    .unwrap_or(0.0);
+                let rotation_delta = target.rotation - old_rotation;
+                if rotation_delta != 0.0 {
+                    crate::transform::transform_footprint_children(
+                        &mut footprint,
+                        &crate::transform::Xform::Rotate {
+                            cx_nm: old_position.x_nm,
+                            cy_nm: old_position.y_nm,
+                            delta_deg: rotation_delta,
+                        },
+                    )?;
+                }
+
+                let new_position = crate::builders::vec2(target.x, target.y);
+                let dx_nm = new_position.x_nm - old_position.x_nm;
+                let dy_nm = new_position.y_nm - old_position.y_nm;
+                if dx_nm != 0 || dy_nm != 0 {
+                    crate::transform::transform_footprint_children(
+                        &mut footprint,
+                        &crate::transform::Xform::Translate { dx_nm, dy_nm },
+                    )?;
+                }
+                footprint.position = Some(new_position);
+                footprint.orientation = Some(kiapi::common::types::Angle {
+                    value_degrees: target.rotation,
+                });
+                updates.push(crate::builders::pack_any(
+                    &footprint,
+                    "kiapi.board.types.FootprintInstance",
+                ));
+            }
+
+            let missing: Vec<_> = placements
+                .iter()
+                .filter(|placement| !matched.contains(&placement.reference))
+                .map(|placement| placement.reference.as_str())
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "footprint{} {} not found on board",
+                    if missing.len() == 1 { "" } else { "s" },
+                    missing.join(", ")
+                );
+            }
+
+            client.update_items(updates)
+        })
+    }
+
     /// Update the visible value field of an existing footprint.
     pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;

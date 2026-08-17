@@ -8,7 +8,9 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
 use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
-use crate::tools::{get_path, require_f64, require_str, require_u64, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, require_array, require_f64, require_str, require_u64, ToolContext, ToolDef,
+};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{
@@ -929,9 +931,11 @@ fn persist_board_replacement(
     write_atomic_if_unchanged(board_path, expected, replacement)
 }
 
+#[derive(Clone, Copy)]
 enum FootprintPlacementUpdate {
     Move { x: f64, y: f64 },
     Rotate { rotation: f64 },
+    Set { x: f64, y: f64, rotation: f64 },
 }
 
 /// Why a closed-board placement update could not be applied.
@@ -997,6 +1001,29 @@ fn update_closed_board_footprint(
     let updated = prepare_closed_board_footprint_update(&content, reference, update)?;
     persist_board_replacement(board_path, &content, &updated)
         .map_err(|e| ClosedBoardError::Io(e.into()))?;
+    Ok(())
+}
+
+fn update_closed_board_footprints(
+    board_path: &Path,
+    placements: &[konnect_ipc::types::IpcFootprintPlacement],
+) -> Result<(), ClosedBoardError> {
+    let content =
+        read_consistent(board_path).map_err(|error| ClosedBoardError::Io(error.into()))?;
+    let mut updated = content.clone();
+    for placement in placements {
+        updated = prepare_closed_board_footprint_update(
+            &updated,
+            &placement.reference,
+            FootprintPlacementUpdate::Set {
+                x: placement.x,
+                y: placement.y,
+                rotation: placement.rotation,
+            },
+        )?;
+    }
+    persist_board_replacement(board_path, &content, &updated)
+        .map_err(|error| ClosedBoardError::Io(error.into()))?;
     Ok(())
 }
 
@@ -1078,6 +1105,7 @@ fn update_footprint_placement(
         FootprintPlacementUpdate::Rotate { rotation } => {
             (old_x, old_y, normalize_root_angle(rotation))
         }
+        FootprintPlacementUpdate::Set { x, y, rotation } => (x, y, normalize_root_angle(rotation)),
     };
 
     // Replace the root `(at …)` FIRST, while `at_start`/`at_end` still index
@@ -1107,7 +1135,8 @@ fn update_footprint_placement(
     );
     let updated = match update {
         FootprintPlacementUpdate::Move { .. } => updated,
-        FootprintPlacementUpdate::Rotate { rotation } => {
+        FootprintPlacementUpdate::Rotate { rotation }
+        | FootprintPlacementUpdate::Set { rotation, .. } => {
             apply_rotation_to_children(&updated, rotation - old_rotation)
         }
     };
@@ -1749,6 +1778,32 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_rotate_component(args, ctx).await }
         ),
         tool!(
+            "set_component_placements",
+            "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "placements": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "x": { "type": "number", "description": "Target X coordinate in millimetres" },
+                                "y": { "type": "number", "description": "Target Y coordinate in millimetres" },
+                                "rotation": { "type": "number", "description": "Target absolute rotation in degrees" }
+                            },
+                            "required": ["reference", "x", "y", "rotation"]
+                        }
+                    }
+                },
+                "required": ["board", "placements"]
+            }),
+            |args, ctx| async move { handle_set_component_placements(args, ctx).await }
+        ),
+        tool!(
             "flip_component",
             "Set a placed footprint to F.Cu or B.Cu with KiCAD-equivalent geometry mirroring. \
              This operation requires a closed board: it safely flips supported footprints with \
@@ -2239,6 +2294,104 @@ async fn handle_rotate_component(
                 Err(error) => Ok(error.into_result()),
             }
         }
+    }
+}
+
+fn invalid_placement(field: String, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.clone(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
+}
+
+fn parse_component_placements(
+    args: &serde_json::Value,
+) -> Result<Vec<konnect_ipc::types::IpcFootprintPlacement>, CallToolResult> {
+    let values = require_array(args, "placements")?;
+    if values.is_empty() {
+        return Err(invalid_placement(
+            "placements".to_string(),
+            "must contain at least one placement",
+        ));
+    }
+
+    let mut references = HashSet::new();
+    let mut placements = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let field = |name: &str| format!("placements[{index}].{name}");
+        let Some(object) = value.as_object() else {
+            return Err(invalid_placement(
+                format!("placements[{index}]"),
+                "must be an object",
+            ));
+        };
+        let reference = object
+            .get("reference")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reference| !reference.is_empty())
+            .ok_or_else(|| invalid_placement(field("reference"), "missing or empty"))?
+            .to_string();
+        if !references.insert(reference.clone()) {
+            return Err(invalid_placement(
+                field("reference"),
+                format!("duplicate footprint reference '{reference}'"),
+            ));
+        }
+        let number = |name: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| invalid_placement(field(name), "missing or not a number"))
+        };
+        placements.push(konnect_ipc::types::IpcFootprintPlacement {
+            reference,
+            x: number("x")?,
+            y: number("y")?,
+            rotation: number("rotation")?,
+        });
+    }
+    Ok(placements)
+}
+
+async fn handle_set_component_placements(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let placements = match parse_component_placements(args) {
+        Ok(placements) => placements,
+        Err(error) => return Ok(error),
+    };
+
+    let placements_ipc = placements.clone();
+    match attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "component placement batch",
+        move |client| client.set_footprint_placements(&placements_ipc),
+    )
+    .await?
+    {
+        BoardWrite::Ipc(()) => Ok(CallToolResult::json(&json!({
+            "count": placements.len(),
+            "placements": placements,
+            "source": "ipc",
+            "undo": "One KiCad undo step reverses the whole placement batch."
+        }))),
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File => match update_closed_board_footprints(&board, &placements) {
+            Ok(()) => Ok(CallToolResult::json(&json!({
+                "count": placements.len(),
+                "placements": placements,
+                "source": "file",
+                "warning": "KiCad IPC was not reachable, so the closed board file was edited once with a revision check."
+            }))),
+            Err(error) => Ok(error.into_result()),
+        },
     }
 }
 
@@ -3524,6 +3677,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unreachable_ipc_sets_multiple_placements_with_one_file_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(tmp.path());
+        for (reference, x) in [("R1", 10.0), ("R2", 20.0)] {
+            let placed = handle_place_component(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "footprint": "Resistor_SMD:R_0805_2012Metric",
+                    "reference": reference,
+                    "x": x,
+                    "y": 20.0,
+                    "rotation": 0.0,
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!placed.is_error, "{reference}: {:?}", placed.content);
+        }
+
+        let result = handle_set_component_placements(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [
+                    {"reference": "R1", "x": 40.0, "y": 50.0, "rotation": 270.0},
+                    {"reference": "R2", "x": 60.0, "y": 70.0, "rotation": 45.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let response: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("batch result must be JSON");
+        assert_eq!(response["source"], "file");
+        assert_eq!(response["count"], 2);
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert!(written.contains("(at 40 50 -90)"), "{written}");
+        assert!(written.contains("(at 60 70 45)"), "{written}");
+        assert!(konnect_sexp::parse_sexp(&written).is_ok());
+    }
+
+    #[tokio::test]
+    async fn placement_batch_is_all_or_nothing_for_missing_and_duplicate_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = placed_fallback_fixture(tmp.path()).await;
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let missing = handle_set_component_placements(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [
+                    {"reference": "R1", "x": 40.0, "y": 50.0, "rotation": 90.0},
+                    {"reference": "R404", "x": 60.0, "y": 70.0, "rotation": 0.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(missing.is_error);
+        assert!(result_text(&missing).contains("R404"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+
+        let duplicate = handle_set_component_placements(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [
+                    {"reference": "R1", "x": 40.0, "y": 50.0, "rotation": 90.0},
+                    {"reference": "R1", "x": 60.0, "y": 70.0, "rotation": 0.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let text = result_text(&duplicate);
+        assert!(duplicate.is_error);
+        assert!(text.contains("invalid_argument") && text.contains("placements[1].reference"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn closed_board_move_and_rotate_reject_a_missing_reference_without_writing() {
         let tmp = tempfile::tempdir().unwrap();
         let board = placed_fallback_fixture(tmp.path()).await;
@@ -3565,11 +3803,11 @@ mod tests {
         .unwrap();
         assert!(rotated.is_error);
         assert!(result_text(&rotated).contains("R404"));
-        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
     #[tokio::test]
-    async fn reachable_rejection_prevents_move_and_rotate_file_fallbacks() {
+    async fn reachable_rejection_prevents_placement_file_fallbacks() {
         let tmp = tempfile::tempdir().unwrap();
         let board = placed_fallback_fixture(tmp.path()).await;
         let before = std::fs::read_to_string(&board).unwrap();
@@ -3613,7 +3851,22 @@ mod tests {
         .unwrap();
         assert!(rotated.is_error);
         assert!(result_text(&rotated).contains("not modified"));
-        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+
+        let batch = handle_set_component_placements(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [
+                    {"reference": "R1", "x": 40.0, "y": 50.0, "rotation": 90.0}
+                ]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(batch.is_error);
+        assert!(result_text(&batch).contains("not modified"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
     const FLIP_FOOTPRINT: &str = r#"(footprint "Test:Flip"

@@ -88,7 +88,7 @@ Konnect/
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
-│   │           ├── pcb_components.rs # 16 tools (IPC real-time + safe headless single-placement fallback)
+│   │           ├── pcb_components.rs # 17 tools (IPC real-time + safe headless placement fallback)
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
 │   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 17 tools (symbol/footprint library management)
@@ -298,7 +298,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 203 tools (209 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 204 tools (210 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -373,9 +373,9 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **19 toolsets, 203 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **19 toolsets, 204 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: 20 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 209 tools (203 registered + 6 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 210 tools (204 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **3 operations `kicad-cli` has never exposed** (specctra DSN/SES, pcb sync — return clear
