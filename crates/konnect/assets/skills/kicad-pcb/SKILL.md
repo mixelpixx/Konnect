@@ -41,7 +41,7 @@ Before any PCB work, load the required toolsets:
 
 ```
 load_toolset('pcb_board')        # board outline, layers, setup, stackup
-load_toolset('pcb_components')   # place, move, rotate, align footprints
+load_toolset('pcb_components')   # place, refresh, move, rotate, align footprints
 load_toolset('pcb_routing')      # traces, vias, differential pairs
 load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
 ```
@@ -71,11 +71,21 @@ Follow this sequence for a clean PCB workflow:
    schematic editor, and the target board must be open in KiCad. A conflict is
    non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
-3. **Place components** — position all footprints
-4. **Route traces** — connect all nets
-5. **Copper pour** — add ground/power zones last
-6. **DRC** — run design rule check
-7. **Save** — `save_project`
+3. **Refresh changed libraries** — when a linked footprint library changed, use
+   `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
+   Footprints from Library**. This is distinct from `update_pcb_from_schematic`:
+   it refreshes supported library-owned pads, graphics, attributes, metadata, and
+   3D models without changing references, placement, side, rotation, KIID, symbol
+   metadata, instance overrides, or pad nets. Always call it first with
+   `dry_run: true`; apply only with `dry_run: false` and the exact returned
+   `expected_plan_revision`. The requested board must be open in live KiCad, one
+   apply is one undo entry, and unsupported or stale content returns a non-mutating
+   conflict instead of silently dropping it.
+4. **Place components** — position all footprints
+5. **Route traces** — connect all nets
+6. **Copper pour** — add ground/power zones last
+7. **DRC** — run design rule check
+8. **Save** — `save_project`
 
 Do NOT add copper pours before routing is complete — they interfere with interactive routing.
 
@@ -97,6 +107,7 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | Tool                      | Use Case                                    |
 |---------------------------|---------------------------------------------|
 | `place_component`         | Position one footprint via IPC or safe file fallback |
+| `update_footprints_from_library` | Refresh placed definitions from linked libraries |
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
 | `flip_component`          | Set F.Cu/B.Cu on a closed board with geometry mirroring |

@@ -12,6 +12,8 @@ pub mod manufacturing;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
+#[allow(dead_code)]
+pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
 pub mod project;

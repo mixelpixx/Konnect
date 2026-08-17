@@ -5,7 +5,9 @@
 //! platform footprint-library discovery, `.kicad_mod` preparation, and live IPC.
 
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_ipc::gen::kiapi;
 use konnect_sexp::{parse_sexp, SexpNode};
+use prost::Message;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -107,6 +109,68 @@ fn footprint<'a>(tree: &'a SexpNode, reference: &str) -> &'a SexpNode {
             })
         })
         .unwrap_or_else(|| panic!("placed footprint {reference} is missing from saved board"))
+}
+
+fn live_footprint(
+    ipc: &KiCadIpcClient,
+    board: &std::path::Path,
+    reference: &str,
+) -> kiapi::board::types::FootprintInstance {
+    let document = ipc.find_open_board(board).unwrap();
+    ipc.get_items_in(
+        document,
+        kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+    )
+    .unwrap()
+    .into_iter()
+    .filter_map(|item| kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok())
+    .find(|footprint| {
+        footprint
+            .reference_field
+            .as_ref()
+            .and_then(|field| field.text.as_ref())
+            .and_then(|text| text.text.as_ref())
+            .map(|text| text.text.as_str())
+            == Some(reference)
+    })
+    .unwrap_or_else(|| panic!("live footprint {reference} is missing"))
+}
+
+fn footprint_pad_size(
+    footprint: &kiapi::board::types::FootprintInstance,
+    number: &str,
+) -> (i64, i64) {
+    footprint
+        .definition
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+        .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+        .find(|pad| pad.number == number)
+        .and_then(|pad| pad.pad_stack)
+        .and_then(|stack| stack.copper_layers.into_iter().next())
+        .and_then(|layer| layer.size)
+        .map(|size| (size.x_nm, size.y_nm))
+        .unwrap_or_else(|| panic!("pad {number} is missing its copper size"))
+}
+
+fn footprint_models(
+    footprint: &kiapi::board::types::FootprintInstance,
+) -> Vec<kiapi::board::types::Footprint3DModel> {
+    footprint
+        .definition
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .filter(|item| {
+            item.type_url
+                .ends_with("kiapi.board.types.Footprint3DModel")
+        })
+        .map(|item| kiapi::board::types::Footprint3DModel::decode(item.value.as_slice()).unwrap())
+        .collect()
 }
 
 #[test]
@@ -282,4 +346,232 @@ fn schematic_sync_apply_then_dry_run_is_noop() {
     );
     let after: Value = serde_json::from_str(after["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(after["status"], "noop", "apply did not converge: {after}");
+}
+
+#[test]
+#[ignore = "requires a running KiCad GUI and a disposable open board"]
+fn footprint_library_update_apply_then_dry_run_is_noop() {
+    let board = std::path::PathBuf::from(
+        std::env::var("KONNECT_LIVE_KICAD_BOARD")
+            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let project = board.with_extension("kicad_pro");
+    assert!(
+        project.is_file(),
+        "the disposable board needs a sibling .kicad_pro"
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let project_dir = board.parent().unwrap();
+    let library_dir = project_dir.join("konnect-update-fixture.pretty");
+    let footprint_path = library_dir.join("RefreshFixture.kicad_mod");
+    let reference = "REFRESH900";
+    let library_id = "konnect-update-fixture:RefreshFixture";
+
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool(
+        "load_toolset",
+        json!({"name": ["library", "pcb_components"]}),
+    );
+    mcp.tool(
+        "create_footprint",
+        json!({
+            "output": footprint_path,
+            "name": "RefreshFixture",
+            "description": "revision A",
+            "pads": [
+                {
+                    "number": "1",
+                    "type": "smd",
+                    "shape": "rect",
+                    "x": -1.0,
+                    "y": 0.0,
+                    "width": 1.0,
+                    "height": 1.0
+                },
+                {
+                    "number": "2",
+                    "type": "smd",
+                    "shape": "rect",
+                    "x": 1.0,
+                    "y": 0.0,
+                    "width": 1.0,
+                    "height": 1.0
+                }
+            ],
+            "body_width": 3.0,
+            "body_height": 2.0,
+            "model": {
+                "path": "../models/revision-a.step",
+                "offset": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                "rotate": {"x": 0.0, "y": 0.0, "z": 0.0}
+            }
+        }),
+    );
+    mcp.tool(
+        "register_footprint_library",
+        json!({
+            "library_path": library_dir,
+            "nickname": "konnect-update-fixture",
+            "scope": "project",
+            "project": project
+        }),
+    );
+    mcp.tool(
+        "place_component",
+        json!({
+            "board": board,
+            "footprint": library_id,
+            "reference": reference,
+            "x": 42.0,
+            "y": 37.0,
+            "rotation": 37.0,
+            "layer": "F.Cu"
+        }),
+    );
+
+    let before = live_footprint(&ipc, &board, reference);
+    let before_id = before.id.clone();
+    let before_position = before.position;
+    let before_orientation = before.orientation;
+    let before_layer = before.layer;
+    let before_pad_one = footprint_pad_size(&before, "1");
+    let before_models = footprint_models(&before);
+
+    mcp.tool(
+        "edit_footprint_pad",
+        json!({
+            "footprint_path": footprint_path,
+            "pad_number": "1",
+            "width": 2.0,
+            "height": 1.5
+        }),
+    );
+    mcp.tool(
+        "set_footprint_graphics",
+        json!({
+            "footprint_path": footprint_path,
+            "selector": {"layer": "F.CrtYd"},
+            "mode": "replace",
+            "graphics": [{
+                "type": "rect",
+                "start": {"x": -2.5, "y": -1.5},
+                "end": {"x": 2.5, "y": 1.5},
+                "stroke_width_mm": 0.05,
+                "fill": "none"
+            }]
+        }),
+    );
+    mcp.tool(
+        "set_footprint_metadata",
+        json!({
+            "footprint_path": footprint_path,
+            "description": "revision B",
+            "tags": ["konnect", "refresh"]
+        }),
+    );
+    mcp.tool(
+        "set_footprint_models",
+        json!({
+            "footprint_path": footprint_path,
+            "mode": "replace",
+            "models": [{
+                "path": "../models/revision-b.step",
+                "offset": {"x": 1.0, "y": 2.0, "z": 3.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                "rotate": {"x": 90.0, "y": 0.0, "z": 45.0}
+            }]
+        }),
+    );
+
+    let dry_run = mcp.tool(
+        "update_footprints_from_library",
+        json!({
+            "board": board,
+            "references": [reference],
+            "dry_run": true
+        }),
+    );
+    let dry_run: Value =
+        serde_json::from_str(dry_run["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(dry_run["status"], "ready", "{dry_run}");
+    assert_eq!(dry_run["coverage"]["selected"]["planned"], 1);
+    assert_eq!(dry_run["coverage"]["changed"]["planned"], 1);
+    let revision = dry_run["plan_revision"].as_str().unwrap();
+
+    let applied = mcp.tool(
+        "update_footprints_from_library",
+        json!({
+            "board": board,
+            "references": [reference],
+            "dry_run": false,
+            "expected_plan_revision": revision
+        }),
+    );
+    let applied: Value =
+        serde_json::from_str(applied["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(applied["status"], "applied", "{applied}");
+
+    let after = live_footprint(&ipc, &board, reference);
+    assert_eq!(after.id, before_id);
+    assert_eq!(after.position, before_position);
+    assert_eq!(after.orientation, before_orientation);
+    assert_eq!(after.layer, before_layer);
+    assert_ne!(footprint_pad_size(&after, "1"), before_pad_one);
+    assert_eq!(footprint_pad_size(&after, "1"), (2_000_000, 1_500_000));
+    assert_ne!(footprint_models(&after), before_models);
+    assert_eq!(
+        footprint_models(&after)[0].filename,
+        "../models/revision-b.step"
+    );
+
+    let converged = mcp.tool(
+        "update_footprints_from_library",
+        json!({
+            "board": board,
+            "references": [reference],
+            "dry_run": true
+        }),
+    );
+    let converged: Value =
+        serde_json::from_str(converged["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(converged["status"], "noop", "{converged}");
+
+    ipc.save_board().unwrap();
+    mcp.tool("load_toolset", json!({"name": "verification"}));
+    let drc = mcp.tool(
+        "run_drc",
+        json!({
+            "board": board,
+            "severity": "info",
+            "tests": ["lib_footprint_mismatch"],
+            "limit": 100
+        }),
+    );
+    let drc: Value = serde_json::from_str(drc["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        drc["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|violation| {
+                !violation["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("doesn't match the copy in the library")
+            }),
+        "{drc}"
+    );
 }

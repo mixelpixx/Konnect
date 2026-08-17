@@ -1077,6 +1077,7 @@ dependencies = [
  "konnect-core",
  "konnect-ipc",
  "konnect-sexp",
+ "prost",
  "serde",
  "serde_json",
  "tempfile",

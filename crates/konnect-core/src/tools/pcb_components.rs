@@ -503,7 +503,8 @@ pub(crate) fn extract_graphic_definitions(
         });
     }
     for text in footprint.find_all("fp_text") {
-        if text_hidden(text) {
+        let kind = text.get(1).and_then(konnect_sexp::SexpNode::as_str);
+        if matches!(kind, Some("reference" | "value")) || text_hidden(text) {
             continue;
         }
         let content = text
@@ -1804,6 +1805,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_find_component(args, ctx).await }
         ),
+        super::pcb_footprint_update::tool(),
         tool!(
             "list_board_footprint_graphics",
             "List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Points are footprint-local millimetres, as the .kicad_mod shows them. Each item reports 'editable', plus 'outlines' and 'holes' for polygons: 'points' covers the first outline only, so an item with more than one outline or any holes is reported but cannot be edited here. Requires KiCAD running with the board open.",
@@ -2967,6 +2969,23 @@ mod tests {
             Graphic::Text { text, layer, size, position, .. }
                 if text == "${REFERENCE}" && layer == "F.Fab" && *size == 0.26
                     && *position == (0.0, 1.17)
+        ));
+    }
+
+    #[test]
+    fn legacy_reference_and_value_text_are_not_duplicated_as_graphics() {
+        let source = r#"(footprint "Legacy"
+  (layer "F.Cu")
+  (fp_text reference "REF**" (at 0 -1) (layer "F.SilkS"))
+  (fp_text value "Legacy" (at 0 1) (layer "F.Fab"))
+  (fp_text user "visible" (at 0 0) (layer "F.Fab")))"#;
+
+        let graphics = extract_graphic_definitions(source).unwrap();
+
+        assert_eq!(graphics.len(), 1, "{graphics:?}");
+        assert!(matches!(
+            &graphics[0],
+            konnect_ipc::IpcGraphicDefinition::Text { text, .. } if text == "visible"
         ));
     }
 
