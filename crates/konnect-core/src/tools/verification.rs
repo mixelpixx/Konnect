@@ -433,27 +433,49 @@ async fn handle_get_design_rules(
 
 // ─── KiCAD UI management ──────────────────────────────────────────────────────
 
-/// Check if the KiCAD GUI is running by scanning the process list.
+const KICAD_GUI_PROCESS_NAMES: &[&str] = &["kicad", "pcbnew", "eeschema"];
+
+fn is_kicad_process_name(name: &str) -> bool {
+    let file_name = std::path::Path::new(name.trim_matches('"'))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    let stem = file_name.strip_suffix(".exe").unwrap_or(&file_name);
+    KICAD_GUI_PROCESS_NAMES.contains(&stem)
+}
+
+fn process_list_has_kicad(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(is_kicad_process_name)
+    })
+}
+
+/// Check if the KiCad project manager or either standalone editor is running.
 fn is_kicad_running() -> bool {
     #[cfg(target_os = "windows")]
     {
-        // On Windows, use `tasklist` to check
         std::process::Command::new("tasklist")
             .output()
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("kicad.exe"))
+            .map(|output| process_list_has_kicad(&String::from_utf8_lossy(&output.stdout)))
             .unwrap_or(false)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        std::process::Command::new("pgrep")
-            .arg("-x")
-            .arg("kicad")
+        std::process::Command::new("ps")
+            .args(["-A", "-o", "comm="])
             .output()
             .ok()
-            .map(|o| o.status.success())
+            .map(|output| process_list_has_kicad(&String::from_utf8_lossy(&output.stdout)))
             .unwrap_or(false)
     }
+}
+
+fn ui_running(process_detected: bool, ipc_responsive: bool) -> bool {
+    process_detected || ipc_responsive
 }
 
 /// Resolve the KiCAD binary path from config or well-known locations.
@@ -542,24 +564,22 @@ async fn handle_check_kicad_ui(
     let addr = ctx.config.ipc_address.clone();
     let started = std::time::Instant::now();
     let check = async move {
-        let running = task::spawn_blocking(is_kicad_running).await?;
-        if !running {
-            return Ok::<_, tokio::task::JoinError>((false, false));
-        }
+        let process_detected = task::spawn_blocking(is_kicad_running).await?;
         let ipc_responsive = task::spawn_blocking(move || {
             konnect_ipc::client::KiCadIpcClient::new(&addr)
                 .ping()
                 .unwrap_or(false)
         })
         .await?;
-        Ok((true, ipc_responsive))
+        Ok::<_, tokio::task::JoinError>((process_detected, ipc_responsive))
     };
 
     match bounded_health_check(std::time::Duration::from_secs(timeout_seconds), check).await {
         Ok(result) => {
-            let (running, ipc_responsive) = result?;
+            let (process_detected, ipc_responsive) = result?;
             Ok(CallToolResult::json(&json!({
-                "running": running,
+                "running": ui_running(process_detected, ipc_responsive),
+                "process_detected": process_detected,
                 "ipc_responsive": ipc_responsive,
                 "timed_out": false,
                 "timeout_seconds": timeout_seconds,
@@ -568,6 +588,7 @@ async fn handle_check_kicad_ui(
         }
         Err(_) => Ok(CallToolResult::json(&json!({
             "running": null,
+            "process_detected": null,
             "ipc_responsive": false,
             "timed_out": true,
             "timeout_seconds": timeout_seconds,
@@ -1012,6 +1033,25 @@ mod tests {
                 .expect_err("out-of-range or non-integer timeout must be refused");
             assert!(error.is_error);
         }
+    }
+
+    #[test]
+    fn standalone_editors_count_as_kicad_ui_processes() {
+        for name in ["kicad", "pcbnew", "eeschema", "PCBNEW.EXE"] {
+            assert!(is_kicad_process_name(name), "did not recognize {name}");
+        }
+        assert!(!is_kicad_process_name("kicad-cli"));
+        assert!(!is_kicad_process_name("freerouting"));
+        assert!(process_list_has_kicad(
+            "/usr/bin/Finder\n/Applications/KiCad/pcbnew\n"
+        ));
+    }
+
+    #[test]
+    fn responsive_ipc_is_sufficient_running_evidence() {
+        assert!(ui_running(false, true));
+        assert!(ui_running(true, false));
+        assert!(!ui_running(false, false));
     }
 
     #[tokio::test]
