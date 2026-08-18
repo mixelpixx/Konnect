@@ -95,7 +95,7 @@ Konnect/
 │   │           ├── footprint_graphics.rs # footprint primitive validation, inspection, and atomic edits
 │   │           ├── footprint_metadata.rs # footprint description, tags, and attribute edits
 │   │           ├── footprint_models.rs # footprint 3D model validation and atomic edits
-│   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting, datasheets)
+│   │           ├── integration.rs    # 8 tools (JLCPCB SQLite, Freerouting discovery, datasheets)
 │   │           ├── verification.rs   # 8 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
 │   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
@@ -298,7 +298,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 203 tools (209 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 202 tools (208 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -373,11 +373,11 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **19 toolsets, 203 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **19 toolsets, 202 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: 20 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 209 tools (203 registered + 6 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 208 tools (202 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
-- **3 operations `kicad-cli` has never exposed** (specctra DSN/SES, pcb sync — return clear
-  errors). These are absent from the KiCAD 8, 9 and 10 CLI alike, not removals; KiCAD's PCB
-  editor still performs all three. See [#253](https://github.com/mixelpixx/Konnect/issues/253).
+- **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands. Konnect
+  therefore does not advertise autorouting until it has a real editor bridge; the
+  `check_freerouting` diagnostic still discovers PCM installations and Java.

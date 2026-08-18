@@ -311,8 +311,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Integration
 
-### `integration` · 9 tools
-**Purpose:** JLCPCB parts database, Freerouting autoroute, datasheet URLs.
+### `integration` · 8 tools
+**Purpose:** JLCPCB parts database, Freerouting installation discovery, datasheet URLs.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
 | Tool | Description |
@@ -324,8 +324,11 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID. |
-| `autoroute` | Run Freerouting autorouter: export DSN → autoroute → import SES result. |
-| `check_freerouting` | Verify that the Freerouting JAR is available and return its version. |
+| `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available. |
+
+Migration from the former `autoroute` tool: use Freerouting's KiCad ActionPlugin for
+DSN/SES routing. Konnect no longer advertises `autoroute` because it had no editor
+bridge and every call failed; `check_freerouting` remains available for diagnostics.
 
 ---
 

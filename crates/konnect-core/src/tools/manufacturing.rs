@@ -427,7 +427,7 @@ async fn handle_validate_for_manufacturing(
         issues.push(json!({
             "severity": "error",
             "issue": format!("{} nets defined but no traces routed", net_count),
-            "fix": "Route traces using route_trace or autoroute before manufacturing"
+            "fix": "Route traces using route_trace before manufacturing"
         }));
     }
 
