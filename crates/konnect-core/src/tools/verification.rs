@@ -23,7 +23,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Run the Design Rule Check on the PCB and return structured violation results, \
              with separate error and warning counts in the summary. Prefer this over \
              `get_drc_violations` (pcb_export toolset) — they run the same underlying \
-             kicad-cli check, but `run_drc` returns a cleaner breakdown.",
+             kicad-cli check, but `run_drc` returns a cleaner breakdown. KiCad runs the \
+             complete configured DRC ruleset; kicad-cli has no per-test selector.",
             json!({
                 "type": "object",
                 "properties": {
@@ -33,11 +34,6 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
-                    },
-                    "tests": {
-                        "type": "array",
-                        "description": "Specific DRC test IDs to run (empty = all tests)",
-                        "items": { "type": "string" }
                     },
                     "limit": {
                         "type": "integer",
