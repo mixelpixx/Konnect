@@ -57,6 +57,12 @@ fn required_phrases() -> Vec<(&'static str, String)> {
             "DEV.md",
             format!("{total} tools ({registered} registered + {meta} meta)"),
         ),
+        (
+            "tool-directory.md",
+            format!(
+                "**{registered} registered tools** + **{meta} always-visible meta-tools** = **{total} total**"
+            ),
+        ),
     ]
 }
 
