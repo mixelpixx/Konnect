@@ -8,7 +8,9 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
 use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
-use crate::tools::{get_path, require_f64, require_str, require_u64, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, require_array, require_f64, require_str, require_u64, ToolContext, ToolDef,
+};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{
@@ -16,8 +18,10 @@ use konnect_sexp::writer::{
     read_consistent, write_atomic_if_unchanged,
 };
 use konnect_sexp::SexpEdit;
+use prost::Message;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
@@ -1792,6 +1796,37 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_edit_component(args, ctx).await }
         ),
         tool!(
+            "repair_corrupted_footprints",
+            "Repair the exact legacy corruption from Konnect issue #244: footprint drawing \
+             shapes rewritten as anonymous pads with empty layer sets. Resolves each affected \
+             footprint from its library, restores its pads and drawing shapes while preserving \
+             placement, identity and pad nets, and applies every requested repair in one KiCad \
+             undo commit. Defaults to a non-mutating dry run; apply requires the exact returned \
+             plan revision. Requires KiCAD running with the requested board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "references": {
+                        "type": "array",
+                        "description": "Optional reference-designator allowlist. Omit to scan every footprint.",
+                        "items": { "type": "string" }
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Report the repair plan without changing the board."
+                    },
+                    "expected_plan_revision": {
+                        "type": "string",
+                        "description": "Exact plan_revision returned by a current dry run; required for apply."
+                    }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_repair_corrupted_footprints(args, ctx).await }
+        ),
+        tool!(
             "find_component",
             "Find a footprint on the board by reference designator and return its position.",
             json!({
@@ -2351,6 +2386,514 @@ async fn handle_edit_component(
     })))
 }
 
+fn footprint_instance_reference(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+) -> String {
+    footprint
+        .reference_field
+        .as_ref()
+        .and_then(|field| field.text.as_ref())
+        .and_then(|text| text.text.as_ref())
+        .map(|text| text.text.clone())
+        .unwrap_or_default()
+}
+
+fn issue_244_phantom_pad(pad: &konnect_ipc::gen::kiapi::board::types::Pad) -> bool {
+    use konnect_ipc::gen::kiapi;
+
+    let layerless = pad
+        .pad_stack
+        .as_ref()
+        .is_none_or(|stack| stack.layers.is_empty());
+    // Once an affected board is saved, KiCad can materialise proto3's empty
+    // pad defaults as a PTH pad on *.Cu with a 1 nm drill. That is still #244,
+    // not a real hole. The plan additionally requires a one-for-one missing
+    // library graphic and an exact match of every legitimate library pad, so
+    // a genuine unnumbered mechanical pad cannot be removed by this test.
+    let normalised_zero_drill = pad.r#type == kiapi::board::types::PadType::PtPth as i32
+        && pad
+            .pad_stack
+            .as_ref()
+            .and_then(|stack| stack.drill.as_ref())
+            .and_then(|drill| drill.diameter.as_ref())
+            .is_some_and(|diameter| {
+                diameter.x_nm.unsigned_abs() <= 1_000 && diameter.y_nm.unsigned_abs() <= 1_000
+            });
+    pad.number.is_empty()
+        // KiCad may normalise an absent proto net into an empty Net message
+        // when the board is saved and reloaded. Neither form names copper.
+        && pad.net.as_ref().is_none_or(|net| net.name.is_empty())
+        && (layerless || normalised_zero_drill)
+}
+
+fn issue_244_counts(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+) -> anyhow::Result<(usize, usize, BTreeMap<String, usize>)> {
+    use konnect_ipc::gen::kiapi;
+
+    let definition = footprint
+        .definition
+        .as_ref()
+        .context("board footprint has no library definition")?;
+    let mut phantom_pads = 0usize;
+    let mut graphic_shapes = 0usize;
+    let mut legitimate_pad_numbers = BTreeMap::new();
+    for child in &definition.items {
+        if konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+            let pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                .context("footprint declares a pad that cannot be decoded")?;
+            if issue_244_phantom_pad(&pad) {
+                phantom_pads += 1;
+            } else {
+                *legitimate_pad_numbers.entry(pad.number).or_insert(0) += 1;
+            }
+        } else if konnect_ipc::builders::any_is(child, "kiapi.board.types.BoardGraphicShape") {
+            graphic_shapes += 1;
+        }
+    }
+    Ok((phantom_pads, graphic_shapes, legitimate_pad_numbers))
+}
+
+/// Replace only a footprint definition's mixed child list with a clean copy
+/// built from its library. Everything owned by the placed instance — KIID,
+/// placement, symbol path, flags and fields — stays on the original message.
+/// Named/legitimate pads keep their live KIID, net and lock state by number;
+/// only #244's anonymous, layerless pads disappear.
+fn merge_clean_footprint_children(
+    current: &prost_types::Any,
+    clean: &prost_types::Any,
+) -> anyhow::Result<prost_types::Any> {
+    use konnect_ipc::gen::kiapi;
+
+    let mut current = kiapi::board::types::FootprintInstance::decode(current.value.as_slice())
+        .context("KiCad returned an invalid current footprint")?;
+    let mut clean = kiapi::board::types::FootprintInstance::decode(clean.value.as_slice())
+        .context("the library produced an invalid clean footprint")?;
+    let current_definition = current
+        .definition
+        .as_mut()
+        .context("current footprint has no library definition")?;
+    let clean_definition = clean
+        .definition
+        .as_mut()
+        .context("clean footprint has no library definition")?;
+
+    // #244 changed only BoardGraphicShape children into Pad children. BoardText
+    // and any future non-shape child types survived and may contain deliberate
+    // per-board customisation, so retain those exact live messages rather than
+    // replacing the whole mixed child list from the library.
+    let preserved_non_shapes = current_definition
+        .items
+        .iter()
+        .filter(|child| {
+            !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad")
+                && !konnect_ipc::builders::any_is(child, "kiapi.board.types.BoardGraphicShape")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut current_pads: BTreeMap<String, VecDeque<kiapi::board::types::Pad>> = BTreeMap::new();
+    for child in &current_definition.items {
+        if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+            continue;
+        }
+        let pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+            .context("current footprint declares a pad that cannot be decoded")?;
+        if !issue_244_phantom_pad(&pad) {
+            current_pads
+                .entry(pad.number.clone())
+                .or_default()
+                .push_back(pad);
+        }
+    }
+
+    let mut clean_items = Vec::new();
+    for mut child in std::mem::take(&mut clean_definition.items) {
+        if !konnect_ipc::builders::any_is(&child, "kiapi.board.types.Pad") {
+            if konnect_ipc::builders::any_is(&child, "kiapi.board.types.BoardGraphicShape") {
+                clean_items.push(child);
+            }
+            continue;
+        }
+        let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+            .context("clean footprint declares a pad that cannot be decoded")?;
+        let preserved = current_pads
+            .get_mut(&pad.number)
+            .and_then(VecDeque::pop_front)
+            .with_context(|| {
+                format!(
+                    "clean library footprint has pad '{}' that the board footprint does not",
+                    pad.number
+                )
+            })?;
+        pad.id = preserved.id;
+        pad.net = preserved.net;
+        pad.locked = preserved.locked;
+        child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        clean_items.push(child);
+    }
+    let leftovers = current_pads
+        .iter()
+        .filter(|(_, pads)| !pads.is_empty())
+        .map(|(number, pads)| format!("'{number}' x{}", pads.len()))
+        .collect::<Vec<_>>();
+    if !leftovers.is_empty() {
+        anyhow::bail!(
+            "board footprint has legitimate pads absent from the library: {}",
+            leftovers.join(", ")
+        );
+    }
+
+    clean_items.extend(preserved_non_shapes);
+    current_definition.items = clean_items;
+    Ok(konnect_ipc::builders::pack_any(
+        &current,
+        "kiapi.board.types.FootprintInstance",
+    ))
+}
+
+struct CorruptedFootprintRepair {
+    reference: String,
+    footprint: String,
+    phantom_pads: usize,
+    restored_graphics: usize,
+    expected_graphics: usize,
+    repaired_item: prost_types::Any,
+}
+
+fn repair_plan_revision(
+    board: &Path,
+    repairs: &[CorruptedFootprintRepair],
+    source_digests: &[(String, Vec<u8>)],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(board.as_os_str().as_encoded_bytes());
+    for repair in repairs {
+        hasher.update(repair.reference.as_bytes());
+        hasher.update(repair.footprint.as_bytes());
+        hasher.update(&repair.repaired_item.value);
+    }
+    for (reference, source) in source_digests {
+        hasher.update(reference.as_bytes());
+        hasher.update(source);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+async fn handle_repair_corrupted_footprints(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi;
+
+    let board = get_path(args, "board")?;
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+    if !dry_run && expected_revision.is_none() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "expected_plan_revision".to_string(),
+                reason: "required when dry_run is false".to_string(),
+            },
+            "Apply requires the plan revision returned by a current dry run.",
+        ));
+    }
+
+    let selected = if args
+        .get("references")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        None
+    } else {
+        let values = match require_array(args, "references") {
+            Ok(values) => values,
+            Err(error) => return Ok(error),
+        };
+        let mut selected = HashSet::new();
+        for (index, value) in values.iter().enumerate() {
+            let Some(reference) = value.as_str().filter(|reference| !reference.is_empty()) else {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: "references".to_string(),
+                        reason: format!("item {index} must be a non-empty string"),
+                    },
+                    format!("Argument 'references' item {index} must be a non-empty string"),
+                ));
+            };
+            if !selected.insert(reference.to_string()) {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: "references".to_string(),
+                        reason: format!("duplicate reference '{reference}'"),
+                    },
+                    format!("Argument 'references' contains duplicate '{reference}'"),
+                ));
+            }
+        }
+        Some(selected)
+    };
+
+    let board_for_ipc = board.clone();
+    let expected_for_ipc = expected_revision.clone();
+    let outcome = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "legacy footprint repair",
+        move |client| {
+            let document = client.find_open_board(&board_for_ipc)?;
+            let summaries = client
+                .list_footprints_in(document.clone())?
+                .into_iter()
+                .map(|footprint| (footprint.reference.clone(), footprint))
+                .collect::<HashMap<_, _>>();
+            let items = client.get_items_in(
+                document.clone(),
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )?;
+            let mut seen = HashSet::new();
+            let mut repairs = Vec::new();
+            let mut source_digests = Vec::new();
+            let mut diagnostics = Vec::new();
+
+            for item in items {
+                let footprint = kiapi::board::types::FootprintInstance::decode(
+                    item.value.as_slice(),
+                )
+                .context("KiCad returned an invalid footprint instance")?;
+                let reference = footprint_instance_reference(&footprint);
+                if reference.is_empty()
+                    || selected
+                        .as_ref()
+                        .is_some_and(|selected| !selected.contains(&reference))
+                {
+                    continue;
+                }
+                seen.insert(reference.clone());
+                let (phantom_pads, current_graphics, board_pad_numbers) =
+                    issue_244_counts(&footprint)?;
+                if phantom_pads == 0 {
+                    continue;
+                }
+
+                let Some(summary) = summaries.get(&reference) else {
+                    diagnostics.push(json!({
+                        "reference": reference,
+                        "code": "live_summary_missing",
+                        "message": "KiCad returned the footprint item but not its summary"
+                    }));
+                    continue;
+                };
+                let source = match resolve_footprint_source(&summary.footprint, &board_for_ipc) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        diagnostics.push(json!({
+                            "reference": reference,
+                            "code": "library_resolution_failed",
+                            "message": format!("{error:#}")
+                        }));
+                        continue;
+                    }
+                };
+                let pads = match extract_pad_definitions(&source) {
+                    Ok(pads) => pads,
+                    Err(error) => {
+                        diagnostics.push(json!({
+                            "reference": reference,
+                            "code": "library_pad_parse_failed",
+                            "message": format!("{error:#}")
+                        }));
+                        continue;
+                    }
+                };
+                let graphics = match extract_graphic_definitions(&source) {
+                    Ok(graphics) => graphics,
+                    Err(error) => {
+                        diagnostics.push(json!({
+                            "reference": reference,
+                            "code": "library_graphic_parse_failed",
+                            "message": format!("{error:#}")
+                        }));
+                        continue;
+                    }
+                };
+                let expected_graphics = graphics
+                    .iter()
+                    .filter(|graphic| {
+                        !matches!(graphic, konnect_ipc::IpcGraphicDefinition::Text { .. })
+                    })
+                    .count();
+                let restored_graphics = expected_graphics.saturating_sub(current_graphics);
+                let library_pad_numbers = pads.iter().fold(BTreeMap::new(), |mut counts, pad| {
+                    *counts.entry(pad.number.clone()).or_insert(0) += 1;
+                    counts
+                });
+                if phantom_pads != restored_graphics || board_pad_numbers != library_pad_numbers {
+                    diagnostics.push(json!({
+                        "reference": reference,
+                        "code": "signature_mismatch",
+                        "message": format!(
+                            "found {phantom_pads} anonymous layerless pads but the library is missing {restored_graphics} drawing shapes; legitimate board pads and library pads must also match exactly"
+                        )
+                    }));
+                    continue;
+                }
+
+                let clean = client.build_footprint_item(
+                    &summary.footprint,
+                    &summary.reference,
+                    &summary.value,
+                    &pads,
+                    &graphics,
+                    &extract_field_placement(&source),
+                    summary.position.x,
+                    summary.position.y,
+                    summary.rotation,
+                    &summary.layer,
+                )?;
+                let repaired_item = merge_clean_footprint_children(&item, &clean)?;
+                source_digests.push((reference.clone(), source.into_bytes()));
+                repairs.push(CorruptedFootprintRepair {
+                    reference,
+                    footprint: summary.footprint.clone(),
+                    phantom_pads,
+                    restored_graphics,
+                    expected_graphics,
+                    repaired_item,
+                });
+            }
+
+            if let Some(selected) = &selected {
+                for reference in selected.difference(&seen) {
+                    diagnostics.push(json!({
+                        "reference": reference,
+                        "code": "reference_not_found",
+                        "message": "the requested footprint reference is not present on the open board"
+                    }));
+                }
+            }
+            repairs.sort_by(|left, right| left.reference.cmp(&right.reference));
+            source_digests.sort_by(|left, right| left.0.cmp(&right.0));
+            let plan_revision = repair_plan_revision(&board_for_ipc, &repairs, &source_digests);
+            let candidates = repairs
+                .iter()
+                .map(|repair| json!({
+                    "reference": repair.reference,
+                    "footprint": repair.footprint,
+                    "phantom_pads_removed": repair.phantom_pads,
+                    "drawing_shapes_restored": repair.restored_graphics,
+                    "expected_drawing_shapes": repair.expected_graphics
+                }))
+                .collect::<Vec<_>>();
+
+            if !diagnostics.is_empty() {
+                return Ok(json!({
+                    "status": "conflict",
+                    "plan_revision": plan_revision,
+                    "candidate_count": repairs.len(),
+                    "candidates": candidates,
+                    "diagnostics": diagnostics,
+                    "applied": false
+                }));
+            }
+            if repairs.is_empty() {
+                return Ok(json!({
+                    "status": "noop",
+                    "plan_revision": plan_revision,
+                    "candidate_count": 0,
+                    "candidates": [],
+                    "diagnostics": [],
+                    "applied": false
+                }));
+            }
+            if dry_run {
+                return Ok(json!({
+                    "status": "ready",
+                    "plan_revision": plan_revision,
+                    "candidate_count": repairs.len(),
+                    "candidates": candidates,
+                    "diagnostics": [],
+                    "applied": false
+                }));
+            }
+            if expected_for_ipc.as_deref() != Some(plan_revision.as_str()) {
+                return Ok(json!({
+                    "status": "conflict",
+                    "plan_revision": plan_revision,
+                    "candidate_count": repairs.len(),
+                    "candidates": candidates,
+                    "diagnostics": [{
+                        "code": "stale_plan_revision",
+                        "message": "The live board or footprint library changed; rerun dry run and apply its new plan revision."
+                    }],
+                    "applied": false
+                }));
+            }
+
+            let repaired_items = repairs
+                .iter()
+                .map(|repair| repair.repaired_item.clone())
+                .collect::<Vec<_>>();
+            client.run_commit("Repair legacy-corrupted footprint graphics", |client| {
+                client.update_items_in(document.clone(), repaired_items)
+            })?;
+
+            let updated = client.get_items_in(
+                document,
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )?;
+            let expected = repairs
+                .iter()
+                .map(|repair| (repair.reference.as_str(), repair.expected_graphics))
+                .collect::<HashMap<_, _>>();
+            let mut verified = HashSet::new();
+            for item in updated {
+                let footprint = kiapi::board::types::FootprintInstance::decode(
+                    item.value.as_slice(),
+                )
+                .context("KiCad returned an invalid repaired footprint")?;
+                let reference = footprint_instance_reference(&footprint);
+                let Some(expected_graphics) = expected.get(reference.as_str()) else {
+                    continue;
+                };
+                let (phantom_pads, graphic_shapes, _) = issue_244_counts(&footprint)?;
+                if phantom_pads != 0 || graphic_shapes != *expected_graphics {
+                    anyhow::bail!(
+                        "KiCad accepted the repair for {reference} but read-back found {phantom_pads} phantom pads and {graphic_shapes}/{expected_graphics} drawing shapes; use Ctrl-Z and inspect the footprint"
+                    );
+                }
+                verified.insert(reference);
+            }
+            if verified.len() != repairs.len() {
+                anyhow::bail!(
+                    "KiCad accepted {} repairs but only {} repaired footprints were found on read-back; use Ctrl-Z and inspect the board",
+                    repairs.len(),
+                    verified.len()
+                );
+            }
+
+            Ok(json!({
+                "status": "applied",
+                "plan_revision": plan_revision,
+                "candidate_count": repairs.len(),
+                "repaired_count": repairs.len(),
+                "candidates": candidates,
+                "diagnostics": [],
+                "applied": true,
+                "undo": "Ctrl-Z reverses the complete repair."
+            }))
+        },
+    )
+    .await?;
+
+    Ok(match outcome {
+        BoardWrite::Ipc(value) => CallToolResult::json(&value),
+        BoardWrite::Refused(result) => result,
+        BoardWrite::File => CallToolResult::error(
+            "KiCad IPC is unreachable. repair_corrupted_footprints is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry.",
+        ),
+    })
+}
+
 async fn handle_find_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -2820,6 +3363,174 @@ mod tests {
   (property "Value" "R_0402" (at 0 1 0) (layer "F.Fab"))
   (pad "1" smd roundrect (at -0.5 0) (size 0.5 0.5)
     (layers "F.Cu" "F.Paste" "F.Mask")))"#;
+
+    fn test_pad(number: &str, layers: Vec<i32>, id: &str, net: Option<&str>) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi;
+        let pad = kiapi::board::types::Pad {
+            id: Some(kiapi::common::types::Kiid {
+                value: id.to_string(),
+            }),
+            number: number.to_string(),
+            net: net.map(|name| kiapi::board::types::Net {
+                code: None,
+                name: name.to_string(),
+            }),
+            pad_stack: Some(kiapi::board::types::PadStack {
+                layers,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad")
+    }
+
+    fn normalised_issue_244_pad() -> prost_types::Any {
+        use konnect_ipc::gen::kiapi;
+        let mut pad = kiapi::board::types::Pad::decode(
+            test_pad("", vec![0], "normalised-phantom", None)
+                .value
+                .as_slice(),
+        )
+        .unwrap();
+        pad.r#type = kiapi::board::types::PadType::PtPth as i32;
+        pad.pad_stack.as_mut().unwrap().drill = Some(kiapi::board::types::DrillProperties {
+            diameter: Some(konnect_ipc::builders::vec2(0.000_001, 0.000_001)),
+            ..Default::default()
+        });
+        konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad")
+    }
+
+    #[test]
+    fn issue_244_signature_distinguishes_real_unnumbered_pads() {
+        use konnect_ipc::gen::kiapi;
+        let footprint = kiapi::board::types::FootprintInstance {
+            definition: Some(kiapi::board::types::Footprint {
+                items: vec![
+                    test_pad("1", vec![0], "named", None),
+                    // A real NPTH/mechanical pad may be unnumbered, but it has
+                    // an explicit layer set and must survive the repair.
+                    test_pad("", vec![0, 31], "mechanical", None),
+                    // #244's proto3 default pad has neither a number nor any
+                    // layers. This exact signature is the only one repaired.
+                    test_pad("", vec![], "phantom", None),
+                    // A save/reload can normalise that same proto default into
+                    // *.Cu with a one-nanometre PTH drill.
+                    normalised_issue_244_pad(),
+                    konnect_ipc::builders::pack_any(
+                        &kiapi::board::types::BoardGraphicShape::default(),
+                        "kiapi.board.types.BoardGraphicShape",
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (phantoms, graphics, pads) = issue_244_counts(&footprint).unwrap();
+        assert_eq!(phantoms, 2);
+        assert_eq!(graphics, 1);
+        assert_eq!(pads.get("1"), Some(&1));
+        assert_eq!(pads.get(""), Some(&1));
+    }
+
+    #[test]
+    fn repair_restores_graphics_and_preserves_live_pad_identity_and_net() {
+        use konnect_ipc::gen::kiapi;
+
+        let current = kiapi::board::types::FootprintInstance {
+            id: Some(kiapi::common::types::Kiid {
+                value: "placed-footprint".to_string(),
+            }),
+            symbol_path: Some(kiapi::common::types::SheetPath {
+                path: vec![kiapi::common::types::Kiid {
+                    value: "symbol-path".to_string(),
+                }],
+                path_human_readable: String::new(),
+            }),
+            definition: Some(kiapi::board::types::Footprint {
+                items: vec![
+                    test_pad("1", vec![0], "live-pad", Some("GND")),
+                    test_pad("", vec![], "phantom", None),
+                    konnect_ipc::builders::pack_any(
+                        &kiapi::board::types::BoardText {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "custom-board-text".to_string(),
+                            }),
+                            ..Default::default()
+                        },
+                        "kiapi.board.types.BoardText",
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let clean = kiapi::board::types::FootprintInstance {
+            definition: Some(kiapi::board::types::Footprint {
+                items: vec![
+                    test_pad("1", vec![0], "library-pad", None),
+                    konnect_ipc::builders::pack_any(
+                        &kiapi::board::types::BoardGraphicShape::default(),
+                        "kiapi.board.types.BoardGraphicShape",
+                    ),
+                    konnect_ipc::builders::pack_any(
+                        &kiapi::board::types::BoardText {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "library-text".to_string(),
+                            }),
+                            ..Default::default()
+                        },
+                        "kiapi.board.types.BoardText",
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let current =
+            konnect_ipc::builders::pack_any(&current, "kiapi.board.types.FootprintInstance");
+        let clean = konnect_ipc::builders::pack_any(&clean, "kiapi.board.types.FootprintInstance");
+
+        let repaired = merge_clean_footprint_children(&current, &clean).unwrap();
+        let repaired =
+            kiapi::board::types::FootprintInstance::decode(repaired.value.as_slice()).unwrap();
+        assert_eq!(repaired.id.as_ref().unwrap().value, "placed-footprint");
+        assert_eq!(
+            repaired.symbol_path.as_ref().unwrap().path[0].value,
+            "symbol-path"
+        );
+        let (phantoms, graphics, pads) = issue_244_counts(&repaired).unwrap();
+        assert_eq!((phantoms, graphics), (0, 1));
+        assert_eq!(pads.get("1"), Some(&1));
+
+        let pad = repaired
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+            .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap())
+            .unwrap();
+        assert_eq!(pad.id.as_ref().unwrap().value, "live-pad");
+        assert_eq!(pad.net.as_ref().unwrap().name, "GND");
+        let texts = repaired
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardText"))
+            .map(|item| {
+                kiapi::board::types::BoardText::decode(item.value.as_slice())
+                    .unwrap()
+                    .id
+                    .unwrap()
+                    .value
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["custom-board-text"]);
+    }
 
     #[test]
     fn prepares_complete_front_footprint() {

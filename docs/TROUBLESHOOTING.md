@@ -87,6 +87,29 @@ is force-quit mid-session, the next such call may edit the file behind it and
 report success. Reopen the board and check before continuing, and prefer
 reopening KiCAD first.
 
+## An older schematic-to-PCB sync left extra unnamed pads
+
+Konnect versions v0.4.0 through v0.6.1 could rewrite each drawing shape inside
+a footprint as an anonymous pad while `update_pcb_from_schematic` reassigned
+pad nets ([#244](https://github.com/mixelpixx/Konnect/issues/244)). Current
+versions prevent and detect that corruption, but prevention does not repair a
+board already saved by an affected release.
+
+Open the affected board in KiCAD, load `pcb_components`, and call
+`repair_corrupted_footprints` with the board path. Its default dry run scans
+for #244's exact signature: an anonymous pad with no net and an empty layer set,
+paired one-for-one with a drawing shape missing from the registered footprint
+library. It refuses ambiguous pad layouts or an unavailable library rather
+than guessing. Optionally pass `references` to restrict the scan.
+
+Review `candidates`, then call the tool again with `dry_run: false` and the
+exact returned `plan_revision` as `expected_plan_revision`. All candidates are
+repaired in one KiCAD undo commit. Placement, footprint identity, symbol path,
+pad nets and non-shape children are preserved; a live read-back verifies that
+the phantom pads are gone and the expected drawing shapes returned. Save the
+board and run DRC afterward. Ctrl-Z reverses the complete repair if its visual
+result is not what you expect.
+
 ## "kicad-cli not found"
 
 Common install paths are auto-detected (including the Windows registry). If
@@ -169,7 +192,7 @@ The fix for those clients is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 209 tools from the first call.
+startup, so `tools/list` carries all 210 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
