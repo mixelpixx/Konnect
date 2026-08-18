@@ -161,7 +161,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. |
 | `get_schematic_layout` | Return a compact spatial summary of the schematic: component positions, bounding box, optionally wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
-| `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
+| `validate_component_connections` | Check selected component pins for a wire or label; optionally exclude KiCad `power_in`/`power_out` pins and report each remaining pin's electrical type. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
 
