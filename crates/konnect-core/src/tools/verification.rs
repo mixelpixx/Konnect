@@ -76,13 +76,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_kicad_ui",
-            "Check whether the KiCAD GUI application is running and responsive.",
+            "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout.",
             json!({
                 "type": "object",
                 "properties": {
                     "timeout_seconds": {
                         "type": "integer",
                         "description": "Timeout for the health check in seconds",
+                        "minimum": 1,
+                        "maximum": 300,
                         "default": 5
                     }
                 },
@@ -490,39 +492,85 @@ fn find_kicad_binary(config_binary: &str) -> String {
     }
 }
 
-async fn handle_check_kicad_ui(
-    _args: &serde_json::Value,
-    ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let running = task::spawn_blocking(is_kicad_running).await?;
-
-    if !running {
-        return Ok(CallToolResult::text(
-            serde_json::to_string(&json!({
-                "running": false,
-                "ipc_responsive": false
-            }))
-            .unwrap(),
+fn health_timeout_seconds(args: &serde_json::Value) -> Result<u64, CallToolResult> {
+    let timeout = match args.get("timeout_seconds") {
+        None | Some(serde_json::Value::Null) => 5,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "timeout_seconds".to_string(),
+                    reason: "must be an integer from 1 to 300".to_string(),
+                },
+                "Argument 'timeout_seconds' must be an integer from 1 to 300",
+            )
+        })?,
+    };
+    if !(1..=300).contains(&timeout) {
+        return Err(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "timeout_seconds".to_string(),
+                reason: "must be between 1 and 300 seconds".to_string(),
+            },
+            "Argument 'timeout_seconds' must be between 1 and 300 seconds",
         ));
     }
+    Ok(timeout)
+}
 
-    // Try IPC ping
+async fn bounded_health_check<F, T>(
+    timeout: std::time::Duration,
+    future: F,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(timeout, future).await
+}
+
+async fn handle_check_kicad_ui(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let timeout_seconds = match health_timeout_seconds(args) {
+        Ok(timeout) => timeout,
+        Err(error) => return Ok(error),
+    };
     let addr = ctx.config.ipc_address.clone();
-    let ipc_ok = task::spawn_blocking(move || {
-        konnect_ipc::client::KiCadIpcClient::new(&addr)
-            .ping()
-            .unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false);
+    let started = std::time::Instant::now();
+    let check = async move {
+        let running = task::spawn_blocking(is_kicad_running).await?;
+        if !running {
+            return Ok::<_, tokio::task::JoinError>((false, false));
+        }
+        let ipc_responsive = task::spawn_blocking(move || {
+            konnect_ipc::client::KiCadIpcClient::new(&addr)
+                .ping()
+                .unwrap_or(false)
+        })
+        .await?;
+        Ok((true, ipc_responsive))
+    };
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "running": true,
-            "ipc_responsive": ipc_ok
-        }))
-        .unwrap(),
-    ))
+    match bounded_health_check(std::time::Duration::from_secs(timeout_seconds), check).await {
+        Ok(result) => {
+            let (running, ipc_responsive) = result?;
+            Ok(CallToolResult::json(&json!({
+                "running": running,
+                "ipc_responsive": ipc_responsive,
+                "timed_out": false,
+                "timeout_seconds": timeout_seconds,
+                "elapsed_ms": started.elapsed().as_millis() as u64
+            })))
+        }
+        Err(_) => Ok(CallToolResult::json(&json!({
+            "running": null,
+            "ipc_responsive": false,
+            "timed_out": true,
+            "timeout_seconds": timeout_seconds,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "note": "KiCad health check exceeded the requested timeout"
+        }))),
+    }
 }
 
 async fn handle_launch_kicad_ui(
@@ -946,6 +994,35 @@ mod tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    #[test]
+    fn health_timeout_is_bounded_and_typed() {
+        assert_eq!(health_timeout_seconds(&json!({})).unwrap(), 5);
+        assert_eq!(
+            health_timeout_seconds(&json!({ "timeout_seconds": 17 })).unwrap(),
+            17
+        );
+        for invalid in [json!(0), json!(301), json!(1.5), json!("5")] {
+            let error = health_timeout_seconds(&json!({ "timeout_seconds": invalid }))
+                .expect_err("out-of-range or non-integer timeout must be refused");
+            assert!(error.is_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_deadline_returns_without_waiting_for_the_inner_future() {
+        let timed_out = bounded_health_check(std::time::Duration::from_millis(1), async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            1
+        })
+        .await;
+        assert!(timed_out.is_err());
+
+        let completed = bounded_health_check(std::time::Duration::from_secs(1), async { 2 })
+            .await
+            .unwrap();
+        assert_eq!(completed, 2);
     }
 
     fn blank_board() -> &'static str {
