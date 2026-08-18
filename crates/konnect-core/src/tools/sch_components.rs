@@ -7,9 +7,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, find_symbol_instance_block, get_path, opt_f64, opt_str,
-    reembed_lib_symbols, require_array, require_f64, require_str, ReembedOutcome, ToolContext,
-    ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, reembed_lib_symbols,
+    require_array, require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -90,7 +89,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_component",
-            "Remove a symbol instance from the schematic by its reference designator.",
+            "Remove a component by reference designator, including every placed unit of a multi-unit symbol.",
             json!({
                 "type": "object",
                 "properties": {
@@ -103,7 +102,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) of a symbol instance.",
+            "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component.",
             json!({
                 "type": "object",
                 "properties": {
@@ -124,7 +123,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_component",
-            "Get all properties, position, and pin locations for a symbol instance.",
+            "Get a component's shared properties and every placed unit's position. Use get_schematic_pin_locations for pins.",
             json!({
                 "type": "object",
                 "properties": {
@@ -150,7 +149,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_schematic_component",
-            "Move a symbol to a new position. Does NOT adjust connected wires.",
+            "Move a component's lowest-numbered unit to a new position and translate every other placed unit by the same delta. Does NOT adjust connected wires.",
             json!({
                 "type": "object",
                 "properties": {
@@ -165,7 +164,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "rotate_schematic_component",
-            "Rotate a symbol by setting its absolute rotation angle (0/90/180/270).",
+            "Set the lowest-numbered unit's absolute rotation and rotate every other placed unit by the same delta.",
             json!({
                 "type": "object",
                 "properties": {
@@ -224,7 +223,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_pin_locations",
-            "Get the exact schematic-space (X,Y) coordinates of every pin on a symbol, \
+            "Get the exact schematic-space (X,Y) coordinates of every pin on every placed unit of a component, \
              accounting for rotation and mirroring. Uses the canonical pin transform. \
              Each pin also reports 'orientation_degrees', the direction leading away \
              from the symbol body (0 = east) — a net label at the pin must read that \
@@ -260,7 +259,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_component_annotation",
-            "Add a custom property (annotation) to a symbol instance in the schematic.",
+            "Add or update a custom property consistently across every placed unit of a component.",
             json!({
                 "type": "object",
                 "properties": {
@@ -275,7 +274,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "group_components",
-            "Add a group property to multiple components in the schematic.",
+            "Add or update a group property on every placed unit of multiple components.",
             json!({
                 "type": "object",
                 "properties": {
@@ -293,14 +292,14 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "replace_component",
-            "Replace a component's lib_id with a new library symbol (swap the component type).",
+            "Replace every placed unit of a component with a new library symbol while preserving unit numbers. A unit override is accepted only for a single placement.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "reference": { "type": "string", "description": "Component reference designator (e.g. 'U1')" },
                     "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" },
-                    "unit": { "type": "integer", "description": "Optional unit number for multi-unit symbols; validated against the new symbol's unit count. When omitted the existing unit is kept." }
+                    "unit": { "type": "integer", "description": "Optional unit number for a single placed unit; rejected as ambiguous when the reference has multiple placements. When omitted, every existing unit number is preserved and validated against the new symbol." }
                 },
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
@@ -659,15 +658,21 @@ async fn handle_delete_schematic_component(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    match sch.symbols.remove_by_reference(&reference) {
-        Some(_) => {
-            sch.overwrite()?;
-            Ok(CallToolResult::json(&json!({ "deleted": reference })))
-        }
-        None => Ok(CallToolResult::error(format!(
+    let before = sch.symbols.len();
+    sch.symbols
+        .retain(|symbol| symbol.reference() != Some(reference.as_str()));
+    let deleted_units = before - sch.symbols.len();
+    if deleted_units == 0 {
+        Ok(CallToolResult::error(format!(
             "Component '{}' not found in schematic",
             reference
-        ))),
+        )))
+    } else {
+        sch.overwrite()?;
+        Ok(CallToolResult::json(&json!({
+            "deleted": reference,
+            "deleted_units": deleted_units
+        })))
     }
 }
 
@@ -679,61 +684,48 @@ fn is_reserved_property(name: &str) -> bool {
     matches!(name, "Reference" | "Value" | "Footprint" | "Datasheet")
 }
 
-/// Does `reference`'s symbol block already carry a `name` property?
-fn property_exists(content: &str, reference: &str, name: &str) -> bool {
-    find_symbol_instance_block(content, reference).is_some_and(|(start, end)| {
-        content[start..end].contains(&format!(r#"(property "{name}" ""#))
-    })
+#[derive(Debug, Clone, Copy)]
+struct PropertyWriteCounts {
+    updated: usize,
+    added: usize,
 }
 
-/// Update the value of an existing `(property "field" "…")` inside
-/// `reference`'s symbol block, in place. Returns the reason on failure so the
-/// caller can report it instead of silently claiming success. Shared by
-/// `edit_schematic_component` and `add_component_annotation` (#203) — the
-/// second used to append a duplicate instead.
-fn update_property_value(
-    content: &str,
-    reference: &str,
-    field: &str,
-    new_val: &str,
-) -> Result<String, String> {
-    let (sym_start, sym_end) = find_symbol_instance_block(content, reference)
-        .ok_or_else(|| format!("symbol '{reference}' not found in this schematic"))?;
-    let sym_block = &content[sym_start..sym_end];
-    let field_search = format!(r#"(property "{field}" ""#);
-    let field_offset = sym_block
-        .find(&field_search)
-        .map(|o| sym_start + o + field_search.len())
-        .ok_or_else(|| format!("'{reference}' has no '{field}' property"))?;
-    // Find the closing quote of the current value
-    let val_end = content[field_offset..]
-        .find('"')
-        .map(|o| field_offset + o)
-        .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
-    Ok(format!(
-        "{}{}{}",
-        &content[..field_offset],
-        new_val,
-        &content[val_end..]
-    ))
+fn escape_property_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
-/// Append a new `(property …)` to `reference`'s symbol block.
+fn closing_quote(content: &str, value_start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in content[value_start..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(value_start + offset);
+        }
+    }
+    None
+}
+
+/// Build the insertion for a custom property in one placed unit's block.
 ///
-/// Anchored at the symbol's own `(at …)` and written hidden: a custom field is
-/// data, not something to draw over the sheet, and KiCad 10's canonical
-/// instance form puts `(hide yes)` as a sibling before `(effects …)` (#96).
-/// The `(at …)` is mandatory — a property written without one is defaulted to
-/// the sheet origin, which is how every `#PWR` reference once piled up in the
-/// top-left corner (#95).
-fn append_property(
+/// The property is anchored at that unit's own placement and inherits its
+/// indentation, so applying this to every block neither piles fields at the
+/// origin nor rewrites an eeschema-formatted file wholesale.
+fn property_insert_edit(
     content: &str,
     reference: &str,
+    start: usize,
+    end: usize,
     name: &str,
     value: &str,
-) -> Result<String, String> {
-    let (start, end) = find_symbol_instance_block(content, reference)
-        .ok_or_else(|| format!("symbol '{reference}' not found in this schematic"))?;
+) -> Result<SexpEdit, String> {
     let block = &content[start..end];
 
     // The symbol's placement, to anchor the new property on.
@@ -760,22 +752,74 @@ fn append_property(
         })
         .unwrap_or_else(|| "\t\t".to_string());
 
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped_name = escape_property_text(name);
+    let escaped_value = escape_property_text(value);
     let prop = format!(
-        "\n{indent}(property \"{name}\" \"{escaped}\"\n{indent}\t(at {x} {y} 0)\n\
+        "\n{indent}(property \"{escaped_name}\" \"{escaped_value}\"\n{indent}\t(at {x} {y} 0)\n\
          {indent}\t(hide yes)\n{indent}\t(effects\n{indent}\t\t(font\n{indent}\t\t\t\
          (size 1.27 1.27)\n{indent}\t\t)\n{indent}\t)\n{indent})"
     );
 
     // Insert before the block's closing paren so the property stays inside it.
-    let close = content[..end]
+    let close = block
         .rfind(')')
+        .map(|offset| start + offset)
         .ok_or_else(|| format!("symbol block for '{reference}' is malformed"))?;
-    Ok(format!(
-        "{}{}{}",
-        &content[..close],
-        prop,
-        &content[close..]
+    Ok(SexpEdit::insert(close, prop))
+}
+
+/// Set one shared component property in every placed unit.
+///
+/// Built-in properties must already exist in every unit (`add_missing=false`).
+/// Custom fields may be present on only some units in a legacy/broken sheet;
+/// `add_missing=true` updates those copies and fills the missing ones in the
+/// same atomic document command.
+fn set_property_value(
+    content: &str,
+    reference: &str,
+    field: &str,
+    new_value: &str,
+    add_missing: bool,
+) -> Result<(String, PropertyWriteCounts), String> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        return Err(format!("symbol '{reference}' not found in this schematic"));
+    }
+
+    let escaped_field = escape_property_text(field);
+    let field_search = format!(r#"(property "{escaped_field}" ""#);
+    let escaped_value = escape_property_text(new_value);
+    let mut edits = Vec::new();
+    let mut updated = 0;
+    let mut added = 0;
+
+    for (start, end) in blocks {
+        let block = &content[start..end];
+        if let Some(relative) = block.find(&field_search) {
+            let value_start = start + relative + field_search.len();
+            let value_end = closing_quote(content, value_start)
+                .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
+            edits.push(SexpEdit::replace(
+                value_start,
+                value_end,
+                escaped_value.clone(),
+            ));
+            updated += 1;
+        } else if add_missing {
+            edits.push(property_insert_edit(
+                content, reference, start, end, field, new_value,
+            )?);
+            added += 1;
+        } else {
+            return Err(format!(
+                "'{reference}' is missing the shared '{field}' property on one of its placed units"
+            ));
+        }
+    }
+
+    Ok((
+        apply_edits(content.to_string(), edits),
+        PropertyWriteCounts { updated, added },
     ))
 }
 
@@ -841,10 +885,13 @@ async fn handle_edit_schematic_component(
     // and a closure capturing them mutably would lock both for its lifetime.
     macro_rules! apply {
         ($field:expr, $new_val:expr) => {
-            match update_property_value(&content, &reference, $field, $new_val) {
-                Ok(updated) => {
+            match set_property_value(&content, &reference, $field, $new_val, false) {
+                Ok((updated, counts)) => {
                     content = updated;
-                    changed.push(format!("{} → {}", $field, $new_val));
+                    changed.push(format!(
+                        "{} → {} ({} unit(s))",
+                        $field, $new_val, counts.updated
+                    ));
                 }
                 Err(why) => errors.push(format!("{}: {}", $field, why)),
             }
@@ -894,16 +941,15 @@ async fn handle_edit_schematic_component(
                 ));
                 continue;
             }
-            if property_exists(&content, &reference, name) {
-                apply!(name.as_str(), value);
-            } else {
-                match append_property(&content, &reference, name, value) {
-                    Ok(updated) => {
-                        content = updated;
-                        changed.push(format!("{name} → {value} (added)"));
-                    }
-                    Err(why) => errors.push(format!("{name}: {why}")),
+            match set_property_value(&content, &reference, name, value, true) {
+                Ok((updated, counts)) => {
+                    content = updated;
+                    changed.push(format!(
+                        "{name} → {value} ({} updated, {} added)",
+                        counts.updated, counts.added
+                    ));
                 }
+                Err(why) => errors.push(format!("{name}: {why}")),
             }
         }
     }
@@ -927,11 +973,11 @@ async fn handle_edit_schematic_component(
     }
 
     if !changed.is_empty() {
-        let item_id = symbol_item_id(&expected, &reference)?;
-        let command = SchematicCommand::replace_item_from_document(
+        let item_ids = symbol_item_ids(&expected, &reference)?;
+        let command = SchematicCommand::replace_items_from_document(
             &expected,
             &content,
-            item_id,
+            item_ids,
             format!("Edit {reference}"),
         )?;
         commit_command(&sch_path, &command)?;
@@ -959,29 +1005,50 @@ async fn handle_get_schematic_component(
 
     let sch = cse::Schematic::load(&sch_path)?;
 
-    match sch.symbols.by_reference(&reference) {
-        Some(sym) => {
-            let (x, y) = sym.position();
-            let rotation = sym.at.rotation.unwrap_or(0.0);
-            let mirror = sym.mirror.as_deref().unwrap_or("");
-            Ok(CallToolResult::json(&json!({
-                "reference": sym.reference().unwrap_or("?"),
-                "value": sym.value_str().unwrap_or(""),
-                "footprint": sym.footprint().unwrap_or(""),
-                "lib_id": sym.lib_id,
-                "x": x,
-                "y": y,
-                "rotation": rotation,
-                "mirror_x": mirror.contains('x'),
-                "mirror_y": mirror.contains('y'),
-                "uuid": sym.uuid
-            })))
-        }
-        None => Ok(CallToolResult::error(format!(
+    let placed: Vec<_> = sch
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+        .collect();
+    let Some(anchor) = placed.iter().copied().min_by_key(|symbol| symbol.unit) else {
+        return Ok(CallToolResult::error(format!(
             "Component '{}' not found",
             reference
-        ))),
-    }
+        )));
+    };
+    let (x, y) = anchor.position();
+    let rotation = anchor.at.rotation.unwrap_or(0.0);
+    let mirror = anchor.mirror.as_deref().unwrap_or("");
+    let units: Vec<_> = placed
+        .iter()
+        .map(|symbol| {
+            let (unit_x, unit_y) = symbol.position();
+            let unit_mirror = symbol.mirror.as_deref().unwrap_or("");
+            json!({
+                "unit": symbol.unit,
+                "x": unit_x,
+                "y": unit_y,
+                "rotation": symbol.at.rotation.unwrap_or(0.0),
+                "mirror_x": unit_mirror.contains('x'),
+                "mirror_y": unit_mirror.contains('y'),
+                "uuid": symbol.uuid
+            })
+        })
+        .collect();
+    Ok(CallToolResult::json(&json!({
+        "reference": anchor.reference().unwrap_or("?"),
+        "value": anchor.value_str().unwrap_or(""),
+        "footprint": anchor.footprint().unwrap_or(""),
+        "lib_id": anchor.lib_id,
+        "x": x,
+        "y": y,
+        "rotation": rotation,
+        "mirror_x": mirror.contains('x'),
+        "mirror_y": mirror.contains('y'),
+        "uuid": anchor.uuid,
+        "unit_count": units.len(),
+        "units": units
+    })))
 }
 
 async fn handle_list_schematic_components(
@@ -1039,16 +1106,37 @@ async fn handle_move_schematic_component(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    match sch.symbols.by_reference_mut(&reference) {
-        Some(sym) => {
-            sym.move_to(new_x, new_y);
-            sch.overwrite()?;
-            Ok(CallToolResult::json(
-                &json!({ "moved": reference, "x": new_x, "y": new_y }),
-            ))
-        }
-        None => Err(anyhow::anyhow!("Component '{}' not found", reference)),
+    let Some(anchor) = sch
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+        .min_by_key(|symbol| symbol.unit)
+    else {
+        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+    };
+    let (old_x, old_y) = anchor.position();
+    let (dx, dy) = (new_x - old_x, new_y - old_y);
+    let mut placements = Vec::new();
+    for symbol in sch
+        .symbols
+        .iter_mut()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+    {
+        symbol.translate(dx, dy);
+        placements.push(json!({
+            "unit": symbol.unit,
+            "x": symbol.at.x,
+            "y": symbol.at.y
+        }));
     }
+    sch.overwrite()?;
+    Ok(CallToolResult::json(&json!({
+        "moved": reference,
+        "x": new_x,
+        "y": new_y,
+        "moved_units": placements.len(),
+        "placements": placements
+    })))
 }
 
 async fn handle_rotate_schematic_component(
@@ -1067,16 +1155,32 @@ async fn handle_rotate_schematic_component(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    match sch.symbols.by_reference_mut(&reference) {
-        Some(sym) => {
-            sym.set_rotation(rotation);
-            sch.overwrite()?;
-            Ok(CallToolResult::json(
-                &json!({ "rotated": reference, "rotation": rotation }),
-            ))
-        }
-        None => Err(anyhow::anyhow!("Component '{}' not found", reference)),
+    let Some(anchor) = sch
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+        .min_by_key(|symbol| symbol.unit)
+    else {
+        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+    };
+    let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
+    let mut placements = Vec::new();
+    for symbol in sch
+        .symbols
+        .iter_mut()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+    {
+        let new_rotation = symbol.at.rotation.unwrap_or(0.0) + rotation_delta;
+        symbol.set_rotation(new_rotation);
+        placements.push(json!({ "unit": symbol.unit, "rotation": new_rotation }));
     }
+    sch.overwrite()?;
+    Ok(CallToolResult::json(&json!({
+        "rotated": reference,
+        "rotation": rotation,
+        "rotated_units": placements.len(),
+        "placements": placements
+    })))
 }
 
 async fn handle_move_connected(
@@ -1119,29 +1223,44 @@ async fn handle_move_region(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    // Collect references of symbols within the bounding box
-    let refs_to_move: Vec<String> = sch
+    // Select placements by UUID, not reference. A multi-unit reference may
+    // have one unit inside the rectangle and another outside; resolving the
+    // selected reference back through `by_reference_mut` moved unit 1 every
+    // time, and could move it twice when both units were selected (#182).
+    let uuids_to_move: std::collections::HashSet<String> = sch
         .symbols
         .within_rectangle(x1, y1, x2, y2)
         .iter()
-        .filter_map(|s| s.reference().map(String::from))
+        .map(|symbol| symbol.uuid.clone())
         .collect();
 
-    let mut moved = Vec::new();
-    for reference in &refs_to_move {
-        if let Some(sym) = sch.symbols.by_reference_mut(reference) {
-            let (ox, oy) = sym.position();
-            let (nx, ny) = snap_point(ox + dx, oy + dy, 1.27);
-            sym.move_to(nx, ny);
-            moved.push(reference.clone());
+    let mut moved_references = Vec::new();
+    let mut placements = Vec::new();
+    for symbol in sch.symbols.iter_mut() {
+        if uuids_to_move.contains(&symbol.uuid) {
+            let (old_x, old_y) = symbol.position();
+            let (new_x, new_y) = snap_point(old_x + dx, old_y + dy, 1.27);
+            symbol.move_to(new_x, new_y);
+            let reference = symbol.reference().unwrap_or("?").to_string();
+            if !moved_references.contains(&reference) {
+                moved_references.push(reference.clone());
+            }
+            placements.push(json!({
+                "reference": reference,
+                "unit": symbol.unit,
+                "x": new_x,
+                "y": new_y
+            }));
         }
     }
 
     sch.overwrite()?;
 
     Ok(CallToolResult::json(&json!({
-        "moved_count": moved.len(),
-        "moved": moved
+        "moved_count": moved_references.len(),
+        "moved": moved_references,
+        "moved_unit_count": placements.len(),
+        "placements": placements
     })))
 }
 
@@ -1165,87 +1284,97 @@ async fn handle_get_schematic_pin_locations(
     };
 
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
-    let inst = match instances.iter().find(|i| i.reference == reference) {
-        Some(i) => i,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Component '{}' not found",
-                reference
-            )))
-        }
-    };
+    match pin_locations_for_reference(&tree, &reference) {
+        Ok(result) => Ok(CallToolResult::json(&result)),
+        Err(error) => Ok(CallToolResult::error(error)),
+    }
+}
 
-    // Find the library symbol definition within the schematic's lib_symbols section
+fn pin_locations_for_reference(
+    tree: &konnect_sexp::SexpNode,
+    reference: &str,
+) -> Result<serde_json::Value, String> {
+    let instances = extract_symbol_instances(tree);
+    let placed: Vec<_> = instances
+        .iter()
+        .filter(|instance| instance.reference == reference)
+        .collect();
+    let Some(anchor) = placed.iter().copied().min_by_key(|instance| instance.unit) else {
+        return Err(format!("Component '{reference}' not found"));
+    };
     let lib_syms = tree
         .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
+        .map(|node| node.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = find_lib_symbol(&lib_syms, inst);
 
-    // A missing embedded definition is an error, not an empty pin list —
-    // silently returning [] hid every bad-lib_id component until wiring or
-    // netlisting failed much later (#34).
-    let Some(sym) = lib_sym else {
-        return Ok(CallToolResult::error(format!(
-            "Component '{}' has no embedded definition for '{}' in this \
-             schematic's lib_symbols — it was likely added with a lib_id that \
-             doesn't exist in the installed libraries, so it is invisible to \
-             KiCAD's netlister. Re-add it with a valid lib_id \
-             (delete_schematic_component + add_schematic_component).",
-            reference,
-            inst.lib_symbol_name()
-        )));
-    };
-    // Unit-aware: only this instance's unit (plus _0_1 commons), not every
-    // unit's pins superimposed (#35).
-    let lib_pins = extract_lib_pins_for_unit(sym, inst.unit);
-    // A definition that resolves but has ZERO pins is almost always an
-    // `(extends "Parent")` stub — kicad-cli can't resolve those either (the
-    // netlist shows a pinless part), so silent pins:[] hides real breakage.
-    // The #34 guard above only catches MISSING definitions.
-    if lib_pins.is_empty() {
-        if let Some(parent) = sym.find_str("extends") {
-            return Ok(CallToolResult::error(format!(
-                "Component '{}': the embedded definition for '{}' is an \
-                 (extends \"{}\") stub with no pins of its own. kicad-cli \
-                 cannot resolve extends stubs (the netlist gets a pinless \
-                 part). Re-add the component (delete_schematic_component + \
-                 add_schematic_component) so the definition is embedded in \
-                 full, or place the parent symbol '{}' directly.",
+    let mut all_pins = Vec::new();
+    let mut units = Vec::new();
+    for instance in placed.iter().copied() {
+        // A missing embedded definition is an error, not an empty pin list —
+        // silently returning [] hid bad lib_ids until netlisting (#34).
+        let Some(symbol) = find_lib_symbol(&lib_syms, instance) else {
+            return Err(format!(
+                "Component '{}' unit {} has no embedded definition for '{}' in this \
+                 schematic's lib_symbols — re-add it with a valid lib_id",
                 reference,
-                inst.lib_symbol_name(),
-                parent,
-                parent
-            )));
+                instance.unit,
+                instance.lib_symbol_name()
+            ));
+        };
+        let lib_pins = extract_lib_pins_for_unit(symbol, instance.unit);
+        if lib_pins.is_empty() {
+            if let Some(parent) = symbol.find_str("extends") {
+                return Err(format!(
+                    "Component '{}' unit {}: the embedded definition for '{}' is an \
+                     (extends \"{}\") stub with no pins — re-add the component so the \
+                     definition is embedded in full",
+                    reference,
+                    instance.unit,
+                    instance.lib_symbol_name(),
+                    parent
+                ));
+            }
         }
-    }
-    let t = inst.pin_transform();
-    let pins: Vec<serde_json::Value> = lib_pins
-        .iter()
-        .map(|p| {
-            let (sx, sy) = pin_endpoint(p, t);
-            json!({
-                "number": p.number,
-                "name": p.name,
-                "x": sx,
-                "y": sy,
-                // Which way the pin faces away from the body (0 = east). A
-                // label here should read that way, or it runs back over the
-                // symbol's pin names.
-                "orientation_degrees": pin_outward_direction(p, t),
-                "length_mm": p.length
-            })
-        })
-        .collect();
 
-    Ok(CallToolResult::json(&json!({
+        let transform = instance.pin_transform();
+        let pins: Vec<serde_json::Value> = lib_pins
+            .iter()
+            .map(|pin| {
+                let (x, y) = pin_endpoint(pin, transform);
+                json!({
+                    "number": pin.number,
+                    "name": pin.name,
+                    "unit": instance.unit,
+                    "x": x,
+                    "y": y,
+                    "orientation_degrees": pin_outward_direction(pin, transform),
+                    "length_mm": pin.length
+                })
+            })
+            .collect();
+        all_pins.extend(pins.iter().cloned());
+        units.push(json!({
+            "unit": instance.unit,
+            "x": instance.x,
+            "y": instance.y,
+            "rotation": instance.rotation,
+            "pins": pins
+        }));
+    }
+
+    Ok(json!({
         "reference": reference,
-        "component_x": inst.x,
-        "component_y": inst.y,
-        "rotation": inst.rotation,
-        "pins": pins
-    })))
+        // Preserve the original single-placement fields as the logical
+        // component anchor while exposing every real placement below.
+        "component_x": anchor.x,
+        "component_y": anchor.y,
+        "x": anchor.x,
+        "y": anchor.y,
+        "rotation": anchor.rotation,
+        "unit_count": units.len(),
+        "units": units,
+        "pins": all_pins
+    }))
 }
 
 async fn handle_batch_get_pin_locations(
@@ -1264,64 +1393,14 @@ async fn handle_batch_get_pin_locations(
     };
 
     let (_, tree) = read_schematic(&sch_path)?; // single read
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
-
     let results: Vec<serde_json::Value> = refs
         .iter()
-        .map(|reference| {
-            let inst = match instances.iter().find(|i| &i.reference == reference) {
-                Some(i) => i,
-                None => return json!({ "reference": reference, "error": "not found" }),
-            };
-            let lib_sym = find_lib_symbol(&lib_syms, inst);
-            // Per-entry error rather than a silent empty pin list (#34).
-            let Some(sym) = lib_sym else {
-                return json!({
-                    "reference": reference,
-                    "error": format!(
-                        "no embedded definition for '{}' in lib_symbols — \
-                         likely added with a nonexistent lib_id",
-                        inst.lib_symbol_name()
-                    )
-                });
-            };
-            let lib_pins = extract_lib_pins_for_unit(sym, inst.unit);
-            // Zero pins from a resolving definition = extends stub (#35);
-            // mirror the single-component handler's structured error.
-            if lib_pins.is_empty() {
-                if let Some(parent) = sym.find_str("extends") {
-                    return json!({
-                        "reference": reference,
-                        "error": format!(
-                            "embedded definition for '{}' is an (extends \"{}\") \
-                             stub with no pins — re-add the component so it is \
-                             embedded in full",
-                            inst.lib_symbol_name(), parent
-                        )
-                    });
-                }
-            }
-            let t = inst.pin_transform();
-            let pins: Vec<serde_json::Value> = lib_pins
-                .iter()
-                .map(|p| {
-                    let (sx, sy) = pin_endpoint(p, t);
-                    json!({
-                        "number": p.number,
-                        "name": p.name,
-                        "x": sx,
-                        "y": sy,
-                        "orientation_degrees": pin_outward_direction(p, t),
-                        "length_mm": p.length
-                    })
-                })
-                .collect();
-            json!({ "reference": reference, "x": inst.x, "y": inst.y, "pins": pins })
-        })
+        .map(
+            |reference| match pin_locations_for_reference(&tree, reference) {
+                Ok(component) => component,
+                Err(error) => json!({ "reference": reference, "error": error }),
+            },
+        )
         .collect();
 
     Ok(CallToolResult::json(&json!({ "components": results })))
@@ -1384,35 +1463,21 @@ async fn handle_add_component_annotation(
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
 
-    if find_symbol_instance_block(&content, &reference).is_none() {
-        return Ok(CallToolResult::error(format!(
-            "Component '{}' not found",
-            reference
-        )));
-    }
-
     // An existing key is updated in place; appending a second `(property
     // "KEY" …)` gives eeschema two fields with one name — it shows both,
     // edits the wrong one, and the duplicate survives save/reload (#203).
-    // A new key goes through append_property, which anchors at the symbol's
-    // own position and matches the block's indentation, rather than the
-    // hardcoded origin-anchored form this handler used to write.
-    let (new_content, updated_existing) = if property_exists(&content, &reference, &key) {
-        match update_property_value(&content, &reference, &key, &value) {
-            Ok(updated) => (updated, true),
-            Err(why) => return Ok(CallToolResult::error(format!("{key}: {why}"))),
-        }
-    } else {
-        match append_property(&content, &reference, &key, &value) {
-            Ok(updated) => (updated, false),
-            Err(why) => return Ok(CallToolResult::error(format!("{key}: {why}"))),
-        }
+    // A new key is anchored separately at every unit's own position and uses
+    // that block's indentation. A partially populated legacy component is
+    // repaired by updating existing copies and adding only the missing ones.
+    let (new_content, counts) = match set_property_value(&content, &reference, &key, &value, true) {
+        Ok(updated) => updated,
+        Err(why) => return Ok(CallToolResult::error(format!("{key}: {why}"))),
     };
-    let item_id = symbol_item_id(&expected, &reference)?;
-    let command = SchematicCommand::replace_item_from_document(
+    let item_ids = symbol_item_ids(&expected, &reference)?;
+    let command = SchematicCommand::replace_items_from_document(
         &expected,
         &new_content,
-        item_id,
+        item_ids,
         format!("Add {key} property to {reference}"),
     )?;
     commit_command(&sch_path, &command)?;
@@ -1421,18 +1486,27 @@ async fn handle_add_component_annotation(
         "reference": reference,
         "added_property": key,
         "value": value,
-        "updated_existing": updated_existing
+        "updated_existing": counts.updated > 0,
+        "updated_units": counts.updated,
+        "added_units": counts.added
     })))
 }
 
-fn symbol_item_id(content: &str, reference: &str) -> anyhow::Result<ItemId> {
-    let (start, end) = find_symbol_instance_block(content, reference)
-        .ok_or_else(|| anyhow::anyhow!("component '{reference}' not found"))?;
-    let symbol = parse_sexp(&content[start..end])?;
-    let uuid = symbol
-        .find_str("uuid")
-        .ok_or_else(|| anyhow::anyhow!("component '{reference}' has no UUID"))?;
-    Ok(ItemId::new(uuid.to_owned())?)
+fn symbol_item_ids(content: &str, reference: &str) -> anyhow::Result<Vec<ItemId>> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        anyhow::bail!("component '{reference}' not found");
+    }
+    blocks
+        .into_iter()
+        .map(|(start, end)| {
+            let symbol = parse_sexp(&content[start..end])?;
+            let uuid = symbol.find_str("uuid").ok_or_else(|| {
+                anyhow::anyhow!("component '{reference}' has a unit without UUID")
+            })?;
+            ItemId::new(uuid.to_owned()).map_err(Into::into)
+        })
+        .collect()
 }
 
 async fn handle_group_components(
@@ -1463,24 +1537,14 @@ async fn handle_group_components(
     let mut item_ids = Vec::new();
 
     for reference in &refs {
-        let (sym_start, sym_end) = match find_symbol_instance_block(&content, reference) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        let sym_block = &content[sym_start..sym_end];
-        let insert_rel = sym_block
-            .find("(instances")
-            .unwrap_or(sym_block.rfind(')').unwrap_or(sym_block.len() - 1));
-        let insert_abs = sym_start + insert_rel;
-
-        let prop_sexp = format!(
-            "    (property \"Group\" \"{group_name}\"\n      (at 0 0 0)\n      (effects (font (size 1.27 1.27)) (hide yes))\n    )\n    "
-        );
-
-        content = apply_edits(content, vec![SexpEdit::insert(insert_abs, prop_sexp)]);
-        item_ids.push(symbol_item_id(&expected, reference)?);
-        grouped.push(reference.clone());
+        match set_property_value(&content, reference, "Group", &group_name, true) {
+            Ok((updated, _)) => {
+                content = updated;
+                item_ids.extend(symbol_item_ids(&expected, reference)?);
+                grouped.push(reference.clone());
+            }
+            Err(_) => continue,
+        }
     }
 
     if !item_ids.is_empty() {
@@ -1740,80 +1804,128 @@ async fn handle_replace_component(
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
 
-    // Find the symbol block for this reference
-    let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
-        Some(r) => r,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Component '{}' not found",
-                reference
-            )))
-        }
-    };
+    let blocks = find_all_symbol_instance_blocks(&content, &reference);
+    if blocks.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' not found",
+            reference
+        )));
+    }
+    if blocks.len() > 1 && new_unit.is_some() {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' has {} placed units; the 'unit' override is only \
+             unambiguous for a single placement. Omit it to preserve each unit.",
+            reference,
+            blocks.len()
+        )));
+    }
 
-    // Find the (lib_id "OLD") and replace it — searching only within this
-    // symbol's block, so a malformed instance can't reach into the next one.
-    let sym_block = &content[sym_start..sym_end];
-    let lib_id_pat = "(lib_id \"";
-    let lib_id_rel = match sym_block.find(lib_id_pat) {
-        Some(o) => o,
-        None => {
-            return Ok(CallToolResult::error(
-                "Could not find lib_id in symbol block",
-            ))
-        }
-    };
-    let lib_id_abs = sym_start + lib_id_rel + lib_id_pat.len();
-    let lib_id_end = match content[lib_id_abs..].find('"') {
-        Some(o) => lib_id_abs + o,
-        None => return Ok(CallToolResult::error("Malformed lib_id")),
-    };
+    let parsed = parse_sexp(&content)?;
+    let current_units: Vec<u32> = extract_symbol_instances(&parsed)
+        .into_iter()
+        .filter(|instance| instance.reference == reference)
+        .map(|instance| instance.unit)
+        .collect();
 
-    let old_lib_id = content[lib_id_abs..lib_id_end].to_string();
-
-    let new_content = apply_edits(
-        content,
-        vec![SexpEdit::replace(
-            lib_id_abs,
-            lib_id_end,
-            new_lib_id.clone(),
-        )],
-    );
-    content = new_content;
-
-    // Optional unit change, validated against the NEW symbol's unit count
-    // (#35). Applied before the embed so all edits land in one write.
     let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let embedded_unit_count = parsed
+        .find("lib_symbols")
+        .and_then(|libraries| {
+            libraries.find_all("symbol").into_iter().find(|symbol| {
+                symbol.get(1).and_then(|value| value.as_str()) == Some(new_lib_id.as_str())
+            })
+        })
+        .map(|symbol| {
+            symbol
+                .find_all("symbol")
+                .into_iter()
+                .filter_map(|unit| {
+                    unit.get(1)
+                        .and_then(|value| value.as_str())
+                        .and_then(konnect_sexp::schematic::parse_subsymbol_unit)
+                })
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        });
+    let unit_count = embedded_unit_count
+        .or_else(|| cse::library::symbol_unit_count(&new_lib_id, &src))
+        .unwrap_or(1);
     if let Some(unit) = new_unit {
-        let unit_count = cse::library::symbol_unit_count(&new_lib_id, &src).unwrap_or(1);
         if unit < 1 || unit > unit_count {
             return Ok(CallToolResult::error(format!(
                 "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
                 unit, new_lib_id, unit_count, unit_count
             )));
         }
-        // Re-find the block (offsets moved with the lib_id edit), then update
-        // every `(unit N)` inside it — the symbol's own and the one in its
-        // (instances …) entry.
-        if let Some((s, e)) = find_symbol_instance_block(&content, &reference) {
-            let block = &content[s..e];
-            let mut edits = Vec::new();
-            let mut from = 0usize;
-            while let Some(rel) = block[from..].find("(unit ") {
-                let num_start = from + rel + "(unit ".len();
-                let Some(close) = block[num_start..].find(')') else {
-                    break;
-                };
-                edits.push(SexpEdit::replace(
-                    s + num_start,
-                    s + num_start + close,
-                    unit.to_string(),
-                ));
-                from = num_start + close;
-            }
-            content = apply_edits(content, edits);
+    } else if let Some(invalid) = current_units
+        .iter()
+        .find(|unit| **unit < 1 || **unit > unit_count)
+    {
+        return Ok(CallToolResult::error(format!(
+            "Cannot replace '{}' with '{}': placed unit {} does not exist in the \
+             new {}-unit symbol. Delete and re-place the component deliberately.",
+            reference, new_lib_id, invalid, unit_count
+        )));
+    }
+
+    // Replace the library id in every unit block. Shared component identity
+    // must not leave one unit pointing at the old symbol (#182).
+    let lib_id_pat = "(lib_id \"";
+    let escaped_lib_id = escape_property_text(&new_lib_id);
+    let mut edits = Vec::new();
+    let mut old_lib_ids = Vec::new();
+    for (start, end) in &blocks {
+        let block = &content[*start..*end];
+        let Some(relative) = block.find(lib_id_pat) else {
+            return Ok(CallToolResult::error(format!(
+                "A unit of '{}' has no lib_id",
+                reference
+            )));
+        };
+        let value_start = *start + relative + lib_id_pat.len();
+        let Some(value_end) = closing_quote(&content, value_start) else {
+            return Ok(CallToolResult::error("Malformed lib_id"));
+        };
+        old_lib_ids.push(content[value_start..value_end].to_string());
+        edits.push(SexpEdit::replace(
+            value_start,
+            value_end,
+            escaped_lib_id.clone(),
+        ));
+    }
+
+    // Add the optional unit edits without a second source read. The multi-unit
+    // guard above means this scan has at most one block.
+    if let Some(unit) = new_unit {
+        let (start, end) = blocks[0];
+        let block = &content[start..end];
+        let mut from = 0usize;
+        while let Some(relative) = block[from..].find("(unit ") {
+            let number_start = from + relative + "(unit ".len();
+            let Some(close) = block[number_start..].find(')') else {
+                break;
+            };
+            edits.push(SexpEdit::replace(
+                start + number_start,
+                start + number_start + close,
+                unit.to_string(),
+            ));
+            from = number_start + close;
         }
     }
+
+    old_lib_ids.sort();
+    old_lib_ids.dedup();
+    if old_lib_ids.len() != 1 {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' already has inconsistent library ids across its units: {}",
+            reference,
+            old_lib_ids.join(", ")
+        )));
+    }
+    let old_lib_id = old_lib_ids.remove(0);
+    content = apply_edits(content, edits);
 
     // Ensure the new library symbol definition is present. Bail BEFORE writing:
     // a replace that can't embed its definition would leave the component
@@ -1827,7 +1939,8 @@ async fn handle_replace_component(
         "reference": reference,
         "old_lib_id": old_lib_id,
         "new_lib_id": new_lib_id,
-        "unit": new_unit
+        "unit": new_unit,
+        "units_replaced": blocks.len()
     })))
 }
 
@@ -3127,8 +3240,8 @@ mod tests {
     }
 
     /// The old path hardcoded (at 0 0 0) — the annotation rendered at the
-    /// sheet origin, far from its symbol. append_property anchors on the
-    /// symbol's own position.
+    /// sheet origin, far from its symbol. The shared property writer anchors
+    /// each property on its own placed unit.
     #[tokio::test]
     async fn add_component_annotation_anchors_at_the_symbol_not_the_origin() {
         let (_symdir, _env) = stub_symbol_dir();
@@ -3473,5 +3586,383 @@ mod page_tests {
         for (n, w, h) in PAPER_SIZES {
             assert!(w > h, "{n} is listed portrait; the table is landscape");
         }
+    }
+}
+
+#[cfg(test)]
+mod multi_unit_component_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const SCHEMATIC: &str = r#"(kicad_sch
+  (version 20260306)
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (lib_symbols
+    (symbol "Test:DUAL"
+      (symbol "DUAL_1_1"
+        (pin input line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "DUAL_2_1"
+        (pin output line (at 0 0 0) (length 0) (name "Y") (number "2"))
+      )
+    )
+    (symbol "Test:DUAL_NEW"
+      (symbol "DUAL_NEW_1_1"
+        (pin input line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "DUAL_NEW_2_1"
+        (pin output line (at 0 0 0) (length 0) (name "Y") (number "2"))
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:DUAL")
+    (at 100 100 0)
+    (unit 1)
+    (uuid "22222222-2222-4222-8222-222222222222")
+    (property "Reference" "U1" (at 100 98 0))
+    (property "Value" "OLD" (at 100 102 0))
+    (property "Footprint" "" (at 100 100 0))
+    (property "Datasheet" "" (at 100 100 0))
+    (property "Note" "OLD" (at 100 100 0) (hide yes))
+    (instances
+      (project "multi"
+        (path "/11111111-1111-4111-8111-111111111111"
+          (reference "U1")
+          (unit 1)
+        )
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:DUAL")
+    (at 100 120 180)
+    (unit 2)
+    (uuid "33333333-3333-4333-8333-333333333333")
+    (property "Reference" "U1" (at 100 118 0))
+    (property "Value" "OLD" (at 100 122 0))
+    (property "Footprint" "" (at 100 120 0))
+    (property "Datasheet" "" (at 100 120 0))
+    (instances
+      (project "multi"
+        (path "/11111111-1111-4111-8111-111111111111"
+          (reference "U1")
+          (unit 2)
+        )
+      )
+    )
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"#;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("multi.kicad_sch");
+        std::fs::write(&path, SCHEMATIC).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "mutation unexpectedly failed");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn instances(path: &std::path::Path) -> Vec<konnect_sexp::schematic::SymbolInstance> {
+        let (_, tree) = read_schematic(path).unwrap();
+        extract_symbol_instances(&tree)
+            .into_iter()
+            .filter(|instance| instance.reference == "U1" || instance.reference == "U9")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn delete_removes_every_placed_unit() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_delete_schematic_component(
+                &json!({ "schematic": path, "reference": "U1" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["deleted_units"], 2);
+        assert!(instances(&path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_translates_every_unit_by_one_shared_delta() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_move_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "x": 110.0,
+                    "y": 110.0
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["moved_units"], 2);
+        let mut placed = instances(&path);
+        placed.sort_by_key(|instance| instance.unit);
+        assert!((placed[0].x - placed[1].x).abs() < 0.001);
+        assert!(((placed[1].y - placed[0].y) - 20.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn rotate_preserves_the_units_relative_orientation() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_rotate_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "rotation": 90.0
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["rotated_units"], 2);
+        let mut placed = instances(&path);
+        placed.sort_by_key(|instance| instance.unit);
+        assert_eq!(placed[0].rotation, 90.0);
+        assert_eq!(placed[1].rotation, 270.0);
+    }
+
+    #[tokio::test]
+    async fn edit_updates_shared_fields_on_every_unit() {
+        let (_directory, path) = fixture();
+        body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "value": "NEW",
+                    "fields": { "MPN": "A\\\"B" }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(source.matches("(property \"Value\" \"NEW\"").count(), 2);
+        assert_eq!(
+            source.matches("(property \"MPN\" \"A\\\\\\\"B\"").count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_updates_rendered_and_netlist_references_on_every_unit() {
+        let (_directory, path) = fixture();
+        body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "new_reference": "U9"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(source.matches("(property \"Reference\" \"U9\"").count(), 2);
+        assert_eq!(source.matches("(reference \"U9\")").count(), 2);
+        assert_eq!(instances(&path).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn annotation_repairs_a_field_missing_from_one_unit() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_add_component_annotation(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "key": "Note",
+                    "value": "NEW"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["updated_units"], 1);
+        assert_eq!(result["added_units"], 1);
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(source.matches("(property \"Note\" \"NEW\"").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn grouping_adds_one_property_to_every_unit() {
+        let (_directory, path) = fixture();
+        body(
+            handle_group_components(
+                &json!({
+                    "schematic": path,
+                    "group_name": "Logic",
+                    "references": ["U1"]
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(source.matches("(property \"Group\" \"Logic\"").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn pin_locations_include_every_units_real_placement() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_get_schematic_pin_locations(
+                &json!({ "schematic": path, "reference": "U1" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["unit_count"], 2);
+        assert_eq!(result["pins"].as_array().unwrap().len(), 2);
+        assert!(result["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pin| pin["number"] == "1" && pin["unit"] == 1 && pin["y"] == 100.0));
+        assert!(result["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pin| pin["number"] == "2" && pin["unit"] == 2 && pin["y"] == 120.0));
+    }
+
+    #[tokio::test]
+    async fn component_summary_lists_every_placement() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_get_schematic_component(
+                &json!({ "schematic": path, "reference": "U1" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["unit_count"], 2);
+        assert_eq!(
+            result["unit_count"].as_u64().unwrap() as usize,
+            result["units"].as_array().unwrap().len()
+        );
+        assert!(result["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|unit| unit["unit"] == 2 && unit["y"] == 120.0));
+    }
+
+    #[tokio::test]
+    async fn replace_changes_every_unit_and_preserves_unit_numbers() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_replace_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "new_lib_id": "Test:DUAL_NEW"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["units_replaced"], 2);
+        let mut placed = instances(&path);
+        placed.sort_by_key(|instance| instance.unit);
+        assert_eq!(
+            placed
+                .iter()
+                .map(|instance| instance.unit)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(placed
+            .iter()
+            .all(|instance| instance.lib_id == "Test:DUAL_NEW"));
+    }
+
+    #[tokio::test]
+    async fn replace_rejects_an_ambiguous_unit_override_without_writing() {
+        let (_directory, path) = fixture();
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_replace_component(
+            &json!({
+                "schematic": path,
+                "reference": "U1",
+                "new_lib_id": "Test:DUAL_NEW",
+                "unit": 1
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn move_region_moves_the_selected_unit_not_unit_one() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_move_region(
+                &json!({
+                    "schematic": path,
+                    "x1": 95.0,
+                    "y1": 115.0,
+                    "x2": 105.0,
+                    "y2": 125.0,
+                    "dx": 10.0,
+                    "dy": 0.0
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["moved_unit_count"], 1);
+        assert_eq!(result["placements"][0]["unit"], 2);
+        let mut placed = instances(&path);
+        placed.sort_by_key(|instance| instance.unit);
+        assert_eq!(placed[0].x, 100.0, "unit 1 must stay put");
+        assert_ne!(placed[1].x, 100.0, "selected unit 2 must move");
     }
 }
