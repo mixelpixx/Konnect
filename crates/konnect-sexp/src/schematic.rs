@@ -325,6 +325,8 @@ pub fn find_lib_symbol<'a>(
 pub struct LibPin {
     pub number: String,
     pub name: String,
+    /// KiCad electrical type token, e.g. `passive`, `input`, `power_in`.
+    pub electrical_type: String,
     /// Position in symbol-local Y-up space (mm).
     pub local_x: f64,
     pub local_y: f64,
@@ -415,9 +417,15 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
+    let electrical_type = node
+        .get(1)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(LibPin {
         number,
         name,
+        electrical_type,
         local_x: x,
         local_y: y,
         rotation,
@@ -774,6 +782,20 @@ mod unit_pin_tests {
     }
 
     #[test]
+    fn extraction_preserves_the_kicad_electrical_type() {
+        let root = parse_sexp(
+            "(kicad_symbol_lib (symbol \"PWR\" (pin power_in line (at 0 0 0) \
+             (length 2.54) (name \"VDD\") (number \"1\"))))",
+        )
+        .unwrap();
+        let pin = extract_lib_pins(root.find("symbol").unwrap())
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(pin.electrical_type, "power_in");
+    }
+
+    #[test]
     fn underscored_base_names_parse_their_unit_suffix() {
         assert_eq!(parse_subsymbol_unit("R_Small_1_1"), Some(1));
         assert_eq!(parse_subsymbol_unit("OP_DUAL_2_1"), Some(2));
@@ -796,6 +818,7 @@ mod pin_endpoint_tests {
         LibPin {
             number: number.to_string(),
             name: "~".to_string(),
+            electrical_type: "passive".to_string(),
             local_x: 0.0,
             local_y,
             rotation,
@@ -1030,6 +1053,7 @@ mod pin_label_rotation_tests {
         LibPin {
             number: "1".into(),
             name: "PIN".into(),
+            electrical_type: "passive".into(),
             // Tip sits 10 mm out from the origin, opposite the way it points.
             local_x: -10.0 * rad.cos(),
             local_y: -10.0 * rad.sin(),
