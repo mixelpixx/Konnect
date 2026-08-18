@@ -240,6 +240,361 @@ impl SymbolInstance {
     }
 }
 
+/// Axis-aligned schematic-space bounds of a placed symbol's non-text drawings
+/// and pins. Property fields and free library text are deliberately excluded:
+/// their font layout is a separate concern, while callers use these bounds for
+/// component placement and body-collision checks. Explicit `text_box` geometry
+/// is included because KiCad gives it exact corners.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SymbolBounds {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+}
+
+impl SymbolBounds {
+    fn point(x: f64, y: f64) -> Self {
+        Self {
+            min_x: x,
+            min_y: y,
+            max_x: x,
+            max_y: y,
+        }
+    }
+
+    fn include(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+    }
+
+    pub fn width(self) -> f64 {
+        self.max_x - self.min_x
+    }
+
+    pub fn height(self) -> f64 {
+        self.max_y - self.min_y
+    }
+
+    /// Intersection depth on each axis. Touching edges return zero; separated
+    /// boxes return a negative value on at least one axis.
+    pub fn overlap_depth(self, other: Self) -> (f64, f64) {
+        (
+            self.max_x.min(other.max_x) - self.min_x.max(other.min_x),
+            self.max_y.min(other.max_y) - self.min_y.max(other.min_y),
+        )
+    }
+}
+
+fn include_point(bounds: &mut Option<SymbolBounds>, x: f64, y: f64) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
+    match bounds {
+        Some(bounds) => bounds.include(x, y),
+        None => *bounds = Some(SymbolBounds::point(x, y)),
+    }
+}
+
+fn include_xy_children(bounds: &mut Option<SymbolBounds>, node: &SexpNode) {
+    if let Some(points) = node.find("pts") {
+        for point in points.find_all("xy") {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                include_point(bounds, x, y);
+            }
+        }
+    }
+}
+
+fn ccw_delta(from: f64, to: f64) -> f64 {
+    (to - from).rem_euclid(std::f64::consts::TAU)
+}
+
+/// Include the exact cardinal extrema of the circular arc through three KiCad
+/// points. Collinear or malformed arcs safely fall back to the three points.
+fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
+    let point = |tag| {
+        let node = arc.find(tag)?;
+        Some((node.get_f64(1)?, node.get_f64(2)?))
+    };
+    let (Some(start), Some(mid), Some(end)) = (point("start"), point("mid"), point("end")) else {
+        return;
+    };
+    for (x, y) in [start, mid, end] {
+        include_point(bounds, x, y);
+    }
+
+    let (x1, y1) = start;
+    let (x2, y2) = mid;
+    let (x3, y3) = end;
+    let divisor = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    if divisor.abs() < 1e-12 {
+        return;
+    }
+    let square = |x: f64, y: f64| x * x + y * y;
+    let center_x =
+        (square(x1, y1) * (y2 - y3) + square(x2, y2) * (y3 - y1) + square(x3, y3) * (y1 - y2))
+            / divisor;
+    let center_y =
+        (square(x1, y1) * (x3 - x2) + square(x2, y2) * (x1 - x3) + square(x3, y3) * (x2 - x1))
+            / divisor;
+    let radius = (x1 - center_x).hypot(y1 - center_y);
+    if !center_x.is_finite() || !center_y.is_finite() || !radius.is_finite() {
+        return;
+    }
+
+    let angle = |(x, y): (f64, f64)| (y - center_y).atan2(x - center_x);
+    let start_angle = angle(start);
+    let mid_angle = angle(mid);
+    let end_angle = angle(end);
+    let ccw = ccw_delta(start_angle, mid_angle) <= ccw_delta(start_angle, end_angle) + 1e-12;
+    for candidate in [
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        3.0 * std::f64::consts::FRAC_PI_2,
+    ] {
+        let on_arc = if ccw {
+            ccw_delta(start_angle, candidate) <= ccw_delta(start_angle, end_angle) + 1e-12
+        } else {
+            ccw_delta(end_angle, candidate) <= ccw_delta(end_angle, start_angle) + 1e-12
+        };
+        if on_arc {
+            include_point(
+                bounds,
+                center_x + radius * candidate.cos(),
+                center_y + radius * candidate.sin(),
+            );
+        }
+    }
+}
+
+fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
+    for rectangle in node
+        .find_all("rectangle")
+        .into_iter()
+        .chain(node.find_all("text_box"))
+    {
+        for tag in ["start", "end"] {
+            if let Some(point) = rectangle.find(tag) {
+                if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                    include_point(bounds, x, y);
+                }
+            }
+        }
+    }
+    for shape in node
+        .find_all("polyline")
+        .into_iter()
+        .chain(node.find_all("bezier"))
+    {
+        // Bezier control points enclose the complete curve, so their box is a
+        // conservative placement bound without flattening the curve.
+        include_xy_children(bounds, shape);
+    }
+    for circle in node.find_all("circle") {
+        let Some(center) = circle.find("center") else {
+            continue;
+        };
+        let (Some(x), Some(y), Some(radius)) = (
+            center.get_f64(1),
+            center.get_f64(2),
+            circle.find_f64("radius"),
+        ) else {
+            continue;
+        };
+        include_point(bounds, x - radius, y - radius);
+        include_point(bounds, x + radius, y + radius);
+    }
+    for arc in node.find_all("arc") {
+        include_arc(bounds, arc);
+    }
+    for pin in node.find_all("pin") {
+        let Some(pin) = parse_lib_pin(pin) else {
+            continue;
+        };
+        include_point(bounds, pin.local_x, pin.local_y);
+        let angle = pin.rotation.to_radians();
+        include_point(
+            bounds,
+            pin.local_x + pin.length * angle.cos(),
+            pin.local_y + pin.length * angle.sin(),
+        );
+    }
+}
+
+fn collect_symbol_geometry_recursive(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
+    collect_direct_symbol_geometry(node, bounds);
+    for child in node.find_all("symbol") {
+        collect_symbol_geometry_recursive(child, bounds);
+    }
+}
+
+/// Bounds of the selected unit in library-local, Y-up coordinates.
+///
+/// KiCad stores common graphics in `Name_0_M` and unit-specific graphics and
+/// pins in `Name_N_M`. The selection mirrors [`extract_lib_pins_for_unit`]:
+/// common nodes, the requested unit, and un-suffixed nested nodes participate;
+/// other units do not.
+pub fn symbol_local_bounds_for_unit(sym_node: &SexpNode, unit: u32) -> Option<SymbolBounds> {
+    let mut bounds = None;
+    collect_direct_symbol_geometry(sym_node, &mut bounds);
+    for child in sym_node.find_all("symbol") {
+        let child_unit = child
+            .get(1)
+            .and_then(|node| node.as_str())
+            .and_then(parse_subsymbol_unit);
+        if !matches!(child_unit, Some(child_unit) if child_unit != 0 && child_unit != unit) {
+            collect_symbol_geometry_recursive(child, &mut bounds);
+        }
+    }
+    bounds
+}
+
+/// Transform a selected library unit's bounds into schematic coordinates for
+/// one placed instance, including rotation and mirroring.
+pub fn symbol_bounds_for_instance(
+    sym_node: &SexpNode,
+    instance: &SymbolInstance,
+) -> Option<SymbolBounds> {
+    let local = symbol_local_bounds_for_unit(sym_node, instance.unit)?;
+    let transform = instance.pin_transform();
+    let mut placed = None;
+    for (x, y) in [
+        (local.min_x, local.min_y),
+        (local.min_x, local.max_y),
+        (local.max_x, local.min_y),
+        (local.max_x, local.max_y),
+    ] {
+        let (x, y) = transform_pin(x, y, transform);
+        include_point(&mut placed, x, y);
+    }
+    placed
+}
+
+#[cfg(test)]
+mod symbol_bounds_tests {
+    use super::*;
+
+    /// Reduced from KiCad 10's stock `Device:R` definition. KiCad prefixes the
+    /// root name when embedding it in a schematic; retained graphic and pin
+    /// nodes are otherwise the library output.
+    const DEVICE_R: &str = r#"(symbol "Device:R"
+	(symbol "R_0_1"
+		(rectangle
+			(start -1.016 -2.54)
+			(end 1.016 2.54)
+			(stroke (width 0.254) (type default))
+			(fill (type none))
+		)
+	)
+	(symbol "R_1_1"
+		(pin passive line
+			(at 0 3.81 270)
+			(length 1.27)
+			(name "" (effects (font (size 1.27 1.27))))
+			(number "1" (effects (font (size 1.27 1.27))))
+		)
+		(pin passive line
+			(at 0 -3.81 90)
+			(length 1.27)
+			(name "" (effects (font (size 1.27 1.27))))
+			(number "2" (effects (font (size 1.27 1.27))))
+		)
+	)
+)"#;
+
+    fn resistor_instance(rotation: f64) -> SymbolInstance {
+        SymbolInstance {
+            reference: "R1".into(),
+            value: "10k".into(),
+            footprint: String::new(),
+            lib_name: None,
+            lib_id: "Device:R".into(),
+            x: 100.0,
+            y: 50.0,
+            rotation,
+            mirror_x: false,
+            mirror_y: false,
+            uuid: None,
+            unit: 1,
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn stock_resistor_bounds_include_body_and_pin_tips() {
+        let symbol = parse_sexp(DEVICE_R).unwrap();
+        let bounds = symbol_local_bounds_for_unit(&symbol, 1).unwrap();
+
+        assert_eq!(
+            bounds,
+            SymbolBounds {
+                min_x: -1.016,
+                min_y: -3.81,
+                max_x: 1.016,
+                max_y: 3.81,
+            }
+        );
+    }
+
+    #[test]
+    fn placed_bounds_follow_schematic_rotation_and_y_axis() {
+        let symbol = parse_sexp(DEVICE_R).unwrap();
+        let vertical = symbol_bounds_for_instance(&symbol, &resistor_instance(0.0)).unwrap();
+        assert_close(vertical.min_x, 98.984);
+        assert_close(vertical.max_x, 101.016);
+        assert_close(vertical.min_y, 46.19);
+        assert_close(vertical.max_y, 53.81);
+
+        let horizontal = symbol_bounds_for_instance(&symbol, &resistor_instance(90.0)).unwrap();
+        assert_close(horizontal.min_x, 96.19);
+        assert_close(horizontal.max_x, 103.81);
+        assert_close(horizontal.min_y, 48.984);
+        assert_close(horizontal.max_y, 51.016);
+    }
+
+    #[test]
+    fn another_units_graphics_do_not_expand_the_selected_unit() {
+        let symbol = parse_sexp(
+            r#"(symbol "Amplifier_Operational:DUAL"
+	(symbol "DUAL_0_1" (circle (center 0 0) (radius 1)))
+	(symbol "DUAL_1_1" (rectangle (start -2 -3) (end 2 3)))
+	(symbol "DUAL_2_1" (rectangle (start -20 -30) (end 20 30)))
+)"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            symbol_local_bounds_for_unit(&symbol, 1).unwrap(),
+            SymbolBounds {
+                min_x: -2.0,
+                min_y: -3.0,
+                max_x: 2.0,
+                max_y: 3.0,
+            }
+        );
+    }
+
+    #[test]
+    fn arc_bounds_include_cardinal_extrema_on_the_selected_sweep() {
+        let upper = parse_sexp("(symbol \"Arc\" (arc (start -1 0) (mid 0 1) (end 1 0)))").unwrap();
+        let bounds = symbol_local_bounds_for_unit(&upper, 1).unwrap();
+        assert_close(bounds.min_x, -1.0);
+        assert_close(bounds.max_x, 1.0);
+        assert_close(bounds.min_y, 0.0);
+        assert_close(bounds.max_y, 1.0);
+    }
+}
+
 pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
     tree.find_all("symbol")
         .iter()
