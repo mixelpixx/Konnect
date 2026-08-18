@@ -33,6 +33,146 @@ fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_t
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum OutlinePrimitive {
+    Line {
+        start: (f64, f64),
+        end: (f64, f64),
+    },
+    Arc {
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+    },
+}
+
+fn push_outline_line(primitives: &mut Vec<OutlinePrimitive>, start: (f64, f64), end: (f64, f64)) {
+    if (start.0 - end.0).abs() > f64::EPSILON || (start.1 - end.1).abs() > f64::EPSILON {
+        primitives.push(OutlinePrimitive::Line { start, end });
+    }
+}
+
+fn rounded_rectangle_outline(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    radius: f64,
+) -> Result<Vec<OutlinePrimitive>, (&'static str, String)> {
+    if ![x1, y1, x2, y2, radius].into_iter().all(f64::is_finite) {
+        return Err((
+            "corner_radius",
+            "coordinates and corner_radius must be finite".to_string(),
+        ));
+    }
+    let (left, right) = (x1.min(x2), x1.max(x2));
+    let (top, bottom) = (y1.min(y2), y1.max(y2));
+    let width = right - left;
+    let height = bottom - top;
+    if width <= 0.0 {
+        return Err(("x2", "must differ from x1".to_string()));
+    }
+    if height <= 0.0 {
+        return Err(("y2", "must differ from y1".to_string()));
+    }
+    if radius < 0.0 {
+        return Err(("corner_radius", "must be zero or greater".to_string()));
+    }
+    let maximum = width.min(height) / 2.0;
+    if radius > maximum {
+        return Err((
+            "corner_radius",
+            format!("{radius} mm exceeds half the shorter side ({maximum} mm)"),
+        ));
+    }
+
+    if radius == 0.0 {
+        return Ok(vec![
+            OutlinePrimitive::Line {
+                start: (left, top),
+                end: (right, top),
+            },
+            OutlinePrimitive::Line {
+                start: (right, top),
+                end: (right, bottom),
+            },
+            OutlinePrimitive::Line {
+                start: (right, bottom),
+                end: (left, bottom),
+            },
+            OutlinePrimitive::Line {
+                start: (left, bottom),
+                end: (left, top),
+            },
+        ]);
+    }
+
+    let diagonal_offset = radius * (1.0 - std::f64::consts::FRAC_1_SQRT_2);
+    let mut primitives = Vec::with_capacity(8);
+
+    push_outline_line(&mut primitives, (left + radius, top), (right - radius, top));
+    primitives.push(OutlinePrimitive::Arc {
+        start: (right - radius, top),
+        mid: (right - diagonal_offset, top + diagonal_offset),
+        end: (right, top + radius),
+    });
+    push_outline_line(
+        &mut primitives,
+        (right, top + radius),
+        (right, bottom - radius),
+    );
+    primitives.push(OutlinePrimitive::Arc {
+        start: (right, bottom - radius),
+        mid: (right - diagonal_offset, bottom - diagonal_offset),
+        end: (right - radius, bottom),
+    });
+    push_outline_line(
+        &mut primitives,
+        (right - radius, bottom),
+        (left + radius, bottom),
+    );
+    primitives.push(OutlinePrimitive::Arc {
+        start: (left + radius, bottom),
+        mid: (left + diagonal_offset, bottom - diagonal_offset),
+        end: (left, bottom - radius),
+    });
+    push_outline_line(
+        &mut primitives,
+        (left, bottom - radius),
+        (left, top + radius),
+    );
+    primitives.push(OutlinePrimitive::Arc {
+        start: (left, top + radius),
+        mid: (left + diagonal_offset, top + diagonal_offset),
+        end: (left + radius, top),
+    });
+    Ok(primitives)
+}
+
+fn outline_items(primitives: &[OutlinePrimitive], width: f64) -> Vec<prost_types::Any> {
+    primitives
+        .iter()
+        .map(|primitive| {
+            let shape = match primitive {
+                OutlinePrimitive::Line { start, end } => {
+                    builders::board_segment("Edge.Cuts", width, start.0, start.1, end.0, end.1)
+                }
+                OutlinePrimitive::Arc { start, mid, end } => builders::board_arc(
+                    "Edge.Cuts",
+                    width,
+                    start.0,
+                    start.1,
+                    mid.0,
+                    mid.1,
+                    end.0,
+                    end.1,
+                ),
+            };
+            builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape")
+        })
+        .collect()
+}
+
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
 async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
@@ -145,6 +285,36 @@ fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -
         "\n  (gr_line\n    (start {x1} {y1})\n    (end {x2} {y2})\n    \
          (stroke (width {width}) (type solid))\n    (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )"
     )
+}
+
+fn format_gr_arc(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+    layer: &str,
+    width: f64,
+) -> String {
+    let uuid = new_uuid();
+    format!(
+        "\n  (gr_arc\n    (start {} {})\n    (mid {} {})\n    (end {} {})\n    \
+         (stroke (width {width}) (type solid))\n    (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )",
+        start.0, start.1, mid.0, mid.1, end.0, end.1
+    )
+}
+
+fn format_outline(primitives: &[OutlinePrimitive], layer: &str, width: f64) -> String {
+    primitives
+        .iter()
+        .map(|primitive| match primitive {
+            OutlinePrimitive::Line { start, end } => {
+                format_gr_line(start.0, start.1, end.0, end.1, layer, width)
+            }
+            OutlinePrimitive::Arc { start, mid, end } => {
+                format_gr_arc(*start, *mid, *end, layer, width)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) -> String {
@@ -389,7 +559,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_board_outline",
-            "Add a rectangular board outline on the Edge.Cuts layer at specified coordinates.",
+            "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded corners.",
             json!({
                 "type": "object",
                 "properties": {
@@ -398,7 +568,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y1":             { "type": "number", "description": "Top-left Y in mm" },
                     "x2":             { "type": "number", "description": "Bottom-right X in mm" },
                     "y2":             { "type": "number", "description": "Bottom-right Y in mm" },
-                    "corner_radius":  { "type": "number", "description": "Corner radius in mm (0 = sharp)", "default": 0 }
+                    "corner_radius":  { "type": "number", "minimum": 0, "description": "Circular corner radius in mm; must not exceed half the shorter side (0 = sharp)", "default": 0 }
                 },
                 "required": ["board", "x1", "y1", "x2", "y2"]
             }),
@@ -855,9 +1025,41 @@ async fn handle_add_board_outline(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let corner_radius = match args.get("corner_radius") {
+        None | Some(serde_json::Value::Null) => 0.0,
+        Some(value) => match value.as_f64() {
+            Some(radius) => radius,
+            None => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: "corner_radius".to_string(),
+                        reason: "must be a number".to_string(),
+                    },
+                    "Argument 'corner_radius' must be a number",
+                ));
+            }
+        },
+    };
+    let primitives = match rounded_rectangle_outline(x1, y1, x2, y2, corner_radius) {
+        Ok(primitives) => primitives,
+        Err((field, reason)) => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: field.to_string(),
+                    reason: reason.clone(),
+                },
+                format!("Argument '{field}' is invalid: {reason}"),
+            ));
+        }
+    };
     let w = 0.05_f64;
+    let line_count = primitives
+        .iter()
+        .filter(|primitive| matches!(primitive, OutlinePrimitive::Line { .. }))
+        .count();
+    let arc_count = primitives.len() - line_count;
 
-    let items = rect_outline_items(x1, y1, x2, y2, w);
+    let items = outline_items(&primitives, w);
     match attempt_ipc_write(
         ctx.config.ipc_address.clone(),
         &board_path,
@@ -870,6 +1072,8 @@ async fn handle_add_board_outline(
             return Ok(CallToolResult::json(&json!({
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+                "corner_radius": corner_radius,
+                "line_count": line_count, "arc_count": arc_count,
                 "source": "ipc"
             })))
         }
@@ -877,22 +1081,18 @@ async fn handle_add_board_outline(
         BoardWrite::File => {}
     }
 
-    let lines = format!(
-        "{}{}{}{}",
-        format_gr_line(x1, y1, x2, y1, "Edge.Cuts", w),
-        format_gr_line(x2, y1, x2, y2, "Edge.Cuts", w),
-        format_gr_line(x2, y2, x1, y2, "Edge.Cuts", w),
-        format_gr_line(x1, y2, x1, y1, "Edge.Cuts", w),
-    );
+    let outline = format_outline(&primitives, "Edge.Cuts", w);
 
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, lines)]);
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, outline)]);
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
         "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+        "corner_radius": corner_radius,
+        "line_count": line_count, "arc_count": arc_count,
         "source": "file"
     })))
 }
@@ -1606,6 +1806,72 @@ mod mounting_hole_tests {
     }
 }
 
+#[cfg(test)]
+mod rounded_outline_tests {
+    use super::*;
+
+    fn endpoints(primitive: &OutlinePrimitive) -> ((f64, f64), (f64, f64)) {
+        match primitive {
+            OutlinePrimitive::Line { start, end } | OutlinePrimitive::Arc { start, end, .. } => {
+                (*start, *end)
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_rectangle_is_a_closed_four_line_four_arc_path() {
+        let outline = rounded_rectangle_outline(10.0, 20.0, 50.0, 60.0, 5.0).unwrap();
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|item| matches!(item, OutlinePrimitive::Line { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|item| matches!(item, OutlinePrimitive::Arc { .. }))
+                .count(),
+            4
+        );
+        for index in 0..outline.len() {
+            let (_, end) = endpoints(&outline[index]);
+            let (next_start, _) = endpoints(&outline[(index + 1) % outline.len()]);
+            assert_eq!(end, next_start, "outline gap after primitive {index}");
+        }
+
+        let OutlinePrimitive::Arc { start, mid, end } = &outline[1] else {
+            panic!("top-right primitive should be an arc");
+        };
+        assert_eq!(*start, (45.0, 20.0));
+        assert_eq!(*end, (50.0, 25.0));
+        let center = (45.0, 25.0);
+        let mid_radius = ((mid.0 - center.0).powi(2) + (mid.1 - center.1).powi(2)).sqrt();
+        assert!((mid_radius - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capsule_outline_omits_zero_length_sides() {
+        let outline = rounded_rectangle_outline(0.0, 0.0, 30.0, 10.0, 5.0).unwrap();
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|item| matches!(item, OutlinePrimitive::Line { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(outline.len(), 6);
+    }
+
+    #[test]
+    fn corner_radius_cannot_overlap_itself() {
+        let error = rounded_rectangle_outline(0.0, 0.0, 20.0, 10.0, 5.1).unwrap_err();
+        assert_eq!(error.0, "corner_radius");
+        assert!(error.1.contains("half the shorter side"));
+    }
+}
+
 /// The board-graphics tools (`set_board_size`, `add_board_outline`,
 /// `add_board_text`, `import_svg_logo`) went to IPC on `with_ipc(..).is_ok()`,
 /// which conflated "no KiCAD there" with "KiCAD said no" and ignored the
@@ -1672,6 +1938,27 @@ mod board_write_gate_tests {
             4,
             "expected four outline segments: {updated}"
         );
+    }
+
+    #[tokio::test]
+    async fn rounded_outline_file_fallback_writes_real_kicad_arcs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let ctx = ctx_with_ipc(String::new());
+        let mut args = board_args(&board);
+        args["corner_radius"] = json!(3.0);
+
+        let result = handle_add_board_outline(&args, &ctx).await.unwrap();
+        assert!(!result.is_error, "handler errored: {:?}", result.content);
+        let response: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(response["corner_radius"], 3.0);
+        assert_eq!(response["line_count"], 4);
+        assert_eq!(response["arc_count"], 4);
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(updated.matches("(gr_line").count(), 4, "{updated}");
+        assert_eq!(updated.matches("(gr_arc").count(), 4, "{updated}");
+        parse_sexp(&updated).expect("rounded outline remains valid KiCad S-expression");
     }
 
     #[tokio::test]
