@@ -990,30 +990,62 @@ impl KiCadIpcClient {
             document,
             kiapi::common::types::KiCadObjectType::KotPcbFootprint,
         )?;
+        let mut found = None;
         for item in &items {
-            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            else {
+            if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
                 continue;
-            };
+            }
+            let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable footprint instance")?;
             if footprint_reference(&fp) != reference {
                 continue;
             }
-            let pads = fp
+            if found.is_some() {
+                anyhow::bail!(
+                    "footprint reference '{}' appears more than once on the board",
+                    reference
+                );
+            }
+
+            let definition = fp
                 .definition
-                .iter()
-                .flat_map(|definition| definition.items.iter())
-                .filter(|child| child.type_url.ends_with("kiapi.board.types.Pad"))
-                .filter_map(|child| kiapi::board::types::Pad::decode(child.value.as_slice()).ok())
-                .map(|pad| IpcPad {
+                .as_ref()
+                .with_context(|| format!("footprint '{reference}' has no definition"))?;
+            let mut pads = Vec::new();
+            for child in &definition.items {
+                if !crate::builders::any_is(child, "kiapi.board.types.Pad") {
+                    continue;
+                }
+                let pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                    .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
+                let position = pad.position.with_context(|| {
+                    format!(
+                        "footprint '{reference}' pad '{}' has no position",
+                        pad.number
+                    )
+                })?;
+                let layers = pad
+                    .pad_stack
+                    .as_ref()
+                    .map(|stack| {
+                        stack
+                            .layers
+                            .iter()
+                            .map(|layer| layer_enum_to_name(*layer).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                pads.push(IpcPad {
                     number: pad.number,
-                    x: pad.position.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
-                    y: pad.position.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                    x: nm_to_mm(position.x_nm),
+                    y: nm_to_mm(position.y_nm),
                     net: pad.net.map(|net| net.name).unwrap_or_default(),
-                })
-                .collect();
-            return Ok(Some(pads));
+                    layers,
+                });
+            }
+            found = Some(pads);
         }
-        Ok(None)
+        Ok(found)
     }
 
     /// Read the title block of a specific open document.

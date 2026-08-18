@@ -28,6 +28,8 @@ pub struct IpcPad {
     pub y: f64,
     /// Net name, empty when the pad carries no net.
     pub net: String,
+    /// KiCad layer names from the live pad stack.
+    pub layers: Vec<String>,
 }
 
 /// The document's title block, which the board file also carries.

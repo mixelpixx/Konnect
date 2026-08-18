@@ -1846,8 +1846,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_component_pads",
-            "Return the pad positions and net assignments for a footprint. \
-             Reads the board open in KiCad when it is reachable, else the file — \
+            "Return live board-space pad positions, layers and net assignments for a footprint. \
+             Reads the board open in KiCad when it is reachable and falls back to the file only \
+             when KiCad IPC is unreachable — \
              'source' says which, so unsaved placements are visible without a save. \
              A pad's 'net' is its net name, \"\" if the pad carries no net \
              (unconnected), or — reading the file — null if the net node is present \
@@ -1864,7 +1865,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_pad_position",
-            "Return the schematic-space position of a specific pad number on a footprint.",
+            "Return the live board-space position, layers and net of a specific pad number on a footprint.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2406,7 +2407,7 @@ async fn handle_get_component_pads(
     // live one. The file stays the fallback for an offline session.
     let ipc_board = board_path.clone();
     let ipc_reference = reference.clone();
-    let live = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+    let live = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
         let document = c.find_open_board(&ipc_board)?;
         c.get_footprint_pads_in(document, &ipc_reference)
     })
@@ -2416,7 +2417,15 @@ async fn handle_get_component_pads(
         Ok(Some(pads)) if !pads.is_empty() => {
             let items: Vec<serde_json::Value> = pads
                 .iter()
-                .map(|pad| json!({ "number": pad.number, "x": pad.x, "y": pad.y, "net": pad.net }))
+                .map(|pad| {
+                    json!({
+                        "number": pad.number,
+                        "x": pad.x,
+                        "y": pad.y,
+                        "net": pad.net,
+                        "layers": pad.layers
+                    })
+                })
                 .collect();
             return Ok(CallToolResult::json(&json!({
                 "reference": reference,
@@ -2453,7 +2462,10 @@ async fn handle_get_component_pads(
                 "Footprint '{reference}' not found on the board open in KiCad"
             )))
         }
-        Err(_) => {}
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {}
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(message));
+        }
     }
 
     let content = std::fs::read_to_string(&board_path)?;
@@ -2507,7 +2519,21 @@ async fn handle_get_component_pads(
                     None => serde_json::Value::Null,
                 },
             };
-            Some(json!({ "number": number, "x": board_x, "y": board_y, "net": net }))
+            let layers: Vec<_> = pad
+                .find("layers")
+                .and_then(konnect_sexp::SexpNode::children)
+                .unwrap_or_default()
+                .iter()
+                .skip(1)
+                .filter_map(konnect_sexp::SexpNode::as_str)
+                .collect();
+            Some(json!({
+                "number": number,
+                "x": board_x,
+                "y": board_y,
+                "net": net,
+                "layers": layers
+            }))
         })
         .collect();
 
@@ -4490,7 +4516,7 @@ mod tests {
         \t(footprint \"R_0805\"\n\
         \t\t(at 5 5 0)\n\
         \t\t(property \"Reference\" \"R1\" (at 0 -1 0) (layer \"F.SilkS\"))\n\
-        \t\t(pad \"1\" smd roundrect (at -0.9 0) (net \"SAVED\"))\n\
+        \t\t(pad \"1\" smd roundrect (at -0.9 0) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (net \"SAVED\"))\n\
         \t)\n\
         )\n";
 
@@ -4502,6 +4528,14 @@ mod tests {
                 net: Some(konnect_ipc::gen::kiapi::board::types::Net {
                     code: None,
                     name: net.to_string(),
+                }),
+                pad_stack: Some(konnect_ipc::gen::kiapi::board::types::PadStack {
+                    layers: vec![
+                        konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFCu as i32,
+                        konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFPaste as i32,
+                        konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFMask as i32,
+                    ],
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -4646,6 +4680,10 @@ mod tests {
         assert_eq!(body["source"], json!("ipc"));
         assert_eq!(body["pads"][0]["net"], json!("/VBUS"));
         assert_eq!(body["pads"][0]["x"], json!(101.155));
+        assert_eq!(
+            body["pads"][0]["layers"],
+            json!(["F.Cu", "F.Paste", "F.Mask"])
+        );
     }
 
     #[tokio::test]
@@ -4724,6 +4762,30 @@ mod tests {
         let body = parsed(&res);
         assert_eq!(body["source"], json!("file"));
         assert_eq!(body["pads"][0]["net"], json!("SAVED"));
+        assert_eq!(
+            body["pads"][0]["layers"],
+            json!(["F.Cu", "F.Paste", "F.Mask"])
+        );
+    }
+
+    #[tokio::test]
+    async fn pad_reads_do_not_fall_back_when_reachable_kicad_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(spawn_rejecting_kicad()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            res.is_error,
+            "a live rejection must not return stale file pads"
+        );
+        assert!(result_text(&res).contains("mock rejects everything"));
     }
 
     #[tokio::test]

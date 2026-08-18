@@ -144,6 +144,8 @@ type CapturedUpdate = Arc<Mutex<Option<kiapi::common::commands::UpdateItems>>>;
 fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKicad, CapturedUpdate) {
     let captured: CapturedUpdate = Arc::new(Mutex::new(None));
     let captured_in_mock = captured.clone();
+    let current = Arc::new(Mutex::new(fp));
+    let current_in_mock = current.clone();
 
     let mock = spawn_mock(move |req| {
         let msg = req.message.expect("request must pack a command");
@@ -168,7 +170,7 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
                 header: None,
                 status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
                 items: vec![builders::pack_any(
-                    &fp,
+                    &*current_in_mock.lock().unwrap(),
                     "kiapi.board.types.FootprintInstance",
                 )],
             };
@@ -191,6 +193,10 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
                     item: Some(item),
                 })
                 .collect();
+            if let Some(item) = update.items.first() {
+                *current_in_mock.lock().unwrap() =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            }
             *captured_in_mock.lock().unwrap() = Some(update);
             Some(reply_with(builders::pack_any(
                 &kiapi::common::commands::UpdateItemsResponse {
@@ -299,4 +305,24 @@ fn rotate_footprint_rotates_children_around_anchor() {
     )
     .unwrap();
     assert_eq!(pad.pad_stack.unwrap().angle.unwrap().value_degrees, 90.0);
+}
+
+#[test]
+fn footprint_pad_readback_observes_the_updated_live_state_after_a_move() {
+    let (mock, _) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+
+    client.move_footprint("R1", 50.0, 50.0).unwrap();
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+    let pads = client
+        .get_footprint_pads_in(document, "R1")
+        .expect("pad read")
+        .expect("R1 is on the board");
+
+    assert_eq!(
+        pads.iter().map(|pad| (pad.x, pad.y)).collect::<Vec<_>>(),
+        vec![(49.0, 50.0), (51.0, 50.0)]
+    );
 }
