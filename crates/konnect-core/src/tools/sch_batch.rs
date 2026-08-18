@@ -15,8 +15,9 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
-        format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
+        extract_labels, extract_lib_pins_for_unit, extract_symbol_instances, extract_wires,
+        find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_label_rotation,
+        read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -277,9 +278,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "validate_component_connections",
-            "Check that every non-passive pin on every component has at least one wire \
-             or label connected. Reports unconnected pins with reference, pin number, \
-             and schematic position.",
+            "Check that every selected component pin has at least one wire or label \
+             connected. Can exclude pins whose KiCad electrical type is power_in or \
+             power_out. Reports unconnected pins with type and position.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1171,7 +1172,7 @@ async fn handle_validate_wire_connections(
         let lib_sym = find_lib_symbol(&lib_syms, inst);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
+            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
                 pin_points.push(pin_endpoint(&pin, t));
             }
         }
@@ -1251,6 +1252,7 @@ async fn handle_validate_component_connections(
                 .collect()
         })
         .unwrap_or_default();
+    let ignore_power_pins = args["ignore_power_pins"].as_bool().unwrap_or(false);
     let tol = 0.01_f64;
 
     let (_, tree) = read_schematic(&sch_path)?;
@@ -1309,6 +1311,7 @@ async fn handle_validate_component_connections(
     };
 
     let mut unconnected: Vec<serde_json::Value> = Vec::new();
+    let mut ignored_power_pin_count = 0usize;
 
     for inst in &instances {
         if !filter_refs.is_empty() && !filter_refs.contains(&inst.reference) {
@@ -1317,7 +1320,13 @@ async fn handle_validate_component_connections(
         let lib_sym = find_lib_symbol(&lib_syms, inst);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
+            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+                if ignore_power_pins
+                    && matches!(pin.electrical_type.as_str(), "power_in" | "power_out")
+                {
+                    ignored_power_pin_count += 1;
+                    continue;
+                }
                 let (px, py) = pin_endpoint(&pin, t);
 
                 // Skip intentional no-connects
@@ -1334,6 +1343,7 @@ async fn handle_validate_component_connections(
                         "value": inst.value,
                         "pin": pin.number,
                         "pin_name": pin.name,
+                        "electrical_type": pin.electrical_type,
                         "x": px,
                         "y": py
                     }));
@@ -1345,6 +1355,8 @@ async fn handle_validate_component_connections(
     Ok(CallToolResult::json(&json!({
         "valid": unconnected.is_empty(),
         "unconnected_count": unconnected.len(),
+        "ignore_power_pins": ignore_power_pins,
+        "ignored_power_pin_count": ignored_power_pin_count,
         "unconnected_pins": unconnected
     })))
 }
@@ -1694,6 +1706,100 @@ mod midwire_pin_tests {
 }
 
 #[cfg(test)]
+mod power_pin_validation_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn power_and_signal_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power-pins.kicad_sch");
+        std::fs::write(
+            &path,
+            r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:IC"
+      (symbol "IC_1_1"
+        (pin power_in line (at 0 0 0) (length 2.54)
+          (name "VDD") (number "1"))
+        (pin input line (at 0 5 0) (length 2.54)
+          (name "IN") (number "2"))
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:IC")
+    (at 100 80 0)
+    (unit 1)
+    (uuid "u1")
+    (property "Reference" "U1" (at 100 75 0))
+    (property "Value" "IC" (at 100 85 0))
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"#,
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ignore_power_pins_uses_the_library_electrical_type() {
+        let (_dir, path) = power_and_signal_schematic();
+
+        let all = handle_validate_component_connections(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let all = result_json(&all);
+        assert_eq!(all["unconnected_count"], 2);
+
+        let signals = handle_validate_component_connections(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ignore_power_pins": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let signals = result_json(&signals);
+        assert_eq!(signals["unconnected_count"], 1);
+        assert_eq!(signals["ignored_power_pin_count"], 1);
+        assert_eq!(signals["unconnected_pins"][0]["pin"], "2");
+        assert_eq!(signals["unconnected_pins"][0]["electrical_type"], "input");
+    }
+}
+
+#[cfg(test)]
 mod connect_to_net_orientation_tests {
     use super::*;
     use crate::router::ToolRouter;
@@ -1876,11 +1982,15 @@ mod connect_to_net_orientation_tests {
 
 #[cfg(test)]
 mod multi_unit_pin_tests {
-    use crate::tools::sch_batch::tools;
+    use super::{handle_validate_component_connections, handle_validate_wire_connections, tools};
+    use crate::mcp::protocol::{CallToolResult, ToolContent};
+    use crate::tools::{ServerConfig, ToolContext};
     use konnect_sexp::schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
     };
+    use serde_json::json;
     use std::io::Write;
+    use std::sync::Arc;
 
     /// Two units of one symbol, placed 15.24mm apart. Unit 1 owns pin 1, unit 2
     /// owns pin 3; both sit at local x = -7.62 in their own unit's drawing.
@@ -1918,6 +2028,61 @@ mod multi_unit_pin_tests {
 	)
 )
 "#;
+
+    const PHANTOM_PIN_SCH: &str = r#"(kicad_sch
+  (version 20260306)
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:DUAL"
+      (symbol "DUAL_1_1"
+        (pin input line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "DUAL_2_1"
+        (pin output line (at 10 0 0) (length 0) (name "Y") (number "2"))
+      )
+    )
+  )
+  (wire (start 110 100) (end 110 110) (uuid "floating"))
+  (symbol (lib_id "Test:DUAL") (at 100 100 0) (unit 1) (uuid "u1a")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "DUAL" (at 100 100 0))
+  )
+  (symbol (lib_id "Test:DUAL") (at 200 200 0) (unit 2) (uuid "u1b")
+    (property "Reference" "U1" (at 200 200 0))
+    (property "Value" "DUAL" (at 200 200 0))
+  )
+)
+"#;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("multi.kicad_sch");
+        std::fs::write(&path, contents).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "validator unexpectedly failed");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
 
     /// The regression: resolving a pin used the FIRST instance with a matching
     /// reference, so every pin of a multi-unit part was transformed by unit 1's
@@ -1972,6 +2137,44 @@ mod multi_unit_pin_tests {
     #[test]
     fn batch_connect_to_net_is_registered() {
         assert!(tools().iter().any(|t| t.name == "batch_connect_to_net"));
+    }
+
+    #[tokio::test]
+    async fn component_validator_reports_only_the_real_unwired_unit_pin() {
+        let mut connected_unit_one = SCH.to_string();
+        let insert = connected_unit_one.rfind("\n)").unwrap();
+        connected_unit_one.insert_str(
+            insert,
+            "\t(wire (start 90 100) (end 92.38 100) (uuid \"w1\"))\n\
+             \t(label \"UNIT1\" (at 90 100 0))\n",
+        );
+        let (_directory, path) = fixture(&connected_unit_one);
+        let result = body(
+            handle_validate_component_connections(
+                &json!({ "schematic": path, "references": ["U1"] }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let pins = result["unconnected_pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 1, "{result}");
+        assert_eq!(pins[0]["pin"], "3");
+        assert!((pins[0]["y"].as_f64().unwrap() - 115.24).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn wire_validator_ignores_an_unplaced_units_phantom_endpoint() {
+        let (_directory, path) = fixture(PHANTOM_PIN_SCH);
+        let result = body(
+            handle_validate_wire_connections(
+                &json!({ "schematic": path, "tolerance": 0.01 }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["floating_count"], 2, "both ends float: {result}");
     }
 }
 

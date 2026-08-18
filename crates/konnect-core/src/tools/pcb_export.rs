@@ -39,13 +39,98 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
+fn invalid_export_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
+}
+
+pub(crate) fn optional_string_array(
+    args: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<String>, CallToolResult> {
+    let Some(value) = args.get(field) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(invalid_export_argument(field, "must be an array"));
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(String::from).ok_or_else(|| {
+                invalid_export_argument(&format!("{field}[{index}]"), "must be a layer name string")
+            })
+        })
+        .collect()
+}
+
+/// Default Gerber selection for a fabrication package: every enabled copper
+/// layer plus solder mask, silkscreen, and the board outline. It deliberately
+/// excludes drawings, comments, adhesive, courtyard, fab, and margin layers.
+pub(crate) fn standard_gerber_layers(board_source: &str) -> anyhow::Result<Vec<String>> {
+    let board = konnect_sexp::parser::parse_sexp(board_source)?;
+    let layers = konnect_sexp::layers::layers(&board)
+        .into_iter()
+        .filter(|layer| {
+            layer.is_copper()
+                || matches!(
+                    layer.name.as_str(),
+                    "F.Mask" | "B.Mask" | "F.SilkS" | "B.SilkS" | "Edge.Cuts"
+                )
+        })
+        .map(|layer| layer.name)
+        .collect::<Vec<_>>();
+    if layers.is_empty() {
+        anyhow::bail!("board declares no standard fabrication layers");
+    }
+    Ok(layers)
+}
+
+pub(crate) fn validate_position_values(
+    format: &str,
+    side: &str,
+    units: &str,
+) -> Result<(), (&'static str, String)> {
+    if !matches!(format, "csv" | "gerber") {
+        return Err((
+            "format",
+            format!("must be 'csv' or 'gerber', got '{format}'"),
+        ));
+    }
+    if !matches!(side, "front" | "back" | "both") {
+        return Err((
+            "side",
+            format!("must be 'front', 'back', or 'both', got '{side}'"),
+        ));
+    }
+    if !matches!(units, "mm" | "in") {
+        return Err(("units", format!("must be 'mm' or 'in', got '{units}'")));
+    }
+    if format == "gerber" && side == "both" {
+        return Err((
+            "side",
+            "Gerber position output supports only 'front' or 'back'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_gerber",
-            "Export Gerber production files for all copper and mask layers using kicad-cli.",
+            "Export Gerber production files using kicad-cli. By default Konnect selects all \
+             enabled copper layers, masks, silkscreens, and Edge.Cuts while excluding \
+             documentation-only layers.",
             json!({
                 "type": "object",
                 "properties": {
@@ -53,7 +138,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output_dir": { "type": "string", "description": "Directory to write Gerber files into" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to export (empty = all fabrication layers)",
+                        "description": "Exact layer names to export. Omit or pass an empty array to auto-select enabled copper, F/B.Mask, F/B.SilkS, and Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "drill_file": { "type": "boolean", "description": "Also generate Excellon drill file", "default": true }
@@ -133,7 +218,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output CSV file path" },
                     "format": {
                         "type": "string",
-                        "description": "BOM format passed to kicad-cli: 'csv' (default)",
+                        "enum": ["csv"],
+                        "description": "BOM format. KiCad 10's schematic BOM export is CSV.",
                         "default": "csv"
                     },
                     "fields": {
@@ -178,7 +264,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_position_file",
-            "Generate a component placement (pick-and-place) position file for SMT assembly.",
+            "Generate a component placement (pick-and-place) position file for SMT assembly. \
+             KiCad automatically omits footprints marked exclude_from_pos_files.",
             json!({
                 "type": "object",
                 "properties": {
@@ -187,16 +274,19 @@ pub fn tools() -> Vec<ToolDef> {
                     "format": {
                         "type": "string",
                         "description": "File format: 'csv' (default) or 'gerber'",
+                        "enum": ["csv", "gerber"],
                         "default": "csv"
                     },
                     "side": {
                         "type": "string",
                         "description": "Board side: 'front', 'back', or 'both'",
+                        "enum": ["front", "back", "both"],
                         "default": "both"
                     },
                     "units": {
                         "type": "string",
-                        "description": "Coordinate units: 'mm' (default) or 'in'",
+                        "description": "Coordinate units for CSV: 'mm' (default) or 'in'. Gerber position output has format-defined units.",
+                        "enum": ["mm", "in"],
                         "default": "mm"
                     }
                 },
@@ -272,16 +362,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "refill_zones",
-            "Refill all copper pour zones on the board. Requires a running KiCAD instance with IPC enabled; returns an error with instructions if KiCAD is not open.",
+            "Refill all copper pour zones on the board. KiCad IPC refills the complete board; per-zone selection is not available. Requires a running KiCad instance with IPC enabled.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "zones": {
-                        "type": "array",
-                        "description": "Net names of specific zones to refill (empty = all zones, currently not filtered)",
-                        "items": { "type": "string" }
-                    }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" }
                 },
                 "required": ["board"]
             }),
@@ -322,11 +407,23 @@ async fn handle_export_gerber(
     let output_dir = get_path(args, "output_dir")?;
     let drill = args["drill_file"].as_bool().unwrap_or(true);
 
+    let requested_layers = match optional_string_array(args, "layers") {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
+    let layers = if requested_layers.is_empty() {
+        let board_source = tokio::fs::read_to_string(&board).await?;
+        standard_gerber_layers(&board_source)?
+    } else {
+        requested_layers
+    };
+    let layer_refs = layers.iter().map(String::as_str).collect::<Vec<_>>();
+
     // Ensure output dir exists
     tokio::fs::create_dir_all(&output_dir).await?;
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_gerber(cli, &board, &output_dir).await?;
+    cli::export_gerber(cli, &board, &output_dir, &layer_refs).await?;
 
     if drill {
         // kicad-cli also has a dedicated drill export. Its --output is a
@@ -351,6 +448,7 @@ async fn handle_export_gerber(
         serde_json::to_string(&json!({
             "success": true,
             "output_dir": output_dir.to_str().unwrap_or(""),
+            "layers": layers,
             "files": files
         }))
         .unwrap(),
@@ -374,14 +472,16 @@ async fn handle_export_pdf(
         })
         .unwrap_or_default();
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
+    let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_pdf(cli, &board, &output, &layer_refs).await?;
+    cli::export_pdf(cli, &board, &output, &layer_refs, black_and_white).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
-            "output": output.to_str().unwrap_or("")
+            "output": output.to_str().unwrap_or(""),
+            "black_and_white": black_and_white
         }))
         .unwrap(),
     ))
@@ -403,14 +503,16 @@ async fn handle_export_svg(
         })
         .unwrap_or_default();
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
+    let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_svg_pcb(cli, &board, &output, &layer_refs).await?;
+    cli::export_svg_pcb(cli, &board, &output, &layer_refs, black_and_white).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
-            "output": output.to_str().unwrap_or("")
+            "output": output.to_str().unwrap_or(""),
+            "black_and_white": black_and_white
         }))
         .unwrap(),
     ))
@@ -423,14 +525,16 @@ async fn handle_export_3d(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
     let format = args["format"].as_str().unwrap_or("step");
+    let include_unspecified = args["include_unspecified"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_3d(cli, &board, &output, format).await?;
+    cli::export_3d(cli, &board, &output, format, include_unspecified).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "format": format,
+            "include_unspecified": include_unspecified,
             "output": output.to_str().unwrap_or("")
         }))
         .unwrap(),
@@ -443,6 +547,13 @@ async fn handle_export_bom(
 ) -> anyhow::Result<CallToolResult> {
     let schematic = get_path(args, "schematic")?;
     let output = get_path(args, "output")?;
+    let format = args["format"].as_str().unwrap_or("csv");
+    if format != "csv" {
+        return Ok(invalid_export_argument(
+            "format",
+            format!("only 'csv' is supported, got '{format}'"),
+        ));
+    }
     let options = cli::BomOptions {
         fields: args["fields"].as_str(),
         labels: args["labels"].as_str(),
@@ -459,6 +570,7 @@ async fn handle_export_bom(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "format": format,
             "fields": options.fields,
             "exclude_dnp": options.exclude_dnp
         }))
@@ -499,18 +611,24 @@ async fn handle_export_position_file(
     let side = args["side"].as_str().unwrap_or("both");
     let units = args["units"].as_str().unwrap_or("mm");
 
-    let cli = &ctx.config.kicad_cli;
-    cli::export_position_file(cli, &board, &output, format).await?;
+    if let Err((field, reason)) = validate_position_values(format, side, units) {
+        return Ok(invalid_export_argument(field, reason));
+    }
 
+    let cli = &ctx.config.kicad_cli;
+    cli::export_position_file(cli, &board, &output, format, units, side).await?;
+
+    let mut result = json!({
+        "success": true,
+        "format": format,
+        "side": side,
+        "output": output.to_str().unwrap_or("")
+    });
+    if format != "gerber" {
+        result["units"] = json!(units);
+    }
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "format": format,
-            "side": side,
-            "units": units,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
+        serde_json::to_string(&result).unwrap(),
     ))
 }
 
@@ -827,6 +945,29 @@ mod new_export_format_tests {
         });
         assert!(handle_export_odb(&args, &ctx).await.is_err());
     }
+
+    #[tokio::test]
+    async fn export_bom_rejects_a_format_kicad_cannot_produce() {
+        let ctx = test_ctx();
+        let result = handle_export_bom(
+            &json!({
+                "schematic": "/tmp/design.kicad_sch",
+                "output": "/tmp/bom.xlsx",
+                "format": "xlsx"
+            }),
+            &ctx,
+        )
+        .await
+        .expect("validation does not spawn kicad-cli");
+
+        assert!(result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["field"], "format");
+    }
 }
 
 /// `export_dxf` declares `layers` required and defaulted it to an empty list.
@@ -912,5 +1053,109 @@ mod required_layers_tests {
                 "{tool_name} must keep `layers` optional"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fabrication_option_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[test]
+    fn default_gerbers_include_only_manufacturing_layers() {
+        // KiCad 9 output from the IPC test fixture, including the real layer
+        // table order and every documentation-only layer this filter excludes.
+        let board = include_str!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb");
+        assert_eq!(
+            standard_gerber_layers(board).unwrap(),
+            [
+                "F.Cu",
+                "B.Cu",
+                "F.SilkS",
+                "B.SilkS",
+                "F.Mask",
+                "B.Mask",
+                "Edge.Cuts"
+            ]
+        );
+    }
+
+    #[test]
+    fn public_schemas_describe_the_options_that_reach_kicad() {
+        let gerber = tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_gerber")
+            .unwrap();
+        assert!(gerber.input_schema["properties"]["layers"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("auto-select"));
+
+        let position = tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_position_file")
+            .unwrap();
+        assert_eq!(
+            position.input_schema["properties"]["units"]["enum"],
+            json!(["mm", "in"])
+        );
+        assert_eq!(
+            position.input_schema["properties"]["side"]["enum"],
+            json!(["front", "back", "both"])
+        );
+        assert!(position.description.contains("exclude_from_pos_files"));
+    }
+
+    #[tokio::test]
+    async fn impossible_gerber_side_is_rejected_before_running_kicad() {
+        let result = handle_export_position_file(
+            &json!({
+                "board": "/tmp/board.kicad_pcb",
+                "output": "/tmp/positions.gbr",
+                "format": "gerber",
+                "side": "both",
+                "units": "mm"
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["field"], "side");
+    }
+
+    #[test]
+    fn malformed_layer_items_name_their_index() {
+        let error = optional_string_array(&json!({ "layers": ["F.Cu", 7] }), "layers")
+            .expect_err("numeric layer must be rejected");
+        let text = match error.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["field"], "layers[1]");
     }
 }

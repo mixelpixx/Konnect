@@ -1,7 +1,8 @@
-//! `integration` toolset — JLCPCB parts database, datasheet enrichment, and Freerouting autorouter.
+//! `integration` toolset — JLCPCB parts database, datasheet enrichment, and Freerouting discovery.
 //!
 //! JLCPCB tools query a local SQLite cache of the JLCPCB parts database.
-//! Freerouting wraps the Freerouting JAR via subprocess.
+//! Freerouting discovery locates the JAR and verifies the Java runtime. Konnect
+//! does not advertise an autorouter until it has a real PCB-editor bridge.
 //! Datasheet enrichment uses the LCSC HTTP API.
 //!
 //! The three network calls (JLCPCB database download, LCSC datasheet lookups)
@@ -128,23 +129,8 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_datasheet_url(args, ctx).await }
         ),
         tool!(
-            "autoroute",
-            "Run Freerouting autorouter on the PCB: export DSN → autoroute → import SES result.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "passes": { "type": "integer", "description": "Number of autorouter passes", "default": 3 },
-                    "timeout_seconds": { "type": "integer", "description": "Maximum autorouter runtime in seconds", "default": 120 },
-                    "jar_path": { "type": "string", "description": "Path to freerouting.jar (optional, uses config default)" }
-                },
-                "required": ["board"]
-            }),
-            |args, ctx| async move { handle_autoroute(args, ctx).await }
-        ),
-        tool!(
             "check_freerouting",
-            "Verify that the Freerouting JAR is available and return its version.",
+            "Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available.",
             json!({
                 "type": "object",
                 "properties": {
@@ -977,43 +963,133 @@ async fn handle_get_datasheet_url(
 
 // ─── Freerouting ──────────────────────────────────────────────────────────────
 
-fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
-    if let Some(p) = args["jar_path"].as_str() {
-        return Some(PathBuf::from(p));
-    }
-    // Common locations
-    let candidates = [
-        "freerouting.jar",
-        "/usr/local/lib/freerouting/freerouting.jar",
-        "/opt/freerouting/freerouting.jar",
-    ];
-    for c in &candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+fn is_freerouting_jar(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("freerouting"))
 }
 
-async fn handle_autoroute(
-    _args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    // The Freerouting workflow needs Specctra DSN export + SES import, which
-    // `kicad-cli` does not expose — in KiCAD 8, 9 or 10. They were never CLI
-    // commands, so this is not a KiCAD 10 removal, and Freerouting itself works
-    // fine on KiCAD 10 through the PCB editor and the PCM ActionPlugin. Tracked
-    // by #253, which covers both a real bridge and no longer advertising a tool
-    // that always fails.
-    Ok(CallToolResult::error(
-        "Autoroute via Freerouting is not available through Konnect: the Specctra \
-         DSN export and SES import it needs are PCB-editor operations that \
-         kicad-cli does not expose. Freerouting itself does work with KiCAD 10 — \
-         use the Freerouting ActionPlugin (Tools > External Plugins), or KiCAD's \
-         PCB editor manually (File > Export > Specctra DSN, route, then \
-         File > Import > Specctra Session).",
-    ))
+fn find_freerouting_jar_below(root: &Path, remaining_depth: usize) -> Option<PathBuf> {
+    if is_freerouting_jar(root) {
+        return Some(root.to_path_buf());
+    }
+    if remaining_depth == 0 || !root.is_dir() {
+        return None;
+    }
+
+    let mut entries = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    entries
+        .iter()
+        .find(|path| is_freerouting_jar(path))
+        .cloned()
+        .or_else(|| {
+            entries.into_iter().find_map(|path| {
+                let file_type = std::fs::symlink_metadata(&path).ok()?.file_type();
+                file_type
+                    .is_dir()
+                    .then(|| find_freerouting_jar_below(&path, remaining_depth - 1))
+                    .flatten()
+            })
+        })
+}
+
+fn freerouting_search_roots() -> Vec<(PathBuf, usize)> {
+    let mut roots = Vec::new();
+
+    for variable in ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"] {
+        if let Some(path) = std::env::var_os(variable) {
+            roots.push((PathBuf::from(path), 5));
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for version in ["10.0", "9.0", "8.0"] {
+            roots.push((
+                home.join("Documents")
+                    .join("KiCad")
+                    .join(version)
+                    .join("3rdparty")
+                    .join("plugins"),
+                5,
+            ));
+            roots.push((
+                home.join(".local")
+                    .join("share")
+                    .join("kicad")
+                    .join(version)
+                    .join("3rdparty")
+                    .join("plugins"),
+                5,
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        for version in ["10.0", "9.0", "8.0"] {
+            roots.push((
+                profile
+                    .join("Documents")
+                    .join("KiCad")
+                    .join(version)
+                    .join("3rdparty")
+                    .join("plugins"),
+                5,
+            ));
+        }
+    }
+
+    roots.extend([
+        (PathBuf::from("freerouting.jar"), 0),
+        (PathBuf::from("/usr/local/lib/freerouting"), 3),
+        (PathBuf::from("/opt/freerouting"), 3),
+    ]);
+    if let Some(path) = std::env::var_os("PATH") {
+        roots.extend(std::env::split_paths(&path).map(|directory| (directory, 1)));
+    }
+    roots
+}
+
+fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
+    if let Some(path) = args["jar_path"].as_str() {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+
+    freerouting_search_roots()
+        .into_iter()
+        .find_map(|(root, depth)| find_freerouting_jar_below(&root, depth))
+}
+
+fn command_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn run_java_command(
+    command: &mut tokio::process::Command,
+) -> Result<std::process::Output, String> {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("Java command timed out after 10 seconds".to_string()),
+    }
 }
 
 async fn handle_check_freerouting(
@@ -1031,30 +1107,76 @@ async fn handle_check_freerouting(
             .unwrap(),
         )),
         Some(jar_path) => {
-            // Try to get version from java -jar freerouting.jar --version
-            let output = tokio::process::Command::new("java")
-                .args(["-jar", jar_path.to_str().unwrap_or(""), "--version"])
-                .output()
-                .await;
-
-            let version = match output {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    format!("{}{}", stdout.trim(), stderr.trim())
+            let mut java_command = tokio::process::Command::new("java");
+            java_command.arg("-version");
+            let java = match run_java_command(&mut java_command).await {
+                Ok(output) => output,
+                Err(error) => {
+                    return Ok(CallToolResult::json(&json!({
+                        "available": false,
+                        "jar_path": jar_path,
+                        "java_available": false,
+                        "note": error
+                    })));
                 }
-                Err(e) => format!("java not available: {e}"),
+            };
+            if !java.status.success() {
+                return Ok(CallToolResult::json(&json!({
+                    "available": false,
+                    "jar_path": jar_path,
+                    "java_available": false,
+                    "java_output": command_output(&java),
+                    "note": "Freerouting was found, but Java did not start successfully"
+                })));
+            }
+
+            let mut freerouting_command = tokio::process::Command::new("java");
+            freerouting_command.args(["-jar", jar_path.to_str().unwrap_or(""), "--version"]);
+            let freerouting = run_java_command(&mut freerouting_command).await;
+            let (version_checked, version_output) = match freerouting {
+                Ok(output) => (output.status.success(), command_output(&output)),
+                Err(error) => (false, error),
             };
 
-            Ok(CallToolResult::text(
-                serde_json::to_string(&json!({
-                    "available": true,
-                    "jar_path": jar_path.to_str().unwrap_or(""),
-                    "version_output": version
-                }))
-                .unwrap(),
-            ))
+            Ok(CallToolResult::json(&json!({
+                "available": true,
+                "jar_path": jar_path,
+                "java_available": true,
+                "java_output": command_output(&java),
+                "version_checked": version_checked,
+                "version_output": version_output
+            })))
         }
+    }
+}
+
+#[cfg(test)]
+mod freerouting_tests {
+    use super::*;
+
+    #[test]
+    fn finds_versioned_jar_inside_pcm_plugin_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("app_freerouting_kicad-plugin").join("lib");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let jar = plugin.join("freerouting-2.3.0.jar");
+        std::fs::write(&jar, b"fixture").unwrap();
+
+        assert_eq!(find_freerouting_jar_below(temp.path(), 5), Some(jar));
+    }
+
+    #[test]
+    fn explicit_missing_jar_does_not_claim_availability() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.jar");
+        assert_eq!(find_freerouting_jar(&json!({ "jar_path": missing })), None);
+    }
+
+    #[test]
+    fn ignores_unrelated_jars() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("other.jar"), b"fixture").unwrap();
+        assert_eq!(find_freerouting_jar_below(temp.path(), 5), None);
     }
 }
 

@@ -10,8 +10,8 @@ use crate::tools::{get_path, ToolContext, ToolDef};
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
-        pin_endpoint, read_schematic,
+        extract_labels, extract_lib_pins_for_unit, extract_symbol_instances, extract_wires,
+        find_lib_symbol, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, write_atomic_if_unchanged, SexpEdit,
@@ -35,7 +35,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output SVG file path (directory used as output dir)" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
-                    "theme": { "type": "string", "description": "KiCAD colour theme name (optional)" }
+                    "theme": { "type": "string", "description": "KiCad colour theme name (optional)" }
                 },
                 "required": ["schematic", "output"]
             }),
@@ -50,7 +50,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output PDF file path" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
-                    "all_sheets": { "type": "boolean", "description": "Include all hierarchical sheets", "default": true }
+                    "all_sheets": { "type": "boolean", "description": "Include all hierarchical sheets; false exports page 1 only", "default": true }
                 },
                 "required": ["schematic", "output"]
             }),
@@ -152,6 +152,10 @@ async fn handle_export_svg(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let output_path = get_path(args, "output")?;
+    let options = cli::SchematicSvgOptions {
+        black_and_white: args["black_and_white"].as_bool().unwrap_or(false),
+        theme: args["theme"].as_str(),
+    };
 
     // kicad-cli writes to an output directory and names the file <stem>.svg
     let output_dir = output_path
@@ -160,10 +164,13 @@ async fn handle_export_svg(
         .to_path_buf();
     std::fs::create_dir_all(&output_dir)?;
 
-    let svg_path = cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir).await?;
+    let svg_path =
+        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir, &options).await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": svg_path.display().to_string()
+        "exported": svg_path.display().to_string(),
+        "black_and_white": options.black_and_white,
+        "theme": options.theme
     })))
 }
 
@@ -173,15 +180,21 @@ async fn handle_export_pdf(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let output_path = get_path(args, "output")?;
+    let options = cli::SchematicPdfOptions {
+        black_and_white: args["black_and_white"].as_bool().unwrap_or(false),
+        all_sheets: args["all_sheets"].as_bool().unwrap_or(true),
+    };
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    cli::export_schematic_pdf(&ctx.config.kicad_cli, &sch_path, &output_path).await?;
+    cli::export_schematic_pdf(&ctx.config.kicad_cli, &sch_path, &output_path, &options).await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": output_path.display().to_string()
+        "exported": output_path.display().to_string(),
+        "black_and_white": options.black_and_white,
+        "all_sheets": options.all_sheets
     })))
 }
 
@@ -239,7 +252,7 @@ async fn handle_export_netlist_summary(
 
             let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
                 let t = inst.pin_transform();
-                extract_lib_pins(sym)
+                extract_lib_pins_for_unit(sym, inst.unit)
                     .iter()
                     .map(|p| {
                         let (px, py) = pin_endpoint(p, t);
@@ -261,6 +274,7 @@ async fn handle_export_netlist_summary(
                 "value": inst.value,
                 "footprint": inst.footprint,
                 "lib_id": inst.lib_id,
+                "unit": inst.unit,
                 "pin_count": pins.len(),
                 "pins": pins
             })
@@ -355,7 +369,7 @@ async fn handle_fix_connectivity(
         let lib_sym = find_lib_symbol(&lib_syms, inst);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
+            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
                 snap_targets.push(pin_endpoint(&pin, t));
             }
         }
@@ -453,4 +467,139 @@ async fn handle_fix_connectivity(
         "dry_run": dry_run,
         "fixes": fixes
     })))
+}
+
+#[cfg(test)]
+mod multi_unit_export_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const SUMMARY_SCHEMATIC: &str = r#"(kicad_sch
+  (version 20260306)
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:DUAL"
+      (symbol "DUAL_1_1"
+        (pin input line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "DUAL_2_1"
+        (pin output line (at 0 0 0) (length 0) (name "Y") (number "2"))
+      )
+    )
+  )
+  (label "UNIT1" (at 100 100 0))
+  (label "UNIT2" (at 100 120 0))
+  (symbol (lib_id "Test:DUAL") (at 100 100 0) (unit 1) (uuid "u1a")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "DUAL" (at 100 100 0))
+    (property "Footprint" "" (at 100 100 0))
+  )
+  (symbol (lib_id "Test:DUAL") (at 100 120 0) (unit 2) (uuid "u1b")
+    (property "Reference" "U1" (at 100 120 0))
+    (property "Value" "DUAL" (at 100 120 0))
+    (property "Footprint" "" (at 100 120 0))
+  )
+)
+"#;
+
+    const PHANTOM_SNAP_SCHEMATIC: &str = r#"(kicad_sch
+  (version 20260306)
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:DUAL"
+      (symbol "DUAL_1_1"
+        (pin input line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "DUAL_2_1"
+        (pin output line (at 10 0 0) (length 0) (name "Y") (number "2"))
+      )
+    )
+  )
+  (wire (start 110.03 100) (end 120 100) (uuid "near-phantom"))
+  (symbol (lib_id "Test:DUAL") (at 100 100 0) (unit 1) (uuid "u1a")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "DUAL" (at 100 100 0))
+  )
+  (symbol (lib_id "Test:DUAL") (at 200 200 0) (unit 2) (uuid "u1b")
+    (property "Reference" "U1" (at 200 200 0))
+    (property "Value" "DUAL" (at 200 200 0))
+  )
+)
+"#;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("multi.kicad_sch");
+        std::fs::write(&path, contents).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "export helper unexpectedly failed");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn netlist_summary_reports_only_each_placed_units_pins() {
+        let (_directory, path) = fixture(SUMMARY_SCHEMATIC);
+        let result = body(
+            handle_export_netlist_summary(&json!({ "schematic": path }), &context())
+                .await
+                .unwrap(),
+        );
+        let components = result["components"].as_array().unwrap();
+        assert_eq!(components.len(), 2);
+        let unit1 = components
+            .iter()
+            .find(|component| component["unit"] == 1)
+            .unwrap();
+        let unit2 = components
+            .iter()
+            .find(|component| component["unit"] == 2)
+            .unwrap();
+        assert_eq!(unit1["pin_count"], 1);
+        assert_eq!(unit1["pins"][0]["number"], "1");
+        assert_eq!(unit1["pins"][0]["net"], "UNIT1");
+        assert_eq!(unit2["pin_count"], 1);
+        assert_eq!(unit2["pins"][0]["number"], "2");
+        assert_eq!(unit2["pins"][0]["net"], "UNIT2");
+    }
+
+    #[tokio::test]
+    async fn connectivity_fix_does_not_snap_to_another_units_phantom_pin() {
+        let (_directory, path) = fixture(PHANTOM_SNAP_SCHEMATIC);
+        let result = body(
+            handle_fix_connectivity(
+                &json!({
+                    "schematic": path,
+                    "snap_tolerance": 0.05,
+                    "dry_run": true
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["fixes_found"], 0, "{result}");
+        assert_eq!(result["fixes"], json!([]));
+    }
 }

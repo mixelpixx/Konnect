@@ -20,6 +20,20 @@ use tracing::{debug, info, warn};
 /// Extended timeout for long operations (export, ERC, DRC).
 const LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
+fn cli_failure_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+        (false, true) => format!("stdout:\n{stdout}"),
+        (true, false) => format!("stderr:\n{stderr}"),
+        (true, true) => "no diagnostic output".to_string(),
+    }
+}
+
 // ─── Result Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,11 +139,10 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
     }
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "kicad-cli exited with {}: {}",
+            "kicad-cli exited with {}:\n{}",
             output.status.code().unwrap_or(-1),
-            stderr.trim()
+            cli_failure_diagnostics(&output.stdout, &output.stderr)
         );
     }
 
@@ -351,35 +364,91 @@ pub async fn annotate_schematic(_cli: &str, schematic: &Path) -> Result<()> {
 
 // ─── Schematic Export ────────────────────────────────────────────────────────
 
-/// KiCAD 10: `sch export svg --output <dir> <input>`
+#[derive(Debug, Default, Clone)]
+pub struct SchematicSvgOptions<'a> {
+    pub black_and_white: bool,
+    pub theme: Option<&'a str>,
+}
+
+fn schematic_svg_args<'a>(
+    output_dir: &'a str,
+    schematic: &'a str,
+    options: &'a SchematicSvgOptions<'a>,
+) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "svg", "--output", output_dir];
+    if options.black_and_white {
+        args.push("--black-and-white");
+    }
+    if let Some(theme) = options.theme {
+        args.push("--theme");
+        args.push(theme);
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export svg --output <dir> [--black-and-white]
+/// [--theme <name>] <input>`
 pub async fn export_schematic_svg(
     cli: &str,
     schematic: &Path,
     output_dir: &Path,
+    options: &SchematicSvgOptions<'_>,
 ) -> Result<PathBuf> {
-    let args = [
-        "sch",
-        "export",
-        "svg",
-        "--output",
+    let args = schematic_svg_args(
         output_dir.to_str().unwrap(),
         schematic.to_str().unwrap(),
-    ];
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
     Ok(output_dir.join(format!("{}.svg", stem)))
 }
 
-/// KiCAD 10: `sch export pdf --output <path> <input>`
-pub async fn export_schematic_pdf(cli: &str, schematic: &Path, output: &Path) -> Result<()> {
-    let args = [
-        "sch",
-        "export",
-        "pdf",
-        "--output",
+#[derive(Debug, Clone)]
+pub struct SchematicPdfOptions {
+    pub black_and_white: bool,
+    pub all_sheets: bool,
+}
+
+impl Default for SchematicPdfOptions {
+    fn default() -> Self {
+        Self {
+            black_and_white: false,
+            all_sheets: true,
+        }
+    }
+}
+
+fn schematic_pdf_args<'a>(
+    output: &'a str,
+    schematic: &'a str,
+    options: &SchematicPdfOptions,
+) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "pdf", "--output", output];
+    if options.black_and_white {
+        args.push("--black-and-white");
+    }
+    if !options.all_sheets {
+        args.extend(["--pages", "1"]);
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export pdf --output <path> [--black-and-white]
+/// [--pages 1] <input>`
+pub async fn export_schematic_pdf(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &SchematicPdfOptions,
+) -> Result<()> {
+    let args = schematic_pdf_args(
         output.to_str().unwrap(),
         schematic.to_str().unwrap(),
-    ];
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -486,16 +555,32 @@ pub async fn export_netlist(
 
 // ─── PCB Export ──────────────────────────────────────────────────────────────
 
-/// KiCAD 10: `pcb export gerbers --output <dir> <input>` (PLURAL!)
-pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<()> {
-    let args = [
-        "pcb",
-        "export",
-        "gerbers",
-        "--output",
-        output_dir.to_str().unwrap(),
-        pcb.to_str().unwrap(),
-    ];
+/// Argument vector for Gerber export. KiCad's plural `gerbers` subcommand
+/// accepts the complete selection as one comma-separated `--layers` value.
+fn gerber_args<'a>(output_dir: &'a str, pcb: &'a str, layers_csv: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["pcb", "export", "gerbers", "--output", output_dir];
+    if !layers_csv.is_empty() {
+        args.push("--layers");
+        args.push(layers_csv);
+    }
+    args.push(pcb);
+    args
+}
+
+/// KiCad 10: `pcb export gerbers --output <dir> [--layers <csv>] <input>`
+/// (PLURAL!)
+pub async fn export_gerber(
+    cli: &str,
+    pcb: &Path,
+    output_dir: &Path,
+    layers: &[&str],
+) -> Result<()> {
+    let layers_csv = layers.join(",");
+    let args = gerber_args(
+        output_dir.to_str().unwrap_or(""),
+        pcb.to_str().unwrap_or(""),
+        &layers_csv,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -562,33 +647,82 @@ pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Ve
     Ok(drill_files_in(output_dir).await)
 }
 
-/// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`
-pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
-    let mut args = vec!["pcb", "export", "pdf", "--output", output.to_str().unwrap()];
-    for layer in layers {
-        args.push("--layers");
-        args.push(layer);
+fn single_file_pcb_export_args(
+    format: &str,
+    output: &str,
+    layers: &[&str],
+    black_and_white: bool,
+    pcb: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "pcb".to_string(),
+        "export".to_string(),
+        format.to_string(),
+        "--output".to_string(),
+        output.to_string(),
+        "--mode-single".to_string(),
+    ];
+    if !layers.is_empty() {
+        args.push("--layers".to_string());
+        args.push(layers.join(","));
     }
-    args.push(pcb.to_str().unwrap());
+    if black_and_white {
+        args.push("--black-and-white".to_string());
+    }
+    args.push(pcb.to_string());
+    args
+}
+
+/// KiCAD 10: `pcb export pdf --output <path> --mode-single [--layers <a,b>]
+/// [--black-and-white] <input>`
+pub async fn export_pdf(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
+    let args = single_file_pcb_export_args(
+        "pdf",
+        output.to_str().unwrap(),
+        layers,
+        black_and_white,
+        pcb.to_str().unwrap(),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export svg --output <path> [--layers <layer>]... <input>`
-pub async fn export_svg_pcb(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
-    let mut args = vec!["pcb", "export", "svg", "--output", output.to_str().unwrap()];
-    for layer in layers {
-        args.push("--layers");
-        args.push(layer);
-    }
-    args.push(pcb.to_str().unwrap());
+/// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>]
+/// [--black-and-white] <input>`
+pub async fn export_svg_pcb(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
+    let args = single_file_pcb_export_args(
+        "svg",
+        output.to_str().unwrap(),
+        layers,
+        black_and_white,
+        pcb.to_str().unwrap(),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export <format> --output <path> <input>`
+/// KiCAD 10: `pcb export <format> --output <path> [--no-unspecified] <input>`
 /// Supported 3D formats: step, vrml, glb, brep, stl, ply, stpz, u3d, xao, 3dpdf
-pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Result<()> {
+fn export_3d_args<'a>(
+    pcb: &'a str,
+    output: &'a str,
+    format: &str,
+    include_unspecified: bool,
+) -> Result<Vec<&'a str>> {
     let subcommand = match format.to_lowercase().as_str() {
         "step" | "stp" => "step",
         "vrml" | "wrl" => "vrml",
@@ -605,36 +739,74 @@ pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Re
             other
         ),
     };
-    let args = vec![
-        "pcb",
-        "export",
-        subcommand,
-        "--output",
-        output.to_str().unwrap(),
+    let mut args = vec!["pcb", "export", subcommand, "--output", output];
+    if !include_unspecified {
+        args.push("--no-unspecified");
+    }
+    args.push(pcb);
+    Ok(args)
+}
+
+pub async fn export_3d(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    format: &str,
+    include_unspecified: bool,
+) -> Result<()> {
+    let args = export_3d_args(
         pcb.to_str().unwrap(),
-    ];
+        output.to_str().unwrap(),
+        format,
+        include_unspecified,
+    )?;
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export pos --output <path> --format <fmt> <input>`
-/// Formats: ascii (default), csv, gerber
+/// Argument vector for position export, factored out so the public options can
+/// be regression-tested without a kicad-cli installation.
+fn position_args<'a>(
+    output: &'a str,
+    pcb: &'a str,
+    format: &'a str,
+    units: &'a str,
+    side: &'a str,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "pcb", "export", "pos", "--output", output, "--format", format, "--side", side,
+    ];
+    // Gerber coordinates have format-defined units; KiCad only accepts this
+    // option for its ASCII and CSV position formats.
+    if format != "gerber" {
+        args.push("--units");
+        args.push(units);
+    }
+    args.push(pcb);
+    args
+}
+
+/// KiCad 10: `pcb export pos --output <path> --format <fmt> --side <side>
+/// [--units <units>] <input>`
+///
+/// KiCad itself omits footprints carrying `exclude_from_pos_files`; Konnect
+/// deliberately leaves that source-of-truth filtering to the exporter rather
+/// than trying to post-process CSV and Gerber output differently.
 pub async fn export_position_file(
     cli: &str,
     pcb: &Path,
     output: &Path,
     format: &str,
+    units: &str,
+    side: &str,
 ) -> Result<()> {
-    let args = [
-        "pcb",
-        "export",
-        "pos",
-        "--output",
-        output.to_str().unwrap(),
-        "--format",
+    let args = position_args(
+        output.to_str().unwrap_or(""),
+        pcb.to_str().unwrap_or(""),
         format,
-        pcb.to_str().unwrap(),
-    ];
+        units,
+        side,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -743,7 +915,7 @@ pub async fn export_odb(
 /// KiCAD 10: `sch export svg --output <dir> <input>`
 pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) -> Result<PathBuf> {
     let output_dir = output.parent().unwrap_or(Path::new("."));
-    export_schematic_svg(cli, schematic, output_dir).await
+    export_schematic_svg(cli, schematic, output_dir, &SchematicSvgOptions::default()).await
 }
 
 /// KiCAD 10: `pcb render --output <path> --width <w> --height <h> <input>`
@@ -775,6 +947,143 @@ pub async fn render_pcb_png(
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod schematic_export_option_tests {
+    use super::*;
+
+    #[test]
+    fn svg_theme_and_monochrome_flags_reach_kicad() {
+        let options = SchematicSvgOptions {
+            black_and_white: true,
+            theme: Some("Solarized Dark"),
+        };
+        let args = schematic_svg_args("/out", "/tmp/design.kicad_sch", &options);
+
+        assert!(args.contains(&"--black-and-white"));
+        let theme = args
+            .iter()
+            .position(|argument| *argument == "--theme")
+            .map(|index| args[index + 1]);
+        assert_eq!(theme, Some("Solarized Dark"));
+        assert_eq!(args.last().copied(), Some("/tmp/design.kicad_sch"));
+    }
+
+    #[test]
+    fn pdf_can_limit_the_export_to_the_root_sheet() {
+        let options = SchematicPdfOptions {
+            black_and_white: true,
+            all_sheets: false,
+        };
+        let args = schematic_pdf_args("/out/design.pdf", "/tmp/design.kicad_sch", &options);
+
+        assert!(args.contains(&"--black-and-white"));
+        let pages = args
+            .iter()
+            .position(|argument| *argument == "--pages")
+            .map(|index| args[index + 1]);
+        assert_eq!(pages, Some("1"));
+    }
+
+    #[test]
+    fn schematic_defaults_leave_kicad_theme_and_page_selection_alone() {
+        let svg_options = SchematicSvgOptions::default();
+        let svg = schematic_svg_args("/out", "/tmp/design.kicad_sch", &svg_options);
+        assert!(!svg.contains(&"--black-and-white"));
+        assert!(!svg.contains(&"--theme"));
+
+        let pdf_options = SchematicPdfOptions::default();
+        let pdf = schematic_pdf_args("/out/design.pdf", "/tmp/design.kicad_sch", &pdf_options);
+        assert!(!pdf.contains(&"--black-and-white"));
+        assert!(!pdf.contains(&"--pages"));
+    }
+}
+
+#[cfg(test)]
+mod three_d_export_option_tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_models_are_excluded_by_default() {
+        let args =
+            export_3d_args("/tmp/board.kicad_pcb", "/out/board.step", "step", false).unwrap();
+        assert!(args.contains(&"--no-unspecified"));
+    }
+
+    #[test]
+    fn including_unspecified_models_omits_the_exclusion_flag() {
+        let args = export_3d_args("/tmp/board.kicad_pcb", "/out/board.wrl", "vrml", true).unwrap();
+        assert!(!args.contains(&"--no-unspecified"));
+    }
+}
+
+#[cfg(test)]
+mod pcb_plot_export_tests {
+    use super::*;
+
+    #[test]
+    fn layers_are_one_comma_separated_argument_for_kicad_10() {
+        let args = single_file_pcb_export_args(
+            "svg",
+            "/out/board.svg",
+            &["F.Cu", "F.Paste", "F.SilkS", "Edge.Cuts"],
+            false,
+            "/tmp/board.kicad_pcb",
+        );
+
+        assert_eq!(args.iter().filter(|arg| *arg == "--layers").count(), 1);
+        let layers = args
+            .iter()
+            .position(|arg| arg == "--layers")
+            .map(|index| args[index + 1].as_str());
+        assert_eq!(layers, Some("F.Cu,F.Paste,F.SilkS,Edge.Cuts"));
+    }
+
+    #[test]
+    fn file_output_uses_single_mode_and_empty_layers_are_omitted() {
+        let args = single_file_pcb_export_args(
+            "pdf",
+            "/out/board.pdf",
+            &[],
+            false,
+            "/tmp/board.kicad_pcb",
+        );
+
+        assert!(args.iter().any(|arg| arg == "--mode-single"));
+        assert!(!args.iter().any(|arg| arg == "--layers"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/tmp/board.kicad_pcb")
+        );
+    }
+
+    #[test]
+    fn black_and_white_reaches_both_single_file_plotters() {
+        for format in ["pdf", "svg"] {
+            let args = single_file_pcb_export_args(
+                format,
+                "/out/board.plot",
+                &["F.Cu"],
+                true,
+                "/tmp/board.kicad_pcb",
+            );
+            assert!(args.iter().any(|argument| argument == "--black-and-white"));
+        }
+    }
+
+    #[test]
+    fn cli_failures_include_stdout_and_stderr_diagnostics() {
+        assert_eq!(
+            cli_failure_diagnostics(b"Duplicate argument --layers\n", b""),
+            "stdout:\nDuplicate argument --layers"
+        );
+        assert_eq!(
+            cli_failure_diagnostics(b"usage text", b"fatal detail"),
+            "stdout:\nusage text\nstderr:\nfatal detail"
+        );
+        assert_eq!(cli_failure_diagnostics(b"", b""), "no diagnostic output");
+    }
 }
 
 #[cfg(test)]
@@ -937,6 +1246,72 @@ mod erc_parse_tests {
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod gerber_export_tests {
+    use super::*;
+
+    #[test]
+    fn requested_layers_reach_kicad_as_one_csv_argument() {
+        let args = gerber_args(
+            "/out/gerbers",
+            "/tmp/board.kicad_pcb",
+            "F.Cu,In1.Cu,B.Cu,F.Mask,B.Mask,Edge.Cuts",
+        );
+        let layers = args
+            .iter()
+            .position(|argument| *argument == "--layers")
+            .map(|index| args[index + 1]);
+        assert_eq!(layers, Some("F.Cu,In1.Cu,B.Cu,F.Mask,B.Mask,Edge.Cuts"));
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[test]
+    fn empty_layer_selection_keeps_the_flag_absent() {
+        let args = gerber_args("/out", "/tmp/board.kicad_pcb", "");
+        assert!(!args.contains(&"--layers"));
+    }
+}
+
+#[cfg(test)]
+mod position_export_tests {
+    use super::*;
+
+    fn flag<'a>(args: &'a [&str], name: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|argument| *argument == name)
+            .map(|index| args[index + 1])
+    }
+
+    #[test]
+    fn csv_units_and_side_reach_kicad_cli() {
+        let args = position_args(
+            "/out/positions.csv",
+            "/tmp/board.kicad_pcb",
+            "csv",
+            "mm",
+            "back",
+        );
+        assert_eq!(flag(&args, "--format"), Some("csv"));
+        assert_eq!(flag(&args, "--units"), Some("mm"));
+        assert_eq!(flag(&args, "--side"), Some("back"));
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[test]
+    fn gerber_position_export_does_not_claim_a_units_flag() {
+        let args = position_args(
+            "/out/positions.gbr",
+            "/tmp/board.kicad_pcb",
+            "gerber",
+            "mm",
+            "front",
+        );
+        assert_eq!(flag(&args, "--format"), Some("gerber"));
+        assert_eq!(flag(&args, "--side"), Some("front"));
+        assert_eq!(flag(&args, "--units"), None);
     }
 }
 

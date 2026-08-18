@@ -4,7 +4,7 @@
 //!
 //! KiCAD interface:
 //!   - create_project   → file system (template)
-//!   - open_project     → IPC ping (check if project is open)
+//!   - open_project     → IPC open-document query
 //!   - save_project     → IPC board.save()
 //!   - get_project_info → file system read
 //!   - snapshot_project → kicad-cli export PDF
@@ -41,14 +41,14 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "open_project",
-            "Check whether a KiCAD project is currently open in the running KiCAD UI. \
-             Returns the active project path and whether KiCAD IPC is available.",
+            "List PCB documents open in the running KiCad UI and optionally check whether \
+             one specific KiCad project or board is open over IPC.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Optional: path to .kicad_pro file to check"
+                        "description": "Optional path to a .kicad_pro project or .kicad_pcb board to check"
                     }
                 },
                 "required": []
@@ -250,21 +250,113 @@ async fn handle_create_project(
     })))
 }
 
+fn requested_board_path(
+    args: &serde_json::Value,
+) -> Result<Option<(String, PathBuf)>, CallToolResult> {
+    let Some(value) = args.get("path").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str().filter(|path| !path.trim().is_empty()) else {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "path".to_string(),
+                reason: "must be a non-empty .kicad_pro or .kicad_pcb path".to_string(),
+            },
+            "Argument 'path' must be a non-empty .kicad_pro or .kicad_pcb path",
+        ));
+    };
+    let requested = PathBuf::from(raw);
+    let extension = requested
+        .extension()
+        .and_then(|extension| extension.to_str());
+    let board = match extension {
+        Some(extension) if extension.eq_ignore_ascii_case("kicad_pro") => {
+            requested.with_extension("kicad_pcb")
+        }
+        Some(extension) if extension.eq_ignore_ascii_case("kicad_pcb") => requested.clone(),
+        _ => {
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "path".to_string(),
+                    reason: "must end in .kicad_pro or .kicad_pcb".to_string(),
+                },
+                "Argument 'path' must end in .kicad_pro or .kicad_pcb",
+            ));
+        }
+    };
+    Ok(Some((raw.to_string(), board)))
+}
+
 async fn handle_open_project(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let requested = match requested_board_path(args) {
+        Ok(requested) => requested,
+        Err(error) => return Ok(error),
+    };
     let ipc = konnect_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
     let connected = ipc.ping().unwrap_or(false);
+    let (open_boards, open_boards_error) = if connected {
+        match ipc.get_open_board_paths() {
+            Ok(paths) => (
+                paths
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    let (requested_path, requested_board, requested_open, requested_check_error) = match requested {
+        Some((project_or_board, board)) if connected => match ipc.find_open_board(&board) {
+            Ok(_) => (
+                Some(project_or_board),
+                Some(board.display().to_string()),
+                Some(true),
+                None,
+            ),
+            Err(error) => (
+                Some(project_or_board),
+                Some(board.display().to_string()),
+                Some(false),
+                Some(format!("{error:#}")),
+            ),
+        },
+        Some((project_or_board, board)) => (
+            Some(project_or_board),
+            Some(board.display().to_string()),
+            None,
+            None,
+        ),
+        None => (None, None, None, None),
+    };
+
+    let message = if !connected {
+        "KiCad IPC is not reachable. Start KiCad and enable the IPC API, or work in file-only mode."
+    } else if requested_open == Some(true) {
+        "The requested board is open in KiCad."
+    } else if requested_open == Some(false) {
+        "KiCad IPC is available, but the requested board is not open."
+    } else {
+        "KiCad IPC is available; open PCB documents are listed in open_boards."
+    };
 
     Ok(CallToolResult::json(&json!({
         "kicad_ui_running": connected,
+        "ipc_available": connected,
         "ipc_address": ctx.config.ipc_address,
-        "message": if connected {
-            "KiCAD is running and IPC is available."
-        } else {
-            "KiCAD IPC is not reachable. Start KiCAD and enable the IPC API, or work in file-only mode."
-        }
+        "open_board_count": open_boards.len(),
+        "open_boards": open_boards,
+        "open_boards_error": open_boards_error,
+        "requested_path": requested_path,
+        "requested_board": requested_board,
+        "requested_open": requested_open,
+        "requested_check_error": requested_check_error,
+        "message": message
     })))
 }
 
@@ -350,7 +442,13 @@ async fn handle_snapshot_project(
     let pdf_name = format!("{}_{}_{}.pdf", stem, label, ts);
     let pdf_path = output_dir.join(&pdf_name);
 
-    crate::tools::cli::export_schematic_pdf(&ctx.config.kicad_cli, &schematic, &pdf_path).await?;
+    crate::tools::cli::export_schematic_pdf(
+        &ctx.config.kicad_cli,
+        &schematic,
+        &pdf_path,
+        &crate::tools::cli::SchematicPdfOptions::default(),
+    )
+    .await?;
 
     let mut result = json!({
         "snapshot": pdf_path.display().to_string(),
@@ -364,8 +462,14 @@ async fn handle_snapshot_project(
         let pcb_pdf_name = format!("{}_pcb_{}_{}.pdf", stem, label, ts);
         let pcb_pdf_path = output_dir.join(&pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
-        let _ =
-            crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &pcb_pdf_path, layers).await;
+        let _ = crate::tools::cli::export_pdf(
+            &ctx.config.kicad_cli,
+            &pcb,
+            &pcb_pdf_path,
+            layers,
+            false,
+        )
+        .await;
         result["pcb_snapshot"] = json!(pcb_pdf_path.display().to_string());
     }
 
@@ -539,6 +643,30 @@ mod tests {
         assert!(content.contains("\"F.Cu\""));
         assert!(content.contains("\"B.Cu\""));
         assert!(content.contains("\"Edge.Cuts\""));
+    }
+
+    #[test]
+    fn open_project_maps_a_project_file_to_its_board() {
+        let requested = requested_board_path(&json!({ "path": "/work/voice.kicad_pro" }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(requested.0, "/work/voice.kicad_pro");
+        assert_eq!(requested.1, PathBuf::from("/work/voice.kicad_pcb"));
+
+        let board = requested_board_path(&json!({ "path": "/work/voice.kicad_pcb" }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(board.1, PathBuf::from("/work/voice.kicad_pcb"));
+    }
+
+    #[test]
+    fn open_project_rejects_a_path_it_cannot_check_over_pcb_ipc() {
+        let error = requested_board_path(&json!({ "path": "/work/voice.kicad_sch" }))
+            .expect_err("schematic documents are not exposed by this IPC query");
+        assert_eq!(
+            extract_error_kind(&error).as_deref(),
+            Some("invalid_argument")
+        );
     }
 
     // ─── handle_create_project ─────────────────────────────────────────────

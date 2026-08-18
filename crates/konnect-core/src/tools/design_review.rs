@@ -28,18 +28,13 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "audit_decoupling",
-            "Check that all ICs have appropriate decoupling capacitors. Finds power pins \
-             without nearby capacitors and flags wrong values. The #1 most common PCB design mistake.",
+            "Audit schematic connectivity between IC power nets and decoupling capacitors. \
+             This does not inspect PCB placement distance; use PCB clearance/placement tools \
+             for a physical review.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file (optional, for distance check)" },
-                    "max_distance_mm": {
-                        "type": "number",
-                        "description": "Max allowed distance from power pin to decoupling cap on PCB (mm)",
-                        "default": 5.0
-                    }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
                 },
                 "required": ["schematic"]
             }),
@@ -171,7 +166,7 @@ async fn handle_audit_decoupling(
             None => continue,
         };
 
-        let pins = extract_lib_pins(lib_sym);
+        let pins = extract_lib_pins_for_unit(lib_sym, inst.unit);
         let is_passive = inst.lib_id.contains("R_")
             || inst.lib_id.contains("C_")
             || inst.lib_id.contains("L_")
@@ -232,6 +227,8 @@ async fn handle_audit_decoupling(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "audit": "decoupling",
+            "scope": "schematic_connectivity",
+            "pcb_distance_checked": false,
             "findings": findings,
             "pass_count": pass_count,
             "total_power_pins": total_power_pins,
@@ -268,7 +265,7 @@ async fn handle_audit_connections(
             None => continue,
         };
 
-        let pins = extract_lib_pins(lib_sym);
+        let pins = extract_lib_pins_for_unit(lib_sym, inst.unit);
 
         // Check for I2C pull-ups
         if has_i2c_pins(&pins) {
@@ -714,20 +711,14 @@ fn inspect_schematic_coverage(
         };
         coverage.resolved_symbols += 1;
 
-        // The design-review call sites tracked by #182 still use the
-        // unit-agnostic extractor. Until that issue lands, surface every such
-        // component as partial coverage rather than pretending it was audited.
+        // Deliberately compare the complete definition with the selected unit
+        // here: this is classification, not pin placement. Every audit below
+        // resolves the selected unit before transforming its pins (#182).
         if extract_lib_pins(lib_symbol).len()
             > extract_lib_pins_for_unit(lib_symbol, instance.unit).len()
             && multi_unit_references.insert(instance.reference.clone())
         {
             coverage.multi_unit_symbols += 1;
-            diagnostics.push(json!({
-                "code": "multi_unit_review_incomplete",
-                "source": path.display().to_string(),
-                "reference": instance.reference,
-                "message": "design-review pin analysis is not unit-aware yet; tracked by issue #182"
-            }));
         }
     }
 }
@@ -1146,7 +1137,7 @@ fn collect_capacitor_nets(
         }
         let lib_sym = find_lib_symbol(lib_syms, inst);
         if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
+            let pins = extract_lib_pins_for_unit(sym, inst.unit);
             for pin in &pins {
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
                 if let Some(net) = find_net_at_point(content, px, py) {
@@ -1188,7 +1179,7 @@ fn collect_bulk_cap_nets(
 
         let lib_sym = find_lib_symbol(lib_syms, inst);
         if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
+            let pins = extract_lib_pins_for_unit(sym, inst.unit);
             for pin in &pins {
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
                 if let Some(net) = find_net_at_point(content, px, py) {
@@ -1302,7 +1293,7 @@ fn has_pull_up_on_net(
         }
         let lib_sym = find_lib_symbol(lib_syms, inst);
         if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
+            let pins = extract_lib_pins_for_unit(sym, inst.unit);
             let pin_nets: Vec<Option<String>> = pins
                 .iter()
                 .map(|p| {
@@ -1536,7 +1527,7 @@ mod review_completion_tests {
         (pin input line (at 0 0 0) (length 2.54) (name "A") (number "1"))
       )
       (symbol "DUAL_2_1"
-        (pin output line (at 0 0 0) (length 2.54) (name "Y") (number "2"))
+        (pin power_in line (at 0 0 0) (length 2.54) (name "VCC") (number "2"))
       )
     )
   )
@@ -1702,20 +1693,28 @@ mod review_completion_tests {
     }
 
     #[tokio::test]
-    async fn multi_unit_symbol_is_partial_until_issue_182_lands() {
+    async fn multi_unit_symbol_is_fully_reviewed() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("multi.kicad_sch");
         std::fs::write(&root, multi_unit_schematic()).unwrap();
 
         let result = review(&root, None).await;
         let report = &result["design_review"];
-        assert_eq!(report["status"], "partial");
+        assert_eq!(report["status"], "complete");
         assert_eq!(report["coverage"]["schematic"]["multi_unit_symbols"], 1);
-        assert!(report["diagnostics"]
+        assert!(!report["diagnostics"]
             .as_array()
             .unwrap()
             .iter()
             .any(|item| item["code"] == "multi_unit_review_incomplete"));
+        assert!(
+            !report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding.to_string().contains("'VCC'")),
+            "the unplaced unit-2 pin must not be audited at unit 1's position: {report}"
+        );
     }
 
     #[tokio::test]

@@ -483,6 +483,16 @@ impl KiCadIpcClient {
         }
     }
 
+    /// Resolve the filenames of every open PCB document, including relative
+    /// document identifiers whose project specifier supplies the directory.
+    pub fn get_open_board_paths(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .get_open_documents()?
+            .iter()
+            .filter_map(board_document_path)
+            .collect())
+    }
+
     /// Get the first open PCB's DocumentSpecifier (needed for most commands).
     fn get_board_document(&self) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;

@@ -10,8 +10,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_junctions, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, read_schematic, Wire,
+        extract_junctions, extract_labels, extract_lib_pins_for_unit, extract_symbol_instances,
+        extract_wires, find_lib_symbol, pin_endpoint, read_schematic, Wire,
     },
 };
 use serde_json::json;
@@ -429,30 +429,17 @@ async fn handle_get_pin_connections(
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_labels(&tree);
-    let inst = instances
-        .iter()
-        .find(|i| i.reference == reference)
-        .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = find_lib_symbol(&lib_syms, inst);
-    let pin_ep = lib_sym.and_then(|sym| {
-        konnect_sexp::schematic::extract_lib_pins(sym)
-            .iter()
-            .find(|p| p.number == pin_number)
-            .map(|p| konnect_sexp::schematic::pin_endpoint(p, inst.pin_transform()))
-    });
-    let (px, py) = match pin_ep {
-        Some(ep) => ep,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Pin '{}' not found on '{}'",
-                pin_number, reference
-            )))
-        }
-    };
+    let (pin, transform) =
+        match super::sch_wiring::resolve_placed_pin(&instances, &lib_syms, &reference, &pin_number)
+        {
+            Ok(placed) => placed,
+            Err(error) => return Ok(CallToolResult::error(format!("{error:#}"))),
+        };
+    let (px, py) = pin_endpoint(&pin, transform);
     let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": g.net_at(px, py) }),
@@ -472,25 +459,39 @@ async fn handle_get_component_nets(
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_labels(&tree);
-    let inst = instances
+    let placed: Vec<_> = instances
         .iter()
-        .find(|i| i.reference == reference)
-        .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
+        .filter(|instance| instance.reference == reference)
+        .collect();
+    if placed.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' not found",
+            reference
+        )));
+    }
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = find_lib_symbol(&lib_syms, inst);
     let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
-    let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
-        let t = inst.pin_transform();
-        konnect_sexp::schematic::extract_lib_pins(sym).iter().map(|p| {
-            let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
-            json!({ "pin": p.number, "name": p.name, "x": px, "y": py, "net": g.net_at(px, py) })
-        }).collect()
-    } else {
-        Vec::new()
-    };
+    let mut pins: Vec<serde_json::Value> = Vec::new();
+    for instance in placed {
+        let Some(symbol) = find_lib_symbol(&lib_syms, instance) else {
+            continue;
+        };
+        let transform = instance.pin_transform();
+        for pin in extract_lib_pins_for_unit(symbol, instance.unit) {
+            let (px, py) = pin_endpoint(&pin, transform);
+            pins.push(json!({
+                "pin": pin.number,
+                "name": pin.name,
+                "unit": instance.unit,
+                "x": px,
+                "y": py,
+                "net": g.net_at(px, py)
+            }));
+        }
+    }
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pins": pins }),
     ))
@@ -520,12 +521,12 @@ async fn handle_get_net_components(
         .filter_map(|inst| {
             let ls = find_lib_symbol(&lib_syms, inst)?;
             let t = inst.pin_transform();
-            let connected: Vec<_> = konnect_sexp::schematic::extract_lib_pins(ls)
+            let connected: Vec<_> = extract_lib_pins_for_unit(ls, inst.unit)
                 .iter()
                 .filter_map(|p| {
                     let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
                     if net_pts.contains(&pt_key(px, py)) {
-                        Some(json!({ "pin": p.number, "name": p.name }))
+                        Some(json!({ "pin": p.number, "name": p.name, "unit": inst.unit }))
                     } else {
                         None
                     }
@@ -534,7 +535,12 @@ async fn handle_get_net_components(
             if connected.is_empty() {
                 None
             } else {
-                Some(json!({ "reference": inst.reference, "value": inst.value, "pins": connected }))
+                Some(json!({
+                    "reference": inst.reference,
+                    "value": inst.value,
+                    "unit": inst.unit,
+                    "pins": connected
+                }))
             }
         })
         .collect();
@@ -684,25 +690,27 @@ async fn handle_get_connected_items(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
-    let inst = match instances.iter().find(|i| i.reference == reference) {
-        Some(i) => i,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Component '{}' not found",
-                reference
-            )))
-        }
-    };
-
-    let lib_sym = find_lib_symbol(&lib_syms, inst);
+    let placed: Vec<_> = instances
+        .iter()
+        .filter(|instance| instance.reference == reference)
+        .collect();
+    if placed.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' not found",
+            reference
+        )));
+    }
     let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
 
-    // Get nets for each pin
+    // Get nets for every actually placed unit of the component.
     let mut connected_nets: HashSet<String> = HashSet::new();
-    if let Some(sym) = lib_sym {
-        let t = inst.pin_transform();
-        for p in konnect_sexp::schematic::extract_lib_pins(sym) {
-            let (px, py) = konnect_sexp::schematic::pin_endpoint(&p, t);
+    for instance in placed {
+        let Some(symbol) = find_lib_symbol(&lib_syms, instance) else {
+            continue;
+        };
+        let transform = instance.pin_transform();
+        for pin in extract_lib_pins_for_unit(symbol, instance.unit) {
+            let (px, py) = pin_endpoint(&pin, transform);
             if let Some(net) = g.net_at(px, py) {
                 connected_nets.insert(net);
             }
@@ -732,20 +740,33 @@ async fn handle_get_connected_items(
         .collect();
 
     // Find other components on the same nets (excluding the queried one)
-    let connected_components: Vec<serde_json::Value> = instances.iter()
+    let connected_components: Vec<serde_json::Value> = instances
+        .iter()
         .filter(|i| i.reference != reference)
         .filter_map(|i| {
             let ls = find_lib_symbol(&lib_syms, i)?;
             let t = i.pin_transform();
-            let matching_pins: Vec<_> = konnect_sexp::schematic::extract_lib_pins(ls).iter()
+            let matching_pins: Vec<_> = extract_lib_pins_for_unit(ls, i.unit)
+                .iter()
                 .filter_map(|p| {
-                    let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
+                    let (px, py) = pin_endpoint(p, t);
                     if all_net_pts.contains(&pt_key(px, py)) {
-                        Some(json!({ "pin": p.number, "name": p.name }))
-                    } else { None }
-                }).collect();
-            if matching_pins.is_empty() { None }
-            else { Some(json!({ "reference": i.reference, "value": i.value, "connected_pins": matching_pins })) }
+                        Some(json!({ "pin": p.number, "name": p.name, "unit": i.unit }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if matching_pins.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "reference": i.reference,
+                    "value": i.value,
+                    "unit": i.unit,
+                    "connected_pins": matching_pins
+                }))
+            }
         })
         .collect();
 
@@ -827,4 +848,160 @@ async fn handle_check_overlaps(
     Ok(CallToolResult::json(
         &json!({ "overlap_count": all.len(), "overlaps": all }),
     ))
+}
+
+#[cfg(test)]
+mod multi_unit_analysis_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    /// Both units own a pin at the same local coordinate. They share a
+    /// reference but are placed on different labelled points, which exposes
+    /// any code that transforms unit 2 through unit 1's placement (#182).
+    const SCHEMATIC: &str = r#"(kicad_sch
+  (version 20260306)
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:DUAL"
+      (symbol "DUAL_1_1"
+        (pin input line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "DUAL_2_1"
+        (pin output line (at 0 0 0) (length 0) (name "Y") (number "2"))
+      )
+    )
+  )
+  (label "UNIT1" (at 100 100 0))
+  (label "UNIT2" (at 100 120 0))
+  (symbol (lib_id "Test:DUAL") (at 100 100 0) (unit 1) (uuid "u1a")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "DUAL" (at 100 100 0))
+  )
+  (symbol (lib_id "Test:DUAL") (at 100 120 0) (unit 2) (uuid "u1b")
+    (property "Reference" "U1" (at 100 120 0))
+    (property "Value" "DUAL" (at 100 120 0))
+  )
+  (symbol (lib_id "Test:DUAL") (at 200 100 0) (unit 1) (uuid "u2a")
+    (property "Reference" "U2" (at 200 100 0))
+    (property "Value" "DUAL" (at 200 100 0))
+  )
+  (symbol (lib_id "Test:DUAL") (at 100 120 0) (unit 2) (uuid "u2b")
+    (property "Reference" "U2" (at 100 120 0))
+    (property "Value" "DUAL" (at 100 120 0))
+  )
+)
+"#;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("multi.kicad_sch");
+        std::fs::write(&path, SCHEMATIC).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "analysis unexpectedly failed");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pin_query_finds_the_unit_that_owns_the_pin() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_get_pin_connections(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "pin_number": "2"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["pin_y"], 120.0);
+        assert_eq!(result["net"], "UNIT2");
+    }
+
+    #[tokio::test]
+    async fn component_query_reports_each_units_real_pin_and_net() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_get_component_nets(&json!({ "schematic": path, "reference": "U1" }), &context())
+                .await
+                .unwrap(),
+        );
+        let pins = result["pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 2, "one pin per placed unit: {result}");
+        assert!(pins
+            .iter()
+            .any(|pin| pin["pin"] == "1" && pin["unit"] == 1 && pin["net"] == "UNIT1"));
+        assert!(pins
+            .iter()
+            .any(|pin| pin["pin"] == "2" && pin["unit"] == 2 && pin["net"] == "UNIT2"));
+    }
+
+    #[tokio::test]
+    async fn net_query_never_reports_another_units_phantom_pin() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_get_net_components(&json!({ "schematic": path, "net": "UNIT2" }), &context())
+                .await
+                .unwrap(),
+        );
+        let u1 = result["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == "U1")
+            .unwrap();
+        assert_eq!(u1["unit"], 2);
+        assert_eq!(u1["pins"].as_array().unwrap().len(), 1);
+        assert_eq!(u1["pins"][0]["pin"], "2");
+    }
+
+    #[tokio::test]
+    async fn connected_items_traces_every_unit_and_classifies_peers_by_unit() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_get_connected_items(
+                &json!({ "schematic": path, "reference": "U1" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let nets = result["nets"].as_array().unwrap();
+        assert!(nets.contains(&json!("UNIT1")), "{result}");
+        assert!(nets.contains(&json!("UNIT2")), "{result}");
+
+        let peer = result["connected_components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == "U2")
+            .unwrap();
+        assert_eq!(peer["unit"], 2);
+        assert_eq!(peer["connected_pins"].as_array().unwrap().len(), 1);
+        assert_eq!(peer["connected_pins"][0]["pin"], "2");
+    }
 }
