@@ -350,7 +350,13 @@ async fn handle_snapshot_project(
     let pdf_name = format!("{}_{}_{}.pdf", stem, label, ts);
     let pdf_path = output_dir.join(&pdf_name);
 
-    crate::tools::cli::export_schematic_pdf(&ctx.config.kicad_cli, &schematic, &pdf_path).await?;
+    crate::tools::cli::export_schematic_pdf(
+        &ctx.config.kicad_cli,
+        &schematic,
+        &pdf_path,
+        &crate::tools::cli::SchematicPdfOptions::default(),
+    )
+    .await?;
 
     let mut result = json!({
         "snapshot": pdf_path.display().to_string(),
@@ -364,8 +370,14 @@ async fn handle_snapshot_project(
         let pcb_pdf_name = format!("{}_pcb_{}_{}.pdf", stem, label, ts);
         let pcb_pdf_path = output_dir.join(&pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
-        let _ =
-            crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &pcb_pdf_path, layers).await;
+        let _ = crate::tools::cli::export_pdf(
+            &ctx.config.kicad_cli,
+            &pcb,
+            &pcb_pdf_path,
+            layers,
+            false,
+        )
+        .await;
         result["pcb_snapshot"] = json!(pcb_pdf_path.display().to_string());
     }
 
