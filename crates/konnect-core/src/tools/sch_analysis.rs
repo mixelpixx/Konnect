@@ -11,7 +11,7 @@ use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
         extract_junctions, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, read_schematic, Wire,
+        find_lib_symbol, read_schematic, symbol_bounds_for_instance, SymbolBounds, Wire,
     },
 };
 use serde_json::json;
@@ -165,11 +165,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_schematic_overlaps",
-            "Find overlapping symbols or labels that may indicate placement errors.",
+            "Find overlapping symbols from their transformed drawing/pin bounds (excluding \
+             free text), plus conflicting labels at the same location. Reports any symbol whose \
+             embedded geometry could not be resolved and used the origin fallback instead.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
-                    "tolerance": { "type": "number", "default": 0.5 }
+                    "tolerance": {
+                        "type": "number",
+                        "description": "Coordinate tolerance in mm for label collisions and the origin fallback when library geometry is unavailable",
+                        "default": 0.5
+                    }
                 },
                 "required": ["schematic"] }),
             |args, ctx| async move { handle_check_overlaps(args, ctx).await }
@@ -765,54 +771,87 @@ async fn handle_check_overlaps(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let tol = opt_f64(args, "tolerance").unwrap_or(0.5);
-    let sch = cse::Schematic::load(&sch_path)?;
+    if !tol.is_finite() || tol < 0.0 {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "tolerance".to_string(),
+                reason: "must be a finite, non-negative number".to_string(),
+            },
+            "Argument 'tolerance' must be a finite, non-negative number.",
+        ));
+    }
+    let (_, tree) = read_schematic(&sch_path)?;
+    let instances = extract_symbol_instances(&tree);
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
 
-    // Component overlap detection using the new crate's spatial query
-    let symbols: Vec<&cse::Symbol> = sch.symbols.iter().collect();
+    // Compare the actual selected-unit graphic/pin envelopes. Distinct origins
+    // can still place two large symbols on top of each other; the old origin
+    // comparison missed that normal collision shape entirely.
+    let placements = instances
+        .iter()
+        .map(|instance| {
+            let bounds = find_lib_symbol(&lib_symbols, instance)
+                .and_then(|symbol| symbol_bounds_for_instance(symbol, instance));
+            (instance, bounds)
+        })
+        .collect::<Vec<_>>();
     let mut comp_overlaps: Vec<serde_json::Value> = Vec::new();
-    for (i, a) in symbols.iter().enumerate() {
-        let (ax, ay) = a.position();
-        for b in &symbols[i + 1..] {
-            let (bx, by) = b.position();
-            if points_coincident(ax, ay, bx, by, tol) {
-                comp_overlaps.push(json!({
-                    "type": "component_overlap",
-                    "a": a.reference().unwrap_or("?"),
-                    "b": b.reference().unwrap_or("?"),
-                    "x": ax, "y": ay
-                }));
+    let bounds_json = |bounds: SymbolBounds| {
+        json!({
+            "x_min": bounds.min_x,
+            "y_min": bounds.min_y,
+            "x_max": bounds.max_x,
+            "y_max": bounds.max_y
+        })
+    };
+    for (index, (a, a_bounds)) in placements.iter().enumerate() {
+        for (b, b_bounds) in &placements[index + 1..] {
+            match (a_bounds, b_bounds) {
+                (Some(a_bounds), Some(b_bounds)) => {
+                    let (overlap_x, overlap_y) = a_bounds.overlap_depth(*b_bounds);
+                    // Edge/pin contact is a normal connection. Positive area
+                    // on both axes means the placed symbol envelopes collide.
+                    if overlap_x > 1e-9 && overlap_y > 1e-9 {
+                        comp_overlaps.push(json!({
+                            "type": "component_overlap",
+                            "a": a.reference,
+                            "unit_a": a.unit,
+                            "b": b.reference,
+                            "unit_b": b.unit,
+                            "overlap_x_mm": overlap_x,
+                            "overlap_y_mm": overlap_y,
+                            "bounds_a": bounds_json(*a_bounds),
+                            "bounds_b": bounds_json(*b_bounds),
+                            "detection": "symbol_geometry"
+                        }));
+                    }
+                }
+                // Preserve a useful conservative check when an old or damaged
+                // schematic lacks the embedded definition. The response names
+                // every such fallback below so it cannot look authoritative.
+                _ if points_coincident(a.x, a.y, b.x, b.y, tol) => {
+                    comp_overlaps.push(json!({
+                        "type": "component_overlap",
+                        "a": a.reference,
+                        "unit_a": a.unit,
+                        "b": b.reference,
+                        "unit_b": b.unit,
+                        "x": a.x,
+                        "y": a.y,
+                        "detection": "origin_fallback"
+                    }));
+                }
+                _ => {}
             }
         }
     }
 
-    // Label overlap detection — collect all label types into a uniform list
-    struct LabelInfo {
-        net: String,
-        x: f64,
-        y: f64,
-    }
-    let mut all_labels: Vec<LabelInfo> = Vec::new();
-    for l in sch.labels.iter() {
-        all_labels.push(LabelInfo {
-            net: l.text.clone(),
-            x: l.at.x,
-            y: l.at.y,
-        });
-    }
-    for g in sch.global_labels.iter() {
-        all_labels.push(LabelInfo {
-            net: g.text.clone(),
-            x: g.at.x,
-            y: g.at.y,
-        });
-    }
-    for h in sch.hierarchical_labels.iter() {
-        all_labels.push(LabelInfo {
-            net: h.text.clone(),
-            x: h.at.x,
-            y: h.at.y,
-        });
-    }
+    // The structural extractor already combines local, global, and
+    // hierarchical labels.
+    let all_labels = extract_labels(&tree);
     let mut label_overlaps: Vec<serde_json::Value> = Vec::new();
     for (i, a) in all_labels.iter().enumerate() {
         for b in &all_labels[i + 1..] {
@@ -824,7 +863,139 @@ async fn handle_check_overlaps(
 
     let mut all = comp_overlaps;
     all.extend(label_overlaps);
-    Ok(CallToolResult::json(
-        &json!({ "overlap_count": all.len(), "overlaps": all }),
-    ))
+    let bounds_unresolved = placements
+        .iter()
+        .filter(|(_, bounds)| bounds.is_none())
+        .map(|(instance, _)| instance.reference.as_str())
+        .collect::<Vec<_>>();
+    Ok(CallToolResult::json(&json!({
+        "overlap_count": all.len(),
+        "overlaps": all,
+        "bounds_resolved": placements.len() - bounds_unresolved.len(),
+        "bounds_unresolved": bounds_unresolved
+    })))
+}
+
+#[cfg(test)]
+mod placement_overlap_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Retained graphic and pin nodes from KiCad 10's stock Device:R.
+    const DEVICE_R: &str = r#"		(symbol "Device:R"
+			(symbol "R_0_1"
+				(rectangle
+					(start -1.016 -2.54)
+					(end 1.016 2.54)
+					(stroke (width 0.254) (type default))
+					(fill (type none))
+				)
+			)
+			(symbol "R_1_1"
+				(pin passive line
+					(at 0 3.81 270)
+					(length 1.27)
+					(name "" (effects (font (size 1.27 1.27))))
+					(number "1" (effects (font (size 1.27 1.27))))
+				)
+				(pin passive line
+					(at 0 -3.81 90)
+					(length 1.27)
+					(name "" (effects (font (size 1.27 1.27))))
+					(number "2" (effects (font (size 1.27 1.27))))
+				)
+			)
+		)
+"#;
+
+    fn schematic(placements: &[(&str, f64, f64)]) -> String {
+        let instances = placements
+            .iter()
+            .map(|(reference, x, y)| {
+                format!(
+                    "\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at {x} {y} 0)\n\t\t(unit 1)\n\t\t(uuid \"{reference}\")\n\t\t(property \"Reference\" \"{reference}\")\n\t\t(property \"Value\" \"10k\")\n\t)\n"
+                )
+            })
+            .collect::<String>();
+        format!(
+            "(kicad_sch\n\t(version 20260206)\n\t(generator \"eeschema\")\n\t(lib_symbols\n{DEVICE_R}\t)\n{instances})\n"
+        )
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn overlaps(source: &str) -> serde_json::Value {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("overlap.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let result =
+            handle_check_overlaps(&json!({"schematic": path.to_string_lossy()}), &test_ctx())
+                .await
+                .unwrap();
+        response_json(&result)
+    }
+
+    #[tokio::test]
+    async fn distinct_origins_with_intersecting_symbol_bodies_are_reported() {
+        let result = overlaps(&schematic(&[
+            ("R1", 100.0, 50.0),
+            ("R2", 101.0, 50.0),
+            ("R3", 110.0, 50.0),
+        ]))
+        .await;
+
+        assert_eq!(result["bounds_resolved"], 3);
+        assert_eq!(result["bounds_unresolved"], json!([]));
+        assert_eq!(result["overlap_count"], 1);
+        assert_eq!(result["overlaps"][0]["a"], "R1");
+        assert_eq!(result["overlaps"][0]["b"], "R2");
+        assert_eq!(result["overlaps"][0]["detection"], "symbol_geometry");
+        assert!(result["overlaps"][0]["overlap_x_mm"].as_f64().unwrap() > 1.0);
+    }
+
+    #[tokio::test]
+    async fn symbols_whose_bounds_only_touch_are_not_collisions() {
+        let result = overlaps(&schematic(&[("R1", 100.0, 50.0), ("R2", 102.032, 50.0)])).await;
+
+        assert_eq!(result["overlap_count"], 0, "{result}");
+    }
+
+    #[tokio::test]
+    async fn invalid_overlap_tolerance_is_a_named_argument_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("overlap.kicad_sch");
+        std::fs::write(&path, schematic(&[("R1", 100.0, 50.0)])).unwrap();
+        let result = handle_check_overlaps(
+            &json!({"schematic": path.to_string_lossy(), "tolerance": -0.1}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let result = response_json(&result);
+
+        assert_eq!(result["error"]["kind"], "invalid_argument");
+        assert_eq!(result["error"]["field"], "tolerance");
+    }
 }

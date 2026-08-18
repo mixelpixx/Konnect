@@ -17,6 +17,7 @@ use konnect_sexp::{
     schematic::{
         extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
         format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
+        symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -249,7 +250,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_schematic_layout",
             "Return a compact spatial summary of the schematic: component positions, \
-             bounding box, and optionally wire segments and label locations.",
+             transformed drawing/pin bounds (excluding free text), and optionally wire segments \
+             and label locations. Reports any component whose embedded library geometry could \
+             not be resolved.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1090,40 +1093,81 @@ async fn handle_get_layout(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
 
-    let components: Vec<serde_json::Value> = instances
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let placements = instances
         .iter()
-        .map(|i| {
+        .map(|instance| {
+            let bounds = find_lib_symbol(&lib_symbols, instance)
+                .and_then(|symbol| symbol_bounds_for_instance(symbol, instance));
+            (instance, bounds)
+        })
+        .collect::<Vec<_>>();
+    let bounds_json = |bounds: SymbolBounds| {
+        json!({
+            "x_min": bounds.min_x,
+            "y_min": bounds.min_y,
+            "x_max": bounds.max_x,
+            "y_max": bounds.max_y,
+            "width": bounds.width(),
+            "height": bounds.height()
+        })
+    };
+    let components: Vec<serde_json::Value> = placements
+        .iter()
+        .map(|(instance, bounds)| {
             json!({
-                "reference": i.reference,
-                "value": i.value,
-                "lib_id": i.lib_id,
-                "x": i.x, "y": i.y,
-                "rotation": i.rotation,
-                "mirror_x": i.mirror_x,
-                "mirror_y": i.mirror_y
+                "reference": instance.reference,
+                "value": instance.value,
+                "lib_id": instance.lib_id,
+                "unit": instance.unit,
+                "x": instance.x, "y": instance.y,
+                "rotation": instance.rotation,
+                "mirror_x": instance.mirror_x,
+                "mirror_y": instance.mirror_y,
+                "bounds": bounds.map(&bounds_json)
             })
         })
         .collect();
 
-    // Bounding box over component origins
-    let (mut min_x, mut min_y) = (f64::MAX, f64::MAX);
-    let (mut max_x, mut max_y) = (f64::MIN, f64::MIN);
-    for i in &instances {
-        min_x = min_x.min(i.x);
-        min_y = min_y.min(i.y);
-        max_x = max_x.max(i.x);
-        max_y = max_y.max(i.y);
+    // Enclose actual placed graphics and pin extents. If a library definition
+    // is missing, preserve the old origin coverage for that one instance and
+    // report the unresolved reference instead of silently understating it.
+    let mut overall: Option<SymbolBounds> = None;
+    let mut unresolved_bounds = Vec::new();
+    for (instance, bounds) in &placements {
+        let bounds = bounds.unwrap_or_else(|| {
+            unresolved_bounds.push(instance.reference.clone());
+            SymbolBounds {
+                min_x: instance.x,
+                min_y: instance.y,
+                max_x: instance.x,
+                max_y: instance.y,
+            }
+        });
+        match &mut overall {
+            Some(overall) => {
+                overall.min_x = overall.min_x.min(bounds.min_x);
+                overall.min_y = overall.min_y.min(bounds.min_y);
+                overall.max_x = overall.max_x.max(bounds.max_x);
+                overall.max_y = overall.max_y.max(bounds.max_y);
+            }
+            None => overall = Some(bounds),
+        }
     }
-    let bbox = if instances.is_empty() {
-        json!({ "x_min": 0, "y_min": 0, "x_max": 0, "y_max": 0 })
-    } else {
-        json!({ "x_min": min_x, "y_min": min_y, "x_max": max_x, "y_max": max_y })
-    };
+    let bbox = overall.map_or_else(
+        || json!({ "x_min": 0, "y_min": 0, "x_max": 0, "y_max": 0, "width": 0, "height": 0 }),
+        bounds_json,
+    );
 
     let mut result = json!({
         "component_count": components.len(),
         "components": components,
-        "bounding_box": bbox
+        "bounding_box": bbox,
+        "bounds_resolved": placements.len() - unresolved_bounds.len(),
+        "bounds_unresolved": unresolved_bounds
     });
 
     if include_wires {
@@ -2343,5 +2387,132 @@ mod bulk_move_field_tests {
     #[tokio::test]
     async fn field_text_follows_a_negative_move() {
         assert_fields_follow(-25.4, -12.7).await;
+    }
+}
+
+#[cfg(test)]
+mod layout_bounds_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// The retained nodes are from KiCad 10's stock Device:R definition; the
+    /// surrounding schematic is reduced to what this read-only query needs.
+    fn schematic() -> &'static str {
+        r#"(kicad_sch
+	(version 20260206)
+	(generator "eeschema")
+	(lib_symbols
+		(symbol "Device:R"
+			(symbol "R_0_1"
+				(rectangle
+					(start -1.016 -2.54)
+					(end 1.016 2.54)
+					(stroke (width 0.254) (type default))
+					(fill (type none))
+				)
+			)
+			(symbol "R_1_1"
+				(pin passive line
+					(at 0 3.81 270)
+					(length 1.27)
+					(name "" (effects (font (size 1.27 1.27))))
+					(number "1" (effects (font (size 1.27 1.27))))
+				)
+				(pin passive line
+					(at 0 -3.81 90)
+					(length 1.27)
+					(name "" (effects (font (size 1.27 1.27))))
+					(number "2" (effects (font (size 1.27 1.27))))
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 100 50 0)
+		(unit 1)
+		(uuid "r1")
+		(property "Reference" "R1" (at 102 50 90))
+		(property "Value" "10k" (at 100 50 90))
+	)
+)
+"#
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn schematic_layout_bounds_enclose_graphics_and_pin_tips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("layout.kicad_sch");
+        std::fs::write(&path, schematic()).unwrap();
+
+        let result = handle_get_layout(
+            &json!({
+                "schematic": path.to_string_lossy(),
+                "include_wires": false,
+                "include_labels": false
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let result = response_json(&result);
+
+        assert_eq!(result["bounds_resolved"], 1);
+        assert_eq!(result["bounds_unresolved"], json!([]));
+        assert_eq!(result["bounding_box"]["x_min"], 98.984);
+        assert_eq!(result["bounding_box"]["x_max"], 101.016);
+        assert_eq!(result["bounding_box"]["y_min"], 46.19);
+        assert_eq!(result["bounding_box"]["y_max"], 53.81);
+        assert_eq!(result["components"][0]["bounds"], result["bounding_box"]);
+        assert_ne!(
+            result["bounding_box"]["x_min"], 100.0,
+            "an origin-only box reproduces the old false result"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_geometry_is_named_and_its_origin_remains_covered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("unresolved.kicad_sch");
+        let source = schematic().replace(
+            "\n)\n",
+            "\n\t(symbol\n\t\t(lib_id \"Missing:Part\")\n\t\t(at 120 60 0)\n\t\t(unit 1)\n\t\t(uuid \"u1\")\n\t\t(property \"Reference\" \"U1\")\n\t)\n)\n",
+        );
+        std::fs::write(&path, source).unwrap();
+
+        let result = handle_get_layout(&json!({"schematic": path.to_string_lossy()}), &test_ctx())
+            .await
+            .unwrap();
+        let result = response_json(&result);
+
+        assert_eq!(result["bounds_resolved"], 1);
+        assert_eq!(result["bounds_unresolved"], json!(["U1"]));
+        assert_eq!(result["components"][1]["bounds"], serde_json::Value::Null);
+        assert_eq!(result["bounding_box"]["x_max"], 120.0);
+        assert_eq!(result["bounding_box"]["y_max"], 60.0);
     }
 }
