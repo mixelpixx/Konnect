@@ -278,9 +278,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "validate_component_connections",
-            "Check that every non-passive pin on every component has at least one wire \
-             or label connected. Reports unconnected pins with reference, pin number, \
-             and schematic position.",
+            "Check that every selected component pin has at least one wire or label \
+             connected. Can exclude pins whose KiCad electrical type is power_in or \
+             power_out. Reports unconnected pins with type and position.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1252,6 +1252,7 @@ async fn handle_validate_component_connections(
                 .collect()
         })
         .unwrap_or_default();
+    let ignore_power_pins = args["ignore_power_pins"].as_bool().unwrap_or(false);
     let tol = 0.01_f64;
 
     let (_, tree) = read_schematic(&sch_path)?;
@@ -1310,6 +1311,7 @@ async fn handle_validate_component_connections(
     };
 
     let mut unconnected: Vec<serde_json::Value> = Vec::new();
+    let mut ignored_power_pin_count = 0usize;
 
     for inst in &instances {
         if !filter_refs.is_empty() && !filter_refs.contains(&inst.reference) {
@@ -1319,6 +1321,12 @@ async fn handle_validate_component_connections(
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+                if ignore_power_pins
+                    && matches!(pin.electrical_type.as_str(), "power_in" | "power_out")
+                {
+                    ignored_power_pin_count += 1;
+                    continue;
+                }
                 let (px, py) = pin_endpoint(&pin, t);
 
                 // Skip intentional no-connects
@@ -1335,6 +1343,7 @@ async fn handle_validate_component_connections(
                         "value": inst.value,
                         "pin": pin.number,
                         "pin_name": pin.name,
+                        "electrical_type": pin.electrical_type,
                         "x": px,
                         "y": py
                     }));
@@ -1346,6 +1355,8 @@ async fn handle_validate_component_connections(
     Ok(CallToolResult::json(&json!({
         "valid": unconnected.is_empty(),
         "unconnected_count": unconnected.len(),
+        "ignore_power_pins": ignore_power_pins,
+        "ignored_power_pin_count": ignored_power_pin_count,
         "unconnected_pins": unconnected
     })))
 }
@@ -1691,6 +1702,100 @@ mod midwire_pin_tests {
                 "with_junction={with_junction}: {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod power_pin_validation_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn power_and_signal_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power-pins.kicad_sch");
+        std::fs::write(
+            &path,
+            r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:IC"
+      (symbol "IC_1_1"
+        (pin power_in line (at 0 0 0) (length 2.54)
+          (name "VDD") (number "1"))
+        (pin input line (at 0 5 0) (length 2.54)
+          (name "IN") (number "2"))
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:IC")
+    (at 100 80 0)
+    (unit 1)
+    (uuid "u1")
+    (property "Reference" "U1" (at 100 75 0))
+    (property "Value" "IC" (at 100 85 0))
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"#,
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ignore_power_pins_uses_the_library_electrical_type() {
+        let (_dir, path) = power_and_signal_schematic();
+
+        let all = handle_validate_component_connections(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let all = result_json(&all);
+        assert_eq!(all["unconnected_count"], 2);
+
+        let signals = handle_validate_component_connections(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ignore_power_pins": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let signals = result_json(&signals);
+        assert_eq!(signals["unconnected_count"], 1);
+        assert_eq!(signals["ignored_power_pin_count"], 1);
+        assert_eq!(signals["unconnected_pins"][0]["pin"], "2");
+        assert_eq!(signals["unconnected_pins"][0]["electrical_type"], "input");
     }
 }
 
