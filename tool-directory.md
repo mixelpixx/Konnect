@@ -168,8 +168,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `export_schematic_svg` | Export a schematic sheet to an SVG file using kicad-cli. |
-| `export_schematic_pdf` | Export a schematic sheet to a PDF file using kicad-cli. |
+| `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
+| `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
@@ -266,10 +266,10 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `export_gerber` | Export Gerber production files for all copper/mask layers using kicad-cli. |
-| `export_pdf` | Export the PCB layout to a PDF file using kicad-cli. |
-| `export_svg` | Export the PCB layout to an SVG file using kicad-cli. |
-| `export_3d` | Export the PCB as a 3D model (STEP or VRML) using kicad-cli. |
-| `export_bom` | Generate a Bill of Materials (BOM) CSV from the schematic's component data. |
+| `export_pdf` | Export selected PCB layers to one PDF file using kicad-cli, optionally in black and white. |
+| `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. |
+| `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
+| `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |

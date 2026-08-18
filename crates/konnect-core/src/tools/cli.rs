@@ -364,35 +364,91 @@ pub async fn annotate_schematic(_cli: &str, schematic: &Path) -> Result<()> {
 
 // ─── Schematic Export ────────────────────────────────────────────────────────
 
-/// KiCAD 10: `sch export svg --output <dir> <input>`
+#[derive(Debug, Default, Clone)]
+pub struct SchematicSvgOptions<'a> {
+    pub black_and_white: bool,
+    pub theme: Option<&'a str>,
+}
+
+fn schematic_svg_args<'a>(
+    output_dir: &'a str,
+    schematic: &'a str,
+    options: &'a SchematicSvgOptions<'a>,
+) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "svg", "--output", output_dir];
+    if options.black_and_white {
+        args.push("--black-and-white");
+    }
+    if let Some(theme) = options.theme {
+        args.push("--theme");
+        args.push(theme);
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export svg --output <dir> [--black-and-white]
+/// [--theme <name>] <input>`
 pub async fn export_schematic_svg(
     cli: &str,
     schematic: &Path,
     output_dir: &Path,
+    options: &SchematicSvgOptions<'_>,
 ) -> Result<PathBuf> {
-    let args = [
-        "sch",
-        "export",
-        "svg",
-        "--output",
+    let args = schematic_svg_args(
         output_dir.to_str().unwrap(),
         schematic.to_str().unwrap(),
-    ];
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
     Ok(output_dir.join(format!("{}.svg", stem)))
 }
 
-/// KiCAD 10: `sch export pdf --output <path> <input>`
-pub async fn export_schematic_pdf(cli: &str, schematic: &Path, output: &Path) -> Result<()> {
-    let args = [
-        "sch",
-        "export",
-        "pdf",
-        "--output",
+#[derive(Debug, Clone)]
+pub struct SchematicPdfOptions {
+    pub black_and_white: bool,
+    pub all_sheets: bool,
+}
+
+impl Default for SchematicPdfOptions {
+    fn default() -> Self {
+        Self {
+            black_and_white: false,
+            all_sheets: true,
+        }
+    }
+}
+
+fn schematic_pdf_args<'a>(
+    output: &'a str,
+    schematic: &'a str,
+    options: &SchematicPdfOptions,
+) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "pdf", "--output", output];
+    if options.black_and_white {
+        args.push("--black-and-white");
+    }
+    if !options.all_sheets {
+        args.extend(["--pages", "1"]);
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export pdf --output <path> [--black-and-white]
+/// [--pages 1] <input>`
+pub async fn export_schematic_pdf(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &SchematicPdfOptions,
+) -> Result<()> {
+    let args = schematic_pdf_args(
         output.to_str().unwrap(),
         schematic.to_str().unwrap(),
-    ];
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -579,6 +635,7 @@ fn single_file_pcb_export_args(
     format: &str,
     output: &str,
     layers: &[&str],
+    black_and_white: bool,
     pcb: &str,
 ) -> Vec<String> {
     let mut args = vec![
@@ -593,16 +650,27 @@ fn single_file_pcb_export_args(
         args.push("--layers".to_string());
         args.push(layers.join(","));
     }
+    if black_and_white {
+        args.push("--black-and-white".to_string());
+    }
     args.push(pcb.to_string());
     args
 }
 
-/// KiCAD 10: `pcb export pdf --output <path> --mode-single [--layers <a,b>] <input>`
-pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+/// KiCAD 10: `pcb export pdf --output <path> --mode-single [--layers <a,b>]
+/// [--black-and-white] <input>`
+pub async fn export_pdf(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
     let args = single_file_pcb_export_args(
         "pdf",
         output.to_str().unwrap(),
         layers,
+        black_and_white,
         pcb.to_str().unwrap(),
     );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -610,12 +678,20 @@ pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -
     Ok(())
 }
 
-/// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>] <input>`
-pub async fn export_svg_pcb(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+/// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>]
+/// [--black-and-white] <input>`
+pub async fn export_svg_pcb(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
     let args = single_file_pcb_export_args(
         "svg",
         output.to_str().unwrap(),
         layers,
+        black_and_white,
         pcb.to_str().unwrap(),
     );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -623,9 +699,14 @@ pub async fn export_svg_pcb(cli: &str, pcb: &Path, output: &Path, layers: &[&str
     Ok(())
 }
 
-/// KiCAD 10: `pcb export <format> --output <path> <input>`
+/// KiCAD 10: `pcb export <format> --output <path> [--no-unspecified] <input>`
 /// Supported 3D formats: step, vrml, glb, brep, stl, ply, stpz, u3d, xao, 3dpdf
-pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Result<()> {
+fn export_3d_args<'a>(
+    pcb: &'a str,
+    output: &'a str,
+    format: &str,
+    include_unspecified: bool,
+) -> Result<Vec<&'a str>> {
     let subcommand = match format.to_lowercase().as_str() {
         "step" | "stp" => "step",
         "vrml" | "wrl" => "vrml",
@@ -642,14 +723,27 @@ pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Re
             other
         ),
     };
-    let args = vec![
-        "pcb",
-        "export",
-        subcommand,
-        "--output",
-        output.to_str().unwrap(),
+    let mut args = vec!["pcb", "export", subcommand, "--output", output];
+    if !include_unspecified {
+        args.push("--no-unspecified");
+    }
+    args.push(pcb);
+    Ok(args)
+}
+
+pub async fn export_3d(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    format: &str,
+    include_unspecified: bool,
+) -> Result<()> {
+    let args = export_3d_args(
         pcb.to_str().unwrap(),
-    ];
+        output.to_str().unwrap(),
+        format,
+        include_unspecified,
+    )?;
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -780,7 +874,7 @@ pub async fn export_odb(
 /// KiCAD 10: `sch export svg --output <dir> <input>`
 pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) -> Result<PathBuf> {
     let output_dir = output.parent().unwrap_or(Path::new("."));
-    export_schematic_svg(cli, schematic, output_dir).await
+    export_schematic_svg(cli, schematic, output_dir, &SchematicSvgOptions::default()).await
 }
 
 /// KiCAD 10: `pcb render --output <path> --width <w> --height <h> <input>`
@@ -815,6 +909,75 @@ pub async fn render_pcb_png(
 }
 
 #[cfg(test)]
+mod schematic_export_option_tests {
+    use super::*;
+
+    #[test]
+    fn svg_theme_and_monochrome_flags_reach_kicad() {
+        let options = SchematicSvgOptions {
+            black_and_white: true,
+            theme: Some("Solarized Dark"),
+        };
+        let args = schematic_svg_args("/out", "/tmp/design.kicad_sch", &options);
+
+        assert!(args.contains(&"--black-and-white"));
+        let theme = args
+            .iter()
+            .position(|argument| *argument == "--theme")
+            .map(|index| args[index + 1]);
+        assert_eq!(theme, Some("Solarized Dark"));
+        assert_eq!(args.last().copied(), Some("/tmp/design.kicad_sch"));
+    }
+
+    #[test]
+    fn pdf_can_limit_the_export_to_the_root_sheet() {
+        let options = SchematicPdfOptions {
+            black_and_white: true,
+            all_sheets: false,
+        };
+        let args = schematic_pdf_args("/out/design.pdf", "/tmp/design.kicad_sch", &options);
+
+        assert!(args.contains(&"--black-and-white"));
+        let pages = args
+            .iter()
+            .position(|argument| *argument == "--pages")
+            .map(|index| args[index + 1]);
+        assert_eq!(pages, Some("1"));
+    }
+
+    #[test]
+    fn schematic_defaults_leave_kicad_theme_and_page_selection_alone() {
+        let svg_options = SchematicSvgOptions::default();
+        let svg = schematic_svg_args("/out", "/tmp/design.kicad_sch", &svg_options);
+        assert!(!svg.contains(&"--black-and-white"));
+        assert!(!svg.contains(&"--theme"));
+
+        let pdf_options = SchematicPdfOptions::default();
+        let pdf = schematic_pdf_args("/out/design.pdf", "/tmp/design.kicad_sch", &pdf_options);
+        assert!(!pdf.contains(&"--black-and-white"));
+        assert!(!pdf.contains(&"--pages"));
+    }
+}
+
+#[cfg(test)]
+mod three_d_export_option_tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_models_are_excluded_by_default() {
+        let args =
+            export_3d_args("/tmp/board.kicad_pcb", "/out/board.step", "step", false).unwrap();
+        assert!(args.contains(&"--no-unspecified"));
+    }
+
+    #[test]
+    fn including_unspecified_models_omits_the_exclusion_flag() {
+        let args = export_3d_args("/tmp/board.kicad_pcb", "/out/board.wrl", "vrml", true).unwrap();
+        assert!(!args.contains(&"--no-unspecified"));
+    }
+}
+
+#[cfg(test)]
 mod pcb_plot_export_tests {
     use super::*;
 
@@ -824,6 +987,7 @@ mod pcb_plot_export_tests {
             "svg",
             "/out/board.svg",
             &["F.Cu", "F.Paste", "F.SilkS", "Edge.Cuts"],
+            false,
             "/tmp/board.kicad_pcb",
         );
 
@@ -837,8 +1001,13 @@ mod pcb_plot_export_tests {
 
     #[test]
     fn file_output_uses_single_mode_and_empty_layers_are_omitted() {
-        let args =
-            single_file_pcb_export_args("pdf", "/out/board.pdf", &[], "/tmp/board.kicad_pcb");
+        let args = single_file_pcb_export_args(
+            "pdf",
+            "/out/board.pdf",
+            &[],
+            false,
+            "/tmp/board.kicad_pcb",
+        );
 
         assert!(args.iter().any(|arg| arg == "--mode-single"));
         assert!(!args.iter().any(|arg| arg == "--layers"));
@@ -846,6 +1015,20 @@ mod pcb_plot_export_tests {
             args.last().map(String::as_str),
             Some("/tmp/board.kicad_pcb")
         );
+    }
+
+    #[test]
+    fn black_and_white_reaches_both_single_file_plotters() {
+        for format in ["pdf", "svg"] {
+            let args = single_file_pcb_export_args(
+                format,
+                "/out/board.plot",
+                &["F.Cu"],
+                true,
+                "/tmp/board.kicad_pcb",
+            );
+            assert!(args.iter().any(|argument| argument == "--black-and-white"));
+        }
     }
 
     #[test]

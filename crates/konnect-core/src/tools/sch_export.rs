@@ -35,7 +35,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output SVG file path (directory used as output dir)" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
-                    "theme": { "type": "string", "description": "KiCAD colour theme name (optional)" }
+                    "theme": { "type": "string", "description": "KiCad colour theme name (optional)" }
                 },
                 "required": ["schematic", "output"]
             }),
@@ -50,7 +50,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output PDF file path" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
-                    "all_sheets": { "type": "boolean", "description": "Include all hierarchical sheets", "default": true }
+                    "all_sheets": { "type": "boolean", "description": "Include all hierarchical sheets; false exports page 1 only", "default": true }
                 },
                 "required": ["schematic", "output"]
             }),
@@ -152,6 +152,10 @@ async fn handle_export_svg(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let output_path = get_path(args, "output")?;
+    let options = cli::SchematicSvgOptions {
+        black_and_white: args["black_and_white"].as_bool().unwrap_or(false),
+        theme: args["theme"].as_str(),
+    };
 
     // kicad-cli writes to an output directory and names the file <stem>.svg
     let output_dir = output_path
@@ -160,10 +164,13 @@ async fn handle_export_svg(
         .to_path_buf();
     std::fs::create_dir_all(&output_dir)?;
 
-    let svg_path = cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir).await?;
+    let svg_path =
+        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir, &options).await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": svg_path.display().to_string()
+        "exported": svg_path.display().to_string(),
+        "black_and_white": options.black_and_white,
+        "theme": options.theme
     })))
 }
 
@@ -173,15 +180,21 @@ async fn handle_export_pdf(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let output_path = get_path(args, "output")?;
+    let options = cli::SchematicPdfOptions {
+        black_and_white: args["black_and_white"].as_bool().unwrap_or(false),
+        all_sheets: args["all_sheets"].as_bool().unwrap_or(true),
+    };
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    cli::export_schematic_pdf(&ctx.config.kicad_cli, &sch_path, &output_path).await?;
+    cli::export_schematic_pdf(&ctx.config.kicad_cli, &sch_path, &output_path, &options).await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": output_path.display().to_string()
+        "exported": output_path.display().to_string(),
+        "black_and_white": options.black_and_white,
+        "all_sheets": options.all_sheets
     })))
 }
 
