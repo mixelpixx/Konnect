@@ -133,7 +133,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output CSV file path" },
                     "format": {
                         "type": "string",
-                        "description": "BOM format passed to kicad-cli: 'csv' (default)",
+                        "enum": ["csv"],
+                        "description": "BOM format. KiCad 10's schematic BOM export is CSV.",
                         "default": "csv"
                     },
                     "fields": {
@@ -374,14 +375,16 @@ async fn handle_export_pdf(
         })
         .unwrap_or_default();
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
+    let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_pdf(cli, &board, &output, &layer_refs).await?;
+    cli::export_pdf(cli, &board, &output, &layer_refs, black_and_white).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
-            "output": output.to_str().unwrap_or("")
+            "output": output.to_str().unwrap_or(""),
+            "black_and_white": black_and_white
         }))
         .unwrap(),
     ))
@@ -403,14 +406,16 @@ async fn handle_export_svg(
         })
         .unwrap_or_default();
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
+    let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_svg_pcb(cli, &board, &output, &layer_refs).await?;
+    cli::export_svg_pcb(cli, &board, &output, &layer_refs, black_and_white).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
-            "output": output.to_str().unwrap_or("")
+            "output": output.to_str().unwrap_or(""),
+            "black_and_white": black_and_white
         }))
         .unwrap(),
     ))
@@ -423,14 +428,16 @@ async fn handle_export_3d(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
     let format = args["format"].as_str().unwrap_or("step");
+    let include_unspecified = args["include_unspecified"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_3d(cli, &board, &output, format).await?;
+    cli::export_3d(cli, &board, &output, format, include_unspecified).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "format": format,
+            "include_unspecified": include_unspecified,
             "output": output.to_str().unwrap_or("")
         }))
         .unwrap(),
@@ -443,6 +450,17 @@ async fn handle_export_bom(
 ) -> anyhow::Result<CallToolResult> {
     let schematic = get_path(args, "schematic")?;
     let output = get_path(args, "output")?;
+    let format = args["format"].as_str().unwrap_or("csv");
+    if format != "csv" {
+        let reason = format!("only 'csv' is supported, got '{format}'");
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "format".to_string(),
+                reason: reason.clone(),
+            },
+            format!("Argument 'format' is invalid: {reason}"),
+        ));
+    }
     let options = cli::BomOptions {
         fields: args["fields"].as_str(),
         labels: args["labels"].as_str(),
@@ -459,6 +477,7 @@ async fn handle_export_bom(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "format": format,
             "fields": options.fields,
             "exclude_dnp": options.exclude_dnp
         }))
@@ -827,6 +846,29 @@ mod new_export_format_tests {
             "compression": "zip"
         });
         assert!(handle_export_odb(&args, &ctx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn export_bom_rejects_a_format_kicad_cannot_produce() {
+        let ctx = test_ctx();
+        let result = handle_export_bom(
+            &json!({
+                "schematic": "/tmp/design.kicad_sch",
+                "output": "/tmp/bom.xlsx",
+                "format": "xlsx"
+            }),
+            &ctx,
+        )
+        .await
+        .expect("validation does not spawn kicad-cli");
+
+        assert!(result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["field"], "format");
     }
 }
 
