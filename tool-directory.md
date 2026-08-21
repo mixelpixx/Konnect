@@ -81,7 +81,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
-| `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
+| `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
 
 ### `sch_wiring` · 20 tools
 **Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.

@@ -30,7 +30,7 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_schematic_svg",
-            "Export a schematic sheet to an SVG file using kicad-cli.",
+            "Export a schematic sheet to an SVG file using kicad-cli. The result doubles as a              machine-readable geometry source: kicad-cli writes every string twice — visibly as              stroke paths, and again as an invisible <text opacity=\"0\"> element carrying x, y,              textLength, font-size and text-anchor — so text content, position and width are              checkable without rendering a pixel.",
             json!({
                 "type": "object",
                 "properties": {

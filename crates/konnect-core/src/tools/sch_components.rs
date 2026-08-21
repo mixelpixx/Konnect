@@ -20,10 +20,7 @@ use konnect_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
         pin_outward_direction, read_schematic,
     },
-    writer::{
-        apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
-        SexpEdit,
-    },
+    writer::{apply_edits, read_consistent, write_atomic_if_unchanged, write_new_atomic, SexpEdit},
     ItemId, SchematicCommand,
 };
 use serde_json::json;
@@ -372,7 +369,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_view",
-            "Render the schematic to a PNG image (base64-encoded) via kicad-cli.",
+            "Render a schematic sheet with kicad-cli and return the path to the SVG it wrote.              There is no PNG: KiCad ships no schematic rasteriser — `sch export` offers no bitmap              format and there is no `sch render` — so this is a vector file, not an image that can              be shown inline. It lands in a temporary directory and is overwritten by the next view              of the same sheet; use export_schematic_svg (toolset sch_export) to choose where it              goes. The SVG doubles as a geometry source: kicad-cli writes every string a second              time as an invisible <text opacity=\"0\"> element carrying x, y, textLength, font-size              and text-anchor, so text content, position and width can be checked without rendering              a pixel.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1362,29 +1359,46 @@ async fn handle_batch_get_pin_locations(
     Ok(CallToolResult::json(&json!({ "components": results })))
 }
 
+/// A stable per-schematic directory under the system temp dir.
+///
+/// The old handler made a fresh `konnect_<uuid>` directory for every call and
+/// deleted it again, so nothing survived to be returned. Keeping a uuid per call
+/// would instead leak a directory per call, so the slot is derived from the
+/// schematic's path: repeated views of the same sheet overwrite one file, and
+/// two sheets that merely share a stem do not collide.
+fn schematic_view_dir(schematic: &std::path::Path) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    schematic.hash(&mut hasher);
+    std::env::temp_dir()
+        .join("konnect-schematic-views")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
 async fn handle_get_schematic_view(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let tmp_dir = std::env::temp_dir().join(format!("konnect_{}", new_uuid()));
-    tokio::fs::create_dir_all(&tmp_dir).await?;
+    let out_dir = schematic_view_dir(&sch_path);
+    tokio::fs::create_dir_all(&out_dir).await?;
 
-    // KiCAD 10 CLI only supports SVG export for schematics (no bitmap)
+    // KiCad has no schematic rasteriser: `sch export` offers no bitmap format
+    // and there is no `sch render` at all. SVG is what there is.
     let svg_path =
-        crate::tools::cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &tmp_dir).await?;
+        crate::tools::cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &out_dir).await?;
 
-    let svg_content = tokio::fs::read_to_string(&svg_path).await?;
-    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+    // Deliberately not deleted. The previous handler rendered the file, read its
+    // length, removed it, and then reported "The SVG file has been generated" —
+    // the caller got neither the image nor a path to it.
+    let bytes = tokio::fs::metadata(&svg_path).await?.len();
 
-    // Return as text content (SVG is XML text, not a raster image)
-    Ok(crate::mcp::protocol::CallToolResult {
-        content: vec![crate::mcp::protocol::ToolContent::Text {
-            text: format!("SVG schematic rendered. {} bytes.\n\nNote: KiCAD 10 CLI exports schematics as SVG only (no bitmap). \
-                          The SVG file has been generated. Use export_schematic_pdf for a PDF version.", svg_content.len()),
-        }],
-        is_error: false,
-    })
+    Ok(CallToolResult::json(&json!({
+        "schematic": sch_path.display().to_string(),
+        "svg": svg_path.display().to_string(),
+        "bytes": bytes,
+        "format": "svg"
+    })))
 }
 
 async fn handle_add_component_annotation(
@@ -3563,5 +3577,102 @@ mod page_tests {
         for (n, w, h) in PAPER_SIZES {
             assert!(w > h, "{n} is listed portrait; the table is landscape");
         }
+    }
+}
+
+#[cfg(test)]
+mod schematic_view_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_view_slot_is_stable_for_one_schematic() {
+        let sheet = Path::new("/projects/alpha/power.kicad_sch");
+        assert_eq!(schematic_view_dir(sheet), schematic_view_dir(sheet));
+    }
+
+    /// The old handler used a fresh uuid per call, which is why nothing could
+    /// be returned without leaking a directory per call. Deriving the slot from
+    /// the path bounds it to one per schematic — but it must be the whole path,
+    /// or two projects with a `power.kicad_sch` would overwrite each other.
+    #[test]
+    fn two_sheets_sharing_a_stem_get_different_slots() {
+        let alpha = schematic_view_dir(Path::new("/projects/alpha/power.kicad_sch"));
+        let beta = schematic_view_dir(Path::new("/projects/beta/power.kicad_sch"));
+        assert_ne!(alpha, beta);
+    }
+
+    #[test]
+    fn the_view_slot_lives_under_the_system_temp_dir() {
+        let dir = schematic_view_dir(Path::new("/projects/alpha/power.kicad_sch"));
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "views must not be written next to the caller's project: {}",
+            dir.display()
+        );
+    }
+
+    /// The reported defect, end to end: the tool used to render the SVG, read
+    /// its length, delete it, and report "The SVG file has been generated".
+    /// Needs a real kicad-cli, so it is ignored like the other live tests.
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli on PATH"]
+    async fn the_rendered_svg_survives_the_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sheet = tmp.path().join("view.kicad_sch");
+        std::fs::write(
+            &sheet,
+            "(kicad_sch\n\t(version 20260101)\n\t(generator \"eeschema\")\n\t(uuid \"view-0001\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n",
+        )
+        .unwrap();
+
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string()),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        };
+        let ctx = ToolContext::new(cfg, std::sync::Arc::new(crate::router::ToolRouter::new()));
+        let args = json!({ "schematic": sheet.display().to_string() });
+
+        let first = handle_get_schematic_view(&args, &ctx).await.unwrap();
+        assert!(!first.is_error, "{:?}", first.content);
+        let body: serde_json::Value = match &first.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).expect("the result is JSON, not prose")
+            }
+            _ => panic!("expected text content"),
+        };
+
+        let svg = PathBuf::from(body["svg"].as_str().expect("a path to the SVG"));
+        assert!(
+            svg.exists(),
+            "the file the tool names must still be there: {}",
+            svg.display()
+        );
+        assert_eq!(
+            std::fs::metadata(&svg).unwrap().len(),
+            body["bytes"].as_u64().unwrap(),
+            "the reported size is the file's size"
+        );
+        assert_eq!(body["format"], "svg");
+
+        // The invisible text layer this SVG is also useful for.
+        let content = std::fs::read_to_string(&svg).unwrap();
+        assert!(
+            content.contains("opacity=\"0\""),
+            "kicad-cli writes a machine-readable text layer"
+        );
+
+        // A second view reuses the slot instead of leaving a directory behind.
+        let second = handle_get_schematic_view(&args, &ctx).await.unwrap();
+        let body2: serde_json::Value = match &second.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(body2["svg"], body["svg"]);
     }
 }
