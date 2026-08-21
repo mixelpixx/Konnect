@@ -25,9 +25,15 @@ where
 }
 
 macro_rules! ipc {
-    ($ctx:expr, |$c:ident| $body:expr) => {{
+    ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
         let addr = $ctx.config.ipc_address.clone();
-        match with_ipc(addr, move |$c| $body).await? {
+        let requested_board = get_path($args, "board")?;
+        match with_ipc(addr, move |$c| {
+            $c.ensure_board_is_active(&requested_board)?;
+            $body
+        })
+        .await?
+        {
             Ok(v) => v,
             Err(msg) => {
                 return Ok(CallToolResult::error(format!(
@@ -402,7 +408,7 @@ async fn handle_route_trace(
 
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| c
+    ipc!(ctx, args, |c| c
         .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
     Ok(CallToolResult::json(&json!({
         "net": net_name, "layer": layer, "width": width,
@@ -453,7 +459,7 @@ async fn handle_route_pad_to_pad(
 
     if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
         // Already axis-aligned: single segment
-        ipc!(ctx, |c| c
+        ipc!(ctx, args, |c| c
             .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
     } else {
         // L-bend: horizontal then vertical
@@ -463,7 +469,7 @@ async fn handle_route_pad_to_pad(
         let net_b = net_name.clone();
         let layer_a = layer.clone();
         let layer_b = layer.clone();
-        ipc!(ctx, |c| {
+        ipc!(ctx, args, |c| {
             c.add_track(&net_a, &layer_a, width, x1, y1, mid_x, mid_y)?;
             c.add_track(&net_b, &layer_b, width, mid_x, mid_y, x2, y2)?;
             Ok(())
@@ -539,7 +545,7 @@ async fn handle_add_via(
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
 
     let net_ipc = net_name.clone();
-    ipc!(ctx, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
+    ipc!(ctx, args, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
     Ok(CallToolResult::json(
         &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
     ))
@@ -608,7 +614,7 @@ async fn handle_delete_trace(
     };
 
     let uuid_ipc = uuid.clone();
-    ipc!(ctx, |c| c.delete_track(&uuid_ipc));
+    ipc!(ctx, args, |c| c.delete_track(&uuid_ipc));
     Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })))
 }
 
@@ -619,7 +625,9 @@ async fn handle_query_traces(
     let net = args["net_name"].as_str().map(String::from);
     let layer = args["layer"].as_str().map(String::from);
 
-    let tracks = ipc!(ctx, |c| { c.get_tracks(net.as_deref(), layer.as_deref()) });
+    let tracks = ipc!(ctx, args, |c| {
+        c.get_tracks(net.as_deref(), layer.as_deref())
+    });
 
     let items: Vec<serde_json::Value> = tracks
         .iter()
@@ -639,10 +647,10 @@ async fn handle_query_traces(
 }
 
 async fn handle_get_nets_list(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let nets = ipc!(ctx, |c| c.get_nets());
+    let nets = ipc!(ctx, args, |c| c.get_nets());
     let items: Vec<serde_json::Value> = nets
         .iter()
         .map(|n| json!({ "name": n.name, "netcode": n.netcode }))
@@ -689,7 +697,7 @@ async fn handle_modify_trace(
     let uuid_ipc = uuid.clone();
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| {
+    ipc!(ctx, args, |c| {
         c.delete_track(&uuid_ipc)?;
         c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
     });
@@ -1119,7 +1127,7 @@ async fn handle_route_diff_pair(
     let np_ipc = net_pos.clone();
     let nn_ipc = net_neg.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| {
+    ipc!(ctx, args, |c| {
         c.add_track(
             &np_ipc,
             &layer_ipc,
