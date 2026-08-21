@@ -966,3 +966,224 @@ fn a_pads_uuid_is_never_accepted_as_a_graphic_to_edit() {
         .expect("the actual graphic is still editable");
     assert_eq!(*updates.lock().unwrap(), 1);
 }
+
+// ─── Reading pads back from the live board ───────────────────────────────────
+//
+// The board file is the last save, so a footprint placed through IPC has no
+// pads on disk until the user presses Ctrl+S. Reading them over IPC is what
+// lets a caller place a part and immediately measure it.
+
+fn pad_at(number: &str, x_mm: f64, y_mm: f64, net: &str) -> prost_types::Any {
+    builders::pack_any(
+        &kiapi::board::types::Pad {
+            number: number.to_string(),
+            position: Some(builders::vec2(x_mm, y_mm)),
+            net: Some(kiapi::board::types::Net {
+                code: None,
+                name: net.to_string(),
+            }),
+            pad_stack: Some(kiapi::board::types::PadStack {
+                layers: vec![
+                    kiapi::board::types::BoardLayer::BlFCu as i32,
+                    kiapi::board::types::BoardLayer::BlFPaste as i32,
+                    kiapi::board::types::BoardLayer::BlFMask as i32,
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "kiapi.board.types.Pad",
+    )
+}
+
+fn footprint_with_pads(reference: &str, pads: Vec<prost_types::Any>) -> prost_types::Any {
+    let mut items = pads;
+    // A non-pad child must be skipped rather than decoded as a pad.
+    items.push(builders::pack_any(
+        &builders::board_segment("F.SilkS", 0.12, 0.0, 0.0, 1.0, 0.0),
+        "kiapi.board.types.BoardGraphicShape",
+    ));
+    builders::pack_any(
+        &kiapi::board::types::FootprintInstance {
+            position: Some(builders::vec2(100.0, 100.0)),
+            reference_field: Some(kiapi::board::types::Field {
+                name: "Reference".to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: reference.to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            definition: Some(kiapi::board::types::Footprint {
+                items,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "kiapi.board.types.FootprintInstance",
+    )
+}
+
+fn spawn_kicad_with_footprints(items: Vec<prost_types::Any>) -> MockKicad {
+    spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("GetItems") {
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: items.clone(),
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        Some(ok_response())
+    })
+}
+
+#[test]
+fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
+    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+        "U1",
+        vec![
+            pad_at("A4", 101.155, 66.11, "/VBUS"),
+            pad_at("A5", 102.155, 66.11, ""),
+        ],
+    )]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let pads = client
+        .get_footprint_pads_in(document, "U1")
+        .expect("pad read")
+        .expect("U1 is on the board");
+
+    assert_eq!(pads.len(), 2, "the silk segment must not decode as a pad");
+    assert_eq!(pads[0].number, "A4");
+    assert_eq!(pads[0].x, 101.155);
+    assert_eq!(pads[0].y, 66.11);
+    assert_eq!(pads[0].net, "/VBUS");
+    assert_eq!(pads[0].layers, vec!["F.Cu", "F.Paste", "F.Mask"]);
+    // KiCad names no net on an unconnected pad; "" is that, not a read failure.
+    assert_eq!(pads[1].net, "");
+}
+
+#[test]
+fn an_unreadable_live_pad_is_reported_instead_of_silently_dropped() {
+    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+        "U1",
+        vec![prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
+            value: vec![0xff],
+        }],
+    )]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let error = client
+        .get_footprint_pads_in(document, "U1")
+        .expect_err("malformed pad data must fail the read");
+    assert!(error.to_string().contains("unreadable pad"), "{error:#}");
+}
+
+#[test]
+fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
+    let pad = builders::pack_any(
+        &kiapi::board::types::Pad {
+            number: "1".to_string(),
+            ..Default::default()
+        },
+        "kiapi.board.types.Pad",
+    );
+    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads("U1", vec![pad])]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let error = client
+        .get_footprint_pads_in(document, "U1")
+        .expect_err("missing coordinates must fail the read");
+    assert!(error.to_string().contains("has no position"), "{error:#}");
+}
+
+#[test]
+fn a_footprint_absent_from_the_live_board_reads_as_none() {
+    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+        "U1",
+        vec![pad_at("1", 1.0, 2.0, "GND")],
+    )]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    assert!(client
+        .get_footprint_pads_in(document, "R99")
+        .expect("pad read")
+        .is_none());
+}
+
+#[test]
+fn pad_reads_target_the_named_board_among_several_open() {
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_in_mock = captured.clone();
+
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![
+                    doc_for("other-project.kicad_pcb"),
+                    doc_for("target.kicad_pcb"),
+                ],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        if message.type_url.ends_with("GetItems") {
+            let request =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            record_doc(&captured_in_mock, &request.header);
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: vec![],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        Some(ok_response())
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .expect("target.kicad_pcb is open");
+    let _ = client.get_footprint_pads_in(document, "R1");
+
+    let addressed = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("a command carried a document");
+    assert_eq!(
+        addressed, "target.kicad_pcb",
+        "a read must answer about the requested board, not the first open one"
+    );
+}
