@@ -1847,9 +1847,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_component_pads",
             "Return the pad positions and net assignments for a footprint. \
-             A pad's 'net' is its net name, \"\" if the pad carries no net node \
-             (unconnected), or null if the node is present but unreadable — \
-             treat null as an error, not as an unconnected pad.",
+             Reads the board open in KiCad when it is reachable, else the file — \
+             'source' says which, so unsaved placements are visible without a save. \
+             A pad's 'net' is its net name, \"\" if the pad carries no net \
+             (unconnected), or — reading the file — null if the net node is present \
+             but unreadable; treat null as an error, not as an unconnected pad.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2372,15 +2374,87 @@ async fn handle_find_component(
     })))
 }
 
+/// How many pads the saved file gives `reference`, or `None` when the file
+/// has no footprint by that name.
+fn saved_pad_count(board_path: &std::path::Path, reference: &str) -> Option<usize> {
+    let content = std::fs::read_to_string(board_path).ok()?;
+    let tree = konnect_sexp::parser::parse_sexp(&content).ok()?;
+    tree.find_all("footprint")
+        .into_iter()
+        .find(|fp| {
+            fp.find_all("property").iter().any(|p| {
+                p.get(1).and_then(|n| n.as_str()) == Some("Reference")
+                    && p.get(2).and_then(|n| n.as_str()) == Some(reference)
+            })
+        })
+        .map(|fp| fp.find_all("pad").len())
+}
+
 async fn handle_get_component_pads(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+
+    // The board open in KiCad first: a part placed but not yet saved has no
+    // pads in the file at all, so reading the file would either error or
+    // answer about a stale board while the writers in this toolset act on the
+    // live one. The file stays the fallback for an offline session.
+    let ipc_board = board_path.clone();
+    let ipc_reference = reference.clone();
+    let live = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        let document = c.find_open_board(&ipc_board)?;
+        c.get_footprint_pads_in(document, &ipc_reference)
+    })
+    .await?;
+    match live {
+        // KiCad has the part and reports pads for it.
+        Ok(Some(pads)) if !pads.is_empty() => {
+            let items: Vec<serde_json::Value> = pads
+                .iter()
+                .map(|pad| json!({ "number": pad.number, "x": pad.x, "y": pad.y, "net": pad.net }))
+                .collect();
+            return Ok(CallToolResult::json(&json!({
+                "reference": reference,
+                "pad_count": items.len(),
+                "pads": items,
+                "source": "ipc"
+            })));
+        }
+        // KiCad has the part and reports no pads. A pad-less footprint is
+        // legal — a logo, a mounting graphic — so this is not wrong by
+        // itself. But "no pads" is also what an unread response shape would
+        // look like, and it reads as a plausible answer rather than a
+        // failure, so it is refused whenever the saved file disagrees.
+        Ok(Some(_)) => {
+            if saved_pad_count(&board_path, &reference).is_some_and(|count| count > 0) {
+                return Ok(CallToolResult::error(format!(
+                    "KiCad reports no pads for footprint '{reference}' while the saved file \
+                     has some. Refusing to answer 'no pads' — save the board in KiCad and \
+                     retry, and report this if it persists."
+                )));
+            }
+            return Ok(CallToolResult::json(&json!({
+                "reference": reference,
+                "pad_count": 0,
+                "pads": [],
+                "source": "ipc"
+            })));
+        }
+        // KiCad holds this board and does not have the part: the file may
+        // still carry a footprint the user has deleted, so answering from it
+        // would be answering about a board that no longer exists.
+        Ok(None) => {
+            return Ok(CallToolResult::error(format!(
+                "Footprint '{reference}' not found on the board open in KiCad"
+            )))
+        }
+        Err(_) => {}
+    }
 
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
@@ -2437,9 +2511,12 @@ async fn handle_get_component_pads(
         })
         .collect();
 
-    Ok(CallToolResult::json(
-        &json!({ "reference": reference, "pad_count": pads.len(), "pads": pads }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "pad_count": pads.len(),
+        "pads": pads,
+        "source": "file"
+    })))
 }
 
 async fn handle_get_pad_position(
@@ -2451,6 +2528,9 @@ async fn handle_get_pad_position(
         Err(e) => return Ok(e),
     };
     let pads_result = handle_get_component_pads(args, ctx).await?;
+    if pads_result.is_error {
+        return Ok(pads_result);
+    }
     // Parse the result and filter for the specific pad number
     if let Some(crate::mcp::protocol::ToolContent::Text { text }) = pads_result.content.first() {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -2459,7 +2539,15 @@ async fn handle_get_pad_position(
                     .iter()
                     .find(|p| p["number"].as_str() == Some(&pad_number))
                 {
-                    return Ok(CallToolResult::json(pad));
+                    // Carry the pad list's source, so a caller measuring one
+                    // pad can still tell whether it measured the live board.
+                    let mut pad = pad.clone();
+                    if let (Some(object), Some(source)) =
+                        (pad.as_object_mut(), parsed.get("source"))
+                    {
+                        object.insert("source".to_string(), source.clone());
+                    }
+                    return Ok(CallToolResult::json(&pad));
                 }
             }
         }
@@ -4392,6 +4480,275 @@ mod tests {
             board_before,
             "a reachable KiCAD that says no must never trigger the file fallback"
         );
+    }
+
+    // ─── Reading pads: live board first, file second ──────────────────────────
+
+    /// A board file whose R1 is stale — the state of the last save.
+    const SAVED_BOARD_WITH_R1: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(footprint \"R_0805\"\n\
+        \t\t(at 5 5 0)\n\
+        \t\t(property \"Reference\" \"R1\" (at 0 -1 0) (layer \"F.SilkS\"))\n\
+        \t\t(pad \"1\" smd roundrect (at -0.9 0) (net \"SAVED\"))\n\
+        \t)\n\
+        )\n";
+
+    fn live_pad(number: &str, x: f64, y: f64, net: &str) -> prost_types::Any {
+        konnect_ipc::builders::pack_any(
+            &konnect_ipc::gen::kiapi::board::types::Pad {
+                number: number.to_string(),
+                position: Some(konnect_ipc::builders::vec2(x, y)),
+                net: Some(konnect_ipc::gen::kiapi::board::types::Net {
+                    code: None,
+                    name: net.to_string(),
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.Pad",
+        )
+    }
+
+    fn live_footprint(reference: &str, pads: Vec<prost_types::Any>) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi;
+        konnect_ipc::builders::pack_any(
+            &kiapi::board::types::FootprintInstance {
+                position: Some(konnect_ipc::builders::vec2(100.0, 100.0)),
+                reference_field: Some(kiapi::board::types::Field {
+                    name: "Reference".to_string(),
+                    text: Some(kiapi::board::types::BoardText {
+                        text: Some(kiapi::common::types::Text {
+                            text: reference.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                definition: Some(kiapi::board::types::Footprint {
+                    items: pads,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    /// A rep0 endpoint playing a KiCad that holds `board` open with `items` on
+    /// it — a live board carrying edits the file on disk has never seen.
+    fn spawn_kicad_holding(board: &Path, items: Vec<prost_types::Any>) -> String {
+        use konnect_ipc::gen::kiapi;
+        use nng::options::Options;
+        use prost::Message;
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+
+        let board = board.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            while let Ok(message) = socket.recv() {
+                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                project: None,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board.clone(),
+                                    ),
+                                ),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("GetItems") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: items.clone(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else {
+                    None
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    fn ctx_talking_to(address: String) -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn parsed(res: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&result_text(res)).expect("json result")
+    }
+
+    #[tokio::test]
+    async fn pads_come_from_the_board_kicad_holds_not_the_last_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let address = spawn_kicad_holding(
+            &board,
+            vec![live_footprint(
+                "R1",
+                vec![live_pad("1", 101.155, 66.11, "/VBUS")],
+            )],
+        );
+
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!res.is_error, "{:?}", res.content);
+        let body = parsed(&res);
+        assert_eq!(body["source"], json!("ipc"));
+        assert_eq!(body["pads"][0]["net"], json!("/VBUS"));
+        assert_eq!(body["pads"][0]["x"], json!(101.155));
+    }
+
+    #[tokio::test]
+    async fn a_part_deleted_in_kicad_is_not_answered_from_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let address = spawn_kicad_holding(&board, vec![]);
+
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(res.is_error, "the live board no longer has R1");
+        assert!(result_text(&res).contains("open in KiCad"));
+    }
+
+    #[tokio::test]
+    async fn no_pads_from_kicad_is_refused_when_the_file_has_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        // The part is there, its pads are not — the shape a response we
+        // failed to read would also take.
+        let address = spawn_kicad_holding(&board, vec![live_footprint("R1", vec![])]);
+
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(res.is_error, "'no pads' must not pass as an answer here");
+        assert!(result_text(&res).contains("no pads"));
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_pad_less_footprint_reads_as_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        // The saved file has no LOGO1 to disagree, so KiCad's answer stands.
+        let address = spawn_kicad_holding(&board, vec![live_footprint("LOGO1", vec![])]);
+
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "LOGO1" }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!res.is_error, "{:?}", res.content);
+        let body = parsed(&res);
+        assert_eq!(body["source"], json!("ipc"));
+        assert_eq!(body["pad_count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn pads_fall_back_to_the_file_when_kicad_is_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+
+        let res = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!res.is_error, "{:?}", res.content);
+        let body = parsed(&res);
+        assert_eq!(body["source"], json!("file"));
+        assert_eq!(body["pads"][0]["net"], json!("SAVED"));
+    }
+
+    #[tokio::test]
+    async fn a_pad_position_carries_the_source_of_the_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAVED_BOARD_WITH_R1).unwrap();
+        let address = spawn_kicad_holding(
+            &board,
+            vec![live_footprint(
+                "R1",
+                vec![live_pad("1", 101.155, 66.11, "/VBUS")],
+            )],
+        );
+
+        let res = handle_get_pad_position(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1", "pad_number": "1" }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        let body = parsed(&res);
+        assert_eq!(body["source"], json!("ipc"));
+        assert_eq!(body["x"], json!(101.155));
     }
 
     // ─── board_lib_id / helpers (ported from PR #66) ──────────────────────────
