@@ -364,21 +364,25 @@ fn replace_source_root_uuid(source: &str, uuid: &str) -> anyhow::Result<String> 
         .or_else(|_| anyhow::bail!("could not replace newly inserted schematic UUID {generated}"))
 }
 
+/// Commit one edited sheet item and report whether the document changed.
+///
+/// A command that restates the block already on disk is valid and commits as a
+/// no-op, so callers that set a value unconditionally get `false` here rather
+/// than an error.
 fn commit_edited_sheet_item(
     path: &Path,
     before: &str,
     edited: &cse::Schematic,
     uuid: &str,
     label: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let command = SchematicCommand::replace_item_from_document(
         before,
         &edited.to_source(),
         ItemId::new(uuid)?,
         label,
     )?;
-    commit_command(path, &command)?;
-    Ok(())
+    Ok(commit_command(path, &command)?.changed)
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -544,35 +548,58 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     };
     let sheet_uuid = sheet.uuid.clone();
 
+    // `requested` is what the caller asked to set, `changed` is what actually
+    // differs. They diverge when a caller re-asserts the state that is already
+    // there, which is a request the sheet can honor.
+    let mut requested = Vec::new();
     let mut changed = Vec::new();
     if let Some(new_name) = opt_str(args, "new_name") {
-        sheet.set_name(new_name);
-        changed.push("name");
+        requested.push("name");
+        if sheet.name() != new_name {
+            sheet.set_name(new_name);
+            changed.push("name");
+        }
     }
     if let Some(new_file) = opt_str(args, "new_file") {
-        sheet.set_file(new_file);
-        changed.push("file");
+        requested.push("file");
+        if sheet.file() != new_file {
+            sheet.set_file(new_file);
+            changed.push("file");
+        }
     }
     if let (Some(x), Some(y)) = (opt_f64(args, "x"), opt_f64(args, "y")) {
-        sheet.move_to(x, y);
-        changed.push("position");
+        requested.push("position");
+        if sheet.at.x != x || sheet.at.y != y {
+            sheet.move_to(x, y);
+            changed.push("position");
+        }
     }
     if let (Some(w), Some(h)) = (opt_f64(args, "width"), opt_f64(args, "height")) {
-        sheet.set_size(w, h);
-        changed.push("size");
+        requested.push("size");
+        if sheet.width != w || sheet.height != h {
+            sheet.set_size(w, h);
+            changed.push("size");
+        }
     }
 
-    if changed.is_empty() {
+    if requested.is_empty() {
         return Ok(CallToolResult::error(
             "No fields to change — provide at least one of: new_name, new_file, x+y, width+height",
         ));
     }
 
     let summary = sheet_json(sheet, &project_name);
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet")?;
+    // Skip the commit outright when nothing differs. Writing would reserialise
+    // the whole sheet (#210) and produce a diff for a request that asked for
+    // the state already on disk.
+    if !changed.is_empty() {
+        let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet")?;
+    }
     Ok(CallToolResult::json(&json!({
         "edited": sheet_name,
+        "changed": !changed.is_empty(),
         "changed_fields": changed,
+        "requested_fields": requested,
         "sheet": summary
     })))
 }
@@ -597,10 +624,14 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     match sch.sheets.by_name_mut(&sheet_name) {
         Some(sheet) => {
             let sheet_uuid = sheet.uuid.clone();
-            sheet.move_to(x, y);
-            commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Move sheet")?;
+            let changed = sheet.at.x != x || sheet.at.y != y;
+            if changed {
+                sheet.move_to(x, y);
+                let _ =
+                    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Move sheet")?;
+            }
             Ok(CallToolResult::json(
-                &json!({ "moved": sheet_name, "x": x, "y": y }),
+                &json!({ "moved": sheet_name, "x": x, "y": y, "changed": changed }),
             ))
         }
         None => Ok(CallToolResult::error(format!(
@@ -1082,7 +1113,7 @@ async fn handle_import_sheet_pins(
     }
 
     if !imported.is_empty() {
-        commit_edited_sheet_item(
+        let _ = commit_edited_sheet_item(
             &sch_path,
             &before,
             &parent,
@@ -1150,7 +1181,7 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         x,
         y,
     ));
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Add sheet pin")?;
+    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Add sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "added_pin": pin_name,
@@ -1223,7 +1254,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let summary = json!({
         "name": pin.name, "pin_type": pin.pin_type, "x": pin.at.x, "y": pin.at.y
     });
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet pin")?;
+    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "edited_pin": pin_name,
@@ -1266,7 +1297,7 @@ async fn handle_delete_sheet_pin(
             pin_name, sheet_name
         )));
     }
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Delete sheet pin")?;
+    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Delete sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "deleted_pin": pin_name,
@@ -1407,6 +1438,166 @@ mod tests {
             parent.sheets.by_name("Power Supply").unwrap().page("root"),
             Some("2")
         );
+    }
+
+    fn result_json(result: &CallToolResult) -> Value {
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    async fn sheet_at(tmp: &TempDir, ctx: &ToolContext, x: f64, y: f64) -> PathBuf {
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_file": "power.kicad_sch",
+            "sheet_name": "Power",
+            "x": x, "y": y
+        });
+        handle_add_hierarchical_sheet(&args, ctx).await.unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_accepts_the_position_the_sheet_already_has() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let before = std::fs::read_to_string(&root).unwrap();
+
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "x": 20.0, "y": 20.0
+        });
+        let result = handle_edit_sheet(&args, &ctx).await.unwrap();
+
+        assert!(!result.is_error, "an idempotent edit is not an error");
+        let body = result_json(&result);
+        assert_eq!(body["changed"], json!(false));
+        assert_eq!(body["changed_fields"], json!([]));
+        assert_eq!(body["requested_fields"], json!(["position"]));
+        assert_eq!(
+            std::fs::read_to_string(&root).unwrap(),
+            before,
+            "a no-op edit leaves the file alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_reports_only_the_fields_that_differ() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+
+        // Position is restated, the name is genuinely new.
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "new_name": "Power Supply",
+            "x": 20.0, "y": 20.0
+        });
+        let result = handle_edit_sheet(&args, &ctx).await.unwrap();
+
+        assert!(!result.is_error);
+        let body = result_json(&result);
+        assert_eq!(body["changed"], json!(true));
+        assert_eq!(body["changed_fields"], json!(["name"]));
+        assert_eq!(body["requested_fields"], json!(["name", "position"]));
+    }
+
+    #[tokio::test]
+    async fn move_sheet_accepts_the_position_the_sheet_already_has() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "x": 20.0, "y": 20.0
+        });
+        let result = handle_move_sheet(&args, &ctx).await.unwrap();
+
+        assert!(!result.is_error, "an idempotent move is not an error");
+        assert_eq!(result_json(&result)["changed"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_is_idempotent_on_a_sheet_konnect_already_wrote() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let move_it = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "x": 30.0, "y": 30.0
+        });
+
+        // The first edit rewrites the sheet in Konnect's own serialisation, so
+        // the block round-trips byte-for-byte from here on. That is the state
+        // in which the reported error appeared.
+        let first = handle_edit_sheet(&move_it, &ctx).await.unwrap();
+        assert!(!first.is_error);
+        assert_eq!(result_json(&first)["changed"], json!(true));
+        let settled = std::fs::read_to_string(&root).unwrap();
+
+        let second = handle_edit_sheet(&move_it, &ctx).await.unwrap();
+
+        assert!(
+            !second.is_error,
+            "re-asserting the current position must not error"
+        );
+        assert_eq!(result_json(&second)["changed"], json!(false));
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), settled);
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_accepts_the_position_the_pin_already_has() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let add = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "pin_name": "VCC",
+            "pin_type": "input",
+            "x": 20.0, "y": 25.0
+        });
+        handle_add_sheet_pin(&add, &ctx).await.unwrap();
+
+        let restate = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "pin_name": "VCC",
+            "x": 20.0, "y": 25.0
+        });
+        handle_edit_sheet_pin(&restate, &ctx).await.unwrap();
+        let result = handle_edit_sheet_pin(&restate, &ctx).await.unwrap();
+
+        // This handler does no field pre-comparison; it reaches the command
+        // layer with an identical block and relies on the no-op being legal.
+        assert!(
+            !result.is_error,
+            "the relaxed command layer covers callers that do not pre-compare"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_still_rejects_a_call_with_no_fields() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power"
+        });
+        let result = handle_edit_sheet(&args, &ctx).await.unwrap();
+
+        assert!(result.is_error, "asking for nothing is still an error");
     }
 
     #[tokio::test]

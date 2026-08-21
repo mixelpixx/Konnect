@@ -514,8 +514,10 @@ impl SchematicCommand {
     ///
     /// # Errors
     ///
-    /// Fails for an empty command, duplicate target UUIDs, no-op transitions,
-    /// or blocks whose direct UUID differs from the change ID.
+    /// Fails for an empty command, duplicate target UUIDs, changes that are
+    /// absent on both sides, or blocks whose direct UUID differs from the
+    /// change ID. A replacement that leaves the block unchanged is accepted and
+    /// commits as a no-op.
     pub fn from_changes(
         source: &str,
         label: impl Into<String>,
@@ -580,6 +582,10 @@ pub struct TransactionOutcome {
     pub revision: DocumentRevision,
     /// True when unrelated document content changed after command preparation.
     pub rebased: bool,
+    /// True when the command actually altered the document. False for a command
+    /// whose every change restates the block that is already there — the caller
+    /// asked for the state that exists, and nothing was written.
+    pub changed: bool,
     /// Exact inverse transaction. Committing it performs conflict-safe undo.
     pub inverse: SchematicCommand,
 }
@@ -670,6 +676,7 @@ pub fn prepare_command(
     }
 
     let next = apply_edits(current.to_owned(), edits);
+    let changed = next != current;
     let revision = DocumentRevision::of(&next);
     let inverse = SchematicCommand {
         label: inverse_label(&command.label),
@@ -690,6 +697,7 @@ pub fn prepare_command(
         previous_revision,
         revision,
         rebased: previous_revision != command.base_revision,
+        changed,
         inverse,
     };
     Ok((next, outcome))
@@ -775,9 +783,15 @@ fn validate_changes(changes: &[ItemChange]) -> Result<(), SexpError> {
                 change.id
             )));
         }
-        if change.before == change.after {
+        // A change that is absent on both sides is neither an insertion nor a
+        // deletion, so it cannot be applied. A replacement whose block is
+        // unchanged is a different matter: the caller asked for the state that
+        // already exists, which is a request the document can honor. Committing
+        // it writes nothing (`transact_atomic` skips an identical document) and
+        // reports `changed: false`.
+        if change.before.is_none() && change.after.is_none() {
             return Err(SexpError::InvalidValue(format!(
-                "schematic item {} has no effective change",
+                "schematic item {} is absent before and after the command",
                 change.id
             )));
         }
@@ -1078,6 +1092,70 @@ mod tests {
         let after = before.replace(old, new);
         SchematicCommand::replace_item(source, id, after, "Move item")
             .expect("replacement is valid")
+    }
+
+    #[test]
+    fn restating_the_current_block_commits_as_a_no_op() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, SOURCE).expect("write fixture");
+        // The caller asks for the coordinate the wire already has.
+        let unchanged = replace_coordinate(SOURCE, "wire-a", "10 0", "10 0");
+
+        let outcome = commit_command(&path, &unchanged).expect("no-op command commits");
+
+        assert!(!outcome.changed, "a restated block changes nothing");
+        assert_eq!(outcome.previous_revision, outcome.revision);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read result"),
+            SOURCE,
+            "the document is left byte-for-byte alone"
+        );
+    }
+
+    #[test]
+    fn an_effective_command_reports_changed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, SOURCE).expect("write fixture");
+        let moved = replace_coordinate(SOURCE, "wire-a", "10 0", "20 0");
+
+        let outcome = commit_command(&path, &moved).expect("command commits");
+
+        assert!(outcome.changed);
+        assert_ne!(outcome.previous_revision, outcome.revision);
+    }
+
+    #[test]
+    fn a_change_absent_on_both_sides_is_still_refused() {
+        let id = ItemId::new("wire-a").expect("fixture ID is valid");
+        let error = SchematicCommand::from_changes(
+            SOURCE,
+            "Neither insert nor delete",
+            vec![ItemChange {
+                id,
+                before: None,
+                after: None,
+                anchor: ItemAnchor::BeforeFooter,
+            }],
+        )
+        .expect_err("a change that is absent on both sides cannot be applied");
+
+        assert!(matches!(error, SexpError::InvalidValue(_)), "{error:?}");
+    }
+
+    #[test]
+    fn the_inverse_of_a_no_op_still_commits() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, SOURCE).expect("write fixture");
+        let unchanged = replace_coordinate(SOURCE, "wire-a", "10 0", "10 0");
+
+        let outcome = commit_command(&path, &unchanged).expect("no-op command commits");
+        let undone = commit_command(&path, &outcome.inverse).expect("undo of a no-op commits");
+
+        assert!(!undone.changed);
+        assert_eq!(std::fs::read_to_string(&path).expect("read result"), SOURCE);
     }
 
     #[test]
