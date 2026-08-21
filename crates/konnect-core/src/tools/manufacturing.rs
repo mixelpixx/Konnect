@@ -37,11 +37,6 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Include BOM + pick-and-place files for SMT assembly",
                         "default": true
                     },
-                    "quantity": {
-                        "type": "integer",
-                        "description": "Production quantity (for BOM pricing context)",
-                        "default": 5
-                    },
                     "bom_fields": {
                         "type": "string",
                         "description": "Ordered, comma-separated BOM columns, e.g. 'Reference,Value,Footprint,MPN,${QUANTITY}'. Any schematic field name works — this is how MPN/LCSC columns reach the fab. Omit for KiCAD's default Reference,Value,Footprint,QUANTITY,DNP."
@@ -62,15 +57,14 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "validate_for_manufacturing",
             "Pre-flight check before ordering: verifies the design is ready for the target \
-             fab house. Runs KiCAD's DRC and checks board outline, design rules, BOM \
-             completeness, and assembly constraints. Returns NOT READY — never READY — if \
+             fab house. Runs KiCad's DRC and checks board outline, design rules, footprints, \
+             and routing evidence. Returns NOT READY — never READY — if \
              DRC reports errors or could not be run, so a READY verdict always rests on \
              evidence rather than on an absence of findings.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file (optional, for BOM checks)" },
                     "fab_house": {
                         "type": "string",
                         "description": "Target manufacturer: 'jlcpcb', 'pcbway', 'oshpark'",
@@ -84,12 +78,12 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "estimate_cost",
             "Estimate the total manufacturing cost for PCB fabrication and assembly at a given fab house. \
-             Returns itemized breakdown: PCB, components, assembly, and total.",
+             Counts components from board footprints and returns an itemized rough estimate: \
+             PCB, components, assembly, and total.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file (for component count)" },
                     "fab_house": {
                         "type": "string",
                         "description": "'jlcpcb' (default), 'pcbway'",

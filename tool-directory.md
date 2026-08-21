@@ -7,6 +7,9 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 - Meta-tool definitions: `crates/konnect-core/src/router/meta_tools.rs` (`meta_tool_descriptions()`)
 - Per-tool names + descriptions: `crates/konnect-core/src/tools/<toolset>.rs` (each `tool!(…)` in the `tools()` vec)
 
+Compatibility notes for removed or narrowed arguments are recorded in
+[`docs/API_MIGRATIONS.md`](docs/API_MIGRATIONS.md).
+
 ## Overview
 
 - **19 toolsets** organized into 10 categories
@@ -277,7 +280,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `export_gencad` | Export the PCB in GenCAD format using kicad-cli. |
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
-| `refill_zones` | Refill all copper pour zones over KiCAD IPC. Requires a running KiCAD with the board open — there is no kicad-cli fallback. |
+| `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
 | `get_drc_violations` | Run the Design Rule Check and return a list of violations. |
 
 ---
@@ -341,7 +344,7 @@ bridge and every call failed; `check_freerouting` remains available for diagnost
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run the Design Rule Check on the PCB and return structured violation results. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `check_kicad_ui` | Check whether the KiCAD GUI application is running and responsive. |
@@ -378,7 +381,7 @@ bridge and every call failed; `check_freerouting` remains available for diagnost
 
 | Tool | Description |
 |------|-------------|
-| `audit_decoupling` | Check that all ICs have appropriate decoupling caps. Finds power pins without nearby caps and flags wrong values. |
+| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. |
 | `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. |
 | `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. |
 | `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
@@ -414,8 +417,8 @@ bridge and every call failed; `check_freerouting` remains available for diagnost
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, pick-and-place. Targets JLCPCB, PCBWay, etc. |
-| `validate_for_manufacturing` | Pre-flight check before ordering: verifies the design is ready for the target fab house (board outline, design rules, BOM completeness, assembly constraints). |
-| `estimate_cost` | Estimate total manufacturing cost (PCB + components + assembly) with itemized breakdown. |
+| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
+| `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 
 ---
 

@@ -28,18 +28,13 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "audit_decoupling",
-            "Check that all ICs have appropriate decoupling capacitors. Finds power pins \
-             without nearby capacitors and flags wrong values. The #1 most common PCB design mistake.",
+            "Audit schematic connectivity between IC power nets and decoupling capacitors. \
+             This does not inspect PCB placement distance; use PCB clearance/placement tools \
+             for a physical review.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file (optional, for distance check)" },
-                    "max_distance_mm": {
-                        "type": "number",
-                        "description": "Max allowed distance from power pin to decoupling cap on PCB (mm)",
-                        "default": 5.0
-                    }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
                 },
                 "required": ["schematic"]
             }),
@@ -232,6 +227,8 @@ async fn handle_audit_decoupling(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "audit": "decoupling",
+            "scope": "schematic_connectivity",
+            "pcb_distance_checked": false,
             "findings": findings,
             "pass_count": pass_count,
             "total_power_pins": total_power_pins,

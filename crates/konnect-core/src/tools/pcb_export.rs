@@ -272,16 +272,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "refill_zones",
-            "Refill all copper pour zones on the board. Requires a running KiCAD instance with IPC enabled; returns an error with instructions if KiCAD is not open.",
+            "Refill all copper pour zones on the board. KiCad IPC refills the complete board; per-zone selection is not available. Requires a running KiCad instance with IPC enabled.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "zones": {
-                        "type": "array",
-                        "description": "Net names of specific zones to refill (empty = all zones, currently not filtered)",
-                        "items": { "type": "string" }
-                    }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" }
                 },
                 "required": ["board"]
             }),
