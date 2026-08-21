@@ -65,20 +65,20 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
-| `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
-| `edit_schematic_component` | Update fields (Reference, Value, Footprint, custom properties) of a symbol instance. |
-| `get_schematic_component` | Get all properties, position, and pin locations for a symbol instance. |
+| `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
+| `edit_schematic_component` | Update shared fields consistently across every placed unit of a component. |
+| `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
-| `move_schematic_component` | Move a symbol to a new position. Does NOT adjust connected wires. |
-| `rotate_schematic_component` | Rotate a symbol by setting its absolute rotation angle (0/90/180/270). |
+| `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. |
+| `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
 | `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
-| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring, plus each pin's `orientation_degrees` (the direction leading away from the body, 0 = east) and `length_mm`. |
+| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
-| `add_component_annotation` | Add a custom property (annotation) to a symbol instance. |
-| `group_components` | Add a group property to multiple components in the schematic. |
-| `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
+| `add_component_annotation` | Add or update a custom property across every placed unit of a component. |
+| `group_components` | Add or update a group property across every placed unit of multiple components. |
+| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
 | `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
