@@ -8,9 +8,9 @@ use crate::tool;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use serde_json::json;
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-use super::cli;
+use super::{cli, pcb_export};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -53,6 +53,23 @@ pub fn tools() -> Vec<ToolDef> {
                     "bom_group_by": {
                         "type": "string",
                         "description": "Comma-separated fields whose matching references collapse into one BOM row, e.g. 'Value,Footprint'."
+                    },
+                    "gerber_layers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exact Gerber layers. Omit or pass [] to auto-select enabled copper, F/B.Mask, F/B.SilkS, and Edge.Cuts while excluding documentation layers."
+                    },
+                    "position_side": {
+                        "type": "string",
+                        "enum": ["front", "back", "both"],
+                        "description": "Board side(s) in the assembly position file.",
+                        "default": "both"
+                    },
+                    "position_units": {
+                        "type": "string",
+                        "enum": ["mm", "in"],
+                        "description": "Coordinate units in the assembly position file.",
+                        "default": "mm"
                     }
                 },
                 "required": ["board", "output_dir"]
@@ -123,6 +140,28 @@ async fn handle_export_manufacturing_package(
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
     let include_assembly = args["include_assembly"].as_bool().unwrap_or(true);
     let schematic = args["schematic"].as_str().map(PathBuf::from);
+    let requested_gerber_layers = match pcb_export::optional_string_array(args, "gerber_layers") {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
+    let gerber_layers = if requested_gerber_layers.is_empty() {
+        let board_source = tokio::fs::read_to_string(&board).await?;
+        pcb_export::standard_gerber_layers(&board_source)?
+    } else {
+        requested_gerber_layers
+    };
+    let position_side = args["position_side"].as_str().unwrap_or("both");
+    let position_units = args["position_units"].as_str().unwrap_or("mm");
+    if let Err((field, reason)) =
+        pcb_export::validate_position_values("csv", position_side, position_units)
+    {
+        let public_field = match field {
+            "side" => "position_side",
+            "units" => "position_units",
+            other => other,
+        };
+        return Ok(invalid_manufacturing_argument(public_field, reason));
+    }
 
     info!(
         board = %board.display(),
@@ -136,17 +175,22 @@ async fn handle_export_manufacturing_package(
 
     let cli_path = &ctx.config.kicad_cli;
     let mut files_generated = Vec::new();
+    let mut verified_paths = Vec::new();
     let mut warnings = Vec::new();
 
     // 1. Export Gerbers
     let gerber_dir = output_dir.join("gerbers");
     tokio::fs::create_dir_all(&gerber_dir).await?;
-    match cli::export_gerber(cli_path, &board, &gerber_dir).await {
-        Ok(()) => {
-            info!("[BETA] Gerber export succeeded");
+    let gerber_layer_refs = gerber_layers.iter().map(String::as_str).collect::<Vec<_>>();
+    match cli::export_gerber(cli_path, &board, &gerber_dir, &gerber_layer_refs).await {
+        Ok(gerber_files) => {
+            info!(files = gerber_files.len(), "[BETA] Gerber export succeeded");
+            verified_paths.extend(gerber_files.iter().cloned());
             files_generated.push(json!({
                 "type": "gerber",
-                "path": gerber_dir.to_str().unwrap_or("")
+                "path": gerber_dir.to_str().unwrap_or(""),
+                "layers": gerber_layers.clone(),
+                "files": gerber_files.iter().map(|path| path.to_str().unwrap_or("")).collect::<Vec<_>>()
             }));
         }
         Err(e) => {
@@ -163,22 +207,18 @@ async fn handle_export_manufacturing_package(
     //    the real Excellon output never appeared in the file list at all.
     match cli::export_drill(cli_path, &board, &gerber_dir).await {
         Ok(drill_files) => {
-            if drill_files.is_empty() {
-                warn!("[BETA] Drill export produced no .drl files");
-                warnings.push("Drill export produced no .drl files.".to_string());
-            } else {
-                info!(files = drill_files.len(), "[BETA] Drill export succeeded");
-                for file in &drill_files {
-                    files_generated.push(json!({
-                        "type": "drill",
-                        "path": file.to_str().unwrap_or("")
-                    }));
-                }
+            info!(files = drill_files.len(), "[BETA] Drill export succeeded");
+            verified_paths.extend(drill_files.iter().cloned());
+            for file in &drill_files {
+                files_generated.push(json!({
+                    "type": "drill",
+                    "path": file.to_str().unwrap_or("")
+                }));
             }
         }
         Err(e) => {
-            warn!(error = %e, "[BETA] Drill export failed (may be included in gerbers)");
-            // Not critical — some gerber exports include drill
+            error!(error = %e, "[BETA] Drill export failed");
+            warnings.push(format!("Drill export failed: {e}"));
         }
     }
 
@@ -190,13 +230,25 @@ async fn handle_export_manufacturing_package(
             _ => "csv",
         };
         let pos_path = output_dir.join(format!("positions.{}", pos_format));
-        match cli::export_position_file(cli_path, &board, &pos_path, pos_format).await {
+        match cli::export_position_file(
+            cli_path,
+            &board,
+            &pos_path,
+            pos_format,
+            position_units,
+            position_side,
+        )
+        .await
+        {
             Ok(()) => {
                 info!("[BETA] Position file export succeeded");
+                verified_paths.push(pos_path.clone());
                 files_generated.push(json!({
                     "type": "pick_and_place",
                     "path": pos_path.to_str().unwrap_or(""),
-                    "format": pos_format
+                    "format": pos_format,
+                    "units": position_units,
+                    "side": position_side
                 }));
             }
             Err(e) => {
@@ -220,6 +272,7 @@ async fn handle_export_manufacturing_package(
             match cli::export_bom(cli_path, sch, &bom_path, &bom_options).await {
                 Ok(()) => {
                     info!("[BETA] BOM export succeeded");
+                    verified_paths.push(bom_path.clone());
                     files_generated.push(json!({
                         "type": "bom",
                         "path": bom_path.to_str().unwrap_or(""),
@@ -237,23 +290,30 @@ async fn handle_export_manufacturing_package(
         }
     }
 
-    // List all files in output dir
-    let mut all_files = Vec::new();
-    if let Ok(mut rd) = tokio::fs::read_dir(&output_dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            all_files.push(entry.file_name().to_string_lossy().to_string());
-        }
-    }
-    // Also list gerber subdir
-    if let Ok(mut rd) = tokio::fs::read_dir(&gerber_dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            all_files.push(format!("gerbers/{}", entry.file_name().to_string_lossy()));
-        }
-    }
+    // Derive the public file list only from artifacts the CLI boundary already
+    // verified as regular and non-empty. A stale or empty directory entry can
+    // no longer make an incomplete package look successful (#252).
+    let mut all_files = verified_paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&output_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
     all_files.sort();
+    all_files.dedup();
+
+    let complete = warnings.is_empty();
 
     let summary = format!(
-        "Generated for {}. {} files total. {}",
+        "{} for {}. {} verified non-empty files. {}",
+        if complete {
+            "Complete package"
+        } else {
+            "INCOMPLETE package"
+        },
         fab_house.to_uppercase(),
         all_files.len(),
         if warnings.is_empty() {
@@ -264,27 +324,51 @@ async fn handle_export_manufacturing_package(
     );
 
     info!(
+        complete = complete,
         files = all_files.len(),
         warnings = warnings.len(),
-        "[BETA] Manufacturing package complete"
+        "[BETA] Manufacturing package finished"
     );
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "fab_house": fab_house,
-            "output_dir": output_dir.to_str().unwrap_or(""),
-            "files": all_files,
-            "files_generated": files_generated,
-            "warnings": warnings,
-            "summary": summary,
-            "next_steps": format!(
+    let next_steps = if complete {
+        format!(
                 "Upload the contents of {} to {}'s order page. Gerbers go in the PCB order, BOM + positions go in the assembly order.",
                 output_dir.display(),
                 fab_house.to_uppercase()
             )
-        }))
-        .unwrap(),
-    ))
+    } else {
+        "Do not upload this package. Resolve every warning and export again.".to_string()
+    };
+    let body = serde_json::to_string(&json!({
+        "complete": complete,
+        "fab_house": fab_house,
+        "output_dir": output_dir.to_str().unwrap_or(""),
+        "files": all_files,
+        "files_generated": files_generated,
+        "gerber_layers": gerber_layers,
+        "position_units": if include_assembly { Some(position_units) } else { None },
+        "position_side": if include_assembly { Some(position_side) } else { None },
+        "warnings": warnings,
+        "summary": summary,
+        "next_steps": next_steps
+    }))
+    .unwrap();
+    Ok(if complete {
+        CallToolResult::text(body)
+    } else {
+        CallToolResult::error(body)
+    })
+}
+
+fn invalid_manufacturing_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
 }
 
 async fn handle_validate_for_manufacturing(
@@ -542,6 +626,87 @@ async fn handle_estimate_cost(
         }))
         .unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod package_export_option_tests {
+    use super::*;
+
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn package_schema_exposes_applied_gerber_and_position_options() {
+        let package = tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_manufacturing_package")
+            .unwrap();
+        let properties = &package.input_schema["properties"];
+        assert_eq!(properties["gerber_layers"]["items"]["type"], "string");
+        assert_eq!(properties["position_units"]["enum"], json!(["mm", "in"]));
+        assert_eq!(
+            properties["position_side"]["enum"],
+            json!(["front", "back", "both"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn package_is_an_error_when_cli_success_produces_no_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("live_ipc.kicad_pcb");
+        // Real KiCad 9 output, as required for tests that parse board layers.
+        std::fs::write(
+            &board,
+            include_str!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb"),
+        )
+        .unwrap();
+        let cli = dir.path().join("fake-kicad-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&cli).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&cli, permissions).unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let result = handle_export_manufacturing_package(
+            &json!({
+                "board": board.display().to_string(),
+                "output_dir": dir.path().join("package").display().to_string(),
+                "include_assembly": false
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "incomplete package must fail closed");
+        let body = result_json(&result);
+        assert_eq!(body["complete"], false);
+        assert_eq!(body["files"], json!([]));
+        assert!(body["warnings"].as_array().unwrap().len() >= 2, "{body}");
+        assert!(body["next_steps"]
+            .as_str()
+            .unwrap()
+            .starts_with("Do not upload"));
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
