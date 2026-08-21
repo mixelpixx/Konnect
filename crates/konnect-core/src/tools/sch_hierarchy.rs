@@ -19,7 +19,7 @@ use konnect_sexp::{
     FileTransition, ItemAnchor, ItemId, SchematicCommand,
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
@@ -339,6 +339,91 @@ fn ensure_source_root_uuid(source: &str) -> anyhow::Result<(String, String)> {
         )],
     );
     Ok((updated, uuid))
+}
+
+/// Give every item in a duplicated document its own UUID.
+///
+/// `duplicate_sheet` rewrote only the root `(uuid ...)`. Every nested item —
+/// text, symbols, wires, labels, sheet pins — arrived in the copy still
+/// carrying the source's UUID, so two sheets claimed the same identities and
+/// anything resolving by UUID picks one of them arbitrarily.
+///
+/// Replacements are applied per quoted string rather than by substring, and a
+/// string is remapped segment by segment, so an instance `(path "/a/b")` that
+/// names a renamed item follows it instead of dangling. Matching whole segments
+/// also keeps short non-UUID identifiers, which fixtures and project names use,
+/// from being rewritten where they merely occur inside another word.
+fn regenerate_item_uuids(source: &str) -> String {
+    const DECLARATION: &str = "(uuid \"";
+
+    let mut mapping: HashMap<&str, String> = HashMap::new();
+    let mut rest = source;
+    while let Some(at) = rest.find(DECLARATION) {
+        let body = &rest[at + DECLARATION.len()..];
+        let Some(end) = body.find('"') else { break };
+        let declared = &body[..end];
+        if !declared.is_empty() {
+            mapping
+                .entry(declared)
+                .or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        }
+        rest = &body[end..];
+    }
+    if mapping.is_empty() {
+        return source.to_owned();
+    }
+
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find('"') {
+        out.push_str(&rest[..=at]);
+        let body = &rest[at + 1..];
+        let mut end = None;
+        let mut escaped = false;
+        for (index, ch) in body.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    end = Some(index);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            rest = body;
+            break;
+        };
+        out.push_str(&remap_uuid_string(&body[..end], &mapping));
+        out.push('"');
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remap a quoted string: either the whole value, or each `/`-separated segment
+/// of an instance path.
+fn remap_uuid_string(value: &str, mapping: &HashMap<&str, String>) -> String {
+    if let Some(replacement) = mapping.get(value) {
+        return replacement.clone();
+    }
+    if !value.contains('/') {
+        return value.to_owned();
+    }
+    value
+        .split('/')
+        .map(|segment| {
+            mapping
+                .get(segment)
+                .map_or(segment, |replacement| replacement.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn replace_source_root_uuid(source: &str, uuid: &str) -> anyhow::Result<String> {
@@ -748,8 +833,11 @@ async fn handle_duplicate_sheet(
     let (parent_after, _) = prepare_command(&sch_path, &parent_base, &parent_command)?;
 
     let source_child_content = read_consistent(&source_child)?;
+    // Fresh identities for the copy's own items before the root is renamed;
+    // otherwise the duplicate shares every nested UUID with its source.
+    let refreshed_child = regenerate_item_uuids(&source_child_content);
     let duplicated_uuid = uuid::Uuid::new_v4().to_string();
-    let duplicated_base = replace_source_root_uuid(&source_child_content, &duplicated_uuid)?;
+    let duplicated_base = replace_source_root_uuid(&refreshed_child, &duplicated_uuid)?;
     let hierarchy_path = format!("{root_path}/{sheet_uuid}");
     let (duplicated_after, patched) = if let Some(command) =
         SchematicCommand::ensure_symbol_instance_path(
@@ -1594,6 +1682,164 @@ mod tests {
         let sch1 = cse::Schematic::load(tmp.path().join("amp.kicad_sch")).unwrap();
         let sch2 = cse::Schematic::load(tmp.path().join("amp2.kicad_sch")).unwrap();
         assert_ne!(sch1.uuid, sch2.uuid);
+    }
+
+    fn declared_uuids(source: &str) -> HashSet<String> {
+        const DECLARATION: &str = "(uuid \"";
+        let mut found = HashSet::new();
+        let mut rest = source;
+        while let Some(at) = rest.find(DECLARATION) {
+            let body = &rest[at + DECLARATION.len()..];
+            let Some(end) = body.find('"') else { break };
+            found.insert(body[..end].to_owned());
+            rest = &body[end + 1..];
+        }
+        found
+    }
+
+    #[test]
+    fn regenerating_uuids_replaces_declarations_and_the_paths_that_name_them() {
+        let source = r#"(kicad_sch
+  (symbol (lib_id "Device:R") (uuid "sym-a")
+    (instances (project "demo" (path "/root-a/sym-a" (reference "R1"))))
+  )
+  (text "see sym-a in the notes" (uuid "text-a"))
+  (sheet_instances (path "/root-a" (page "2")))
+)
+"#;
+
+        let out = regenerate_item_uuids(source);
+
+        let before = declared_uuids(source);
+        let after = declared_uuids(&out);
+        assert_eq!(before.len(), 2, "fixture declares two UUIDs");
+        assert_eq!(after.len(), 2, "the copy declares two UUIDs");
+        assert!(
+            before.is_disjoint(&after),
+            "every declaration must change: {before:?} vs {after:?}"
+        );
+
+        // The instance path naming the renamed symbol follows it.
+        let new_symbol = out
+            .split_once("(uuid \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(id, _)| id.to_owned())
+            .expect("symbol uuid present");
+        assert!(
+            out.contains(&format!("(path \"/root-a/{new_symbol}\"")),
+            "the path must follow the renamed item:\n{out}"
+        );
+
+        // Strings that are not declared UUIDs are left alone — including a
+        // sentence that merely contains one, and "root-a", which is a path
+        // segment but was never declared here.
+        assert!(out.contains("(project \"demo\""), "{out}");
+        assert!(out.contains("(reference \"R1\")"), "{out}");
+        assert!(out.contains("(lib_id \"Device:R\")"), "{out}");
+        assert!(
+            out.contains("\"see sym-a in the notes\""),
+            "text content must survive verbatim:\n{out}"
+        );
+        assert!(out.contains("(path \"/root-a\" (page \"2\"))"), "{out}");
+    }
+
+    #[test]
+    fn regenerating_uuids_leaves_a_document_without_any_alone() {
+        let source = "(kicad_sch\n  (lib_symbols)\n)\n";
+        assert_eq!(regenerate_item_uuids(source), source);
+    }
+
+    /// The scan walks every quoted string in the file, so an escaped quote
+    /// inside text content must not shift it out of step — a bug there
+    /// corrupts the whole document, not just the annotation.
+    #[test]
+    fn regenerating_uuids_survives_escaped_quotes_in_text() {
+        let source = r#"(kicad_sch
+  (text "a \"b\" c" (uuid "text-a"))
+  (generator "konnect")
+)
+"#;
+
+        let out = regenerate_item_uuids(source);
+
+        assert!(
+            out.contains("(generator \"konnect\")"),
+            "a later string was corrupted by the escape:\n{out}"
+        );
+        assert!(out.contains(r#""a \"b\" c""#), "{out}");
+        assert!(!out.contains("text-a"), "{out}");
+    }
+
+    /// The report: `add_schematic_text` then `duplicate_sheet` leaves both
+    /// sheets carrying the same text UUID.
+    #[tokio::test]
+    async fn duplicate_sheet_gives_the_copy_its_own_item_uuids() {
+        const SOURCE_TEXT_UUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "amp.kicad_sch",
+                "sheet_name": "Amp1",
+                "x": 10.0, "y": 10.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // An annotation in the child, shaped as add_schematic_text writes one.
+        let child = tmp.path().join("amp.kicad_sch");
+        let content = std::fs::read_to_string(&child).unwrap();
+        let cut = content.rfind(')').unwrap();
+        let block = format!(
+            "\n  (text \"NOTE\"\n    (at 10 10 0)\n    \
+             (effects (font (size 1.27 1.27)) (justify left bottom))\n    \
+             (uuid \"{SOURCE_TEXT_UUID}\")\n  )\n"
+        );
+        std::fs::write(
+            &child,
+            format!("{}{}{}", &content[..cut], block, &content[cut..]),
+        )
+        .unwrap();
+
+        let result = handle_duplicate_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "source_sheet_name": "Amp1",
+                "new_sheet_name": "Amp2",
+                "new_file": "amp2.kicad_sch"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let source_ids = declared_uuids(&std::fs::read_to_string(&child).unwrap());
+        let copy_ids =
+            declared_uuids(&std::fs::read_to_string(tmp.path().join("amp2.kicad_sch")).unwrap());
+
+        assert!(
+            source_ids.contains(SOURCE_TEXT_UUID),
+            "the source keeps its own annotation"
+        );
+        assert!(
+            !copy_ids.contains(SOURCE_TEXT_UUID),
+            "the copy kept the source's text UUID"
+        );
+        assert!(
+            source_ids.is_disjoint(&copy_ids),
+            "no UUID may be shared between a sheet and its copy:\n{source_ids:?}\n{copy_ids:?}"
+        );
+        assert_eq!(
+            source_ids.len(),
+            copy_ids.len(),
+            "same items, new identities"
+        );
     }
 
     #[tokio::test]
