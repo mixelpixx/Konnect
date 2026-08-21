@@ -10,7 +10,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
-use super::cli;
+use super::{cli, pcb_export};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -53,6 +53,23 @@ pub fn tools() -> Vec<ToolDef> {
                     "bom_group_by": {
                         "type": "string",
                         "description": "Comma-separated fields whose matching references collapse into one BOM row, e.g. 'Value,Footprint'."
+                    },
+                    "gerber_layers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exact Gerber layers. Omit or pass [] to auto-select enabled copper, F/B.Mask, F/B.SilkS, and Edge.Cuts while excluding documentation layers."
+                    },
+                    "position_side": {
+                        "type": "string",
+                        "enum": ["front", "back", "both"],
+                        "description": "Board side(s) in the assembly position file.",
+                        "default": "both"
+                    },
+                    "position_units": {
+                        "type": "string",
+                        "enum": ["mm", "in"],
+                        "description": "Coordinate units in the assembly position file.",
+                        "default": "mm"
                     }
                 },
                 "required": ["board", "output_dir"]
@@ -123,6 +140,28 @@ async fn handle_export_manufacturing_package(
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
     let include_assembly = args["include_assembly"].as_bool().unwrap_or(true);
     let schematic = args["schematic"].as_str().map(PathBuf::from);
+    let requested_gerber_layers = match pcb_export::optional_string_array(args, "gerber_layers") {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
+    let gerber_layers = if requested_gerber_layers.is_empty() {
+        let board_source = tokio::fs::read_to_string(&board).await?;
+        pcb_export::standard_gerber_layers(&board_source)?
+    } else {
+        requested_gerber_layers
+    };
+    let position_side = args["position_side"].as_str().unwrap_or("both");
+    let position_units = args["position_units"].as_str().unwrap_or("mm");
+    if let Err((field, reason)) =
+        pcb_export::validate_position_values("csv", position_side, position_units)
+    {
+        let public_field = match field {
+            "side" => "position_side",
+            "units" => "position_units",
+            other => other,
+        };
+        return Ok(invalid_manufacturing_argument(public_field, reason));
+    }
 
     info!(
         board = %board.display(),
@@ -141,12 +180,14 @@ async fn handle_export_manufacturing_package(
     // 1. Export Gerbers
     let gerber_dir = output_dir.join("gerbers");
     tokio::fs::create_dir_all(&gerber_dir).await?;
-    match cli::export_gerber(cli_path, &board, &gerber_dir).await {
+    let gerber_layer_refs = gerber_layers.iter().map(String::as_str).collect::<Vec<_>>();
+    match cli::export_gerber(cli_path, &board, &gerber_dir, &gerber_layer_refs).await {
         Ok(()) => {
             info!("[BETA] Gerber export succeeded");
             files_generated.push(json!({
                 "type": "gerber",
-                "path": gerber_dir.to_str().unwrap_or("")
+                "path": gerber_dir.to_str().unwrap_or(""),
+                "layers": gerber_layers.clone()
             }));
         }
         Err(e) => {
@@ -190,13 +231,24 @@ async fn handle_export_manufacturing_package(
             _ => "csv",
         };
         let pos_path = output_dir.join(format!("positions.{}", pos_format));
-        match cli::export_position_file(cli_path, &board, &pos_path, pos_format).await {
+        match cli::export_position_file(
+            cli_path,
+            &board,
+            &pos_path,
+            pos_format,
+            position_units,
+            position_side,
+        )
+        .await
+        {
             Ok(()) => {
                 info!("[BETA] Position file export succeeded");
                 files_generated.push(json!({
                     "type": "pick_and_place",
                     "path": pos_path.to_str().unwrap_or(""),
-                    "format": pos_format
+                    "format": pos_format,
+                    "units": position_units,
+                    "side": position_side
                 }));
             }
             Err(e) => {
@@ -275,6 +327,9 @@ async fn handle_export_manufacturing_package(
             "output_dir": output_dir.to_str().unwrap_or(""),
             "files": all_files,
             "files_generated": files_generated,
+            "gerber_layers": gerber_layers,
+            "position_units": if include_assembly { Some(position_units) } else { None },
+            "position_side": if include_assembly { Some(position_side) } else { None },
             "warnings": warnings,
             "summary": summary,
             "next_steps": format!(
@@ -285,6 +340,17 @@ async fn handle_export_manufacturing_package(
         }))
         .unwrap(),
     ))
+}
+
+fn invalid_manufacturing_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
 }
 
 async fn handle_validate_for_manufacturing(
@@ -542,6 +608,26 @@ async fn handle_estimate_cost(
         }))
         .unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod package_export_option_tests {
+    use super::*;
+
+    #[test]
+    fn package_schema_exposes_applied_gerber_and_position_options() {
+        let package = tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_manufacturing_package")
+            .unwrap();
+        let properties = &package.input_schema["properties"];
+        assert_eq!(properties["gerber_layers"]["items"]["type"], "string");
+        assert_eq!(properties["position_units"]["enum"], json!(["mm", "in"]));
+        assert_eq!(
+            properties["position_side"]["enum"],
+            json!(["front", "back", "both"])
+        );
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

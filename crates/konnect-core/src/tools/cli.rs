@@ -536,16 +536,32 @@ pub async fn export_netlist(
 
 // ─── PCB Export ──────────────────────────────────────────────────────────────
 
-/// KiCAD 10: `pcb export gerbers --output <dir> <input>` (PLURAL!)
-pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<()> {
-    let args = [
-        "pcb",
-        "export",
-        "gerbers",
-        "--output",
-        output_dir.to_str().unwrap(),
-        pcb.to_str().unwrap(),
-    ];
+/// Argument vector for Gerber export. KiCad's plural `gerbers` subcommand
+/// accepts the complete selection as one comma-separated `--layers` value.
+fn gerber_args<'a>(output_dir: &'a str, pcb: &'a str, layers_csv: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["pcb", "export", "gerbers", "--output", output_dir];
+    if !layers_csv.is_empty() {
+        args.push("--layers");
+        args.push(layers_csv);
+    }
+    args.push(pcb);
+    args
+}
+
+/// KiCad 10: `pcb export gerbers --output <dir> [--layers <csv>] <input>`
+/// (PLURAL!)
+pub async fn export_gerber(
+    cli: &str,
+    pcb: &Path,
+    output_dir: &Path,
+    layers: &[&str],
+) -> Result<()> {
+    let layers_csv = layers.join(",");
+    let args = gerber_args(
+        output_dir.to_str().unwrap_or(""),
+        pcb.to_str().unwrap_or(""),
+        &layers_csv,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -691,24 +707,49 @@ pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Re
     Ok(())
 }
 
-/// KiCAD 10: `pcb export pos --output <path> --format <fmt> <input>`
-/// Formats: ascii (default), csv, gerber
+/// Argument vector for position export, factored out so the public options can
+/// be regression-tested without a kicad-cli installation.
+fn position_args<'a>(
+    output: &'a str,
+    pcb: &'a str,
+    format: &'a str,
+    units: &'a str,
+    side: &'a str,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "pcb", "export", "pos", "--output", output, "--format", format, "--side", side,
+    ];
+    // Gerber coordinates have format-defined units; KiCad only accepts this
+    // option for its ASCII and CSV position formats.
+    if format != "gerber" {
+        args.push("--units");
+        args.push(units);
+    }
+    args.push(pcb);
+    args
+}
+
+/// KiCad 10: `pcb export pos --output <path> --format <fmt> --side <side>
+/// [--units <units>] <input>`
+///
+/// KiCad itself omits footprints carrying `exclude_from_pos_files`; Konnect
+/// deliberately leaves that source-of-truth filtering to the exporter rather
+/// than trying to post-process CSV and Gerber output differently.
 pub async fn export_position_file(
     cli: &str,
     pcb: &Path,
     output: &Path,
     format: &str,
+    units: &str,
+    side: &str,
 ) -> Result<()> {
-    let args = [
-        "pcb",
-        "export",
-        "pos",
-        "--output",
-        output.to_str().unwrap(),
-        "--format",
+    let args = position_args(
+        output.to_str().unwrap_or(""),
+        pcb.to_str().unwrap_or(""),
         format,
-        pcb.to_str().unwrap(),
-    ];
+        units,
+        side,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -1181,6 +1222,72 @@ mod erc_parse_tests {
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod gerber_export_tests {
+    use super::*;
+
+    #[test]
+    fn requested_layers_reach_kicad_as_one_csv_argument() {
+        let args = gerber_args(
+            "/out/gerbers",
+            "/tmp/board.kicad_pcb",
+            "F.Cu,In1.Cu,B.Cu,F.Mask,B.Mask,Edge.Cuts",
+        );
+        let layers = args
+            .iter()
+            .position(|argument| *argument == "--layers")
+            .map(|index| args[index + 1]);
+        assert_eq!(layers, Some("F.Cu,In1.Cu,B.Cu,F.Mask,B.Mask,Edge.Cuts"));
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[test]
+    fn empty_layer_selection_keeps_the_flag_absent() {
+        let args = gerber_args("/out", "/tmp/board.kicad_pcb", "");
+        assert!(!args.contains(&"--layers"));
+    }
+}
+
+#[cfg(test)]
+mod position_export_tests {
+    use super::*;
+
+    fn flag<'a>(args: &'a [&str], name: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|argument| *argument == name)
+            .map(|index| args[index + 1])
+    }
+
+    #[test]
+    fn csv_units_and_side_reach_kicad_cli() {
+        let args = position_args(
+            "/out/positions.csv",
+            "/tmp/board.kicad_pcb",
+            "csv",
+            "mm",
+            "back",
+        );
+        assert_eq!(flag(&args, "--format"), Some("csv"));
+        assert_eq!(flag(&args, "--units"), Some("mm"));
+        assert_eq!(flag(&args, "--side"), Some("back"));
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[test]
+    fn gerber_position_export_does_not_claim_a_units_flag() {
+        let args = position_args(
+            "/out/positions.gbr",
+            "/tmp/board.kicad_pcb",
+            "gerber",
+            "mm",
+            "front",
+        );
+        assert_eq!(flag(&args, "--format"), Some("gerber"));
+        assert_eq!(flag(&args, "--side"), Some("front"));
+        assert_eq!(flag(&args, "--units"), None);
     }
 }
 
