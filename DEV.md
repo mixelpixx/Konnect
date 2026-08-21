@@ -2,6 +2,10 @@
 
 Internal reference for developing and maintaining the Rust port.
 
+New to the codebase? Start with the map in
+[docs/DEVELOPER_OVERVIEW.md](docs/DEVELOPER_OVERVIEW.md), then return here for
+the detailed implementation reference and current statistics.
+
 Repository-wide naming, public API, branch, and pull-request rules live in
 [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md).
 
