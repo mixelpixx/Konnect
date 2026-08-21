@@ -151,7 +151,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Scope: 'global' or 'project'",
                         "default": "project"
                     },
-                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" },
                     "replace_existing": {
                         "type": "boolean",
                         "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
@@ -279,7 +279,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Scope: 'global' or 'project'",
                         "default": "project"
                     },
-                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" },
                     "replace_existing": {
                         "type": "boolean",
                         "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
@@ -1730,6 +1730,40 @@ fn lexical_relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
 ///
 /// Shared by the symbol and footprint registrars so the two cannot drift: both
 /// need the same `${KIPRJMOD}` portability and the same empty-parent guard.
+/// Resolve the caller's `project` argument to the directory whose library table
+/// KiCad actually reads.
+///
+/// The schema documents a `.kicad_pro` path, but every other tool on this
+/// surface takes a project directory and callers pass one. Taking `parent()`
+/// unconditionally then lands one level *above* the project — a directory that
+/// holds no `.kicad_pro` and that KiCad never consults. The write succeeds
+/// there and reports `inserted`, so two projects sharing a parent end up
+/// sharing one stray table that neither of them reads.
+///
+/// A path that is neither an existing directory nor recognisable as a file is
+/// refused rather than guessed at, because guessing is what produced the stray
+/// table.
+fn project_table_dir(project: &str) -> Result<PathBuf, CallToolResult> {
+    let path = PathBuf::from(project);
+    if path.is_dir() {
+        return Ok(path);
+    }
+    let looks_like_a_file =
+        path.is_file() || path.extension().is_some_and(|ext| ext == "kicad_pro");
+    if looks_like_a_file {
+        // `Path::new("board.kicad_pro").parent()` is Some("") — an empty path,
+        // not None — so the `.` default needs an explicit emptiness check.
+        return Ok(path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf());
+    }
+    Err(CallToolResult::error(format!(
+        "'project' must be a .kicad_pro file or an existing project directory, got '{project}'"
+    )))
+}
+
 fn lib_table_target(
     scope: &str,
     project: Option<&str>,
@@ -1745,13 +1779,7 @@ fn lib_table_target(
             "For project scope, provide 'project' path to .kicad_pro file",
         ));
     };
-    // `Path::new("board.kicad_pro").parent()` is Some("") — an empty path, not
-    // None — so the `.` default needs an explicit emptiness check.
-    let table_dir = PathBuf::from(proj)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let table_dir = project_table_dir(proj)?;
     let uri = project_relative_uri(lib_path, &table_dir);
     let uri = if uri.starts_with("${KIPRJMOD}") {
         uri
@@ -4546,6 +4574,86 @@ mod tests {
         assert!(!updated.contains("C:/stale"));
     }
 
+    /// The whole reported failure, end to end: two projects side by side under
+    /// one parent, the same nickname registered in each. Before, both resolved
+    /// to a stray table in the parent, so the second call reported `unchanged`
+    /// against the first project's entry and neither project ever saw one.
+    #[tokio::test]
+    async fn registering_by_project_directory_keeps_two_projects_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        let library = tmp.path().join("shared.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+
+        let register = |project: std::path::PathBuf| {
+            let library = library.clone();
+            async move {
+                handle_register_symbol_library(
+                    &json!({
+                        "library_path": library,
+                        "nickname": "Shared",
+                        "project": project
+                    }),
+                    &test_ctx(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let first = register(alpha.clone()).await;
+        let second = register(beta.clone()).await;
+
+        assert!(!first.is_error, "{:?}", first.content);
+        assert!(!second.is_error, "{:?}", second.content);
+        let first: serde_json::Value = serde_json::from_str(&result_text(&first)).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&result_text(&second)).unwrap();
+        assert_eq!(first["state"], "inserted");
+        assert_eq!(
+            second["state"], "inserted",
+            "the second project must get its own entry, not `unchanged`"
+        );
+
+        assert!(
+            alpha.join("sym-lib-table").exists(),
+            "alpha must carry its own table"
+        );
+        assert!(
+            beta.join("sym-lib-table").exists(),
+            "beta must carry its own table"
+        );
+        assert!(
+            !tmp.path().join("sym-lib-table").exists(),
+            "nothing may be written above the projects"
+        );
+    }
+
+    /// A project argument that names nothing is refused instead of resolving to
+    /// its parent and reporting success there.
+    #[tokio::test]
+    async fn registering_against_a_missing_project_refuses_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("parts.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": library,
+                "nickname": "Parts",
+                "project": tmp.path().join("no-such-project")
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{:?}", result.content);
+        assert!(!tmp.path().join("sym-lib-table").exists());
+    }
+
     #[tokio::test]
     async fn register_footprint_library_rejects_duplicate_nicknames_without_writing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6732,6 +6840,175 @@ mod symbol_source_tests {
 
     /// Both registrars share one target helper, so footprints get the same
     /// portable URI and the same empty-parent guard as symbols.
+    /// The report: passing the project *directory* resolved one level above it,
+    /// so the table landed where KiCad never looks and the call still said
+    /// `inserted`.
+    #[test]
+    fn a_project_directory_resolves_to_its_own_table() {
+        let parent = tempfile::tempdir().unwrap();
+        let proj = parent.path().join("board");
+        std::fs::create_dir_all(proj.join("lib")).unwrap();
+        let sym = proj.join("lib/parts.kicad_sym");
+        std::fs::write(&sym, "(kicad_symbol_lib)\n").unwrap();
+
+        let (table, uri) = lib_table_target(
+            "project",
+            proj.to_str(),
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("a project directory is a usable project argument");
+
+        assert_eq!(table, proj.join("sym-lib-table"));
+        assert_ne!(
+            table,
+            parent.path().join("sym-lib-table"),
+            "the table must not land above the project"
+        );
+        assert_eq!(uri, "${KIPRJMOD}/lib/parts.kicad_sym");
+    }
+
+    /// Both spellings of the same project must name the same table, or a caller
+    /// gets a different answer depending on which one it happened to pass.
+    #[test]
+    fn a_project_file_and_its_directory_agree() {
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join("lib")).unwrap();
+        let sym = proj.path().join("lib/parts.kicad_sym");
+        std::fs::write(&sym, "(kicad_symbol_lib)\n").unwrap();
+        let proj_file = proj.path().join("board.kicad_pro");
+        std::fs::write(&proj_file, "{}\n").unwrap();
+
+        let from_file = lib_table_target(
+            "project",
+            proj_file.to_str(),
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("project file");
+        let from_dir = lib_table_target(
+            "project",
+            proj.path().to_str(),
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("project directory");
+
+        assert_eq!(from_file, from_dir);
+    }
+
+    /// The follow-on failure in the report: with both projects resolving to the
+    /// same stray table, registering a nickname for the second one came back
+    /// `unchanged` because the handler was reading the first one's entry.
+    #[test]
+    fn two_projects_under_one_parent_get_separate_tables() {
+        let parent = tempfile::tempdir().unwrap();
+        let one = parent.path().join("alpha");
+        let two = parent.path().join("beta");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let lib = parent.path().join("shared.kicad_sym");
+        std::fs::write(&lib, "(kicad_symbol_lib)\n").unwrap();
+
+        let (table_one, _) = lib_table_target(
+            "project",
+            one.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("first project");
+        let (table_two, _) = lib_table_target(
+            "project",
+            two.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("second project");
+
+        assert_ne!(
+            table_one, table_two,
+            "two projects must not share one table"
+        );
+        assert_eq!(table_one, one.join("sym-lib-table"));
+        assert_eq!(table_two, two.join("sym-lib-table"));
+    }
+
+    /// A path that is neither a directory nor recognisable as a file is refused
+    /// rather than resolved to its parent — guessing is what produced the stray
+    /// table in the first place.
+    #[test]
+    fn an_unusable_project_argument_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("no-such-project");
+        let lib = parent.path().join("parts.kicad_sym");
+        std::fs::write(&lib, "(kicad_symbol_lib)\n").unwrap();
+
+        let result = lib_table_target(
+            "project",
+            missing.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        );
+
+        assert!(
+            result.is_err(),
+            "a path that names nothing must not resolve"
+        );
+        assert!(
+            !parent.path().join("sym-lib-table").exists(),
+            "nothing may be written above the project"
+        );
+    }
+
+    /// A `.kicad_pro` that does not exist yet still resolves — the project file
+    /// is often written by the very next call.
+    #[test]
+    fn a_project_file_not_yet_on_disk_still_resolves() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("parts.kicad_sym");
+        std::fs::write(&lib, "(kicad_symbol_lib)\n").unwrap();
+        let not_yet = proj.path().join("board.kicad_pro");
+
+        let (table, _) = lib_table_target(
+            "project",
+            not_yet.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("a .kicad_pro path resolves whether or not it exists yet");
+
+        assert_eq!(table, proj.path().join("sym-lib-table"));
+    }
+
+    /// The footprint registrar shares `lib_table_target`, so the directory form
+    /// has to reach it too.
+    #[test]
+    fn the_footprint_registrar_takes_a_project_directory_as_well() {
+        let parent = tempfile::tempdir().unwrap();
+        let proj = parent.path().join("board");
+        std::fs::create_dir_all(proj.join("lib/parts.pretty")).unwrap();
+        let fp = proj.join("lib/parts.pretty");
+
+        let (table, uri) = lib_table_target(
+            "project",
+            proj.to_str(),
+            &fp,
+            global_fp_lib_table(),
+            "fp-lib-table",
+        )
+        .expect("footprint target");
+
+        assert_eq!(table, proj.join("fp-lib-table"));
+        assert_eq!(uri, "${KIPRJMOD}/lib/parts.pretty");
+    }
+
     #[test]
     fn both_registrars_agree_on_the_project_table_target() {
         let proj = tempfile::tempdir().unwrap();
