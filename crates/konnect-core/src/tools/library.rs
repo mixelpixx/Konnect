@@ -44,8 +44,14 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
                 "enum": ["line", "inverted", "clock", "inverted_clock", "input_low", "clock_low", "output_low", "edge_clock_high", "non_logic"],
                 "description": "Pin graphic style (default 'line'). 'inverted' = active-low bubble, 'clock' = clock input, etc. Works with any body shape."
             },
-            "x": { "type": "number" },
-            "y": { "type": "number" },
+            "x": {
+                "type": "number",
+                "description": "Starting position, not a fixed one. For a rectangle body the box is sized to fit the pin names and every pin whose angle names an edge is then aligned to that edge, so a pin can end up further out than requested. A `glyph` body ignores x/y entirely. The response reports where each pin actually ended up under `units[].pins`, with `requested` alongside whenever it differs."
+            },
+            "y": {
+                "type": "number",
+                "description": "Starting position, not a fixed one — see `x`."
+            },
             "angle": { "type": "number", "default": 0 },
             "length": { "type": "number", "default": 2.54 }
         },
@@ -203,7 +209,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "pins": {
                         "type": "array",
-                        "description": "Pin definitions. x/y position the rectangle body and are ignored when a `glyph` is set.",
+                        "description": "Pin definitions. x/y size and position the rectangle body rather than fixing the pins: see the per-pin `x`. They are ignored entirely when a `glyph` is set.",
                         "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').", false)
                     },
                     "show_pin_names": { "type": "boolean", "description": "Show pin names on the symbol (default true).", "default": true },
@@ -2798,7 +2804,7 @@ fn glyph_geom(g: Glyph) -> GlyphGeom {
 fn build_glyph_unit(
     pins_val: &[serde_json::Value],
     g: Glyph,
-) -> Result<(String, SymbolRect), String> {
+) -> Result<(String, SymbolRect, Vec<ResolvedPin>), String> {
     let mut inputs: Vec<&serde_json::Value> = Vec::new();
     let mut outputs: Vec<&serde_json::Value> = Vec::new();
     let mut powers: Vec<&serde_json::Value> = Vec::new();
@@ -2837,9 +2843,11 @@ fn build_glyph_unit(
 
     let geom = glyph_geom(g);
     let mut sexp = geom.body.clone();
+    let mut resolved = Vec::with_capacity(pins_val.len());
 
     // Inputs map onto the glyph anchors in the caller's order (top-to-bottom).
     for (p, &(x, y, angle, length)) in inputs.iter().zip(geom.inputs.iter()) {
+        resolved.push(ResolvedPin::new(p, x, y));
         let number = p["number"].as_str().unwrap_or("1");
         let name = p["name"].as_str().unwrap_or("~");
         let style = pin_style_token(p["style"].as_str());
@@ -2868,6 +2876,7 @@ fn build_glyph_unit(
         None => "line",
     };
     let (ox, oy, oa, ol) = geom.output;
+    resolved.push(ResolvedPin::new(out, ox, oy));
     sexp.push_str(&emit_pin(
         out_type,
         out_style,
@@ -2895,6 +2904,7 @@ fn build_glyph_unit(
             let (ax, ay) = geom.power_bottom;
             (ax, ay - length, 90.0) // bulb below, root on the bottom edge
         };
+        resolved.push(ResolvedPin::new(p, x, y));
         sexp.push_str(&emit_pin(
             ptype,
             style,
@@ -2908,7 +2918,7 @@ fn build_glyph_unit(
         ));
     }
 
-    Ok((sexp, Some(geom.rect)))
+    Ok((sexp, Some(geom.rect), resolved))
 }
 
 /// Build one unit's inner S-expression — an optional body (a rectangle, or a
@@ -2925,26 +2935,49 @@ fn build_symbol_unit(
     pins_val: &[serde_json::Value],
     glyph: Option<Glyph>,
     show_names: bool,
-) -> anyhow::Result<(String, SymbolRect, Option<String>)> {
+) -> anyhow::Result<BuiltUnit> {
     validate_pin_types(pins_val)?;
     if let Some(g) = glyph {
         if g != Glyph::Rectangle {
             match build_glyph_unit(pins_val, g) {
-                Ok((sexp, rect)) => return Ok((sexp, rect, None)),
+                Ok((sexp, rect, pins)) => {
+                    return Ok(BuiltUnit {
+                        sexp,
+                        rect,
+                        warning: None,
+                        body: g.name(),
+                        pins,
+                    })
+                }
                 Err(reason) => {
-                    let (sexp, rect) = build_rect_unit(pins_val, show_names);
-                    return Ok((sexp, rect, Some(reason)));
+                    let (sexp, rect, pins) = build_rect_unit(pins_val, show_names);
+                    return Ok(BuiltUnit {
+                        sexp,
+                        rect,
+                        warning: Some(reason),
+                        body: "rectangle",
+                        pins,
+                    });
                 }
             }
         }
     }
-    let (sexp, rect) = build_rect_unit(pins_val, show_names);
-    Ok((sexp, rect, None))
+    let (sexp, rect, pins) = build_rect_unit(pins_val, show_names);
+    Ok(BuiltUnit {
+        sexp,
+        rect,
+        warning: None,
+        body: "rectangle",
+        pins,
+    })
 }
 
 /// The default rectangle body + caller-positioned pins. Pin types are assumed
 /// already validated by `build_symbol_unit`.
-fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String, SymbolRect) {
+fn build_rect_unit(
+    pins_val: &[serde_json::Value],
+    show_names: bool,
+) -> (String, SymbolRect, Vec<ResolvedPin>) {
     let mut pin_geoms: Vec<PinGeom> = Vec::new();
     for pin in pins_val {
         pin_geoms.push(PinGeom {
@@ -2971,7 +3004,9 @@ fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String,
     }
 
     let mut pins_sexp = String::new();
+    let mut resolved = Vec::with_capacity(pins_val.len());
     for (pin, g) in pins_val.iter().zip(&pin_geoms) {
+        resolved.push(ResolvedPin::new(pin, g.x, g.y));
         pins_sexp.push_str(&emit_pin(
             pin["type"].as_str().unwrap_or("passive"),
             pin_style_token(pin["style"].as_str()),
@@ -2991,10 +3026,110 @@ fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String,
         ),
         None => String::new(),
     };
-    (format!("{}{}", body_sexp, pins_sexp), body)
+    (format!("{}{}", body_sexp, pins_sexp), body, resolved)
 }
 
 type SymbolRect = Option<(f64, f64, f64, f64)>;
+
+/// Where a pin ended up, next to where the caller asked for it.
+///
+/// `create_symbol` treats a pin's `x`/`y` as a starting point, not a fixed
+/// position: the body is sized to fit the pin names and every pin on an edge is
+/// then aligned to that edge. Callers cannot plan wiring from the coordinates
+/// they sent, so the resolved ones are reported back.
+struct ResolvedPin {
+    number: String,
+    name: String,
+    requested: Option<(f64, f64)>,
+    x: f64,
+    y: f64,
+}
+
+impl ResolvedPin {
+    fn new(pin: &serde_json::Value, x: f64, y: f64) -> Self {
+        let requested = match (pin["x"].as_f64(), pin["y"].as_f64()) {
+            (Some(rx), Some(ry)) => Some((rx, ry)),
+            _ => None,
+        };
+        ResolvedPin {
+            number: pin["number"].as_str().unwrap_or("1").to_string(),
+            name: pin["name"].as_str().unwrap_or("~").to_string(),
+            requested,
+            x,
+            y,
+        }
+    }
+
+    /// How far the pin was moved, or `None` when the caller named no position.
+    fn displacement(&self) -> Option<f64> {
+        let (rx, ry) = self.requested?;
+        let moved = ((self.x - rx).powi(2) + (self.y - ry).powi(2)).sqrt();
+        (moved > POSITION_EPSILON).then_some(moved)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut out = json!({
+            "number": self.number,
+            "name": self.name,
+            "x": self.x,
+            "y": self.y
+        });
+        // Only when it differs, so the common case stays compact and a moved
+        // pin stands out.
+        if let (Some((rx, ry)), Some(_)) = (self.requested, self.displacement()) {
+            out["requested"] = json!({ "x": rx, "y": ry });
+        }
+        out
+    }
+}
+
+/// Below this a difference is float noise from the body arithmetic, not a move.
+const POSITION_EPSILON: f64 = 1e-6;
+
+/// One unit's rendered body, and what became of the pins the caller placed.
+struct BuiltUnit {
+    sexp: String,
+    rect: SymbolRect,
+    /// A glyph that did not fit its pins and fell back to a rectangle.
+    warning: Option<String>,
+    /// `"rectangle"` or the glyph's name — a glyph places pins by type, so a
+    /// moved pin there is intended rather than a surprise.
+    body: &'static str,
+    pins: Vec<ResolvedPin>,
+}
+
+impl BuiltUnit {
+    /// A per-unit summary of the auto-size override, or `None` when nothing
+    /// moved. Per pin would be a dozen lines of noise on a normal symbol, and a
+    /// glyph unit moves every pin by design.
+    fn displacement_warning(&self, unit_label: &str) -> Option<String> {
+        if self.body != "rectangle" {
+            return None;
+        }
+        let moved: Vec<f64> = self
+            .pins
+            .iter()
+            .filter_map(ResolvedPin::displacement)
+            .collect();
+        let furthest = moved.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (!moved.is_empty()).then(|| {
+            format!(
+                "{unit_label}: the body was sized to fit the pin names, moving {} of {} pins by up to {:.2} mm; the resolved positions are in `units`",
+                moved.len(),
+                self.pins.len(),
+                furthest
+            )
+        })
+    }
+
+    fn to_json(&self, unit: usize) -> serde_json::Value {
+        json!({
+            "unit": unit,
+            "body": self.body,
+            "pins": self.pins.iter().map(ResolvedPin::to_json).collect::<Vec<_>>()
+        })
+    }
+}
 
 async fn handle_create_symbol(
     args: &serde_json::Value,
@@ -3027,6 +3162,10 @@ async fn handle_create_symbol(
     // Optional conventional body shape. `glyph` may be set at the symbol level
     // (a default for every unit) and/or per unit (overriding the default).
     let mut warnings: Vec<String> = Vec::new();
+    // Where each unit's pins actually ended up. The caller's x/y are a starting
+    // point, so this is the only way to plan wiring without re-measuring the
+    // finished symbol with batch_get_schematic_pin_locations.
+    let mut units_report: Vec<serde_json::Value> = Vec::new();
     let sym_glyph = match args["glyph"].as_str() {
         None => None,
         Some(s) => match Glyph::parse(s) {
@@ -3067,35 +3206,38 @@ async fn handle_create_symbol(
                 .cloned()
                 .collect();
             // Unit 1: the triangle with its signal pins.
-            let (inner1, body1, warn1) = match build_symbol_unit(&signal, sym_glyph, show_names) {
+            let unit1 = match build_symbol_unit(&signal, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn1 {
-                warnings.push(w);
-            }
+            warnings.extend(unit1.warning.clone());
+            warnings.extend(unit1.displacement_warning("unit 1"));
+            units_report.push(unit1.to_json(1));
+            let (inner1, body1) = (unit1.sexp, unit1.rect);
             units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
-            let (inner2, _, warn2) = match build_symbol_unit(&power_laid, None, show_names) {
+            let unit2 = match build_symbol_unit(&power_laid, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn2 {
-                warnings.push(w);
-            }
+            warnings.extend(unit2.warning.clone());
+            warnings.extend(unit2.displacement_warning("unit 2"));
+            units_report.push(unit2.to_json(2));
+            let inner2 = unit2.sexp;
             units_sexp.push_str(&format!("\n    (symbol \"{}_2_1\"{}\n    )", name, inner2));
             unit_count = 2;
             ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
-            let (inner, body, warn) = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
+            let unit = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn {
-                warnings.push(w);
-            }
+            warnings.extend(unit.warning.clone());
+            warnings.extend(unit.displacement_warning("unit 1"));
+            units_report.push(unit.to_json(1));
+            let (inner, body) = (unit.sexp, unit.rect);
             units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
             unit_count = 1;
             ref_body = body;
@@ -3125,13 +3267,16 @@ async fn handle_create_symbol(
                     }
                 },
             };
-            let (inner, body, warn) = match build_symbol_unit(&unit_pins, unit_glyph, show_names) {
+            let unit = match build_symbol_unit(&unit_pins, unit_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn {
+            if let Some(w) = unit.warning.clone() {
                 warnings.push(format!("unit {}: {}", i + 1, w));
             }
+            warnings.extend(unit.displacement_warning(&format!("unit {}", i + 1)));
+            units_report.push(unit.to_json(i + 1));
+            let (inner, body) = (unit.sexp, unit.rect);
             if i == 0 {
                 first_body = body;
             }
@@ -3145,11 +3290,14 @@ async fn handle_create_symbol(
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
             // The power unit is always a rectangle.
-            let (inner, _, _) = match build_symbol_unit(&power_pins, None, show_names) {
+            let unit = match build_symbol_unit(&power_pins, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
             total += 1;
+            warnings.extend(unit.displacement_warning(&format!("unit {total}")));
+            units_report.push(unit.to_json(total));
+            let inner = unit.sexp;
             units_sexp.push_str(&format!(
                 "\n    (symbol \"{}_{}_1\"{}\n    )",
                 name, total, inner
@@ -3244,6 +3392,7 @@ async fn handle_create_symbol(
         "unit_count": unit_count,
         "power_pin_count": power_pins.len()
     });
+    result["units"] = json!(units_report);
     if !warnings.is_empty() {
         result["warnings"] = json!(warnings);
     }
@@ -5908,6 +6057,196 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.ends_with("_0_1")),
             "sub-units leaked: {names:?}"
+        );
+    }
+
+    /// A 14-pin module with pins declared on two facing columns, as the report
+    /// describes it. `names` decides how wide the body has to be.
+    async fn module_response(names: &[&str], x: f64) -> serde_json::Value {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("mod.kicad_sym");
+        let pins: Vec<serde_json::Value> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                // Facing columns: each row carries a left and a right pin, which
+                // is what makes two long names run into each other across the
+                // body and forces it wider.
+                let left = i % 2 == 0;
+                json!({
+                    "number": (i + 1).to_string(),
+                    "name": name,
+                    "type": "bidirectional",
+                    "x": if left { -x } else { x },
+                    "y": (i / 2) as f64 * 2.54,
+                    "angle": if left { 0 } else { 180 },
+                    "length": 2.54
+                })
+            })
+            .collect();
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "MODULE",
+                "reference_prefix": "U",
+                "pins": pins
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+        serde_json::from_str(&result_text(&res)).unwrap()
+    }
+
+    fn pin_x(report: &serde_json::Value, number: &str) -> f64 {
+        report["units"][0]["pins"]
+            .as_array()
+            .expect("units[0].pins is an array")
+            .iter()
+            .find(|p| p["number"] == number)
+            .expect("pin present")["x"]
+            .as_f64()
+            .expect("x is a number")
+    }
+
+    /// The reported case: long pin names widen the body, the pins slide out to
+    /// meet it, and the response now says where they went.
+    #[tokio::test]
+    async fn long_pin_names_move_the_pins_and_the_response_reports_it() {
+        let long = ["D4/A4/SDA/P0.04"; 14];
+        let report = module_response(&long, 19.05).await;
+
+        let first = &report["units"][0]["pins"][0];
+        assert_eq!(report["units"][0]["body"], "rectangle");
+        assert!(
+            first["requested"].is_object(),
+            "a moved pin carries the position that was asked for: {first}"
+        );
+        assert_eq!(first["requested"]["x"], json!(-19.05));
+        assert!(
+            pin_x(&report, "1") < -19.05,
+            "the pin must sit further out than requested, got {}",
+            pin_x(&report, "1")
+        );
+
+        let warnings = report["warnings"]
+            .as_array()
+            .expect("a move is worth a warning");
+        assert_eq!(warnings.len(), 1, "one summary per unit, not one per pin");
+        let text = warnings[0].as_str().unwrap();
+        assert!(text.contains("14 of 14 pins"), "{text}");
+        assert!(text.contains("unit 1"), "{text}");
+    }
+
+    /// The other row of the report's table: short names need no extra width, so
+    /// the pins stay where they were put and nothing is warned about.
+    #[tokio::test]
+    async fn short_pin_names_leave_the_pins_alone() {
+        let short = ["D4/SDA"; 14];
+        let report = module_response(&short, 19.05).await;
+
+        assert_eq!(pin_x(&report, "1"), -19.05);
+        assert!(
+            report["units"][0]["pins"][0]["requested"].is_null(),
+            "an unmoved pin needs no `requested`: {}",
+            report["units"][0]["pins"][0]
+        );
+        assert!(
+            report["warnings"].is_null(),
+            "nothing moved, so nothing to warn about: {}",
+            report["warnings"]
+        );
+    }
+
+    /// Two symbols with identical pin coordinates but different name lengths
+    /// come out with different connection points. That is the surprise the
+    /// report is about, and the response is what makes it visible.
+    #[tokio::test]
+    async fn identical_coordinates_can_still_resolve_differently() {
+        let long = module_response(&["D4/A4/SDA/P0.04"; 14], 19.05).await;
+        let short = module_response(&["D4/SDA"; 14], 19.05).await;
+
+        assert_ne!(
+            pin_x(&long, "1"),
+            pin_x(&short, "1"),
+            "same request, different result — the caller has to be told"
+        );
+    }
+
+    /// Every pin on an edge is aligned to it, names or no names. A ragged
+    /// column is squared up even with `show_pin_names` off, so the response has
+    /// to report that too.
+    #[tokio::test]
+    async fn pins_are_aligned_to_the_body_edge_even_without_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("ragged.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "RAGGED",
+                "reference_prefix": "U",
+                "show_pin_names": false,
+                "pins": [
+                    {"number":"1","name":"A","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54},
+                    {"number":"2","name":"B","type":"input","x":-12.7,"y":2.54,"angle":0,"length":2.54}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+        let report: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        assert_eq!(
+            pin_x(&report, "1"),
+            pin_x(&report, "2"),
+            "both pins end up on the same edge"
+        );
+        let moved = report["units"][0]["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["requested"].is_object())
+            .count();
+        assert_eq!(moved, 1, "the pin that was pulled out is marked: {report}");
+    }
+
+    /// A glyph places its pins by type — documented, intended, and reported
+    /// without a warning, or every correct call would carry one.
+    #[tokio::test]
+    async fn a_glyph_unit_reports_its_placement_without_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("gate.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "GATE",
+                "reference_prefix": "U",
+                "glyph": "inverter",
+                "pins": [
+                    {"number":"1","name":"A","type":"input","x":100.0,"y":100.0},
+                    {"number":"2","name":"Y","type":"output","x":200.0,"y":200.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+        let report: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        assert_eq!(report["units"][0]["body"], "inverter");
+        assert_ne!(
+            pin_x(&report, "1"),
+            100.0,
+            "a glyph ignores the requested position"
+        );
+        assert!(
+            report["warnings"].is_null(),
+            "a glyph move is intended, not a surprise: {}",
+            report["warnings"]
         );
     }
 
