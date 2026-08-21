@@ -131,7 +131,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "New Y position in mm (optional)" },
                     "width": { "type": "number", "description": "New pad width in mm (optional)" },
                     "height": { "type": "number", "description": "New pad height in mm (optional)" },
-                    "shape": { "type": "string", "description": "New pad shape (optional)" },
+                    "shape": {
+                        "type": "string",
+                        "enum": ["circle", "rect", "oval", "roundrect"],
+                        "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
+                    },
                     "drill": { "type": "number", "description": "New drill diameter in mm (optional)" }
                 },
                 "required": ["footprint_path", "pad_number"]
@@ -851,6 +855,28 @@ async fn handle_edit_footprint_pad(
             }
         },
     };
+    let shape = match args.get("shape") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_str() {
+            Some(shape) if matches!(shape, "circle" | "rect" | "oval" | "roundrect") => {
+                Some(shape)
+            }
+            Some(shape) => {
+                return Ok(invalid_library_argument(
+                    "shape",
+                    format!(
+                        "unsupported standard shape '{shape}'; expected circle, rect, oval, or roundrect"
+                    ),
+                ))
+            }
+            None => {
+                return Ok(invalid_library_argument(
+                    "shape",
+                    "must be a string when supplied",
+                ))
+            }
+        },
+    };
 
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
@@ -885,11 +911,11 @@ async fn handle_edit_footprint_pad(
         }
 
         matched_count += 1;
-        edits.push(SexpEdit::replace(
-            start,
-            end,
-            edit_footprint_pad_block(block, args, new_number),
-        ));
+        let edited = match edit_footprint_pad_block(block, args, new_number, shape) {
+            Ok(edited) => edited,
+            Err(reason) => return Ok(invalid_library_argument("shape", reason)),
+        };
+        edits.push(SexpEdit::replace(start, end, edited));
         if !match_all {
             break;
         }
@@ -909,6 +935,7 @@ async fn handle_edit_footprint_pad(
         serde_json::to_string(&json!({
             "success": true,
             "pad": pad_number,
+            "shape": shape,
             "matched_count": matched_count,
             "updated_count": matched_count
         }))
@@ -927,11 +954,76 @@ fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolR
     )
 }
 
+fn skip_pad_header_token(source: &str, mut index: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    let start = index;
+    if bytes.get(index) == Some(&b'"') {
+        index += 1;
+        while index < bytes.len() {
+            if bytes[index] == b'\\' {
+                index += 2;
+            } else if bytes[index] == b'"' {
+                return Some((start, index + 1));
+            } else {
+                index += 1;
+            }
+        }
+        return None;
+    }
+    while bytes
+        .get(index)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b')')
+    {
+        index += 1;
+    }
+    (index > start).then_some((start, index))
+}
+
+fn pad_shape_range(pad_block: &str) -> Option<(usize, usize)> {
+    let open = pad_block.find('(')? + 1;
+    let (_, pad_end) = skip_pad_header_token(pad_block, open)?;
+    if &pad_block[open..pad_end] != "pad" {
+        return None;
+    }
+    let (_, number_end) = skip_pad_header_token(pad_block, pad_end)?;
+    let (_, type_end) = skip_pad_header_token(pad_block, number_end)?;
+    skip_pad_header_token(pad_block, type_end)
+}
+
+fn remove_pad_shape_children(pad_block: String, keep_roundrect_ratio: bool) -> String {
+    let mut edits = Vec::new();
+    for (start, end) in find_direct_child_blocks(&pad_block, "pad") {
+        let Ok(child) = parse_sexp(&pad_block[start..end]) else {
+            continue;
+        };
+        let remove = match child.head() {
+            Some("roundrect_rratio") => !keep_roundrect_ratio,
+            Some("chamfer_ratio" | "chamfer" | "rect_delta" | "options" | "primitives") => true,
+            _ => false,
+        };
+        if remove {
+            edits.push(SexpEdit::delete(start, end));
+        }
+    }
+    apply_edits(pad_block, edits)
+}
+
+fn has_direct_pad_child(pad_block: &str, head: &str) -> bool {
+    find_direct_child_blocks(pad_block, "pad")
+        .into_iter()
+        .filter_map(|(start, end)| parse_sexp(&pad_block[start..end]).ok())
+        .any(|child| child.head() == Some(head))
+}
+
 fn edit_footprint_pad_block(
     pad_block: &str,
     args: &serde_json::Value,
     new_number: Option<&str>,
-) -> String {
+    shape: Option<&str>,
+) -> Result<String, String> {
     let mut new_pad = pad_block.to_string();
 
     if let Some(number) = new_number {
@@ -940,6 +1032,25 @@ fn edit_footprint_pad_block(
                 let number_end = number_start + 1 + number_end;
                 new_pad.replace_range(number_start + 1..number_end, &escape_library_string(number));
             }
+        }
+    }
+
+    if let Some(shape) = shape {
+        let (shape_start, shape_end) = pad_shape_range(&new_pad)
+            .ok_or_else(|| "could not locate the pad shape token".to_string())?;
+        new_pad.replace_range(shape_start..shape_end, shape);
+        let is_roundrect = shape == "roundrect";
+        new_pad = remove_pad_shape_children(new_pad, is_roundrect);
+        if is_roundrect && !has_direct_pad_child(&new_pad, "roundrect_rratio") {
+            let insert_at = new_pad
+                .rfind(')')
+                .ok_or_else(|| "pad block has no closing parenthesis".to_string())?;
+            let ratio = if new_pad.contains('\n') {
+                "\n    (roundrect_rratio 0.25)"
+            } else {
+                " (roundrect_rratio 0.25)"
+            };
+            new_pad.insert_str(insert_at, ratio);
         }
     }
 
@@ -983,12 +1094,28 @@ fn edit_footprint_pad_block(
             new_pad.replace_range(at_pos..at_end, &format!("(at {} {}{})", old_x, y, rot));
         }
     }
-    if let (Some(width), Some(height)) = (args["width"].as_f64(), args["height"].as_f64()) {
+    if args["width"].as_f64().is_some() || args["height"].as_f64().is_some() {
         if let Some(size_pos) = new_pad.find("(size ") {
             let size_end = new_pad[size_pos..]
                 .find(')')
                 .map(|i| size_pos + i + 1)
                 .unwrap_or(new_pad.len());
+            let size_block = &new_pad[size_pos..size_end];
+            let parts: Vec<&str> = size_block
+                .trim_start_matches("(size ")
+                .trim_end_matches(')')
+                .split_whitespace()
+                .collect();
+            let old_width = parts
+                .first()
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let old_height = parts
+                .get(1)
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let width = args["width"].as_f64().unwrap_or(old_width);
+            let height = args["height"].as_f64().unwrap_or(old_height);
             new_pad.replace_range(size_pos..size_end, &format!("(size {width} {height})"));
         }
     }
@@ -1005,7 +1132,7 @@ fn edit_footprint_pad_block(
         }
     }
 
-    new_pad
+    Ok(new_pad)
 }
 
 fn escape_library_string(value: &str) -> String {
@@ -4641,6 +4768,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_footprint_pad_persists_a_valid_shape_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "3",
+                "shape": "roundrect"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches("thru_hole roundrect").count(), 1);
+        assert_eq!(updated.matches("(roundrect_rratio 0.25)").count(), 1);
+        parse_sexp(&updated).expect("edited footprint stays parseable");
+    }
+
+    #[tokio::test]
     async fn edit_footprint_pad_renumbers_and_resizes_every_duplicate_atomically() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("DualSocket.kicad_mod");
@@ -4744,9 +4895,65 @@ mod tests {
         assert_eq!(properties["match_all"]["type"], "boolean");
         assert_eq!(properties["match_all"]["default"], false);
         assert_eq!(
+            properties["shape"]["enum"],
+            json!(["circle", "rect", "oval", "roundrect"])
+        );
+        assert_eq!(
             tool.input_schema["required"],
             json!(["footprint_path", "pad_number"])
         );
+    }
+
+    #[test]
+    fn pad_shape_change_adds_and_removes_shape_specific_children() {
+        let circle = r#"(pad "1" smd circle (at 0 0) (size 2 1) (layers "F.Cu" "F.Mask"))"#;
+        let rounded =
+            edit_footprint_pad_block(circle, &json!({}), None, Some("roundrect")).unwrap();
+        assert!(rounded.contains(r#"(pad "1" smd roundrect"#), "{rounded}");
+        assert!(rounded.contains("(roundrect_rratio 0.25)"), "{rounded}");
+        parse_sexp(&rounded).unwrap();
+
+        let chamfered = r#"(pad "1" smd roundrect
+  (at 0 0)
+  (size 2 1)
+  (layers "F.Cu" "F.Mask")
+  (roundrect_rratio 0)
+  (chamfer_ratio 0.2)
+  (chamfer top_left)
+)"#;
+        let oval = edit_footprint_pad_block(chamfered, &json!({}), None, Some("oval")).unwrap();
+        assert!(oval.contains(r#"(pad "1" smd oval"#), "{oval}");
+        for removed in ["roundrect_rratio", "chamfer_ratio", "(chamfer "] {
+            assert!(!oval.contains(removed), "left {removed} in {oval}");
+        }
+        parse_sexp(&oval).unwrap();
+    }
+
+    #[test]
+    fn changing_one_pad_dimension_preserves_the_other() {
+        let pad = r#"(pad "1" smd rect (at 0 0) (size 2 1) (layers "F.Cu"))"#;
+        let wider = edit_footprint_pad_block(pad, &json!({ "width": 3.5 }), None, None).unwrap();
+        assert!(wider.contains("(size 3.5 1)"), "{wider}");
+
+        let taller = edit_footprint_pad_block(pad, &json!({ "height": 4.5 }), None, None).unwrap();
+        assert!(taller.contains("(size 2 4.5)"), "{taller}");
+    }
+
+    #[tokio::test]
+    async fn unsupported_pad_shape_is_rejected_before_reading_or_writing() {
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": "/does/not/exist.kicad_mod",
+                "pad_number": "1",
+                "shape": "custom"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["field"], "shape");
     }
 
     #[test]
