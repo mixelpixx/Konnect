@@ -614,9 +614,46 @@ async fn handle_batch_add_wire(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let wires = match require_array(args, "wires") {
-        Ok(a) => a.clone(),
+        Ok(a) => a,
         Err(e) => return Ok(e),
     };
+
+    // Validate the complete batch before loading or changing the schematic.
+    // The tool schema requires every coordinate, so substituting 0.0 for a
+    // missing field silently created a (0,0)-(0,0) wire (#234). Refusing the
+    // whole batch preserves the same atomic contract as a missing top-level
+    // argument and tells the caller exactly which item needs fixing.
+    let mut parsed_wires = Vec::with_capacity(wires.len());
+    for (index, wire) in wires.iter().enumerate() {
+        if !wire.is_object() {
+            return Ok(invalid_wire_argument(
+                format!("wires[{index}]"),
+                "must be an object",
+            ));
+        }
+        let coordinate = |field: &str| {
+            wire[field].as_f64().ok_or_else(|| {
+                invalid_wire_argument(format!("wires[{index}].{field}"), "missing or not a number")
+            })
+        };
+        let x1 = match coordinate("x1") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let y1 = match coordinate("y1") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let x2 = match coordinate("x2") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let y2 = match coordinate("y2") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        parsed_wires.push((x1, y1, x2, y2));
+    }
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added = 0usize;
@@ -626,11 +663,7 @@ async fn handle_batch_add_wire(
         .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
         .unwrap_or_default();
 
-    for w in &wires {
-        let x1 = w["x1"].as_f64().unwrap_or(0.0);
-        let y1 = w["y1"].as_f64().unwrap_or(0.0);
-        let x2 = w["x2"].as_f64().unwrap_or(0.0);
-        let y2 = w["y2"].as_f64().unwrap_or(0.0);
+    for (x1, y1, x2, y2) in parsed_wires {
         let (x1, y1) = snap_point(x1, y1, 1.27);
         let (x2, y2) = snap_point(x2, y2, 1.27);
 
@@ -654,6 +687,16 @@ async fn handle_batch_add_wire(
 
     sch.overwrite()?;
     Ok(CallToolResult::json(&json!({ "added_wires": added })))
+}
+
+fn invalid_wire_argument(field: String, reason: &str) -> CallToolResult {
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.clone(),
+            reason: reason.to_string(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
 }
 
 async fn handle_delete_wire(
@@ -2190,6 +2233,38 @@ mod unit_aware_wiring_tests {
         for (x, y) in tees {
             assert_eq!(junctions_at(&path, x, y), 1, "T at ({x}, {y})");
         }
+    }
+
+    #[tokio::test]
+    async fn batch_add_wire_rejects_a_malformed_item_without_writing() {
+        let (_d, path) = bare_schematic();
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_batch_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "wires": [
+                    { "x1": 10.16, "y1": 10.16, "x2": 20.32, "y2": 10.16 },
+                    { "x1": 20.32, "y1": 10.16, "y2": 20.32 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "the complete batch must be refused");
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["kind"], "invalid_argument");
+        assert_eq!(error["error"]["field"], "wires[1].x2");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "an earlier valid item must not be applied before rejection"
+        );
     }
 
     // ─── connect_to_net stub orientation ───────────────────────────────────

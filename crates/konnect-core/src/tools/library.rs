@@ -693,16 +693,21 @@ async fn handle_create_footprint(
         Ok(v) => v.clone(),
         Err(e) => return Ok(e),
     };
+    if let Err(error) = validate_footprint_pad_items(&pads_val) {
+        return Ok(error);
+    }
     let mut pad_geoms: Vec<PadGeom> = Vec::new();
     let mut pad_sexp = String::new();
     for pad in &pads_val {
-        let number = pad["number"].as_str().unwrap_or("1").to_string();
-        let pad_type = pad["type"].as_str().unwrap_or("smd").to_string();
-        let shape = pad["shape"].as_str().unwrap_or("rect");
-        let x = pad["x"].as_f64().unwrap_or(0.0);
-        let y = pad["y"].as_f64().unwrap_or(0.0);
-        let w = pad["width"].as_f64().unwrap_or(1.0);
-        let h = pad["height"].as_f64().unwrap_or(1.0);
+        // Safe after validate_footprint_pad_items: every schema-required field
+        // has the declared type, so no plausible-looking pad is invented.
+        let number = pad["number"].as_str().expect("validated").to_string();
+        let pad_type = pad["type"].as_str().expect("validated").to_string();
+        let shape = pad["shape"].as_str().expect("validated");
+        let x = pad["x"].as_f64().expect("validated");
+        let y = pad["y"].as_f64().expect("validated");
+        let w = pad["width"].as_f64().expect("validated");
+        let h = pad["height"].as_f64().expect("validated");
 
         let layer_names = if let Some(layers) = pad["layers"].as_array() {
             let mut names = Vec::with_capacity(layers.len());
@@ -816,6 +821,37 @@ async fn handle_create_footprint(
         }))
         .unwrap(),
     ))
+}
+
+/// Enforce the nested `pads.items.required` schema before any output file is
+/// created or replaced. Top-level MCP validation is deliberately shallow, so
+/// handlers that own nested objects must preserve this invariant themselves.
+fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallToolResult> {
+    for (index, pad) in pads.iter().enumerate() {
+        if !pad.is_object() {
+            return Err(invalid_library_argument(
+                &format!("pads[{index}]"),
+                "must be an object",
+            ));
+        }
+        for field in ["number", "type", "shape"] {
+            if pad[field].as_str().is_none() {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].{field}"),
+                    "missing or not a string",
+                ));
+            }
+        }
+        for field in ["x", "y", "width", "height"] {
+            if pad[field].as_f64().is_none() {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].{field}"),
+                    "missing or not a number",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_edit_footprint_pad(
@@ -2377,6 +2413,86 @@ fn validate_pin_types(pins_val: &[serde_json::Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct SymbolItems {
+    pins: Vec<serde_json::Value>,
+    units: Vec<serde_json::Value>,
+    power_pins: Vec<serde_json::Value>,
+}
+
+/// Read and validate every array that contributes pins to a generated symbol.
+/// This runs before library content is read or written, making a malformed
+/// nested item an atomic, indexed `invalid_argument` rejection (#234).
+fn parse_symbol_items(args: &serde_json::Value) -> Result<SymbolItems, CallToolResult> {
+    fn optional_array(
+        args: &serde_json::Value,
+        field: &str,
+    ) -> Result<Vec<serde_json::Value>, CallToolResult> {
+        match args.get(field) {
+            None => Ok(Vec::new()),
+            Some(value) => value
+                .as_array()
+                .cloned()
+                .ok_or_else(|| invalid_library_argument(field, "must be an array when provided")),
+        }
+    }
+
+    fn validate_pins(
+        pins: &[serde_json::Value],
+        path: &str,
+        require_xy: bool,
+    ) -> Result<(), CallToolResult> {
+        for (index, pin) in pins.iter().enumerate() {
+            let pin_path = format!("{path}[{index}]");
+            if !pin.is_object() {
+                return Err(invalid_library_argument(&pin_path, "must be an object"));
+            }
+            for field in ["number", "name", "type"] {
+                if pin[field].as_str().is_none() {
+                    return Err(invalid_library_argument(
+                        &format!("{pin_path}.{field}"),
+                        "missing or not a string",
+                    ));
+                }
+            }
+            if require_xy {
+                for field in ["x", "y"] {
+                    if pin[field].as_f64().is_none() {
+                        return Err(invalid_library_argument(
+                            &format!("{pin_path}.{field}"),
+                            "missing or not a number",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let pins = optional_array(args, "pins")?;
+    validate_pins(&pins, "pins", false)?;
+
+    let units = optional_array(args, "units")?;
+    for (index, unit) in units.iter().enumerate() {
+        let unit_path = format!("units[{index}]");
+        if !unit.is_object() {
+            return Err(invalid_library_argument(&unit_path, "must be an object"));
+        }
+        let unit_pins = unit["pins"].as_array().ok_or_else(|| {
+            invalid_library_argument(&format!("{unit_path}.pins"), "missing or not an array")
+        })?;
+        validate_pins(unit_pins, &format!("{unit_path}.pins"), false)?;
+    }
+
+    let power_pins = optional_array(args, "power_pins")?;
+    validate_pins(&power_pins, "power_pins", true)?;
+
+    Ok(SymbolItems {
+        pins,
+        units,
+        power_pins,
+    })
+}
+
 /// A conventional body shape for a symbol unit. `Rectangle` is the default (a
 /// derived box around caller-positioned pins); the others draw a fixed op-amp or
 /// logic-gate glyph copied from KiCAD's stock libraries and auto-place the pins.
@@ -3024,6 +3140,15 @@ async fn handle_create_symbol(
     let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
     let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
 
+    let SymbolItems {
+        pins,
+        units: unit_objs,
+        power_pins,
+    } = match parse_symbol_items(args) {
+        Ok(items) => items,
+        Err(error) => return Ok(error),
+    };
+
     // Optional conventional body shape. `glyph` may be set at the symbol level
     // (a default for every unit) and/or per unit (overriding the default).
     let mut warnings: Vec<String> = Vec::new();
@@ -3041,14 +3166,11 @@ async fn handle_create_symbol(
     // Multi-unit when `units` is a non-empty array; otherwise the single-unit
     // `pins` path. Sub-symbols are named NAME_<unit>_1; units 1..N are the
     // individual units, and shared `power_pins` become a dedicated final unit.
-    let unit_objs: Vec<serde_json::Value> = args["units"].as_array().cloned().unwrap_or_default();
-    let power_pins = args["power_pins"].as_array().cloned().unwrap_or_default();
-
     let mut units_sexp = String::new();
     let unit_count: usize;
     let ref_body: SymbolRect;
     if unit_objs.is_empty() {
-        let pins_val = args["pins"].as_array().cloned().unwrap_or_default();
+        let pins_val = pins;
         // A single-unit triangular glyph (op-amp/buffer/inverter/schmitt) has no
         // room for power-pin names on its narrow apex, so if it carries power
         // pins, split them onto a dedicated rectangular power unit (like KiCAD's
@@ -6998,6 +7120,32 @@ mod required_argument_tests {
     }
 
     #[tokio::test]
+    async fn create_footprint_rejects_a_malformed_pad_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.kicad_mod");
+        let original = b"(footprint \"Existing\"\r\n\t(layer \"F.Cu\")\r\n)\r\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = call(
+            "create_footprint",
+            json!({
+                "output": path.display().to_string(),
+                "name": "Replacement",
+                "pads": [{}]
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "an invented origin pad must be refused");
+        assert_eq!(error_field(&result), "pads[0].number");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "the existing footprint must remain byte-identical"
+        );
+    }
+
+    #[tokio::test]
     async fn create_symbol_refuses_a_missing_name_or_reference_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lib.kicad_sym");
@@ -7019,5 +7167,55 @@ mod required_argument_tests {
             before,
             "no symbol should have been appended"
         );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_rejects_a_unit_without_pins_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.kicad_sym");
+        let original = b"(kicad_symbol_lib\r\n\t(version 20240108)\r\n)\r\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = call(
+            "create_symbol",
+            json!({
+                "library_path": path.display().to_string(),
+                "name": "BrokenMulti",
+                "reference_prefix": "U",
+                "units": [{}]
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "a pin-less invented unit must be refused");
+        assert_eq!(error_field(&result), "units[0].pins");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "the existing symbol library must remain byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_names_the_malformed_nested_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.kicad_sym");
+        let result = call(
+            "create_symbol",
+            json!({
+                "library_path": path.display().to_string(),
+                "name": "BrokenPin",
+                "reference_prefix": "U",
+                "units": [{ "pins": [
+                    { "number": "1", "name": "A", "type": "input" },
+                    { "number": "2", "type": "output" }
+                ] }]
+            }),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert_eq!(error_field(&result), "units[0].pins[1].name");
+        assert!(!path.exists(), "no library may be created on rejection");
     }
 }
