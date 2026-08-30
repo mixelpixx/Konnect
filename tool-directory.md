@@ -148,7 +148,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `trace_from_point` | Trace connectivity from any (X,Y) point — returns what is at that point and the net it belongs to. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_shorted_nets` | Detect accidentally merged nets — pairs of distinct net names sharing a wire path. |
-| `find_single_pin_nets` | Find nets with only one label/connection — often indicates a missing counterpart. |
+| `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 

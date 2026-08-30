@@ -5,20 +5,22 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::sch_connectivity::{net_graph_for, pt_key, ConnectivityIndex};
+use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
-    get_path, opt_f64, placed_pins_by_reference, require_f64, require_str, ToolContext, ToolDef,
+    get_path, is_power_symbol_reference, opt_f64, placed_pins_by_reference, require_f64,
+    require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, read_schematic, symbol_bounds_for_instance, LabelKind, SymbolBounds, Wire,
+        extract_all_net_labels, extract_labels, extract_sheet_pins, extract_symbol_instances,
+        extract_wires, find_lib_symbol, read_schematic, symbol_bounds_for_instance, Label,
+        LabelKind, LibPin, SymbolBounds, Wire,
     },
 };
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -152,7 +154,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "find_single_pin_nets",
-            "Find nets with only one label/connection — often indicates a missing counterpart.",
+            "Find nets that reach at most one pin — often a missing counterpart, an orphan \
+             label, or a stub left by a deleted component. Component pins and hierarchical \
+             sheet pins count; a power symbol's own pin names the rail rather than consuming \
+             it and does not. Reports the pin and label counts, and every label kind that \
+             named the net. Read per sheet: a net a global, hierarchical or power label can \
+             carry off this one is flagged cross_sheet_unverified.",
             json!({ "type": "object",
                 "properties": { "schematic": { "type": "string" } },
                 "required": ["schematic"] }),
@@ -551,10 +558,9 @@ async fn handle_find_shorted_nets(
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
-    let mut root_nets: HashMap<(i64, i64), Vec<String>> = HashMap::new();
-    for l in &labels {
-        let root = g.find(pt_key(l.x, l.y));
-        root_nets.entry(root).or_default().push(l.net.clone());
+    let mut root_nets: HashMap<(i64, i64), Vec<&str>> = HashMap::new();
+    for (root, label) in label_roots(&mut g, &labels) {
+        root_nets.entry(root).or_default().push(label.net.as_str());
     }
     let shorts: Vec<serde_json::Value> = root_nets
         .into_values()
@@ -573,25 +579,202 @@ async fn handle_find_shorted_nets(
     ))
 }
 
+/// A point that counts as reaching a net.
+enum Connection<'a> {
+    ComponentPin {
+        reference: &'a str,
+        pin: &'a LibPin,
+        x: f64,
+        y: f64,
+    },
+    /// A hierarchical sheet pin: whatever the net meets on the other side.
+    SheetPin { x: f64, y: f64 },
+}
+
+impl Connection<'_> {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Connection::ComponentPin {
+                reference,
+                pin,
+                x,
+                y,
+            } => json!({
+                "type": "component_pin",
+                "reference": reference,
+                "pin": pin.number,
+                "pin_name": pin.name,
+                "x": x,
+                "y": y
+            }),
+            Connection::SheetPin { x, y } => json!({ "type": "sheet_pin", "x": x, "y": y }),
+        }
+    }
+}
+
+/// Whether a label of this kind can carry its net off the sheet being read.
+///
+/// A local `NetLabel` cannot: it names a net within one sheet, so a count taken
+/// from that sheet is the whole answer. The other three can, and a reader has
+/// to know which it is holding. `GlobalLabel` and a power symbol — which KiCAD
+/// makes a global label out of — join every same-named net in the project;
+/// `HierarchicalLabel` continues through the parent's sheet pin.
+fn reaches_beyond_this_sheet(kind: &LabelKind) -> bool {
+    match kind {
+        LabelKind::NetLabel => false,
+        LabelKind::GlobalLabel | LabelKind::HierarchicalLabel | LabelKind::PowerSymbol => true,
+    }
+}
+
+/// Nets that reach at most one pin.
+///
+/// Zero counts as well as one: a label whose net reaches nothing is the orphan
+/// label or the stub left by a deleted component that the review skill sends
+/// this tool looking for, and `find_orphan_items` reports the dangling wire end
+/// without ever naming the net. `pin_count` tells the two apart.
+///
+/// This counted *label instances* per net name, so every net drawn the ordinary
+/// way — one label on a wire that reaches two or more pins — was reported, and
+/// the defect the tool advertises passed through unreported as soon as its net
+/// carried a second label. The count comes from the shared net graph now, and
+/// the label count stays beside it as its own field: a net with no label at all
+/// is a different smell.
+///
+/// A power symbol's own pin is not a connection here, though it is one to
+/// `find_orphan_items`, which reports an unwired `#PWR01`. The divergence is
+/// deliberate: the rail that reaches exactly one component pin is what this
+/// tool is for, and counting the symbol that named it would hide every one of
+/// them.
+///
+/// The answer is per sheet, so a net named by a global or hierarchical label
+/// may well continue on another one, and the report has to say so rather than
+/// leave the caller to infer it. `cross_sheet_unverified` is that statement:
+/// true when any label naming the net can carry it off this sheet, which is as
+/// far as a single-sheet reader can go. Reporting the net anyway is deliberate
+/// — a rail that reaches one pin here is worth showing — but the flag marks it
+/// as a lead rather than a finding.
+///
+/// # Response compatibility
+///
+/// Every field this tool used to return is still returned and still means the
+/// same thing: `single_pin_net_count`, and per net `net`, `x`, `y`, and `type`.
+/// `type` remains the kind of the *first* label found, so a consumer matching
+/// on it is unaffected. It is also why the other two fields exist: local labels
+/// are extracted first, so a net carrying both a local and a global label
+/// reports `NetLabel` and says nothing about the global one. `label_types`
+/// carries every distinct kind, sorted; `cross_sheet_unverified` is the same
+/// evidence as one boolean.
+///
+/// The additive fields are `label_types`, `cross_sheet_unverified`,
+/// `pin_count`, `label_count`, and `pins`.
+///
+/// What *does* change is which nets appear, because that was the defect: the
+/// membership rule went from "exactly one label instance names it" to "the net
+/// reaches at most one pin". A consumer reading `single_pin_net_count` as a
+/// defect count gets a smaller, truer number and needs no migration; one that
+/// had learned to ignore this tool's noise can stop. No consumer can keep the
+/// old set, since it was wrong in both directions.
 async fn handle_find_single_pin_nets(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let (_, tree) = read_schematic(&sch_path)?;
+    let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for l in &labels {
-        *counts.entry(l.net.clone()).or_insert(0) += 1;
+    let mut graph = net_graph_for(&tree, &wires, &labels);
+
+    // Every connection point, under the graph root that carries it. A sheet
+    // holds hundreds and reports a handful, so nothing is rendered until a net
+    // qualifies.
+    let placed = placed_pins_by_reference(&tree);
+    let mut pins_by_root: HashMap<(i64, i64), Vec<Connection>> = HashMap::new();
+    for (instance, pins) in &placed {
+        if is_power_symbol_reference(&instance.reference) {
+            continue;
+        }
+        for (pin, transform) in pins {
+            let (x, y) = konnect_sexp::schematic::pin_endpoint(pin, *transform);
+            pins_by_root
+                .entry(graph.find(pt_key(x, y)))
+                .or_default()
+                .push(Connection::ComponentPin {
+                    reference: &instance.reference,
+                    pin,
+                    x,
+                    y,
+                });
+        }
     }
-    let singles: Vec<serde_json::Value> = counts
+    for (x, y) in extract_sheet_pins(&tree) {
+        pins_by_root
+            .entry(graph.find(pt_key(x, y)))
+            .or_default()
+            .push(Connection::SheetPin { x, y });
+    }
+
+    // Each net name, the roots its labels sit on, and the first label to name
+    // it. Two labels of one name on segments that never meet are still one net
+    // to KiCAD, so the roots pool.
+    struct NamedNet<'a> {
+        roots: HashSet<(i64, i64)>,
+        label_count: usize,
+        first_label: &'a Label,
+        /// Every kind that named this net, not just the first. Sorted, so the
+        /// field reads the same on two runs over one sheet.
+        kinds: BTreeSet<String>,
+        cross_sheet_unverified: bool,
+    }
+    let mut by_net: HashMap<&str, NamedNet> = HashMap::new();
+    for (root, label) in label_roots(&mut graph, &labels) {
+        let named = by_net
+            .entry(label.net.as_str())
+            .or_insert_with(|| NamedNet {
+                roots: HashSet::new(),
+                label_count: 0,
+                first_label: label,
+                kinds: BTreeSet::new(),
+                cross_sheet_unverified: false,
+            });
+        named.roots.insert(root);
+        named.label_count += 1;
+        named.kinds.insert(format!("{:?}", label.kind));
+        named.cross_sheet_unverified |= reaches_beyond_this_sheet(&label.kind);
+    }
+
+    // HashMap order is not an answer: two runs of one binary over one sheet
+    // would report the same nets in different orders.
+    let mut by_net: Vec<(&str, NamedNet)> = by_net.into_iter().collect();
+    by_net.sort_by_key(|(net, _)| *net);
+
+    let singles: Vec<serde_json::Value> = by_net
         .iter()
-        .filter(|(_, &c)| c == 1)
-        .map(|(net, _)| {
-            let l = labels.iter().find(|l| &l.net == net).unwrap();
-            json!({ "net": net, "x": l.x, "y": l.y, "type": format!("{:?}", l.kind) })
+        .filter_map(|(net, named)| {
+            let mut on_net = named
+                .roots
+                .iter()
+                .filter_map(|root| pins_by_root.get(root))
+                .flatten();
+            let reached = on_net.next();
+            if on_net.next().is_some() {
+                return None;
+            }
+            let pins: Vec<serde_json::Value> =
+                reached.map(Connection::to_json).into_iter().collect();
+            Some(json!({
+                "net": net,
+                "x": named.first_label.x,
+                "y": named.first_label.y,
+                "type": format!("{:?}", named.first_label.kind),
+                "label_types": named.kinds,
+                "cross_sheet_unverified": named.cross_sheet_unverified,
+                "pin_count": pins.len(),
+                "label_count": named.label_count,
+                "pins": pins
+            }))
         })
         .collect();
+
     Ok(CallToolResult::json(
         &json!({ "single_pin_net_count": singles.len(), "nets": singles }),
     ))
@@ -1134,19 +1317,19 @@ mod orphan_item_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
-mod power_symbol_net_tests {
+mod tool_call_support {
     use super::*;
     use crate::tools::ServerConfig;
     use std::io::Write;
     use std::sync::Arc;
 
-    /// R1 with pin 1 on a `SIG` label and pin 2 wired down to a `power:GND`
-    /// symbol. The rail is what a label-only net graph loses.
-    const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
-
-    /// Run a tool by name against a temp file holding `sch`.
-    async fn call(sch: &str, tool: &str, mut args: serde_json::Value) -> serde_json::Value {
+    /// Run a tool by name against a temp file holding `sch`, exactly as the MCP
+    /// dispatch layer does after selecting its `ToolDef`.
+    pub(super) async fn call(
+        sch: &str,
+        tool: &str,
+        mut args: serde_json::Value,
+    ) -> serde_json::Value {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
         f.write_all(sch.as_bytes()).unwrap();
         f.flush().unwrap();
@@ -1164,6 +1347,16 @@ mod power_symbol_net_tests {
         };
         serde_json::from_str(text).unwrap()
     }
+}
+
+#[cfg(test)]
+mod power_symbol_net_tests {
+    use super::tool_call_support::call;
+    use super::*;
+
+    /// R1 with pin 1 on a `SIG` label and pin 2 wired down to a `power:GND`
+    /// symbol. The rail is what a label-only net graph loses.
+    const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
 
     /// The S-expression path: a pin reached only through a power symbol used to
     /// report no net at all.
@@ -1218,6 +1411,232 @@ mod power_symbol_net_tests {
         );
         let s = call(&shorted, "find_shorted_nets", json!({})).await;
         assert_eq!(s["short_count"], 1, "SIG and GND share one wire: {s}");
+    }
+}
+
+#[cfg(test)]
+mod single_pin_net_tests {
+    use super::tool_call_support::call;
+    use super::*;
+
+    /// A KiCad 10.0.5-authored parent sheet carrying one net of every shape the
+    /// tool has to tell apart. Provenance and the KiCad netlist that fixes the
+    /// expected pin count of each net are in `single_pin_nets.README.md`; the
+    /// counts asserted below are that netlist's, not this crate's.
+    ///
+    /// - `TWO_PIN` — one label, R1.2 and R2.1. The ordinary way to draw a net,
+    ///   and what the label count reported as a single-pin net.
+    /// - `LONE` — two labels on two wire segments that never meet, one pin
+    ///   between them. The defect the tool exists to find, invisible while a
+    ///   second label made the count 2, and it can only be found by pooling the
+    ///   two roots.
+    /// - `SPLIT` — the same shape with a pin on each root. Pooling is what
+    ///   keeps it off the report; KiCad's netlister agrees it is one 2-pin net.
+    /// - `VCC` — a power symbol and one component pin.
+    /// - `FLAGGED` — a `PWR_FLAG` (`#FLG01`) and one component pin.
+    /// - `SHEET_NET` — R8.2 and a hierarchical sheet pin.
+    /// - `MIXED` — a local and a global label naming one net that reaches one
+    ///   pin.
+    /// - `STUB` — a label on a wire that reaches no pin at all.
+    /// - `GND` — the rail nine pins sit on, the control for a net that is
+    ///   named by a power symbol and is not a defect.
+    const SCH: &str = include_str!("../../tests/fixtures/single_pin_nets.kicad_sch");
+
+    /// The child of that sheet: `SHEET_NET` continues here onto R10.2 through
+    /// a hierarchical label, so each sheet on its own sees one pin of a net
+    /// KiCad resolves to two.
+    const CHILD: &str = include_str!("../../tests/fixtures/single_pin_nets_child.kicad_sch");
+
+    async fn nets_of(sch: &str) -> Vec<serde_json::Value> {
+        call(sch, "find_single_pin_nets", json!({})).await["nets"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    async fn nets() -> Vec<serde_json::Value> {
+        nets_of(SCH).await
+    }
+
+    fn net<'a>(nets: &'a [serde_json::Value], name: &str) -> Option<&'a serde_json::Value> {
+        nets.iter().find(|net| net["net"] == name)
+    }
+
+    fn expect<'a>(nets: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+        net(nets, name).unwrap_or_else(|| panic!("{name} missing: {nets:?}"))
+    }
+
+    /// The false positive that made the tool unusable: 11 of 11 nets reported
+    /// on a real sheet, every one of them wired to two or more pins.
+    #[tokio::test]
+    async fn a_net_with_one_label_and_two_pins_is_not_reported() {
+        let nets = nets().await;
+
+        assert!(net(&nets, "TWO_PIN").is_none(), "{nets:?}");
+    }
+
+    /// And the miss on the other side: a second label used to make a real
+    /// single-pin net count 2 and disappear.
+    #[tokio::test]
+    async fn a_net_with_two_labels_and_one_pin_is_reported() {
+        let nets = nets().await;
+        let lone = expect(&nets, "LONE");
+
+        assert_eq!(lone["pin_count"], 1);
+        assert_eq!(lone["label_count"], 2, "the label count is kept, not used");
+        assert_eq!(lone["pins"][0]["reference"], "R3");
+        assert_eq!(lone["pins"][0]["pin"], "2");
+    }
+
+    /// `LONE`'s two labels sit on wire segments that never touch. KiCAD joins
+    /// them by name, so the pins under both roots are one net's pins — count
+    /// them per root and the one pin under the far root is a second net that
+    /// reaches nothing.
+    #[tokio::test]
+    async fn labels_of_one_name_on_disconnected_roots_pool() {
+        let nets = nets().await;
+
+        assert_eq!(expect(&nets, "LONE")["pin_count"], 1);
+    }
+
+    /// The same two-root shape with a pin on each root. Pooling is the only
+    /// reason this is not reported, and KiCad's own netlister resolves it to a
+    /// single net of R4.2 and R5.1.
+    #[tokio::test]
+    async fn one_pin_under_each_of_two_pooled_roots_is_two_pins() {
+        let nets = nets().await;
+
+        assert!(net(&nets, "SPLIT").is_none(), "{nets:?}");
+    }
+
+    /// A rail that reaches exactly one component pin is the defect. The power
+    /// symbol's own pin names it and must not make the count 2.
+    #[tokio::test]
+    async fn a_rail_reaching_one_pin_is_reported_without_its_power_symbol() {
+        let nets = nets().await;
+        let vcc = expect(&nets, "VCC");
+
+        assert_eq!(vcc["pin_count"], 1);
+        assert_eq!(vcc["pins"][0]["reference"], "R6", "not #PWR001");
+    }
+
+    /// `PWR_FLAG` is the other symbol whose pin names a net without consuming
+    /// one, and it is not a `LabelKind::PowerSymbol` — its pin is `power_out`,
+    /// so the `(power)` test lets it through. `#FLG01` is what keeps it out.
+    #[tokio::test]
+    async fn a_pwr_flag_pin_does_not_count_as_a_connection() {
+        let nets = nets().await;
+        let flagged = expect(&nets, "FLAGGED");
+
+        assert_eq!(flagged["pin_count"], 1);
+        assert_eq!(flagged["pins"][0]["reference"], "R7", "not #FLG01");
+    }
+
+    /// The rail nine pins sit on. A power symbol names it, so the tool has to
+    /// count past the naming symbol without reporting the net.
+    #[tokio::test]
+    async fn a_rail_reaching_many_pins_is_not_reported() {
+        let nets = nets().await;
+
+        assert!(net(&nets, "GND").is_none(), "{nets:?}");
+    }
+
+    /// A net leaving the sheet is connected to whatever is on the other side.
+    #[tokio::test]
+    async fn a_hierarchical_sheet_pin_counts_as_a_pin() {
+        let nets = nets().await;
+
+        assert!(net(&nets, "SHEET_NET").is_none(), "{nets:?}");
+    }
+
+    /// The stub a deleted component leaves behind reaches nothing at all. The
+    /// label count reported it, `find_orphan_items` names only its wire end,
+    /// and counting pins must not drop it on the floor. KiCad's netlist has no
+    /// `STUB` net to compare against, which is the point.
+    #[tokio::test]
+    async fn a_net_that_reaches_no_pin_is_reported_as_zero() {
+        let nets = nets().await;
+        let stub = expect(&nets, "STUB");
+
+        assert_eq!(stub["pin_count"], 0);
+        assert_eq!(stub["label_count"], 1);
+        assert_eq!(stub["pins"].as_array().unwrap().len(), 0);
+    }
+
+    /// Local labels are extracted first, so `type` alone reports `NetLabel` for
+    /// a net that also carries a global label and hides the one fact a caller
+    /// needs: this count is not the whole net.
+    #[tokio::test]
+    async fn a_net_carrying_a_global_label_reports_every_kind_that_named_it() {
+        let nets = nets().await;
+        let mixed = expect(&nets, "MIXED");
+
+        assert_eq!(mixed["type"], "NetLabel", "the compatibility field");
+        assert_eq!(
+            mixed["label_types"],
+            json!(["GlobalLabel", "NetLabel"]),
+            "sorted, and the global label is not lost"
+        );
+        assert_eq!(mixed["cross_sheet_unverified"], true);
+    }
+
+    /// A net named only by a local label is fully answered by this sheet.
+    #[tokio::test]
+    async fn a_locally_named_net_is_not_flagged_cross_sheet() {
+        let nets = nets().await;
+        let stub = expect(&nets, "STUB");
+
+        assert_eq!(stub["label_types"], json!(["NetLabel"]));
+        assert_eq!(stub["cross_sheet_unverified"], false);
+    }
+
+    /// A power symbol is a global label in KiCAD, so a rail counted on one
+    /// sheet is a lead, not a finding — even when, as here, the project-wide
+    /// netlist agrees that `VCC` reaches exactly one pin.
+    #[tokio::test]
+    async fn a_power_symbol_rail_is_flagged_cross_sheet() {
+        let nets = nets().await;
+        let vcc = expect(&nets, "VCC");
+
+        assert_eq!(vcc["label_types"], json!(["PowerSymbol"]));
+        assert_eq!(vcc["cross_sheet_unverified"], true);
+    }
+
+    /// The hierarchy boundary from the child's side. `SHEET_NET` reaches R10.2
+    /// and its hierarchical label here, and R8.2 and the sheet pin on the
+    /// parent; KiCad resolves the pair to one 2-pin net. Neither sheet can see
+    /// that alone, so the child reports one pin and says it is unverified.
+    #[tokio::test]
+    async fn a_child_sheet_reports_a_hierarchical_net_as_unverified() {
+        let nets = nets_of(CHILD).await;
+        let sheet_net = expect(&nets, "SHEET_NET");
+
+        assert_eq!(sheet_net["pin_count"], 1);
+        assert_eq!(sheet_net["pins"][0]["reference"], "R10");
+        assert_eq!(sheet_net["label_types"], json!(["HierarchicalLabel"]));
+        assert_eq!(sheet_net["cross_sheet_unverified"], true);
+    }
+
+    /// And the control on the same child: a local net of two pins is answered
+    /// there in full.
+    #[tokio::test]
+    async fn a_child_sheet_local_net_of_two_pins_is_not_reported() {
+        let nets = nets_of(CHILD).await;
+
+        assert!(net(&nets, "CHILD_LOCAL").is_none(), "{nets:?}");
+    }
+
+    /// The nets came out of a `HashMap` in whatever order it held them, so two
+    /// runs of the same binary over the same sheet could disagree on the order.
+    #[tokio::test]
+    async fn the_report_is_sorted_and_stable() {
+        let names: Vec<String> = nets()
+            .await
+            .iter()
+            .map(|net| net["net"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(names, vec!["FLAGGED", "LONE", "MIXED", "STUB", "VCC"]);
     }
 }
 
