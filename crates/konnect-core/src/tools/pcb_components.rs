@@ -41,14 +41,10 @@ macro_rules! ipc {
                     msg
                 )))
             }
-            // "Not open" is its own answer, and so is "could not tell": these
-            // tools have no file path, so both are still errors, but neither
-            // must be dressed up as a KiCad refusal — the message from
-            // `find_open_board` names the boards KiCad does hold, or the ones
-            // it could not identify.
-            Err(konnect_ipc::IpcFailure::BoardNotOpen(msg))
-            | Err(konnect_ipc::IpcFailure::Ambiguous(msg))
-            | Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
+            Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+                return Ok(crate::tools::ipc_target_error_result(&error))
+            }
+            Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
         }
     }};
 }
@@ -3215,19 +3211,10 @@ async fn handle_get_component_pads(
         }
         // Unreachable, or reachable and holding some other board: either way
         // no live KiCad can be answering about this one, so read the file.
-        Err(konnect_ipc::IpcFailure::Unreachable(_))
-        | Err(konnect_ipc::IpcFailure::BoardNotOpen(_)) => {}
-        // Not that, though. The file is the fallback for a board no editor
-        // holds, and an open-document list Konnect could not read does not
-        // establish that — a live KiCad may hold newer state, so answering
-        // from the file would present a stale board as the board.
-        Err(konnect_ipc::IpcFailure::Ambiguous(message)) => {
-            return Ok(CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::AmbiguousOpenBoard {
-                    path: board_path.display().to_string(),
-                },
-                message,
-            ));
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {}
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {}
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
         }
         Err(konnect_ipc::IpcFailure::Rejected(message)) => {
             return Ok(CallToolResult::error(message));

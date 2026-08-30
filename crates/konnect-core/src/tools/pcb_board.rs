@@ -285,28 +285,7 @@ where
                  board open, so editing the file directly could be silently overwritten."
             ))))
         }
-        // KiCad answered, and the answer did not say. Not a refusal — it
-        // declined nothing — and emphatically not "not open": the file path
-        // is unlocked by *proving* the board closed, and this is the case
-        // where that proof does not exist.
-        Err(konnect_ipc::IpcFailure::Ambiguous(message)) => {
-            Ok(BoardWrite::Refused(CallToolResult::error_kind(
-                ToolErrorKind::AmbiguousOpenBoard {
-                    path: board_path.display().to_string(),
-                },
-                format!(
-                    "Konnect could not confirm whether KiCAD has this board open, so it did not \
-                     apply the {what}: {message}. The board file was not modified. Close the \
-                     documents KiCAD cannot identify, or open this board in KiCAD and retry."
-                ),
-            )))
-        }
-        // KiCad up on another project, or freshly launched with nothing open.
-        // Gated on the same observation as `Unreachable`: KiCad no longer
-        // holding a board this session already saw it hold is the #240
-        // hazard — a crash-and-restart, or a close mid-operation — and a
-        // reachable transport says nothing about the work that board carried.
-        Err(konnect_ipc::IpcFailure::BoardNotOpen(answer)) => {
+        Err(konnect_ipc::IpcFailure::Target { error, message }) if error.proves_not_open() => {
             if ctx.board_session.was_observed_live(board_path) {
                 Ok(BoardWrite::Refused(unsafe_file_fallback(
                     board_path,
@@ -314,9 +293,12 @@ where
                      has it open.",
                 )))
             } else {
-                Ok(BoardWrite::File(NoLiveBoard::NotOpen(answer)))
+                Ok(BoardWrite::File(NoLiveBoard::NotOpen(message)))
             }
         }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => Ok(BoardWrite::Refused(
+            crate::tools::ipc_target_error_result(&error),
+        )),
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
             if ctx.board_session.was_observed_live(board_path) {
                 Ok(BoardWrite::Refused(unsafe_file_fallback(
@@ -367,20 +349,7 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
              there) and retry — this tool has no IPC path for a live board yet."
         )))),
         Err(konnect_ipc::IpcFailure::Rejected(_)) => Ok(None),
-        // Unlike `Rejected` — where KiCad answered about *this* board and said
-        // no, leaving the file demonstrably free — an unreadable open-document
-        // list says nothing about this board. Refuse rather than write.
-        Err(konnect_ipc::IpcFailure::Ambiguous(message)) => Ok(Some(CallToolResult::error_kind(
-            ToolErrorKind::AmbiguousOpenBoard {
-                path: board_path.display().to_string(),
-            },
-            format!(
-                "Konnect could not confirm whether KiCAD has this board open, so it did not \
-                     write the {what} to the file: {message}. Close the documents KiCAD cannot \
-                     identify, or make the edit in KiCAD."
-            ),
-        ))),
-        Err(konnect_ipc::IpcFailure::BoardNotOpen(_)) => {
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
             Ok(ctx.board_session.was_observed_live(board_path).then(|| {
                 unsafe_file_fallback(
                     board_path,
@@ -388,6 +357,9 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
                      has it open.",
                 )
             }))
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            Ok(Some(crate::tools::ipc_target_error_result(&error)))
         }
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
             Ok(ctx.board_session.was_observed_live(board_path).then(|| {
@@ -2553,7 +2525,7 @@ mod open_document_ambiguity_tests {
         let BoardWrite::Refused(result) = outcome else {
             panic!("the requested board open twice must not be resolved by order")
         };
-        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_target"));
         assert!(!entered, "no single document to address");
     }
 
@@ -2629,7 +2601,7 @@ mod open_document_ambiguity_tests {
         };
         let text = super::mounting_hole_tests::result_text(&result);
         assert!(!text.contains("rejected"), "{text}");
-        assert!(text.contains("could not confirm"), "{text}");
+        assert!(text.contains("cannot be compared safely"), "{text}");
     }
 
     /// A board this session watched KiCad hold stays protected: an unreadable
@@ -2939,7 +2911,7 @@ mod board_session_safety_tests {
         assert!(
             body["warning"]
                 .as_str()
-                .is_some_and(|warning| warning.contains("is not open in KiCAD")),
+                .is_some_and(|warning| warning.contains("is not open in KiCad")),
             "the warning must cover the path taken, not only an unreachable transport: {}",
             body["warning"]
         );

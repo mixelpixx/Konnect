@@ -415,6 +415,120 @@ fn warn_if_ipc_unreachable(address: &str, error: &anyhow::Error) {
     );
 }
 
+/// Convert an IPC board-target refusal into the stable MCP error taxonomy.
+pub(crate) fn ipc_target_error_result(error: &konnect_ipc::BoardTargetError) -> CallToolResult {
+    use konnect_ipc::BoardTargetError;
+
+    let message = format!("{}. Konnect did not read or modify another board.", error);
+    match error {
+        BoardTargetError::NoOpenDocuments { requested } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: Vec::new(),
+            },
+            message,
+        ),
+        BoardTargetError::WrongDocument {
+            requested,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: open_documents.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::AmbiguousDocument {
+            requested,
+            candidates,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                target: requested.clone(),
+                candidates: candidates.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::UnresolvedDocumentIdentities { requested, .. } => {
+            CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::AmbiguousOpenBoard {
+                    path: requested.clone(),
+                },
+                message,
+            )
+        }
+        BoardTargetError::StaleDocument {
+            requested,
+            previously_bound,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: requested.clone(),
+                reason: format!(
+                    "previously bound document '{}' is no longer uniquely open; observed [{}]",
+                    previously_bound,
+                    open_documents.join(", ")
+                ),
+            },
+            message,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod ipc_target_error_tests {
+    use super::*;
+
+    #[test]
+    fn ipc_document_target_failures_keep_distinct_structured_kinds() {
+        let cases = [
+            (
+                konnect_ipc::BoardTargetError::NoOpenDocuments {
+                    requested: "target.kicad_pcb".to_string(),
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::WrongDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::AmbiguousDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    candidates: vec!["target.kicad_pcb".to_string(); 2],
+                },
+                "ambiguous_target",
+            ),
+            (
+                konnect_ipc::BoardTargetError::StaleDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    previously_bound: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "stale_target",
+            ),
+            (
+                konnect_ipc::BoardTargetError::UnresolvedDocumentIdentities {
+                    requested: "target.kicad_pcb".to_string(),
+                    reasons: vec!["unidentified document".to_string()],
+                },
+                "ambiguous_open_board",
+            ),
+        ];
+
+        for (error, expected_kind) in cases {
+            let result = ipc_target_error_result(&error);
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some(expected_kind)
+            );
+        }
+    }
+}
+
 // ─── Argument helpers ─────────────────────────────────────────────────────────
 
 /// Build a structured `InvalidArgument` CallToolResult. Used by the

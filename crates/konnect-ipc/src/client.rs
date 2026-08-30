@@ -320,81 +320,87 @@ pub fn is_transport_unreachable(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<TransportUnreachable>())
 }
 
-/// Marker error carried (via anyhow's error chain) when KiCad answered and
-/// does not hold the requested board: another project is open, or no board is.
+/// A board-bearing operation could not resolve one exact live KiCad document.
 ///
-/// It carries its own message rather than taking one from `.context()`, so
-/// the classified failure reads as the one sentence a caller shows the user
-/// — a context line *and* a marker `Display` would say it twice.
-///
-/// Callers must classify with [`IpcFailure::from_error`], never by matching
-/// error text.
-#[derive(Debug)]
-pub struct BoardNotOpen(String);
+/// `NoOpenDocuments` and `WrongDocument` positively prove that the requested
+/// board is not open and may therefore permit the guarded file fallback.
+/// `AmbiguousDocument` and `StaleDocument` do not prove absence and must fail
+/// closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoardTargetError {
+    NoOpenDocuments {
+        requested: String,
+    },
+    WrongDocument {
+        requested: String,
+        open_documents: Vec<String>,
+    },
+    AmbiguousDocument {
+        requested: String,
+        candidates: Vec<String>,
+    },
+    UnresolvedDocumentIdentities {
+        requested: String,
+        reasons: Vec<String>,
+    },
+    StaleDocument {
+        requested: String,
+        previously_bound: String,
+        open_documents: Vec<String>,
+    },
+}
 
-impl BoardNotOpen {
-    fn err(message: String) -> anyhow::Error {
-        anyhow::Error::new(Self(message))
+impl BoardTargetError {
+    pub fn proves_not_open(&self) -> bool {
+        matches!(
+            self,
+            Self::NoOpenDocuments { .. } | Self::WrongDocument { .. }
+        )
     }
 }
 
-impl std::fmt::Display for BoardNotOpen {
+impl std::fmt::Display for BoardTargetError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        match self {
+            Self::NoOpenDocuments { requested } => write!(
+                formatter,
+                "requested board '{requested}' is not open because KiCad reports no PCB documents"
+            ),
+            Self::WrongDocument {
+                requested,
+                open_documents,
+            } => write!(
+                formatter,
+                "requested board '{requested}' is not open in KiCad (open boards: {})",
+                open_documents.join(", ")
+            ),
+            Self::AmbiguousDocument {
+                requested,
+                candidates,
+            } => write!(
+                formatter,
+                "requested board '{requested}' cannot be resolved uniquely ({})",
+                candidates.join("; ")
+            ),
+            Self::UnresolvedDocumentIdentities { requested, reasons } => write!(
+                formatter,
+                "KiCad's open documents cannot be compared safely with requested board '{requested}' ({})",
+                reasons.join("; ")
+            ),
+            Self::StaleDocument {
+                requested,
+                previously_bound,
+                open_documents,
+            } => write!(
+                formatter,
+                "requested board '{requested}' was bound to '{previously_bound}', but that document is no longer uniquely open (open boards: {})",
+                open_documents.join(", ")
+            ),
+        }
     }
 }
 
-impl std::error::Error for BoardNotOpen {}
-
-/// The "nothing is open" half of [`BoardNotOpen`], shared by the two lookups
-/// that can hit it.
-fn no_board_open() -> anyhow::Error {
-    BoardNotOpen::err("No PCB document is open in KiCAD. Open a board file first.".to_string())
-}
-
-/// Marker error carried when KiCad's open-document list cannot be read as a
-/// complete set of comparable board identities — so whether it holds the
-/// requested board is *unknown*, not answered.
-///
-/// It exists because the alternative is worse than a wrong error message.
-/// [`BoardNotOpen`] tells a caller that KiCad has no unsaved state for this
-/// board and the saved file is authoritative, which is what permits a direct
-/// file write. Reaching that conclusion by discarding the records that could
-/// not be resolved turns "we could not tell" into "it is safe to overwrite".
-///
-/// Like [`BoardNotOpen`], it carries its own message and is classified by
-/// walking the error chain.
-#[derive(Debug)]
-pub struct AmbiguousOpenBoards(String);
-
-impl AmbiguousOpenBoards {
-    fn err(message: String) -> anyhow::Error {
-        anyhow::Error::new(Self(message))
-    }
-}
-
-impl std::fmt::Display for AmbiguousOpenBoards {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for AmbiguousOpenBoards {}
-
-/// Whether `error` says KiCad's open-board list could not be read as a
-/// complete, comparable set. Walks the chain, never the message text.
-fn is_ambiguous_open_boards(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<AmbiguousOpenBoards>())
-}
-
-/// Whether `error` says KiCad is not holding the requested board.
-///
-/// Private: nothing outside the classification needs to ask this yet, and a
-/// caller that does can match [`IpcFailure::BoardNotOpen`]. Like
-/// [`IpcFailure::from_error`], it walks the chain — never the message text.
-fn is_board_not_open(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<BoardNotOpen>())
-}
+impl std::error::Error for BoardTargetError {}
 
 /// Why an IPC operation failed, for callers deciding whether a file-based
 /// fallback is safe.
@@ -404,19 +410,8 @@ fn is_board_not_open(error: &anyhow::Error) -> bool {
 /// KiCad can be holding the board, and editing the board file directly
 /// cannot race an editor.
 ///
-/// `BoardNotOpen` means KiCad answered and does not have the requested board
-/// open — a different project, or none at all. KiCad cannot be holding
-/// unsaved state for a board it never opened, so this is as safe to edit on
-/// disk as `Unreachable`, and it must not be reported as a refusal: KiCad
-/// declined nothing.
-///
-/// `Ambiguous` means KiCad answered and the answer could not be read as a
-/// complete set of comparable board identities, so whether it holds the
-/// requested board is unknown. It is deliberately not `BoardNotOpen`: absence
-/// has to be *proven* before a saved file may be treated as authoritative.
-/// It is not `Rejected` either, because KiCad declined nothing — reporting a
-/// refusal it never made is the misreading this classification exists to end.
-/// Fail closed, and say which it was.
+/// `Target` retains a typed board-identity decision. Only target errors whose
+/// [`BoardTargetError::proves_not_open`] is true may permit a file fallback.
 ///
 /// `Rejected` is everything else, including any error after a request was
 /// delivered (a receive timeout may mean KiCad is still processing it).
@@ -425,9 +420,11 @@ fn is_board_not_open(error: &anyhow::Error) -> bool {
 #[derive(Debug)]
 pub enum IpcFailure {
     Unreachable(String),
-    BoardNotOpen(String),
-    Ambiguous(String),
     Rejected(String),
+    Target {
+        error: BoardTargetError,
+        message: String,
+    },
 }
 
 impl IpcFailure {
@@ -436,12 +433,16 @@ impl IpcFailure {
     /// message text.
     pub fn from_error(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
-        if is_transport_unreachable(&error) {
+        if let Some(target) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<BoardTargetError>().cloned())
+        {
+            IpcFailure::Target {
+                error: target,
+                message,
+            }
+        } else if is_transport_unreachable(&error) {
             IpcFailure::Unreachable(message)
-        } else if is_ambiguous_open_boards(&error) {
-            IpcFailure::Ambiguous(message)
-        } else if is_board_not_open(&error) {
-            IpcFailure::BoardNotOpen(message)
         } else {
             IpcFailure::Rejected(message)
         }
@@ -450,9 +451,8 @@ impl IpcFailure {
     pub fn message(&self) -> &str {
         match self {
             IpcFailure::Unreachable(message)
-            | IpcFailure::BoardNotOpen(message)
-            | IpcFailure::Ambiguous(message)
-            | IpcFailure::Rejected(message) => message,
+            | IpcFailure::Rejected(message)
+            | IpcFailure::Target { message, .. } => message,
         }
     }
 }
@@ -467,6 +467,13 @@ pub struct KiCadIpcClient {
     socket_path: String,
     kicad_token: String,
     client_name: String,
+    bound_board: std::sync::Mutex<Option<BoundBoardTarget>>,
+}
+
+#[derive(Clone)]
+struct BoundBoardTarget {
+    requested: PathBuf,
+    document: kiapi::common::types::DocumentSpecifier,
 }
 
 impl KiCadIpcClient {
@@ -489,6 +496,7 @@ impl KiCadIpcClient {
             socket_path: effective_path,
             kicad_token: std::env::var("KICAD_API_TOKEN").unwrap_or_default(),
             client_name: format!("konnect-{}", std::process::id()),
+            bound_board: std::sync::Mutex::new(None),
         }
     }
 
@@ -660,10 +668,52 @@ impl KiCadIpcClient {
             .collect())
     }
 
-    /// Get the first open PCB's DocumentSpecifier (needed for most commands).
+    /// Get the uniquely targeted PCB document for generic board helpers.
+    ///
+    /// Once [`Self::find_open_board`] binds a requested board, this re-observes
+    /// the open-document set and carries the same typed target forward. It
+    /// never substitutes the first board in KiCad's list.
     fn get_board_document(&self) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;
-        docs.into_iter().next().ok_or_else(no_board_open)
+        let bound = self
+            .bound_board
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bound board target lock is poisoned"))?
+            .clone();
+
+        if let Some(bound) = bound {
+            return match select_requested_board(&docs, &bound.requested) {
+                Ok(document) => {
+                    self.bind_board(bound.requested, document.clone())?;
+                    Ok(document)
+                }
+                Err(
+                    error @ (BoardTargetError::AmbiguousDocument { .. }
+                    | BoardTargetError::UnresolvedDocumentIdentities { .. }),
+                ) => Err(anyhow::Error::new(error)),
+                Err(_) => Err(anyhow::Error::new(BoardTargetError::StaleDocument {
+                    requested: bound.requested.display().to_string(),
+                    previously_bound: board_document_label(&bound.document),
+                    open_documents: board_document_labels(&docs),
+                })),
+            };
+        }
+
+        match docs.as_slice() {
+            [] => Err(anyhow::Error::new(BoardTargetError::NoOpenDocuments {
+                requested: "<unspecified>".to_string(),
+            })),
+            [document] => {
+                if let Ok(path) = board_document_identity(document) {
+                    self.bind_board(path, document.clone())?;
+                }
+                Ok(document.clone())
+            }
+            _ => Err(anyhow::Error::new(BoardTargetError::AmbiguousDocument {
+                requested: "<unspecified>".to_string(),
+                candidates: board_document_labels(&docs),
+            })),
+        }
     }
 
     /// Find the open document matching `requested`, so a path-bearing MCP
@@ -677,80 +727,25 @@ impl KiCadIpcClient {
         requested: &Path,
     ) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;
-        if docs.is_empty() {
-            return Err(no_board_open());
-        }
+        let document = select_requested_board(&docs, requested).map_err(anyhow::Error::new)?;
+        self.bind_board(requested.to_path_buf(), document.clone())?;
+        Ok(document)
+    }
 
-        // Resolve the whole list before deciding anything. A record that could
-        // not be resolved is not evidence that the requested board is absent,
-        // and dropping it where it is produced is what turned "we cannot tell"
-        // into "the saved file is authoritative" (#426).
-        let identities: Vec<_> = docs.iter().map(board_document_identity).collect::<Vec<_>>();
-        let requested_identity = comparable_identity(requested).map_err(|reason| {
-            AmbiguousOpenBoards::err(format!(
-                "the requested board '{}' {reason}, so KiCad's open boards cannot be compared \
-                 against it",
-                requested.display()
-            ))
-        })?;
-
-        // A positive match is the safe direction — it sends the operation to
-        // KiCad rather than to the file — but only when exactly one open
-        // document claims to be this board.
-        let matched: Vec<usize> = identities
-            .iter()
-            .enumerate()
-            .filter(|(_, identity)| identity.as_ref().is_ok_and(|id| *id == requested_identity))
-            .map(|(index, _)| index)
-            .collect();
-        if matched.len() == 1 {
-            return Ok(docs[matched[0]].clone());
-        }
-        if matched.len() > 1 {
-            return Err(AmbiguousOpenBoards::err(format!(
-                "KiCAD reports board '{}' open {} times, so Konnect cannot tell which document \
-                 an edit would reach",
-                requested.display(),
-                matched.len()
-            )));
-        }
-
-        // No match. Absence is only proven by a list that was read in full.
-        let unresolved: Vec<&str> = identities
-            .iter()
-            .filter_map(|identity| identity.as_ref().err().map(String::as_str))
-            .collect();
-        if !unresolved.is_empty() {
-            return Err(AmbiguousOpenBoards::err(format!(
-                "KiCAD has {} PCB document(s) open that Konnect cannot identify ({}), so it \
-                 cannot prove that board '{}' is closed",
-                unresolved.len(),
-                unresolved.join("; "),
-                requested.display()
-            )));
-        }
-
-        let open: Vec<&PathBuf> = identities
-            .iter()
-            .filter_map(|id| id.as_ref().ok())
-            .collect();
-        if let Some(duplicated) = first_duplicate(&open) {
-            return Err(AmbiguousOpenBoards::err(format!(
-                "KiCAD reports board '{}' open more than once, so its open-document list is not \
-                 one Konnect can read; it cannot prove that board '{}' is closed",
-                duplicated.display(),
-                requested.display()
-            )));
-        }
-
-        Err(BoardNotOpen::err(format!(
-            "requested board '{}' is not open in KiCAD (open boards: {})",
-            requested.display(),
-            open.iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+    fn bind_board(
+        &self,
+        requested: PathBuf,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<()> {
+        *self
+            .bound_board
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bound board target lock is poisoned"))? =
+            Some(BoundBoardTarget {
+                requested,
+                document,
+            });
+        Ok(())
     }
 
     /// Fail closed unless the requested board is open in the IPC session.
@@ -2822,6 +2817,97 @@ fn board_document_path(document: &kiapi::common::types::DocumentSpecifier) -> Op
         .filter(|project| !project.path.is_empty())
         .map(|project| PathBuf::from(&project.path).join(&path))
         .or(Some(path))
+}
+
+fn board_document_label(document: &kiapi::common::types::DocumentSpecifier) -> String {
+    board_document_identity(document)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|reason| format!("<unidentified PCB document: {reason}>"))
+}
+
+fn board_document_labels(documents: &[kiapi::common::types::DocumentSpecifier]) -> Vec<String> {
+    documents.iter().map(board_document_label).collect()
+}
+
+/// Resolve exactly one requested board while retaining #407's safety rule:
+/// absence is only proven when every reported document identity is readable.
+fn select_requested_board(
+    documents: &[kiapi::common::types::DocumentSpecifier],
+    requested: &Path,
+) -> std::result::Result<kiapi::common::types::DocumentSpecifier, BoardTargetError> {
+    let requested_label = requested.display().to_string();
+    if documents.is_empty() {
+        return Err(BoardTargetError::NoOpenDocuments {
+            requested: requested_label,
+        });
+    }
+
+    let requested_identity = comparable_identity(requested).map_err(|reason| {
+        BoardTargetError::UnresolvedDocumentIdentities {
+            requested: requested_label.clone(),
+            reasons: vec![format!(
+                "requested path {reason}, so it cannot be compared with KiCad's documents"
+            )],
+        }
+    })?;
+    let identities = documents
+        .iter()
+        .map(board_document_identity)
+        .collect::<Vec<_>>();
+    let matched = identities
+        .iter()
+        .enumerate()
+        .filter(|(_, identity)| {
+            identity
+                .as_ref()
+                .is_ok_and(|path| *path == requested_identity)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    match matched.as_slice() {
+        [index] => return Ok(documents[*index].clone()),
+        [] => {}
+        _ => {
+            return Err(BoardTargetError::AmbiguousDocument {
+                requested: requested_label,
+                candidates: matched
+                    .iter()
+                    .map(|index| board_document_label(&documents[*index]))
+                    .collect(),
+            })
+        }
+    }
+
+    let unresolved = identities
+        .iter()
+        .filter_map(|identity| identity.as_ref().err().cloned())
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        return Err(BoardTargetError::UnresolvedDocumentIdentities {
+            requested: requested_label,
+            reasons: unresolved,
+        });
+    }
+
+    let open = identities
+        .iter()
+        .filter_map(|identity| identity.as_ref().ok())
+        .collect::<Vec<_>>();
+    if let Some(duplicated) = first_duplicate(&open) {
+        return Err(BoardTargetError::UnresolvedDocumentIdentities {
+            requested: requested_label,
+            reasons: vec![format!(
+                "KiCad reports '{}' open more than once",
+                duplicated.display()
+            )],
+        });
+    }
+
+    Err(BoardTargetError::WrongDocument {
+        requested: requested_label,
+        open_documents: open.iter().map(|path| path.display().to_string()).collect(),
+    })
 }
 
 /// One open PCB document as a path that can be compared with a requested

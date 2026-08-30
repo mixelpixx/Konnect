@@ -678,7 +678,10 @@ fn real_kicad_open_documents_resolve_to_comparable_paths() {
     assert!(
         matches!(
             konnect_ipc::IpcFailure::from_error(error),
-            konnect_ipc::IpcFailure::BoardNotOpen(_)
+            konnect_ipc::IpcFailure::Target {
+                error: konnect_ipc::BoardTargetError::WrongDocument { .. },
+                ..
+            }
         ),
         "a complete open-document list must prove absence, not merely fail to confirm it"
     );

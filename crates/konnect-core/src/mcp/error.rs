@@ -58,6 +58,12 @@ pub enum ToolErrorKind {
         target: String,
         candidates: Vec<String>,
     },
+    /// The requested document is not the document set observed in the target
+    /// editor, so proceeding would answer about or mutate another file.
+    WrongDocument {
+        requested: String,
+        open_documents: Vec<String>,
+    },
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
@@ -85,6 +91,7 @@ impl ToolErrorKind {
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
+            Self::WrongDocument { .. } => "wrong_document",
             Self::StaleTarget { .. } => "stale_target",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
@@ -214,6 +221,10 @@ mod tests {
             ToolErrorKind::AmbiguousTarget {
                 target: "t".into(),
                 candidates: vec!["a".into(), "b".into()],
+            },
+            ToolErrorKind::WrongDocument {
+                requested: "p".into(),
+                open_documents: vec!["a".into()],
             },
             ToolErrorKind::StaleTarget {
                 target: "p".into(),
