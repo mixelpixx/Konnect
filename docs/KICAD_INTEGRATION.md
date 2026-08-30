@@ -62,6 +62,15 @@ schematic protobuf currently decodes line and label selections. Schematic
 symbols and other unmodelled types remain explicitly unsupported until KiCad
 provides stable typed serialization for them.
 
+Navigation target resolution keeps two evidence channels in the same result
+without merging them. `GetOpenDocuments` proves that the exact requested live
+project/document/sheet context is still addressable; the saved `.kicad_sch` or
+`.kicad_pcb` structure proves object KIID and human-reference identity. Stable
+KIID lookup is primary. A reference such as `C10` is accepted only when one
+object matches in the exact document and sheet instance; duplicates return
+structured candidates, and stale project ownership or symbol-instance paths
+fail closed before any editor mutation.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses
