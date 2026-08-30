@@ -49,6 +49,29 @@
 			)
 		)
 	)
+	(property "KiLib_Generator" "konnect_test_generator"
+		(at 0 0 0)
+		(layer "F.SilkS")
+		(hide yes)
+		(uuid "d7d0fd3f-bcab-4eb1-8131-334305f93cd8")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "AssemblyVendor" "Example Assembly"
+		(at 0.5 0.75 15)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "b15b8a94-8ee9-45f5-8720-af02ba40ef78")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
 	(attr smd exclude_from_pos_files)
 	(duplicate_pad_numbers_are_jumpers no)
 	(fp_line

@@ -286,16 +286,36 @@ impl Symbol {
     /// Whether this symbol already has an instance entry for the given
     /// project name and hierarchical path.
     pub fn has_instance_path(&self, project_name: &str, path: &str) -> bool {
-        self.raw_sub_nodes
+        self.instance_paths()
             .iter()
-            .find(|n| n.tag() == Some("instances"))
-            .map(|inst| {
-                inst.find_all("project").iter().any(|p| {
-                    p.value() == Some(project_name)
-                        && p.find_all("path").iter().any(|pp| pp.value() == Some(path))
-                })
-            })
-            .unwrap_or(false)
+            .any(|(project, candidate)| project == project_name && candidate == path)
+    }
+
+    /// Every project/path identity carried by this placed symbol.
+    ///
+    /// A child schematic file can be instantiated more than once in one root
+    /// hierarchy, so one placed symbol legitimately carries multiple paths.
+    /// Returning all of them lets callers compare the saved identity with the
+    /// structurally observed hierarchy instead of selecting the first entry.
+    pub fn instance_paths(&self) -> Vec<(String, String)> {
+        let mut paths = Vec::new();
+        for instances in self
+            .raw_sub_nodes
+            .iter()
+            .filter(|node| node.tag() == Some("instances"))
+        {
+            for project in instances.find_all("project") {
+                let Some(project_name) = project.value() else {
+                    continue;
+                };
+                for path in project.find_all("path") {
+                    if let Some(path_value) = path.value() {
+                        paths.push((project_name.to_string(), path_value.to_string()));
+                    }
+                }
+            }
+        }
+        paths
     }
 
     // ---- position -----------------------------------------------------------
@@ -527,5 +547,24 @@ mod tests {
             "property must keep its offset"
         );
         assert_eq!((sym.at.x, sym.at.y), (110.0, 60.0));
+    }
+
+    #[test]
+    fn instance_paths_reports_every_reused_hierarchy_identity() {
+        let mut symbol = Symbol::new("Device:R", 100.0, 50.0);
+        symbol.set_instance_path("control", "/root/a", "R1", 1);
+        symbol.set_instance_path("control", "/root/b", "R1", 1);
+        symbol.set_instance_path("other", "/other/c", "R1", 1);
+
+        assert_eq!(
+            symbol.instance_paths(),
+            [
+                ("control".to_string(), "/root/a".to_string()),
+                ("control".to_string(), "/root/b".to_string()),
+                ("other".to_string(), "/other/c".to_string()),
+            ]
+        );
+        assert!(symbol.has_instance_path("control", "/root/b"));
+        assert!(!symbol.has_instance_path("control", "/root/missing"));
     }
 }

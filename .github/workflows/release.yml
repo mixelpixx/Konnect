@@ -12,6 +12,9 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: konnect
+  # Embedded into get_installation_info so release artifacts identify the
+  # exact source commit even when built outside a Git working tree.
+  KONNECT_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
   build:

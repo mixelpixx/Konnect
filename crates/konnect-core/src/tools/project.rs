@@ -88,7 +88,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_project_info",
             "Read project metadata from a .kicad_pro file. Returns the project name, \
-             schematic and PCB paths, and last modified times.",
+             schematic and PCB paths, last modified time, project-file format version, \
+             and the generator versions recorded by the sibling design files. The \
+             compatibility kicad_version is null when those siblings disagree.",
             json!({
                 "type": "object",
                 "properties": {
@@ -409,6 +411,18 @@ async fn handle_get_project_info(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
 
+    let schematic_generator_version = read_generator_version(&sch).await;
+    let pcb_generator_version = read_generator_version(&pcb).await;
+    let kicad_version = match (
+        schematic_generator_version.as_deref(),
+        pcb_generator_version.as_deref(),
+    ) {
+        (Some(schematic), Some(pcb)) if schematic == pcb => Some(schematic.to_string()),
+        (Some(schematic), None) => Some(schematic.to_string()),
+        (None, Some(pcb)) => Some(pcb.to_string()),
+        _ => None,
+    };
+
     Ok(CallToolResult::json(&json!({
         "name": stem,
         "path": path.display().to_string(),
@@ -417,8 +431,17 @@ async fn handle_get_project_info(
         "pcb": pcb.display().to_string(),
         "pcb_exists": pcb.exists(),
         "last_modified_unix": modified,
-        "kicad_version": pro.get("meta").and_then(|m| m.get("filename")).and_then(|v| v.as_str())
+        "project_file_version": pro.get("meta").and_then(|m| m.get("version")),
+        "schematic_generator_version": schematic_generator_version,
+        "pcb_generator_version": pcb_generator_version,
+        "kicad_version": kicad_version
     })))
+}
+
+async fn read_generator_version(path: &Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let root = konnect_sexp::parse_sexp(&content).ok()?;
+    root.find_str("generator_version").map(str::to_owned)
 }
 
 async fn handle_snapshot_project(
@@ -811,6 +834,42 @@ mod tests {
         assert_eq!(parsed["name"], "widget");
         assert_eq!(parsed["schematic_exists"], true);
         assert_eq!(parsed["pcb_exists"], true);
+        assert_eq!(parsed["project_file_version"], 1);
+        assert_eq!(parsed["schematic_generator_version"], "10.0");
+        assert_eq!(parsed["pcb_generator_version"], "10.0");
+        assert_eq!(parsed["kicad_version"], "10.0");
+    }
+
+    #[tokio::test]
+    async fn get_project_info_does_not_claim_a_version_when_siblings_disagree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = test_ctx();
+        let create_args = json!({
+            "path": dir.path().to_str().unwrap(),
+            "name": "widget"
+        });
+        handle_create_project(&create_args, &ctx)
+            .await
+            .expect("setup: create_project should succeed");
+
+        let pcb_path = dir.path().join("widget.kicad_pcb");
+        let pcb = std::fs::read_to_string(&pcb_path).expect("read generated board");
+        std::fs::write(
+            &pcb_path,
+            pcb.replace("generator_version \"10.0\"", "generator_version \"10.1\""),
+        )
+        .expect("write board with a distinct generator version");
+
+        let pro_path = dir.path().join("widget.kicad_pro");
+        let info_args = json!({ "path": pro_path.to_str().unwrap() });
+        let result = handle_get_project_info(&info_args, &ctx)
+            .await
+            .expect("handler should succeed");
+        let parsed = response_json(&result);
+
+        assert_eq!(parsed["schematic_generator_version"], "10.0");
+        assert_eq!(parsed["pcb_generator_version"], "10.1");
+        assert!(parsed["kicad_version"].is_null());
     }
 
     #[tokio::test]

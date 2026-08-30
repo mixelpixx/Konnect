@@ -936,6 +936,197 @@ fn doc_for(filename: &str) -> kiapi::common::types::DocumentSpecifier {
     }
 }
 
+#[test]
+fn generic_read_and_write_helpers_keep_the_bound_named_board() {
+    let captured = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let captured_in_mock = captured.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![doc_for("other.kicad_pcb"), doc_for("target.kicad_pcb")],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        if message.type_url.ends_with("GetItems") {
+            let command =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            let document = command.header.unwrap().document.unwrap();
+            captured_in_mock
+                .lock()
+                .unwrap()
+                .push(("read".to_string(), board_filename(&document)));
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: Vec::new(),
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("CreateItems") {
+            let command =
+                kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            let document = command.header.unwrap().document.unwrap();
+            captured_in_mock
+                .lock()
+                .unwrap()
+                .push(("write".to_string(), board_filename(&document)));
+            let response = kiapi::common::commands::CreateItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                created_items: vec![creation_result(
+                    kiapi::common::commands::ItemStatusCode::IscOk,
+                    "",
+                )],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.CreateItemsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .expect("bind target");
+    client
+        .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)
+        .expect("generic read");
+    client
+        .create_items(vec![any_item()])
+        .expect("generic write");
+
+    assert_eq!(
+        *captured.lock().unwrap(),
+        [
+            ("read".to_string(), "target.kicad_pcb".to_string()),
+            ("write".to_string(), "target.kicad_pcb".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn zero_wrong_and_duplicate_open_document_sets_are_typed_target_failures() {
+    let cases = [
+        (
+            Vec::new(),
+            "no_open",
+            std::path::PathBuf::from("target.kicad_pcb"),
+        ),
+        (
+            vec![doc_for("other.kicad_pcb")],
+            "wrong",
+            std::path::PathBuf::from("target.kicad_pcb"),
+        ),
+        (
+            vec![doc_for("target.kicad_pcb"), doc_for("target.kicad_pcb")],
+            "ambiguous",
+            std::path::PathBuf::from("target.kicad_pcb"),
+        ),
+    ];
+
+    for (documents, expected, requested) in cases {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("request must pack a command");
+            assert!(message.type_url.ends_with("GetOpenDocuments"));
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: documents.clone(),
+            };
+            Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let failure = konnect_ipc::IpcFailure::from_error(
+            client
+                .find_open_board(&requested)
+                .expect_err("target selection must refuse"),
+        );
+        match (expected, failure) {
+            (
+                "no_open",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::NoOpenDocuments { .. },
+                    ..
+                },
+            )
+            | (
+                "wrong",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::WrongDocument { .. },
+                    ..
+                },
+            )
+            | (
+                "ambiguous",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::AmbiguousDocument { .. },
+                    ..
+                },
+            ) => {}
+            (_, other) => panic!("unexpected target classification: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_bound_document_disappearing_before_a_generic_command_is_stale() {
+    let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observations_in_mock = observations.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        let count = observations_in_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let response = kiapi::common::commands::GetOpenDocumentsResponse {
+            documents: if count == 0 {
+                vec![doc_for("target.kicad_pcb")]
+            } else {
+                vec![doc_for("other.kicad_pcb")]
+            },
+        };
+        Some(reply_with(builders::pack_any(
+            &response,
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .expect("initial target binding");
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)
+            .expect_err("closed bound document must refuse before GetItems"),
+    );
+    assert!(matches!(
+        failure,
+        konnect_ipc::IpcFailure::Target {
+            error: konnect_ipc::BoardTargetError::StaleDocument { .. },
+            ..
+        }
+    ));
+    assert_eq!(observations.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+fn board_filename(document: &kiapi::common::types::DocumentSpecifier) -> String {
+    match document.identifier.as_ref() {
+        Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(name)) => {
+            name.clone()
+        }
+        other => panic!("expected board filename, got {other:?}"),
+    }
+}
+
 fn record_doc(
     slot: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
     header: &Option<kiapi::common::types::ItemHeader>,

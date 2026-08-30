@@ -8,7 +8,9 @@
 //!    `Err`, not a crash, because tool handlers feed it user files verbatim.
 //! 2. Parsing is total and deterministic over well-formed input.
 
-use konnect_sexp::{parse_sexp, writer::apply_edits, SexpEdit, SexpNode};
+use konnect_sexp::{
+    board::ZoneOutlineElement, parse_sexp, writer::apply_edits, SexpEdit, SexpNode,
+};
 use proptest::prelude::*;
 
 // ─── Strategies ──────────────────────────────────────────────────────────────
@@ -155,7 +157,15 @@ proptest! {
                 prop_assert!(!v.layers.is_empty());
             }
             for z in &konnect_sexp::board::zones(&tree).items {
-                prop_assert!(z.points.len() >= 3);
+                let defining_coordinate_count: usize = z
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        ZoneOutlineElement::Point(_) => 1,
+                        ZoneOutlineElement::Arc { .. } => 3,
+                    })
+                    .sum();
+                prop_assert!(defining_coordinate_count >= 3);
                 prop_assert!(!z.layers.is_empty());
             }
             if let Some((x0, y0, x1, y1)) = konnect_sexp::board::board_outline_bbox(&tree) {

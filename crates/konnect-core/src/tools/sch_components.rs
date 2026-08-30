@@ -542,14 +542,22 @@ async fn handle_add_schematic_component(
     // whose path doesn't resolve. On a child sheet both differ from this
     // file's own stem and uuid, which is what left hierarchical designs
     // unannotated (#204).
-    let context = crate::tools::sheet_instance_context(&sch_path, &mut sch);
-    let instance_path = context.instance_path.clone();
-    let project_name = context.project_name.clone();
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
+    let source = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
 
-    let result = match place_one_component(
+    let uuid = match place_one_component(
         &mut sch,
-        &instance_path,
-        &project_name,
+        &context.instance_paths,
+        &context.project_name,
         &lib_id,
         x,
         y,
@@ -557,9 +565,9 @@ async fn handle_add_schematic_component(
         ref_str,
         value,
         unit,
-        &crate::tools::library::KiCadSymbolSource::for_file(&sch_path),
+        &source,
     ) {
-        Ok(v) => v,
+        Ok(uuid) => uuid,
         Err(e) => return Ok(e),
     };
 
@@ -569,8 +577,12 @@ async fn handle_add_schematic_component(
     // KiCad's netlister treats it as unconnected. Runs after the write because
     // it re-reads the saved file; `place_one_component` stays pure so the batch
     // path can do one junction pass for the whole batch instead of one per part.
-    let mut result = result;
     let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
+    let committed = cse::Schematic::load(&sch_path)?;
+    let mut result = match placed_component_readback(&sch_path, &committed, &uuid, &context) {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
     result["junctions_added"] = json!(junctions
         .iter()
         .map(|(x, y)| json!({ "x": x, "y": y }))
@@ -585,7 +597,7 @@ async fn handle_add_schematic_component(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_one_component(
     sch: &mut cse::Schematic,
-    instance_path: &str,
+    instance_paths: &[String],
     project_name: &str,
     lib_id: &str,
     x: f64,
@@ -595,7 +607,7 @@ pub(crate) fn place_one_component(
     value: Option<&str>,
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
-) -> Result<serde_json::Value, CallToolResult> {
+) -> Result<String, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
     let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
@@ -686,18 +698,74 @@ pub(crate) fn place_one_component(
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
-    sym.set_instance_path(project_name, instance_path, reference, unit);
+    for instance_path in instance_paths {
+        sym.set_instance_path(project_name, instance_path, reference, unit);
+    }
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
 
+    Ok(uuid)
+}
+
+/// Build a placement response only from the committed schematic that was read
+/// back after the write. The UUID is the mutation's stable identity; requested
+/// coordinates, fields, and hierarchy paths are never echoed as proof.
+pub(crate) fn placed_component_readback(
+    sch_path: &std::path::Path,
+    committed: &cse::Schematic,
+    uuid: &str,
+    context: &crate::tools::SheetInstanceContext,
+) -> Result<serde_json::Value, CallToolResult> {
+    if let Err(error) = crate::tools::validate_sheet_instance_state(sch_path, committed, context) {
+        return Err(error.into_tool_result());
+    }
+    let Some(symbol) = committed.symbols.iter().find(|symbol| symbol.uuid == uuid) else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!("placed symbol UUID '{uuid}' is absent from post-write readback"),
+        }
+        .into_tool_result());
+    };
+    let Some(reference) = symbol.reference() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed symbol UUID '{}' has no Reference in post-write readback",
+                symbol.uuid
+            ),
+        }
+        .into_tool_result());
+    };
+    let Some(value) = symbol.value_str() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed symbol UUID '{}' has no Value in post-write readback",
+                symbol.uuid
+            ),
+        }
+        .into_tool_result());
+    };
+    let mut instance_paths = symbol
+        .instance_paths()
+        .into_iter()
+        .filter_map(|(project, path)| (project == context.project_name).then_some(path))
+        .collect::<Vec<_>>();
+    instance_paths.sort();
+
     Ok(json!({
-        "added": lib_id,
+        "schematic": sch_path.display().to_string(),
+        "added": symbol.lib_id,
         "reference": reference,
-        "value": val_str,
-        "x": x, "y": y,
-        "unit": unit,
-        "uuid": uuid
+        "value": value,
+        "x": symbol.at.x,
+        "y": symbol.at.y,
+        "rotation": symbol.at.rotation.unwrap_or(0.0),
+        "unit": symbol.unit,
+        "uuid": symbol.uuid,
+        "project": context.project_name,
+        "instance_paths": instance_paths
     }))
 }
 
@@ -1754,7 +1822,10 @@ async fn handle_update_symbols_from_library(
     let mut unchanged = Vec::new();
     let mut pins_moved = Vec::new();
     let mut errors = Vec::new();
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     let outcomes = reembed_lib_symbols(&mut content, &lib_ids, allow_pin_moves, &src);
     for (lib_id, outcome) in lib_ids.iter().zip(outcomes) {
         match outcome {
@@ -1972,7 +2043,10 @@ async fn handle_replace_component(
         .map(|instance| instance.unit)
         .collect();
 
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     let embedded_unit_count = parsed
         .find("lib_symbols")
         .and_then(|libraries| {
@@ -2305,6 +2379,204 @@ mod tests {
             !written.contains("(path \"/CHILDUUID\""),
             "the child's own uuid must not be the whole path:\n{written}"
         );
+    }
+
+    #[tokio::test]
+    async fn reused_child_placement_writes_and_reports_every_observed_instance_path() {
+        let (dir, _env) = stub_symbol_dir();
+        let root = dir.path().join("board.kicad_sch");
+        let child = dir.path().join("shared.kicad_sch");
+        std::fs::write(dir.path().join("board.kicad_pro"), "{}").unwrap();
+        std::fs::write(
+            &root,
+            r#"(kicad_sch
+	(version 20250610)
+	(generator "eeschema")
+	(uuid "ROOTUUID")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 20 20)
+		(size 40 20)
+		(uuid "SHEET-A")
+		(property "Sheetname" "First" (at 20 19.365 0))
+		(property "Sheetfile" "shared.kicad_sch" (at 20 40.635 0))
+	)
+	(sheet
+		(at 80 20)
+		(size 40 20)
+		(uuid "SHEET-B")
+		(property "Sheetname" "Second" (at 80 19.365 0))
+		(property "Sheetfile" "shared.kicad_sch" (at 80 40.635 0))
+	)
+	(sheet_instances (path "/" (page "1")))
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(&child, crate::tools::blank_schematic_template()).unwrap();
+        let root_before = std::fs::read(&root).unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": child.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "value": "4k7",
+                "x": 100.1,
+                "y": 80.2
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let response: serde_json::Value = serde_json::from_str(&content_text(&result)).unwrap();
+        assert_eq!(
+            response["instance_paths"],
+            json!(["/ROOTUUID/SHEET-A", "/ROOTUUID/SHEET-B"])
+        );
+        assert_eq!(response["schematic"], child.display().to_string());
+        assert_eq!(response["project"], "board");
+
+        let committed = cse::Schematic::load(&child).unwrap();
+        let symbol = committed.symbols.by_reference("R1").unwrap();
+        let mut observed = symbol
+            .instance_paths()
+            .into_iter()
+            .filter_map(|(project, path)| (project == "board").then_some(path))
+            .collect::<Vec<_>>();
+        observed.sort();
+        assert_eq!(observed, ["/ROOTUUID/SHEET-A", "/ROOTUUID/SHEET-B"]);
+        assert_eq!(response["uuid"], symbol.uuid);
+        assert_eq!(response["x"].as_f64(), Some(symbol.at.x));
+        assert_eq!(response["y"].as_f64(), Some(symbol.at.y));
+        assert_eq!(
+            std::fs::read(&root).unwrap(),
+            root_before,
+            "the explicitly targeted child edit must not rewrite the root document"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_child_instance_metadata_is_refused_without_writing() {
+        let (dir, _env) = stub_symbol_dir();
+        let root = dir.path().join("board.kicad_sch");
+        let child = dir.path().join("child.kicad_sch");
+        std::fs::write(dir.path().join("board.kicad_pro"), "{}").unwrap();
+        std::fs::write(
+            &root,
+            r#"(kicad_sch
+	(version 20250610)
+	(generator "eeschema")
+	(uuid "ROOTUUID")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 20 20)
+		(size 40 20)
+		(uuid "CURRENT-SHEET")
+		(property "Sheetname" "Child" (at 20 19.365 0))
+		(property "Sheetfile" "child.kicad_sch" (at 20 40.635 0))
+	)
+	(sheet_instances (path "/" (page "1")))
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(&child, crate::tools::blank_schematic_template()).unwrap();
+        let mut stale = cse::Schematic::load(&child).unwrap();
+        let mut existing = cse::Symbol::new("Device:R", 50.0, 50.0);
+        existing.set_reference("R0");
+        existing.set_value_str("1k");
+        existing.set_instance_path("board", "/ROOTUUID/OLD-SHEET", "R0", 1);
+        stale.add_symbol(existing);
+        stale.overwrite().unwrap();
+        let before = std::fs::read(&child).unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": child.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("stale_target")
+        );
+        assert!(content_text(&result).contains("R0"));
+        assert_eq!(std::fs::read(&child).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn placement_refuses_ambiguous_project_ownership_without_writing() {
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(outer.path().join("outer.kicad_pro"), "{}").unwrap();
+        std::fs::write(nested.join("inner.kicad_pro"), "{}").unwrap();
+        let root = |root_uuid: &str, sheet_uuid: &str, child: &str| {
+            format!(
+                r#"(kicad_sch
+	(version 20250610)
+	(generator "eeschema")
+	(uuid "{root_uuid}")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 20 20)
+		(size 40 20)
+		(uuid "{sheet_uuid}")
+		(property "Sheetname" "Child" (at 20 19.365 0))
+		(property "Sheetfile" "{child}" (at 20 40.635 0))
+	)
+	(sheet_instances (path "/" (page "1")))
+)
+"#,
+            )
+        };
+        std::fs::write(
+            outer.path().join("outer.kicad_sch"),
+            root("outer-root", "outer-path", "nested/child.kicad_sch"),
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("inner.kicad_sch"),
+            root("inner-root", "inner-path", "child.kicad_sch"),
+        )
+        .unwrap();
+        let child = nested.join("child.kicad_sch");
+        std::fs::write(&child, crate::tools::blank_schematic_template()).unwrap();
+        let before = std::fs::read(&child).unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": child.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "x": 100.0,
+                "y": 100.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+        assert_eq!(std::fs::read(&child).unwrap(), before);
     }
 
     /// A standalone sheet — no project file, no parent — keeps the old

@@ -42,6 +42,9 @@ macro_rules! ipc {
                 )))
             }
             Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
+            Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+                return Ok(crate::tools::ipc_target_error_result(&error))
+            }
         }
     }};
 }
@@ -410,6 +413,19 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
 pub(crate) fn extract_graphic_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
+    extract_graphic_definitions_with_properties(source, true)
+}
+
+pub(crate) fn extract_graphic_definitions_without_properties(
+    source: &str,
+) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
+    extract_graphic_definitions_with_properties(source, false)
+}
+
+fn extract_graphic_definitions_with_properties(
+    source: &str,
+    include_properties: bool,
+) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
     use konnect_ipc::IpcGraphicDefinition as Graphic;
     let footprint = konnect_sexp::parse_sexp(source)?;
     let mut graphics = Vec::new();
@@ -493,7 +509,12 @@ pub(crate) fn extract_graphic_definitions(
             stroke_width_mm: text_stroke_width(text),
         });
     }
-    for property in footprint.find_all("property") {
+    let properties = if include_properties {
+        footprint.find_all("property")
+    } else {
+        Vec::new()
+    };
+    for property in properties {
         let name = property.get(1).and_then(konnect_sexp::SexpNode::as_str);
         // Reference and Value travel as first-class fields; hidden built-ins
         // (Footprint, Datasheet, …) are not drawn.
@@ -3190,6 +3211,9 @@ async fn handle_get_component_pads(
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {}
         Err(konnect_ipc::IpcFailure::Rejected(message)) => {
             return Ok(CallToolResult::error(message));
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
         }
     }
 

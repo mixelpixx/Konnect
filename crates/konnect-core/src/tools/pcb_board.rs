@@ -229,6 +229,9 @@ where
                  board open, so editing the file directly could be silently overwritten."
             ))))
         }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => Ok(BoardWrite::Refused(
+            crate::tools::ipc_target_error_result(&error),
+        )),
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
             if ctx.board_session.was_observed_live(board_path) {
                 Ok(BoardWrite::Refused(unsafe_file_fallback(board_path)))
@@ -271,7 +274,16 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
              be discarded by KiCAD's next save. Close the board in KiCAD (or make the edit \
              there) and retry — this tool has no IPC path for a live board yet."
         )))),
-        Err(konnect_ipc::IpcFailure::Rejected(_)) => Ok(None),
+        Err(konnect_ipc::IpcFailure::Target {
+            error:
+                konnect_ipc::BoardTargetError::NoOpenDocuments { .. }
+                | konnect_ipc::BoardTargetError::WrongDocument { .. },
+            ..
+        })
+        | Err(konnect_ipc::IpcFailure::Rejected(_)) => Ok(None),
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            Ok(Some(crate::tools::ipc_target_error_result(&error)))
+        }
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => Ok(ctx
             .board_session
             .was_observed_live(board_path)
@@ -2244,7 +2256,7 @@ mod board_mock {
 
 #[cfg(test)]
 mod board_session_safety_tests {
-    use super::board_mock::ctx_talking_to;
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
     use super::*;
     use konnect_ipc::gen::kiapi;
     use prost::Message;
@@ -2358,6 +2370,37 @@ mod board_session_safety_tests {
             .unwrap();
 
         assert!(matches!(outcome, BoardWrite::File));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_open_document_is_structured_and_never_reaches_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = super::mounting_hole_tests::blank_board(dir.path());
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "(kicad_pcb)\n").unwrap();
+        let before = std::fs::read(&requested).unwrap();
+        let address = spawn_kicad_holding_board(&other, |_| None);
+        let ctx = ctx_talking_to(address);
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in_write = called.clone();
+
+        let outcome = attempt_ipc_write(&ctx, &requested, "test write", move |_| {
+            called_in_write.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("wrong document must be a refusal")
+        };
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("wrong_document")
+        );
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(std::fs::read(&requested).unwrap(), before);
+        assert!(!ctx.board_session.was_observed_live(&requested));
     }
 
     #[tokio::test]

@@ -307,6 +307,24 @@ impl McpHandler {
                         Some("invalid_argument".to_string()),
                     )
                 }
+                Err(e) if kicad_editor_locked_path(&e).is_some() => {
+                    let path = kicad_editor_locked_path(&e)
+                        .expect("guard matched")
+                        .display()
+                        .to_string();
+                    (
+                        CallToolResult::error_kind(
+                            ToolErrorKind::Conflict {
+                                paths: vec![path.clone()],
+                            },
+                            format!(
+                                "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                            ),
+                        ),
+                        CallStatus::Error,
+                        Some("conflict".to_string()),
+                    )
+                }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
                     let kind = ToolErrorKind::HandlerError {
@@ -378,6 +396,22 @@ impl McpHandler {
             sinks.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
+}
+
+fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
+    for cause in error.chain() {
+        if let Some(konnect_sexp::SexpError::KiCadEditorLocked { path, .. }) =
+            cause.downcast_ref::<konnect_sexp::SexpError>()
+        {
+            return Some(path);
+        }
+        if let Some(konnect_schematic_editor::Error::KiCadEditorLocked { path, .. }) =
+            cause.downcast_ref::<konnect_schematic_editor::Error>()
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Sum of content bytes in a `CallToolResult` — used for observability size
@@ -627,6 +661,51 @@ mod required_argument_dispatch_tests {
             Some("invalid_argument"),
             "an empty uuids list is a request to delete nothing, not a mistake"
         );
+    }
+
+    #[tokio::test]
+    async fn a_kicad_schematic_lock_is_a_typed_conflict() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("locked.kicad_sch");
+        let lock = directory.path().join("~locked.kicad_sch.lck");
+        let source = "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t\
+                      (uuid \"r\")\n\t(paper \"A4\")\n\t(lib_symbols)\n)\n";
+        std::fs::write(&schematic, source).unwrap();
+        std::fs::write(
+            &lock,
+            r#"{"username":"konnect-test","hostname":"test-host"}"#,
+        )
+        .unwrap();
+
+        let (result, status, kind) = handler
+            .dispatch_tool(
+                "add_wire",
+                &json!({
+                    "schematic": schematic.display().to_string(),
+                    "x1": 10.0,
+                    "y1": 10.0,
+                    "x2": 20.0,
+                    "y2": 10.0
+                }),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(status, CallStatus::Error);
+        assert_eq!(kind.as_deref(), Some("conflict"));
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "conflict");
+        assert_eq!(
+            body["error"]["paths"],
+            json!([schematic.display().to_string()])
+        );
+        assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
+        assert!(lock.exists());
     }
 }
 

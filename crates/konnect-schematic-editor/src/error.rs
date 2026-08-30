@@ -14,6 +14,9 @@ pub enum Error {
 
     #[error("write conflict: '{0}' changed since it was loaded")]
     Conflict(PathBuf),
+
+    #[error("KiCad editor lock blocks write to '{path}': {lock_path}")]
+    KiCadEditorLocked { path: PathBuf, lock_path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

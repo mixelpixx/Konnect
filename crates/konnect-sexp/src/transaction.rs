@@ -7,8 +7,8 @@
 //! explicit resolution.
 
 use crate::writer::{
-    open_document_lock, read_string_unlocked, sync_parent_directory, write_atomic_unlocked,
-    write_new_atomic_unlocked,
+    ensure_kicad_schematic_is_closed, open_document_lock, read_string_unlocked,
+    sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
 };
 use crate::SexpError;
 use fs4::FileExt;
@@ -289,6 +289,7 @@ pub fn commit_file_transaction(
     };
     let journal_path = journal_path(&root, &id);
     let _locks = lock_entries(&root, &journal.entries)?;
+    ensure_entries_are_closed(&root, &journal.entries)?;
     verify_before_images(&root, &journal_path, &journal.entries)?;
     persist_journal(&journal_path, &journal)?;
 
@@ -439,6 +440,7 @@ pub fn abandon_file_transaction(
 fn recover_journal(root: &Path, journal_path: &Path) -> Result<RecoveryOutcome, SexpError> {
     let journal = read_validated_journal(root, journal_path)?;
     let _locks = lock_entries(root, &journal.entries)?;
+    ensure_entries_are_closed(root, &journal.entries)?;
     let mut pending = Vec::new();
     for entry in &journal.entries {
         let path = root.join(&entry.path);
@@ -646,6 +648,13 @@ fn lock_entries(root: &Path, entries: &[JournalEntry]) -> Result<Vec<std::fs::Fi
         locks.push(lock);
     }
     Ok(locks)
+}
+
+fn ensure_entries_are_closed(root: &Path, entries: &[JournalEntry]) -> Result<(), SexpError> {
+    for entry in entries {
+        ensure_kicad_schematic_is_closed(&root.join(&entry.path))?;
+    }
+    Ok(())
 }
 
 fn verify_before_images(
@@ -872,6 +881,31 @@ mod tests {
     }
 
     #[test]
+    fn editor_lock_changes_nothing_and_leaves_no_journal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let parent = directory.path().join("root.kicad_sch");
+        let child = directory.path().join("child.kicad_sch");
+        let lock = directory.path().join("~root.kicad_sch.lck");
+        std::fs::write(&parent, "parent before").expect("write parent");
+        std::fs::write(&lock, "not parseable").expect("write editor lock");
+
+        let error = commit_file_transaction(
+            directory.path(),
+            vec![
+                FileTransition::replace(&parent, "parent before", "parent after"),
+                FileTransition::create(&child, "child after"),
+            ],
+        )
+        .expect_err("editor lock conflicts");
+
+        assert!(matches!(error, SexpError::KiCadEditorLocked { .. }));
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "parent before");
+        assert!(!child.exists());
+        assert!(active_journal_paths(directory.path()).unwrap().is_empty());
+        assert!(lock.exists());
+    }
+
+    #[test]
     fn recovery_finishes_a_partially_applied_transaction() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().canonicalize().unwrap();
@@ -903,6 +937,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(parent).unwrap(), "parent after");
         assert_eq!(std::fs::read_to_string(child).unwrap(), "child after");
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn recovery_defers_to_an_editor_lock_without_changing_the_journal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("root.kicad_sch");
+        let lock = root.join("~root.kicad_sch.lck");
+        std::fs::write(&parent, "parent before").expect("write parent");
+        std::fs::write(&lock, "stale-looking lock").expect("write editor lock");
+        let journal = Journal {
+            version: JOURNAL_VERSION,
+            id: "locked-recovery".to_owned(),
+            entries: vec![JournalEntry {
+                path: PathBuf::from("root.kicad_sch"),
+                expected: Some("parent before".to_owned()),
+                replacement: "parent after".to_owned(),
+            }],
+        };
+        let journal_path = journal_path(&root, &journal.id);
+        persist_journal(&journal_path, &journal).expect("persist crash journal");
+        let journal_before = std::fs::read(&journal_path).expect("read journal");
+
+        let error = recover_file_transactions(&root).expect_err("editor lock conflicts");
+
+        assert!(matches!(error, SexpError::KiCadEditorLocked { .. }));
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "parent before");
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        assert!(lock.exists());
     }
 
     #[test]

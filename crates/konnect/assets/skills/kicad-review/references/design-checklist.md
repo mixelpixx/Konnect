@@ -72,8 +72,9 @@
 | Single-pin nets | `find_single_pin_nets` |
 | ERC violations | `run_erc` |
 | DRC violations | `get_drc_violations` |
-| Decoupling audit | `audit_decoupling` |
-| Connection audit | `audit_connections` |
-| Power rail audit | `audit_power_rails` |
+| Decoupling audit | `audit_decoupling(schematic_scope="hierarchy")` for a hierarchy root |
+| Connection audit | `audit_connections(schematic_scope="hierarchy")` for a hierarchy root |
+| Power rail audit | `audit_power_rails(schematic_scope="hierarchy")` for a hierarchy root |
+| BOM health | `check_bom_health(schematic_scope="hierarchy")` for a hierarchy root |
 | DFM audit | `audit_manufacturing` |
 | Full review | `run_design_review` |

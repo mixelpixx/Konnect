@@ -8,8 +8,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_array,
-    require_f64, require_str, ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_str, require_array, require_f64, require_str,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -29,7 +29,7 @@ use std::collections::HashSet;
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
-use super::sch_components::place_one_component;
+use super::sch_components::{place_one_component, placed_component_readback};
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -479,12 +479,20 @@ async fn handle_batch_place_components(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    let project_name = project_name_for(&sch_path);
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
     // Built once: the lib-table parse is memoised across the whole batch.
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
 
-    let mut placed: Vec<serde_json::Value> = Vec::new();
+    let mut placed_uuids = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for comp in &components {
@@ -503,8 +511,8 @@ async fn handle_batch_place_components(
 
         match place_one_component(
             &mut sch,
-            &root_uuid,
-            &project_name,
+            &context.instance_paths,
+            &context.project_name,
             lib_id,
             x,
             y,
@@ -514,13 +522,21 @@ async fn handle_batch_place_components(
             unit,
             &src,
         ) {
-            Ok(v) => placed.push(v),
+            Ok(uuid) => placed_uuids.push(uuid),
             Err(e) => errors.push(error_text(&e)),
         }
     }
 
-    if !placed.is_empty() {
+    let mut placed = Vec::new();
+    if !placed_uuids.is_empty() {
         sch.overwrite()?;
+        let committed = cse::Schematic::load(&sch_path)?;
+        for uuid in &placed_uuids {
+            match placed_component_readback(&sch_path, &committed, uuid, &context) {
+                Ok(result) => placed.push(result),
+                Err(error) => return Ok(error),
+            }
+        }
     }
 
     let mut result = CallToolResult::json(&json!({
@@ -1652,6 +1668,78 @@ mod batch_place_and_connect_tests {
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "batch placement must not leave trailing whitespace: {after:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_placement_uses_all_reused_child_paths_and_observed_results() {
+        let (directory, child) = seeded_schematic();
+        std::fs::write(directory.path().join("board.kicad_pro"), "{}").unwrap();
+        let root = directory.path().join("board.kicad_sch");
+        std::fs::write(
+            &root,
+            r#"(kicad_sch
+  (version 20250610)
+  (generator "eeschema")
+  (uuid "ROOTUUID")
+  (paper "A4")
+  (lib_symbols)
+  (sheet
+    (at 20 20)
+    (size 40 20)
+    (uuid "SHEET-A")
+    (property "Sheetname" "First" (at 20 19.365 0))
+    (property "Sheetfile" "place.kicad_sch" (at 20 40.635 0))
+  )
+  (sheet
+    (at 80 20)
+    (size 40 20)
+    (uuid "SHEET-B")
+    (property "Sheetname" "Second" (at 80 19.365 0))
+    (property "Sheetfile" "place.kicad_sch" (at 80 40.635 0))
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"#,
+        )
+        .unwrap();
+        let root_before = std::fs::read(&root).unwrap();
+
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": child.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 100.1, "y": 100.2, "reference": "R1" },
+                    { "lib_id": "Device:R", "x": 110.1, "y": 100.2, "reference": "R2" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let response: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(response["placed_count"], 2);
+        for placed in response["placed"].as_array().unwrap() {
+            assert_eq!(
+                placed["instance_paths"],
+                json!(["/ROOTUUID/SHEET-A", "/ROOTUUID/SHEET-B"])
+            );
+            let uuid = placed["uuid"].as_str().unwrap();
+            let committed = cse::Schematic::load(&child).unwrap();
+            let symbol = committed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.uuid == uuid)
+                .unwrap();
+            assert_eq!(placed["x"].as_f64(), Some(symbol.at.x));
+            assert_eq!(placed["y"].as_f64(), Some(symbol.at.y));
+        }
+        assert_eq!(std::fs::read(&root).unwrap(), root_before);
     }
 
     #[tokio::test]

@@ -1,5 +1,24 @@
 # Troubleshooting
 
+## Which Konnect binary is this client using?
+
+Call the always-visible `get_installation_info` tool in the affected MCP
+session. The result comes from the process serving that call and includes its
+version, build commit when available, executable path, conservatively detected
+install source, the version produced by the binary currently on disk at that
+same path, KiCad CLI version, redacted IPC endpoint, and restart guidance.
+
+`installation.binary_on_disk.newer_than_running: true` is reported only when
+both stable versions can be parsed and the on-disk binary is newer. `null`
+means the comparison could not be proven, not that the process is current.
+Likewise, `installation.source: "unknown"` means no trusted package manifest
+identified the channel; Konnect does not guess from directory names. Endpoint
+credentials and query or fragment data are redacted.
+
+Follow the returned platform-specific guidance, restart the MCP client (and
+KiCad when it owns the server process), then call `get_installation_info` again
+to verify the process that actually restarted. This diagnostic writes nothing.
+
 ## "KiCAD IPC socket path not configured"
 
 Any tool that talks to a live KiCAD session (`save_project`, PCB editing,
@@ -155,6 +174,20 @@ This option is unavailable on KiCad 11 after removal of the legacy SWIG Python
 API. Konnect then uses its Rust exporter unless KiCad gains an equivalent
 supported IPC operation.
 
+## A schematic write is blocked by a KiCad editor lock
+
+Konnect refuses to change a `.kicad_sch` file while the sibling
+`~<name>.kicad_sch.lck` exists. Close the schematic editor normally and retry.
+Read-only schematic tools remain available while the lock exists.
+
+KiCad's lock stores only a username and hostname, not a process identifier or
+document-instance token. Konnect therefore cannot distinguish a live lock from
+one left by a crash without risking unsaved editor state. It treats valid,
+foreign-host, empty, and malformed locks alike and never removes one
+automatically. If KiCad crashed, first confirm that no schematic editor owns the
+file; reopening and closing the project cleanly is the preferred way to resolve
+the lock. Remove a confirmed stale lock manually only as a last resort.
+
 ## Transaction recovery is blocked by divergent content
 
 Multi-file schematic changes persist a `.konnect-transaction-<id>.json`
@@ -232,7 +265,7 @@ callable tools, the fix is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 227 tools from the first call.
+startup, so `tools/list` carries all 228 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.

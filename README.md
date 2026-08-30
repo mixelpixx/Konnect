@@ -191,6 +191,13 @@ argument Konnect does not recognise is an error rather than being ignored, so a
 typo such as `--cleint codex` stops instead of quietly installing for the
 default client.
 
+To verify which Konnect process an MCP client is actually using, call the
+always-visible `get_installation_info` tool. It reports the serving build,
+executable path, verified installation source when one can be proven, KiCad
+CLI and IPC detection, and restart guidance. A missing build commit or an
+`unknown` installation source means the available evidence was insufficient;
+it is not silently guessed from a directory name.
+
 ### macOS
 
 The [Releases](https://github.com/mixelpixx/Konnect/releases) page ships
