@@ -95,6 +95,13 @@ pub enum ToolErrorKind {
         before_kiids: Vec<String>,
         after_kiids: Vec<String>,
     },
+    /// Saved KiCad structure cannot prove one exact destination for a
+    /// cross-probe source object.
+    UnresolvedCrossProbeDestination {
+        source_kiid: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
     UnsafeFileFallback { path: String, reason: String },
@@ -126,6 +133,7 @@ impl ToolErrorKind {
             Self::EditorUnavailable { .. } => "editor_unavailable",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::ReadbackMismatch { .. } => "readback_mismatch",
+            Self::UnresolvedCrossProbeDestination { .. } => "unresolved_cross_probe_destination",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::HandlerError { .. } => "handler_error",
@@ -284,6 +292,11 @@ mod tests {
                 requested_kiids: vec!["b".into()],
                 before_kiids: vec!["a".into()],
                 after_kiids: vec!["a".into()],
+            },
+            ToolErrorKind::UnresolvedCrossProbeDestination {
+                source_kiid: "sym".into(),
+                candidates: vec!["fp-a".into(), "fp-b".into()],
+                reason: "ambiguous".into(),
             },
             ToolErrorKind::UnsafeFileFallback {
                 path: "p".into(),

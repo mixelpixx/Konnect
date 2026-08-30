@@ -228,6 +228,10 @@ fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_ho
             .as_deref()
             .is_some_and(|reason| { reason.contains("no stable typed") }));
     }
+    assert_eq!(
+        schematic.capabilities.cross_probe.availability,
+        konnect_ipc::IpcCapabilityAvailability::Available
+    );
 
     let pcb = &state.editors[1];
     assert_eq!(pcb.editor, konnect_ipc::IpcEditorKind::Pcb);

@@ -15,6 +15,7 @@ use konnect_ipc::{
 use serde_json::json;
 use std::path::PathBuf;
 
+use super::cross_probe::{resolve_cross_probe, CrossProbeError, CrossProbeRequest};
 use super::navigation_target::{
     resolve_navigation_target, NavigationTargetErrorKind, NavigationTargetRequest,
 };
@@ -89,6 +90,25 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["operation", "editor", "project_name", "project_path", "document_path", "object_kiids"]
             }),
             |args, ctx| async move { handle_mutate_editor_selection(args, ctx).await }
+        ),
+        tool!(
+            "resolve_cross_probe_target",
+            "Resolve an exact schematic-symbol/PCB-footprint relationship in either direction from stable saved KiCad symbol-path linkage, while proving both explicit live document contexts. This resolve-only operation does not activate or select; pin/pad/net expansion remains unsupported unless a unique stable destination can be modeled.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source_editor": { "type": "string", "enum": ["schematic", "pcb"] },
+                    "project_name": { "type": "string" },
+                    "project_path": { "type": "string" },
+                    "schematic_document_path": { "type": "string" },
+                    "pcb_document_path": { "type": "string" },
+                    "schematic_sheet_instance_path": { "type": "array", "items": { "type": "string" } },
+                    "sheet_path_human_readable": { "type": "string" },
+                    "source_object_kiid": { "type": "string" }
+                },
+                "required": ["source_editor", "project_name", "project_path", "schematic_document_path", "pcb_document_path", "schematic_sheet_instance_path", "source_object_kiid"]
+            }),
+            |args, ctx| async move { handle_resolve_cross_probe_target(args, ctx).await }
         ),
     ]
 }
@@ -687,6 +707,171 @@ fn selection_mutation_error_result(error: anyhow::Error) -> CallToolResult {
     }
 }
 
+async fn handle_resolve_cross_probe_target(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let request = match parse_cross_probe_request(args) {
+        Ok(request) => request,
+        Err(result) => return Ok(result),
+    };
+    let address = ctx.config.ipc_address.clone();
+    if address.is_empty() {
+        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    }
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let resolution = resolve_cross_probe(&request)?;
+        let source_live = live_cross_probe_document(&request, request.source_editor);
+        let destination_editor = match request.source_editor {
+            IpcEditorKind::Schematic => IpcEditorKind::Pcb,
+            IpcEditorKind::Pcb => IpcEditorKind::Schematic,
+        };
+        let destination_live = live_cross_probe_document(&request, destination_editor);
+        let client = konnect_ipc::KiCadIpcClient::new(address);
+        let source_observed = client.observe_exact_open_document(&source_live)?;
+        let destination_observed = client.observe_exact_open_document(&destination_live)?;
+        Ok((resolution, source_observed, destination_observed))
+    })
+    .await?;
+    match result {
+        Ok((resolution, source_observed, destination_observed)) => {
+            Ok(CallToolResult::json(&json!({
+                "resolution": resolution,
+                "live_context_evidence": {
+                    "source": "kicad_ipc_get_open_documents",
+                    "source_document": source_observed,
+                    "destination_document": destination_observed
+                },
+                "destination_navigation": {
+                    "attempted": false,
+                    "status": "not_attempted",
+                    "reason": "exact activation/reveal is unsupported by the bundled stable protocol; resolution does not imply a state change"
+                }
+            })))
+        }
+        Err(error) => Ok(cross_probe_error_result(error)),
+    }
+}
+
+fn parse_cross_probe_request(
+    args: &serde_json::Value,
+) -> Result<CrossProbeRequest, CallToolResult> {
+    let source_editor = match require_str(args, "source_editor")? {
+        "schematic" => IpcEditorKind::Schematic,
+        "pcb" => IpcEditorKind::Pcb,
+        _ => {
+            return Err(invalid_arg(
+                "source_editor",
+                "expected 'schematic' or 'pcb'",
+            ))
+        }
+    };
+    let project_name = require_str(args, "project_name")?;
+    let project_path = require_str(args, "project_path")?;
+    let schematic_document_path = require_str(args, "schematic_document_path")?;
+    let pcb_document_path = require_str(args, "pcb_document_path")?;
+    let source_object_kiid = require_str(args, "source_object_kiid")?;
+    if [
+        project_name,
+        project_path,
+        schematic_document_path,
+        pcb_document_path,
+        source_object_kiid,
+    ]
+    .iter()
+    .any(|value| value.is_empty())
+    {
+        return Err(invalid_arg(
+            "source_object_kiid",
+            "project, document, and source KIID strings must not be empty",
+        ));
+    }
+    let sheet_kiids = require_array(args, "schematic_sheet_instance_path")?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            invalid_arg(
+                "schematic_sheet_instance_path",
+                "every entry must be a string",
+            )
+        })?;
+    if sheet_kiids.is_empty() || sheet_kiids.iter().any(String::is_empty) {
+        return Err(invalid_arg(
+            "schematic_sheet_instance_path",
+            "must contain non-empty root-to-leaf KIIIDs",
+        ));
+    }
+    Ok(CrossProbeRequest {
+        project: IpcProjectIdentity {
+            name: project_name.to_string(),
+            path: project_path.to_string(),
+        },
+        schematic_document_path: PathBuf::from(schematic_document_path),
+        pcb_document_path: PathBuf::from(pcb_document_path),
+        schematic_sheet_instance_path: IpcSheetInstancePath {
+            kiids: sheet_kiids,
+            human_readable: opt_str(args, "sheet_path_human_readable")
+                .unwrap_or("")
+                .to_string(),
+        },
+        source_editor,
+        source_object_kiid: source_object_kiid.to_string(),
+    })
+}
+
+fn live_cross_probe_document(
+    request: &CrossProbeRequest,
+    editor: IpcEditorKind,
+) -> IpcEditorDocument {
+    IpcEditorDocument {
+        editor,
+        project: Some(request.project.clone()),
+        document_path: (editor == IpcEditorKind::Pcb)
+            .then(|| request.pcb_document_path.display().to_string()),
+        sheet_instance_path: (editor == IpcEditorKind::Schematic)
+            .then(|| request.schematic_sheet_instance_path.clone()),
+    }
+}
+
+fn cross_probe_error_result(error: anyhow::Error) -> CallToolResult {
+    if let Some(cross_probe) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CrossProbeError>())
+    {
+        return match cross_probe {
+            CrossProbeError::Target(target) => navigation_target_error_result(target.clone()),
+            CrossProbeError::UnresolvedDestination {
+                source_kiid,
+                reason,
+                candidates,
+            } => CallToolResult::error_kind(
+                ToolErrorKind::UnresolvedCrossProbeDestination {
+                    source_kiid: source_kiid.clone(),
+                    candidates: candidates.clone(),
+                    reason: reason.clone(),
+                },
+                cross_probe.to_string(),
+            ),
+        };
+    }
+    if konnect_ipc::IpcSelectionObservationError::from_error(&error).is_some() {
+        return selection_error_result(error);
+    }
+    match konnect_ipc::IpcFailure::from_error(error) {
+        konnect_ipc::IpcFailure::Unreachable(_) => {
+            editor_unavailable("a requested cross-probe editor endpoint is unreachable")
+        }
+        _ => CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: "requested cross-probe context".to_string(),
+                reason: "live or structural evidence was incomplete".to_string(),
+            },
+            "Cross-probe resolution did not return complete live and structural evidence.",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,7 +883,7 @@ mod tests {
     use konnect_ipc::gen::kiapi;
     use nng::options::Options;
     use prost::Message;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn context(ipc_address: String) -> ToolContext {
@@ -964,10 +1149,86 @@ mod tests {
         url
     }
 
+    fn spawn_cross_probe_context_mock(
+        project_path: String,
+        commands: Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://cross-probe-core-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
+        socket.listen(&url).expect("listen");
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let message = socket.recv().expect("request");
+                let request =
+                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
+                let command = request.message.expect("command");
+                commands.lock().unwrap().push(command.type_url.clone());
+                let query =
+                    kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
+                        .expect("open documents");
+                let document = if query.r#type
+                    == kiapi::common::types::DocumentType::DoctypeSchematic as i32
+                {
+                    kiapi::common::types::DocumentSpecifier {
+                        r#type: query.r#type,
+                        identifier: Some(
+                            kiapi::common::types::document_specifier::Identifier::SheetPath(
+                                kiapi::common::types::SheetPath {
+                                    path: vec![kiapi::common::types::Kiid {
+                                        value: "root".to_string(),
+                                    }],
+                                    path_human_readable: "/".to_string(),
+                                },
+                            ),
+                        ),
+                        project: Some(kiapi::common::types::ProjectSpecifier {
+                            name: "nav".to_string(),
+                            path: project_path.clone(),
+                        }),
+                    }
+                } else {
+                    kiapi::common::types::DocumentSpecifier {
+                        r#type: query.r#type,
+                        identifier: Some(
+                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                "nav.kicad_pcb".to_string(),
+                            ),
+                        ),
+                        project: Some(kiapi::common::types::ProjectSpecifier {
+                            name: "nav".to_string(),
+                            path: project_path.clone(),
+                        }),
+                    }
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: Some(builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![document],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                };
+                socket
+                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                    .expect("response");
+            }
+        });
+        url
+    }
+
     #[test]
     fn public_tool_is_read_only_and_takes_no_required_arguments() {
         let definitions = tools();
-        assert_eq!(definitions.len(), 4);
+        assert_eq!(definitions.len(), 5);
         let state = definitions
             .iter()
             .find(|tool| tool.name == "get_editor_state")
@@ -1002,6 +1263,22 @@ mod tests {
                 "project_path",
                 "document_path",
                 "object_kiids"
+            ])
+        );
+        let cross_probe = definitions
+            .iter()
+            .find(|tool| tool.name == "resolve_cross_probe_target")
+            .expect("cross-probe resolver tool");
+        assert_eq!(
+            cross_probe.input_schema["required"],
+            json!([
+                "source_editor",
+                "project_name",
+                "project_path",
+                "schematic_document_path",
+                "pcb_document_path",
+                "schematic_sheet_instance_path",
+                "source_object_kiid"
             ])
         );
     }
@@ -1282,6 +1559,83 @@ mod tests {
         assert_eq!(
             extract_error_kind(&result).as_deref(),
             Some("unsupported_capability")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_cross_probe_proves_both_live_contexts_without_state_change() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nav.kicad_pro"), "{}").unwrap();
+        let schematic = temp.path().join("nav.kicad_sch");
+        std::fs::write(
+            &schematic,
+            "(kicad_sch (uuid \"root\") \
+             (symbol (lib_id \"Device:C\") (at 1 2) (uuid \"sym-c10\") \
+               (property \"Reference\" \"C10\") \
+               (instances (project \"nav\" (path \"/root\" (reference \"C10\") (unit 1))))) \
+             (sheet_instances (path \"/\" (page \"1\"))))",
+        )
+        .unwrap();
+        let board = temp.path().join("nav.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (footprint \"Capacitor:C\" (layer \"F.Cu\") (at 1 2) \
+             (uuid \"fp-c10\") (property \"Reference\" \"C10\") (path \"/sym-c10\")))",
+        )
+        .unwrap();
+        let project_path = temp.path().display().to_string();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let result = handle_resolve_cross_probe_target(
+            &json!({
+                "source_editor": "schematic",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "schematic_document_path": schematic.display().to_string(),
+                "pcb_document_path": board.display().to_string(),
+                "schematic_sheet_instance_path": ["root"],
+                "sheet_path_human_readable": "/",
+                "source_object_kiid": "sym-c10"
+            }),
+            &context(spawn_cross_probe_context_mock(
+                project_path,
+                commands.clone(),
+            )),
+        )
+        .await
+        .expect("handler result");
+        assert!(!result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["resolution"]["source"]["object"]["kiid"], "sym-c10");
+        assert_eq!(
+            body["resolution"]["destination"]["object"]["kiid"],
+            "fp-c10"
+        );
+        assert_eq!(
+            body["resolution"]["evidence"]["source"],
+            "saved_kicad_footprint_symbol_path"
+        );
+        assert_eq!(body["destination_navigation"]["attempted"], false);
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands
+            .iter()
+            .all(|command| command.ends_with("GetOpenDocuments")));
+    }
+
+    #[test]
+    fn unresolved_cross_probe_has_a_public_structured_refusal() {
+        let result =
+            cross_probe_error_result(anyhow::Error::new(CrossProbeError::UnresolvedDestination {
+                source_kiid: "sym-c10".to_string(),
+                reason: "duplicate linkage".to_string(),
+                candidates: vec!["fp-a".to_string(), "fp-b".to_string()],
+            }));
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("unresolved_cross_probe_destination")
         );
     }
 }
