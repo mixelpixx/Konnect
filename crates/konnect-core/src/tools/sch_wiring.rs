@@ -6,8 +6,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    get_path, opt_f64, opt_str, project_name_for, require_array, require_f64, require_str,
-    ToolContext, ToolDef,
+    get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -1587,12 +1586,22 @@ async fn handle_add_power_symbol(
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
 
     let mut sch = cse::Schematic::load(&sch_path)?;
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
 
     let pwr_ref = format!("#PWR{:03}", next_pwr_number(&sch));
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
@@ -1670,27 +1679,31 @@ async fn handle_add_power_symbol(
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
     // symbol from net formation.
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    sym.set_instance_path(
-        &project_name_for(&sch_path),
-        &format!("/{}", root_uuid),
-        &pwr_ref,
-        1,
-    );
+    for instance_path in &context.instance_paths {
+        sym.set_instance_path(&context.project_name, instance_path, &pwr_ref, 1);
+    }
 
+    let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
     sch.overwrite()?;
 
     // A power pin landing mid-segment on an existing wire needs a junction
     // dot, or KiCad ERC reports it as not connected.
     let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref)?;
+    let committed = cse::Schematic::load(&sch_path)?;
+    let mut observed = match super::sch_components::placed_component_readback(
+        &sch_path, &committed, &uuid, &context,
+    ) {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
+    observed["added_power"] = observed["value"].clone();
+    observed["junctions_added"] = json!(junctions_added
+        .iter()
+        .map(|(x, y)| json!({"x": x, "y": y}))
+        .collect::<Vec<_>>());
 
-    Ok(CallToolResult::json(&json!({
-        "added_power": power_net,
-        "reference": pwr_ref,
-        "x": x, "y": y,
-        "junctions_added": junctions_added.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
-    })))
+    Ok(CallToolResult::json(&observed))
 }
 
 async fn handle_add_no_connect(

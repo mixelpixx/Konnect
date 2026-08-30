@@ -1,4 +1,4 @@
-//! The 6 always-visible meta-tools.
+//! The 7 always-visible meta-tools.
 //!
 //! Discovery / routing:
 //!   list_toolboxes()          — show every toolset with descriptions and load state
@@ -9,6 +9,7 @@
 //! Observability:
 //!   get_recent_calls(limit?)  — last N tool calls (newest first) with timing + status
 //!   server_stats()            — uptime, per-tool totals/errors, JSONL log path
+//!   get_installation_info()   — serving build, binary, install, KiCad, and IPC provenance
 //!
 //! At server startup only the STARTER_KIT (`project`, `config`) is pre-loaded so
 //! baseline context stays small. The LLM reads `list_toolboxes` and calls
@@ -19,7 +20,7 @@ use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
 use serde_json::{json, Value};
 
-/// Return the 6 meta-tool MCP descriptions (always in the tools/list response).
+/// Return the 7 meta-tool MCP descriptions (always in the tools/list response).
 pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
     vec![
         McpToolDescription {
@@ -120,6 +121,20 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
                 "required": []
             }),
         },
+        McpToolDescription {
+            name: "get_installation_info".to_string(),
+            description:
+                "Report read-only provenance for the Konnect process serving this call: build \
+                 version and commit when available, executable path, conservatively detected \
+                 install source, on-disk binary version, KiCad CLI version, redacted IPC \
+                 endpoint, proven newer-binary state, and platform-specific restart guidance."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
     ]
 }
 
@@ -136,6 +151,10 @@ pub async fn handle_meta_tool(
         "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
         "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
         "server_stats" => Some(handle_server_stats(ctx).await),
+        "get_installation_info" => {
+            let info = crate::runtime_info::collect(&ctx.config).await;
+            Some(CallToolResult::json(&info))
+        }
         _ => None,
     }
 }

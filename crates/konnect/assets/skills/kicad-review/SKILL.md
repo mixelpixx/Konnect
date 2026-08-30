@@ -141,10 +141,18 @@ Checks PCB-level rules:
 
 These go beyond rule checking — they evaluate design quality and best practices.
 
+The standalone schematic audits and `check_bom_health` default to the supplied
+file only. When the supplied file is a hierarchy root, pass
+`schematic_scope: "hierarchy"` to cover every reachable sheet instance. Read
+`status`, `coverage`, and `diagnostics` before interpreting a hierarchy result;
+missing or cyclic child references make the result incomplete. Reused child
+files have one result per KiCad sheet instance, identified by the
+`sheet_instance_path` response field.
+
 ### Decoupling Audit
 
 ```
-audit_decoupling()
+audit_decoupling(schematic, schematic_scope="hierarchy")
 ```
 
 Checks:
@@ -156,7 +164,7 @@ Checks:
 ### Connection Audit
 
 ```
-audit_connections()
+audit_connections(schematic, schematic_scope="hierarchy")
 ```
 
 Checks:
@@ -168,7 +176,7 @@ Checks:
 ### Power Rail Audit
 
 ```
-audit_power_rails()
+audit_power_rails(schematic, schematic_scope="hierarchy")
 ```
 
 Checks:

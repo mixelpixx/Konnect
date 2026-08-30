@@ -181,6 +181,56 @@ fn handshake_baseline_and_full_registry_loads() {
 }
 
 #[test]
+fn installation_info_reports_the_serving_process_without_leaking_endpoint_secrets() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        "ipc_address = \"ipc://diagnostic-test.sock?token=secret#fragment\"\n",
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+
+    let list = p.request("tools/list", json!({}));
+    assert!(list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "get_installation_info"));
+
+    let result = p.call_tool("get_installation_info", json!({}));
+    assert_ne!(result["isError"], json!(true), "{result:#?}");
+    let body = McpProcess::tool_body(&result);
+
+    assert_eq!(body["build"]["version"], env!("CARGO_PKG_VERSION"));
+    if let Some(commit) = body["build"]["commit"].as_str() {
+        assert!((7..=64).contains(&commit.len()));
+        assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(body["build"]["commit_source"].is_string());
+    } else {
+        assert!(body["build"]["commit_source"].is_null());
+    }
+    assert!(body["runtime"]["executable_path"].is_string());
+    assert_eq!(body["installation"]["binary_on_disk"]["probe_status"], "ok");
+    assert_eq!(
+        body["installation"]["binary_on_disk"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        body["installation"]["binary_on_disk"]["newer_than_running"],
+        false
+    );
+    assert_eq!(body["ipc"]["configured"], true);
+    assert_eq!(
+        body["ipc"]["endpoint"],
+        "ipc://diagnostic-test.sock [query/fragment redacted]"
+    );
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("token=secret"), "{body:#?}");
+    assert!(!serialized.contains("#fragment"), "{body:#?}");
+    assert!(!body["restart_guidance"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn file_based_tool_roundtrip_in_temp_project() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proto_demo");

@@ -10,7 +10,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::sch_connectivity::{net_graph_for, NetGraph};
 use crate::tools::{
-    get_path, placed_pins_by_reference, project_name_for, sch_hierarchy, ToolContext, ToolDef,
+    get_path, invalid_arg, placed_pins_by_reference, project_name_for, sch_hierarchy, ToolContext,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -34,11 +35,18 @@ pub fn tools() -> Vec<ToolDef> {
             "audit_decoupling",
             "Audit schematic connectivity between IC power nets and decoupling capacitors. \
              This does not inspect PCB placement distance; use PCB clearance/placement tools \
-             for a physical review.",
+             for a physical review. Defaults to one file; set schematic_scope to 'hierarchy' \
+             to audit every reachable sheet instance.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "schematic_scope": {
+                        "type": "string",
+                        "enum": ["file", "hierarchy"],
+                        "description": "Audit only the supplied file (default) or every reachable hierarchy instance",
+                        "default": "file"
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -47,11 +55,19 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "audit_connections",
             "Check for common connection mistakes: missing pull-ups on I2C/reset, \
-             missing series resistors on LEDs, floating inputs, outputs shorted together.",
+             missing series resistors on LEDs, floating inputs, outputs shorted together. \
+             Defaults to one file; set schematic_scope to 'hierarchy' to audit every \
+             reachable sheet instance.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "schematic_scope": {
+                        "type": "string",
+                        "enum": ["file", "hierarchy"],
+                        "description": "Audit only the supplied file (default) or every reachable hierarchy instance",
+                        "default": "file"
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -60,11 +76,18 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "audit_power_rails",
             "Check power rail integrity: missing bulk capacitance, no test points on power rails, \
-             voltage regulator output caps missing.",
+             voltage regulator output caps missing. Defaults to one file; set schematic_scope \
+             to 'hierarchy' to audit every reachable sheet instance.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "schematic_scope": {
+                        "type": "string",
+                        "enum": ["file", "hierarchy"],
+                        "description": "Audit only the supplied file (default) or every reachable hierarchy instance",
+                        "default": "file"
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -115,11 +138,18 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "check_bom_health",
             "Analyze the BOM for supply chain risks: parts with no MPN, lifecycle warnings, \
-             low stock, parts not available from preferred distributors.",
+             low stock, parts not available from preferred distributors. Defaults to one \
+             file; set schematic_scope to 'hierarchy' to audit every reachable sheet instance.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "schematic_scope": {
+                        "type": "string",
+                        "enum": ["file", "hierarchy"],
+                        "description": "Audit only the supplied file (default) or every reachable hierarchy instance",
+                        "default": "file"
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -139,9 +169,65 @@ struct AuditFinding {
     recommendation: String,
 }
 
-// ─── Decoupling audit ────────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
+enum StandaloneSchematicAudit {
+    Decoupling,
+    Connections,
+    PowerRails,
+    BomHealth,
+}
+
+impl StandaloneSchematicAudit {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Decoupling => "decoupling",
+            Self::Connections => "connections",
+            Self::PowerRails => "power_rails",
+            Self::BomHealth => "bom_health",
+        }
+    }
+
+    async fn run_file(self, args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+        match self {
+            Self::Decoupling => handle_audit_decoupling_file(args, ctx).await,
+            Self::Connections => handle_audit_connections_file(args, ctx).await,
+            Self::PowerRails => handle_audit_power_rails_file(args, ctx).await,
+            Self::BomHealth => handle_check_bom_health_file(args, ctx).await,
+        }
+    }
+}
 
 async fn handle_audit_decoupling(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_scoped_schematic_audit(StandaloneSchematicAudit::Decoupling, args, ctx).await
+}
+
+async fn handle_audit_connections(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_scoped_schematic_audit(StandaloneSchematicAudit::Connections, args, ctx).await
+}
+
+async fn handle_audit_power_rails(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_scoped_schematic_audit(StandaloneSchematicAudit::PowerRails, args, ctx).await
+}
+
+async fn handle_check_bom_health(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_scoped_schematic_audit(StandaloneSchematicAudit::BomHealth, args, ctx).await
+}
+
+// ─── Decoupling audit ────────────────────────────────────────────────────────
+
+async fn handle_audit_decoupling_file(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -239,7 +325,7 @@ async fn handle_audit_decoupling(
 
 // ─── Connection audit ────────────────────────────────────────────────────────
 
-async fn handle_audit_connections(
+async fn handle_audit_connections_file(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -329,7 +415,7 @@ async fn handle_audit_connections(
 
 // ─── Power rail audit ────────────────────────────────────────────────────────
 
-async fn handle_audit_power_rails(
+async fn handle_audit_power_rails_file(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -611,49 +697,91 @@ impl AuditAggregate {
     }
 }
 
-fn collect_hierarchy_paths(
+#[derive(Clone)]
+struct SchematicSheetInstance {
+    path: PathBuf,
+    instance_path: String,
+}
+
+#[derive(Default)]
+struct SchematicHierarchyTraversal {
+    sheet_instances: usize,
+    schematic_files: Vec<PathBuf>,
+    auditable_instances: Vec<SchematicSheetInstance>,
+    diagnostics: Vec<Value>,
+    seen_files: HashSet<PathBuf>,
+}
+
+fn collect_hierarchy(
     path: &Path,
+    instance_path: &str,
     node: &Value,
-    sheet_instances: &mut usize,
-    seen_files: &mut HashSet<PathBuf>,
-    files: &mut Vec<PathBuf>,
-    diagnostics: &mut Vec<Value>,
+    traversal: &mut SchematicHierarchyTraversal,
 ) {
-    *sheet_instances += 1;
+    traversal.sheet_instances += 1;
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if seen_files.insert(canonical) {
-        files.push(path.to_path_buf());
+    if traversal.seen_files.insert(canonical) {
+        traversal.schematic_files.push(path.to_path_buf());
     }
 
-    if let Some(error) = node.get("error").and_then(Value::as_str) {
-        diagnostics.push(json!({
+    let hierarchy_error = node.get("error").and_then(Value::as_str);
+    if let Some(error) = hierarchy_error {
+        traversal.diagnostics.push(json!({
             "code": "hierarchy_error",
             "source": path.display().to_string(),
+            "sheet_instance_path": instance_path,
             "message": error
         }));
+    } else {
+        traversal.auditable_instances.push(SchematicSheetInstance {
+            path: path.to_path_buf(),
+            instance_path: instance_path.to_string(),
+        });
     }
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if let Some(children) = node.get("children").and_then(Value::as_array) {
-        for child in children {
+        for (index, child) in children.iter().enumerate() {
             let Some(file) = child.get("file").and_then(Value::as_str) else {
-                diagnostics.push(json!({
+                traversal.diagnostics.push(json!({
                     "code": "hierarchy_error",
                     "source": path.display().to_string(),
+                    "sheet_instance_path": instance_path,
                     "message": "hierarchy entry has no child file"
                 }));
                 continue;
             };
-            collect_hierarchy_paths(
+            let child_uuid = child
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    traversal.diagnostics.push(json!({
+                        "code": "hierarchy_error",
+                        "source": path.display().to_string(),
+                        "sheet_instance_path": instance_path,
+                        "message": "hierarchy entry has no sheet UUID"
+                    }));
+                    format!("unknown-{index}")
+                });
+            collect_hierarchy(
                 &parent.join(file),
+                &format!("{instance_path}{child_uuid}/"),
                 child,
-                sheet_instances,
-                seen_files,
-                files,
-                diagnostics,
+                traversal,
             );
         }
     }
+}
+
+fn inspect_hierarchy(root_path: &Path) -> anyhow::Result<SchematicHierarchyTraversal> {
+    let project_name = project_name_for(root_path);
+    let mut hierarchy_visited = HashSet::new();
+    let hierarchy =
+        sch_hierarchy::build_hierarchy_node(root_path, &project_name, 0, &mut hierarchy_visited)?;
+    let mut traversal = SchematicHierarchyTraversal::default();
+    collect_hierarchy(root_path, "/", &hierarchy, &mut traversal);
+    Ok(traversal)
 }
 
 fn inspect_schematic_coverage(
@@ -731,6 +859,205 @@ fn args_for_schematic(args: &Value, path: &Path) -> Value {
     sheet_args
 }
 
+fn requested_schematic_scope(args: &Value) -> Result<&'static str, CallToolResult> {
+    match args.get("schematic_scope") {
+        None | Some(Value::Null) => Ok("file"),
+        Some(Value::String(scope)) if scope == "file" => Ok("file"),
+        Some(Value::String(scope)) if scope == "hierarchy" => Ok("hierarchy"),
+        Some(Value::String(_)) => Err(invalid_arg(
+            "schematic_scope",
+            "expected 'file' or 'hierarchy'",
+        )),
+        Some(_) => Err(invalid_arg("schematic_scope", "expected a string")),
+    }
+}
+
+fn audit_result_json(result: CallToolResult) -> anyhow::Result<Value> {
+    let text = match result.content.first() {
+        Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+        Some(_) => anyhow::bail!("audit returned non-text content"),
+        None => anyhow::bail!("audit returned no content"),
+    };
+    if result.is_error {
+        anyhow::bail!("audit returned an error result: {text}");
+    }
+    let body: Value = serde_json::from_str(text)?;
+    if !body.is_object() {
+        anyhow::bail!("audit result was not a JSON object");
+    }
+    Ok(body)
+}
+
+fn schematic_symbol_count(path: &Path) -> anyhow::Result<usize> {
+    let (_, tree) = read_schematic(path)?;
+    Ok(extract_symbol_instances(&tree).len())
+}
+
+fn decorate_file_audit_result(body: &mut Value, symbol_instances: usize) {
+    body["schematic_scope"] = json!("file");
+    body["status"] = json!("complete");
+    body["coverage"] = json!({
+        "sheet_instances": 1,
+        "audited_sheet_instances": 1,
+        "schematic_files": 1,
+        "symbol_instances": symbol_instances
+    });
+    body["diagnostics"] = json!([]);
+}
+
+fn sum_sheet_metric(sheet_results: &[Value], key: &str) -> u64 {
+    sheet_results
+        .iter()
+        .filter_map(|result| result.get(key).and_then(Value::as_u64))
+        .sum()
+}
+
+async fn handle_scoped_schematic_audit(
+    audit: StandaloneSchematicAudit,
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let schematic_scope = match requested_schematic_scope(args) {
+        Ok(scope) => scope,
+        Err(error) => return Ok(error),
+    };
+    let root_path = get_path(args, "schematic")?;
+
+    if schematic_scope == "file" {
+        let result = audit.run_file(args, ctx).await?;
+        let mut body = audit_result_json(result)?;
+        decorate_file_audit_result(&mut body, schematic_symbol_count(&root_path)?);
+        return Ok(CallToolResult::text(serde_json::to_string(&body)?));
+    }
+
+    let traversal = inspect_hierarchy(&root_path)?;
+    let sheet_instances = traversal.sheet_instances;
+    let schematic_files = traversal.schematic_files.len();
+    let mut diagnostics = traversal.diagnostics;
+    let mut sheet_results = Vec::new();
+    let mut findings = Vec::new();
+    let mut symbol_instances = 0usize;
+
+    for sheet in &traversal.auditable_instances {
+        let sheet_args = args_for_schematic(args, &sheet.path);
+        let result = match audit.run_file(&sheet_args, ctx).await {
+            Ok(result) => result,
+            Err(error) => {
+                diagnostics.push(json!({
+                    "code": "audit_failed",
+                    "audit": audit.name(),
+                    "source": sheet.path.display().to_string(),
+                    "sheet_instance_path": sheet.instance_path,
+                    "message": error.to_string()
+                }));
+                continue;
+            }
+        };
+        let mut body = match audit_result_json(result) {
+            Ok(body) => body,
+            Err(error) => {
+                diagnostics.push(json!({
+                    "code": "invalid_audit_result",
+                    "audit": audit.name(),
+                    "source": sheet.path.display().to_string(),
+                    "sheet_instance_path": sheet.instance_path,
+                    "message": error.to_string()
+                }));
+                continue;
+            }
+        };
+        let sheet_symbol_instances = match schematic_symbol_count(&sheet.path) {
+            Ok(count) => count,
+            Err(error) => {
+                diagnostics.push(json!({
+                    "code": "schematic_parse_failed",
+                    "source": sheet.path.display().to_string(),
+                    "sheet_instance_path": sheet.instance_path,
+                    "message": error.to_string()
+                }));
+                continue;
+            }
+        };
+        symbol_instances += sheet_symbol_instances;
+        decorate_file_audit_result(&mut body, sheet_symbol_instances);
+        body["source"] = json!(sheet.path.display().to_string());
+        body["sheet_instance_path"] = json!(sheet.instance_path);
+        if let Some(sheet_findings) = body.get_mut("findings").and_then(Value::as_array_mut) {
+            for finding in sheet_findings {
+                finding["source"] = json!(sheet.path.display().to_string());
+                finding["sheet_instance_path"] = json!(sheet.instance_path);
+                findings.push(finding.clone());
+            }
+        }
+        sheet_results.push(body);
+    }
+
+    let status = if sheet_results.is_empty() {
+        "failed"
+    } else if diagnostics.is_empty() {
+        "complete"
+    } else {
+        "partial"
+    };
+    let audited_sheet_instances = sheet_results.len();
+    let finding_count = findings.len();
+    let mut body = json!({
+        "audit": audit.name(),
+        "schematic_scope": "hierarchy",
+        "status": status,
+        "coverage": {
+            "sheet_instances": sheet_instances,
+            "audited_sheet_instances": audited_sheet_instances,
+            "schematic_files": schematic_files,
+            "symbol_instances": symbol_instances
+        },
+        "findings": findings,
+        "sheet_results": sheet_results.clone(),
+        "diagnostics": diagnostics,
+        "summary": format!(
+            "{} audit covered {}/{} sheet instances across {} schematic files; {} findings.",
+            audit.name(),
+            audited_sheet_instances,
+            sheet_instances,
+            schematic_files,
+            finding_count
+        )
+    });
+
+    match audit {
+        StandaloneSchematicAudit::Decoupling => {
+            // Preserve the pre-existing field that distinguishes connectivity
+            // review from a physical PCB-distance check. `schematic_scope` is
+            // the new file-versus-hierarchy contract.
+            body["scope"] = json!("schematic_connectivity");
+            body["pcb_distance_checked"] = json!(false);
+            body["pass_count"] = json!(sum_sheet_metric(&sheet_results, "pass_count"));
+            body["total_power_pins"] = json!(sum_sheet_metric(&sheet_results, "total_power_pins"));
+        }
+        StandaloneSchematicAudit::Connections => {}
+        StandaloneSchematicAudit::PowerRails => {
+            body["power_nets"] = json!(sheet_results
+                .iter()
+                .filter_map(|result| result.get("power_nets").and_then(Value::as_array))
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>());
+        }
+        StandaloneSchematicAudit::BomHealth => {
+            for key in [
+                "total_components",
+                "missing_mpn",
+                "missing_footprint",
+                "missing_value",
+            ] {
+                body[key] = json!(sum_sheet_metric(&sheet_results, key));
+            }
+        }
+    }
+
+    Ok(CallToolResult::text(serde_json::to_string(&body)?))
+}
+
 async fn handle_run_design_review(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -744,24 +1071,19 @@ async fn handle_run_design_review(
     };
 
     let root_path = get_path(args, "schematic")?;
-    let project_name = project_name_for(&root_path);
-    let mut hierarchy_visited = HashSet::new();
-    let hierarchy =
-        sch_hierarchy::build_hierarchy_node(&root_path, &project_name, 0, &mut hierarchy_visited)?;
-
-    let mut diagnostics = Vec::new();
-    let mut schematic_coverage = SchematicReviewCoverage::default();
-    let mut schematic_files = Vec::new();
-    let mut seen_files = HashSet::new();
-    collect_hierarchy_paths(
-        &root_path,
-        &hierarchy,
-        &mut schematic_coverage.sheet_instances,
-        &mut seen_files,
-        &mut schematic_files,
-        &mut diagnostics,
-    );
-    schematic_coverage.schematic_files = schematic_files.len();
+    let traversal = inspect_hierarchy(&root_path)?;
+    let mut diagnostics = traversal.diagnostics;
+    let mut schematic_coverage = SchematicReviewCoverage {
+        sheet_instances: traversal.sheet_instances,
+        schematic_files: traversal.schematic_files.len(),
+        ..SchematicReviewCoverage::default()
+    };
+    for sheet in &traversal.auditable_instances {
+        // A reused child file represents a distinct KiCad sheet instance each
+        // time it appears. Count its symbols and named nets once per instance,
+        // while the file-level audit calls below remain deduplicated.
+        inspect_schematic_coverage(&sheet.path, &mut schematic_coverage, &mut diagnostics);
+    }
 
     let mut audits = vec![
         AuditAggregate::new("decoupling"),
@@ -770,17 +1092,16 @@ async fn handle_run_design_review(
         AuditAggregate::new("bom_health"),
     ];
 
-    for schematic_path in &schematic_files {
-        inspect_schematic_coverage(schematic_path, &mut schematic_coverage, &mut diagnostics);
+    for schematic_path in &traversal.schematic_files {
         let sheet_args = args_for_schematic(args, schematic_path);
 
-        let result = handle_audit_decoupling(&sheet_args, ctx).await;
+        let result = handle_audit_decoupling_file(&sheet_args, ctx).await;
         audits[0].record(schematic_path, result, &mut diagnostics);
-        let result = handle_audit_connections(&sheet_args, ctx).await;
+        let result = handle_audit_connections_file(&sheet_args, ctx).await;
         audits[1].record(schematic_path, result, &mut diagnostics);
-        let result = handle_audit_power_rails(&sheet_args, ctx).await;
+        let result = handle_audit_power_rails_file(&sheet_args, ctx).await;
         audits[2].record(schematic_path, result, &mut diagnostics);
-        let result = handle_check_bom_health(&sheet_args, ctx).await;
+        let result = handle_check_bom_health_file(&sheet_args, ctx).await;
         audits[3].record(schematic_path, result, &mut diagnostics);
     }
 
@@ -995,7 +1316,7 @@ async fn handle_run_design_review(
 
 // ─── BOM health check ───────────────────────────────────────────────────────
 
-async fn handle_check_bom_health(
+async fn handle_check_bom_health_file(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -1465,6 +1786,32 @@ mod review_completion_tests {
         root
     }
 
+    fn root_with_reused_child(file: &str) -> String {
+        let mut root = root_with_child(file);
+        let insert_at = root.rfind(')').expect("blank schematic has a root close");
+        let block = format_hierarchical_sheet(HierarchicalSheetSpec {
+            name: "Power B",
+            file,
+            x: 120.0,
+            y: 20.0,
+            width: 80.0,
+            height: 50.0,
+            project_name: "root",
+            parent_instance_path: "/11111111-1111-4111-8111-111111111111",
+            page: "3",
+        });
+        root.insert_str(insert_at, &block);
+        root
+    }
+
+    fn tool_json(result: CallToolResult) -> Value {
+        assert!(!result.is_error, "audit must return a structured result");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("audit result must be text JSON")
+        };
+        serde_json::from_str(text).expect("audit result must be valid JSON")
+    }
+
     fn review_json(result: CallToolResult) -> Value {
         assert!(
             !result.is_error,
@@ -1542,6 +1889,168 @@ mod review_completion_tests {
             .unwrap()
             .iter()
             .any(|finding| finding["source"] == child.display().to_string()));
+    }
+
+    #[test]
+    fn every_standalone_schematic_audit_declares_hierarchy_scope() {
+        for name in [
+            "audit_decoupling",
+            "audit_connections",
+            "audit_power_rails",
+            "check_bom_health",
+        ] {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .expect("standalone audit must exist");
+            assert_eq!(
+                tool.input_schema["properties"]["schematic_scope"]["enum"],
+                json!(["file", "hierarchy"]),
+                "{name} must make its schematic scope explicit"
+            );
+            assert_eq!(
+                tool.input_schema["properties"]["schematic_scope"]["default"], "file",
+                "{name} must preserve the existing one-file default"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hierarchy_scope_counts_reused_child_instances_for_every_audit() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root.kicad_sch");
+        let child = tmp.path().join("shared.kicad_sch");
+        std::fs::write(&root, root_with_reused_child("shared.kicad_sch")).unwrap();
+        std::fs::write(&child, single_unit_schematic("")).unwrap();
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "schematic_scope": "hierarchy"
+        });
+
+        let results = [
+            handle_audit_decoupling(&args, &test_ctx()).await.unwrap(),
+            handle_audit_connections(&args, &test_ctx()).await.unwrap(),
+            handle_audit_power_rails(&args, &test_ctx()).await.unwrap(),
+            handle_check_bom_health(&args, &test_ctx()).await.unwrap(),
+        ];
+
+        for result in results {
+            let audit = tool_json(result);
+            assert_eq!(audit["schematic_scope"], "hierarchy", "{audit}");
+            assert_eq!(audit["status"], "complete", "{audit}");
+            assert_eq!(audit["coverage"]["sheet_instances"], 3, "{audit}");
+            assert_eq!(audit["coverage"]["schematic_files"], 2, "{audit}");
+            assert_eq!(audit["coverage"]["symbol_instances"], 2, "{audit}");
+            assert_eq!(audit["sheet_results"].as_array().unwrap().len(), 3);
+            assert!(audit["diagnostics"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn design_review_uses_shared_instance_aware_hierarchy_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root.kicad_sch");
+        let child = tmp.path().join("shared.kicad_sch");
+        std::fs::write(&root, root_with_reused_child("shared.kicad_sch")).unwrap();
+        std::fs::write(&child, single_unit_schematic("")).unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["coverage"]["schematic"]["sheet_instances"], 3);
+        assert_eq!(report["coverage"]["schematic"]["schematic_files"], 2);
+        assert_eq!(report["coverage"]["schematic"]["symbol_instances"], 2);
+        assert_eq!(
+            report["audits"]["bom_health"]["requested"], 2,
+            "file-level review work remains deduplicated even though coverage is instance-aware"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_file_scope_remains_the_default() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root.kicad_sch");
+        let child = tmp.path().join("child.kicad_sch");
+        std::fs::write(&root, root_with_child("child.kicad_sch")).unwrap();
+        std::fs::write(&child, single_unit_schematic("")).unwrap();
+
+        let result = tool_json(
+            handle_check_bom_health(
+                &json!({"schematic": root.display().to_string()}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["schematic_scope"], "file");
+        assert_eq!(result["status"], "complete");
+        assert_eq!(result["total_components"], 0);
+        assert_eq!(result["coverage"]["sheet_instances"], 1);
+        assert_eq!(result["coverage"]["schematic_files"], 1);
+        assert_eq!(result["coverage"]["symbol_instances"], 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_schematic_scope_is_a_structured_argument_error() {
+        let result = handle_check_bom_health(
+            &json!({"schematic": "unused.kicad_sch", "schematic_scope": "project"}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("argument error must be text JSON")
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "schematic_scope");
+    }
+
+    #[tokio::test]
+    async fn missing_or_cyclic_hierarchy_is_incomplete_with_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let missing_root = tmp.path().join("missing_root.kicad_sch");
+        std::fs::write(&missing_root, root_with_child("missing.kicad_sch")).unwrap();
+
+        let missing = tool_json(
+            handle_check_bom_health(
+                &json!({
+                    "schematic": missing_root.display().to_string(),
+                    "schematic_scope": "hierarchy"
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(missing["status"], "partial", "{missing}");
+        assert!(missing["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "hierarchy_error"));
+
+        let cyclic_root = tmp.path().join("cyclic_root.kicad_sch");
+        std::fs::write(&cyclic_root, root_with_child("cyclic_root.kicad_sch")).unwrap();
+        let cyclic = tool_json(
+            handle_check_bom_health(
+                &json!({
+                    "schematic": cyclic_root.display().to_string(),
+                    "schematic_scope": "hierarchy"
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(cyclic["status"], "partial", "{cyclic}");
+        assert!(cyclic["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cycle detected"))));
     }
 
     #[tokio::test]

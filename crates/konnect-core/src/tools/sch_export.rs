@@ -18,7 +18,6 @@ use konnect_sexp::{
     },
 };
 use serde_json::json;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::cli;
@@ -611,7 +610,11 @@ async fn handle_run_erc(
     let sch_path = get_path(args, "schematic")?;
     let min_severity = args["severity"].as_str().unwrap_or("warning");
 
-    if let Some(root) = owning_project_root(&sch_path) {
+    let owning_root = match owning_project_root(&sch_path) {
+        Ok(root) => root,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Some(root) = owning_root {
         // Structured, not free text: a caller can react to `invalid_argument`
         // on `schematic` by retrying against the named root, which is exactly
         // what the message says to do.
@@ -1012,60 +1015,15 @@ mod multi_unit_connectivity_tests {
 /// Returns `None` for a schematic that is a root in its own right, one that
 /// belongs to no project, and one that sits beside a project without appearing
 /// in its sheet tree.
-fn owning_project_root(file: &Path) -> Option<PathBuf> {
+fn owning_project_root(file: &Path) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
     if file.with_extension("kicad_pro").is_file() {
-        return None;
+        return Ok(None);
     }
-    let root = project_root_schematic(&crate::tools::library::project_root_for(file)?)?;
-    if same_file(&root, file) {
-        return None;
-    }
-    let mut visited = HashSet::new();
-    sheet_tree_contains(&root, file, 0, &mut visited).then_some(root)
-}
-
-/// The `<stem>.kicad_sch` beside the single `.kicad_pro` in `dir`. A directory
-/// holding more than one project says nothing definite about which root a loose
-/// sheet belongs to, so it yields nothing rather than a guess.
-fn project_root_schematic(dir: &Path) -> Option<PathBuf> {
-    let mut found: Option<PathBuf> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "kicad_pro") {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(path);
-        }
-    }
-    let sch = found?.with_extension("kicad_sch");
-    sch.is_file().then_some(sch)
-}
-
-/// Whether `target` is reachable as a sheet from `root`. Depth and visited set
-/// guard the same way [`crate::tools::sch_hierarchy::build_hierarchy_node`]
-/// does: a sheet may reference a file that references it back.
-fn sheet_tree_contains(
-    root: &Path,
-    target: &Path,
-    depth: usize,
-    visited: &mut HashSet<PathBuf>,
-) -> bool {
-    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
-        return false;
-    }
-    let canon = canonical(root);
-    if !visited.insert(canon) {
-        return false;
-    }
-    let Ok(sch) = konnect_schematic_editor::Schematic::load(root) else {
-        return false;
-    };
-    let dir = root.parent().unwrap_or_else(|| Path::new("."));
-    sch.sheets.iter().any(|sheet| {
-        let child = dir.join(sheet.file());
-        same_file(&child, target) || sheet_tree_contains(&child, target, depth + 1, visited)
-    })
+    Ok(
+        crate::tools::resolve_schematic_ownership(file)?.and_then(|ownership| {
+            (!same_file(&ownership.root_schematic, file)).then_some(ownership.root_schematic)
+        }),
+    )
 }
 
 /// Path equality that survives `.\foo` versus `foo` and case-insensitive
@@ -1196,7 +1154,7 @@ mod tests {
         let root = root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
         let child = blank(tmp.path(), "child.kicad_sch");
 
-        assert_eq!(owning_project_root(&child), Some(root));
+        assert_eq!(owning_project_root(&child).unwrap(), Some(root));
     }
 
     #[test]
@@ -1206,7 +1164,7 @@ mod tests {
         let root = root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
         blank(tmp.path(), "child.kicad_sch");
 
-        assert_eq!(owning_project_root(&root), None);
+        assert_eq!(owning_project_root(&root).unwrap(), None);
     }
 
     #[test]
@@ -1214,7 +1172,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let loose = blank(tmp.path(), "loose.kicad_sch");
 
-        assert_eq!(owning_project_root(&loose), None);
+        assert_eq!(owning_project_root(&loose).unwrap(), None);
     }
 
     /// The refusal is a structured `invalid_argument` naming `schematic`, so a
@@ -1270,7 +1228,7 @@ mod tests {
         blank(tmp.path(), "child.kicad_sch");
         let stranger = blank(tmp.path(), "stranger.kicad_sch");
 
-        assert_eq!(owning_project_root(&stranger), None);
+        assert_eq!(owning_project_root(&stranger).unwrap(), None);
     }
 
     /// A sheet cycle must not hang the walk.
@@ -1282,6 +1240,6 @@ mod tests {
         root_with_child(tmp.path(), "a.kicad_sch", "proj.kicad_sch");
         let stranger = blank(tmp.path(), "stranger.kicad_sch");
 
-        assert_eq!(owning_project_root(&stranger), None);
+        assert_eq!(owning_project_root(&stranger).unwrap(), None);
     }
 }

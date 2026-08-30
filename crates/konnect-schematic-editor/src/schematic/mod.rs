@@ -623,6 +623,9 @@ fn map_sexp_error(error: konnect_sexp::SexpError) -> crate::error::Error {
     match error {
         konnect_sexp::SexpError::Io(error) => crate::error::Error::Io(error),
         konnect_sexp::SexpError::Conflict { path } => crate::error::Error::Conflict(path),
+        konnect_sexp::SexpError::KiCadEditorLocked { path, lock_path } => {
+            crate::error::Error::KiCadEditorLocked { path, lock_path }
+        }
         error => crate::error::Error::Io(std::io::Error::other(error)),
     }
 }

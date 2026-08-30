@@ -348,6 +348,111 @@ where
     .await
 }
 
+/// Convert the IPC layer's typed board-target refusal into the stable MCP
+/// taxonomy. No handler should flatten these into "KiCad must be running" or
+/// a generic rejection: callers need to distinguish a wrong document from an
+/// ambiguous or stale one.
+pub(crate) fn ipc_target_error_result(error: &konnect_ipc::BoardTargetError) -> CallToolResult {
+    use konnect_ipc::BoardTargetError;
+
+    let message = format!("{}. Konnect did not read or modify another board.", error);
+    match error {
+        BoardTargetError::NoOpenDocuments { requested } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: Vec::new(),
+            },
+            message,
+        ),
+        BoardTargetError::WrongDocument {
+            requested,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: open_documents.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::AmbiguousDocument {
+            requested,
+            candidates,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                target: requested.clone(),
+                candidates: candidates.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::StaleDocument {
+            requested,
+            previously_bound,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: requested.clone(),
+                reason: format!(
+                    "previously bound document '{}' is no longer uniquely open; observed [{}]",
+                    previously_bound,
+                    open_documents.join(", ")
+                ),
+            },
+            message,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod ipc_target_error_tests {
+    use super::*;
+
+    #[test]
+    fn ipc_document_target_failures_keep_distinct_structured_kinds() {
+        let cases = [
+            (
+                konnect_ipc::BoardTargetError::NoOpenDocuments {
+                    requested: "target.kicad_pcb".to_string(),
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::WrongDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::AmbiguousDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    candidates: vec![
+                        "target.kicad_pcb".to_string(),
+                        "target.kicad_pcb".to_string(),
+                    ],
+                },
+                "ambiguous_target",
+            ),
+            (
+                konnect_ipc::BoardTargetError::StaleDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    previously_bound: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "stale_target",
+            ),
+        ];
+
+        for (error, expected_kind) in cases {
+            let result = ipc_target_error_result(&error);
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some(expected_kind)
+            );
+        }
+    }
+}
+
 // ─── Argument helpers ─────────────────────────────────────────────────────────
 
 /// Build a structured `InvalidArgument` CallToolResult. Used by the
@@ -1332,101 +1437,487 @@ pub struct SheetInstanceContext {
     pub project_name: String,
     /// `/root-uuid[/sheet-uuid…]`, the path from the root down to this sheet.
     pub instance_path: String,
+    /// Every structurally observed path to this document. A reused child sheet
+    /// has one entry per hierarchy instance; document-wide edits affect all of
+    /// them and must never silently choose the first.
+    pub instance_paths: Vec<String>,
     /// Whether this sheet was reached from a root other than itself.
     pub is_child_sheet: bool,
 }
 
+/// One structurally proven project owner of a schematic file.
+///
+/// Ownership is not inferred from directory ancestry alone. A child sheet is
+/// owned only when a candidate project's root schematic reaches it through
+/// parsed `(sheet (property "Sheetfile" ...))` nodes. This is the authority
+/// bound for the ancestor walk: it may inspect every ancestor so deeply nested
+/// sheets continue to work, but an unrelated project can never win merely by
+/// being higher in the filesystem (#189).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchematicOwnership {
+    pub project_file: std::path::PathBuf,
+    pub root_schematic: std::path::PathBuf,
+    pub instance_paths: Vec<String>,
+}
+
+/// A schematic target could not be resolved without choosing arbitrarily.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SchematicTargetError {
+    AmbiguousProject {
+        target: std::path::PathBuf,
+        roots: Vec<std::path::PathBuf>,
+    },
+    StaleTarget {
+        target: std::path::PathBuf,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SchematicTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AmbiguousProject { target, roots } => write!(
+                formatter,
+                "schematic '{}' belongs to multiple project roots: {}",
+                target.display(),
+                roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::StaleTarget { target, reason } => {
+                write!(
+                    formatter,
+                    "schematic '{}' is stale: {reason}",
+                    target.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchematicTargetError {}
+
+impl SchematicTargetError {
+    pub(crate) fn into_tool_result(self) -> CallToolResult {
+        match self {
+            Self::AmbiguousProject { target, roots } => {
+                let candidates = roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>();
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                        target: target.display().to_string(),
+                        candidates: candidates.clone(),
+                    },
+                    format!(
+                        "Schematic '{}' is reachable from multiple project roots ({}). \
+                         Provide a document inside one unambiguous project; Konnect did not \
+                         choose one or modify the schematic.",
+                        target.display(),
+                        candidates.join(", ")
+                    ),
+                )
+            }
+            Self::StaleTarget { target, reason } => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::StaleTarget {
+                    target: target.display().to_string(),
+                    reason: reason.clone(),
+                },
+                format!(
+                    "Schematic '{}' does not match its structurally observed target state: {}. \
+                     Konnect did not modify the schematic.",
+                    target.display(),
+                    reason
+                ),
+            ),
+        }
+    }
+}
+
+/// Resolve the unique project whose parsed sheet hierarchy owns `target`.
+///
+/// A project beside a root schematic is exact. A project above a child is a
+/// candidate only when its `<project>.kicad_sch` structurally reaches the
+/// target. Missing/unreadable roots and unrelated projects are ignored. If
+/// more than one parsed root reaches the target, resolution refuses and names
+/// every root instead of depending on `read_dir` order.
+pub(crate) fn resolve_schematic_ownership(
+    target: &std::path::Path,
+) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
+    use std::collections::BTreeSet;
+
+    let Some(start) = target.parent() else {
+        return Ok(None);
+    };
+    let mut project_files = BTreeSet::new();
+    for directory in start.ancestors() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pro"))
+            {
+                project_files.insert(path);
+            }
+        }
+    }
+
+    let mut owners = Vec::new();
+    for project_file in project_files {
+        let root_schematic = project_file.with_extension("kicad_sch");
+        let Ok(root) = konnect_schematic_editor::Schematic::load(&root_schematic) else {
+            continue;
+        };
+        let Some(root_uuid) = root.uuid.clone() else {
+            continue;
+        };
+
+        let mut instance_paths = Vec::new();
+        if same_schematic_document(&root_schematic, target) {
+            instance_paths.push(format!("/{root_uuid}"));
+        } else {
+            let mut suffix = Vec::new();
+            let mut stack = std::collections::HashSet::new();
+            collect_sheet_instance_paths(
+                &root_schematic,
+                target,
+                &mut suffix,
+                &mut stack,
+                0,
+                &root_uuid,
+                &mut instance_paths,
+            );
+        }
+        instance_paths.sort();
+        instance_paths.dedup();
+        if !instance_paths.is_empty() {
+            owners.push(SchematicOwnership {
+                project_file,
+                root_schematic,
+                instance_paths,
+            });
+        }
+    }
+
+    owners.sort_by(|left, right| left.root_schematic.cmp(&right.root_schematic));
+    if owners.len() > 1 {
+        return Err(SchematicTargetError::AmbiguousProject {
+            target: target.to_path_buf(),
+            roots: owners
+                .into_iter()
+                .map(|owner| owner.root_schematic)
+                .collect(),
+        });
+    }
+    Ok(owners.pop())
+}
+
+fn collect_sheet_instance_paths(
+    current: &std::path::Path,
+    target: &std::path::Path,
+    suffix: &mut Vec<String>,
+    stack: &mut std::collections::HashSet<std::path::PathBuf>,
+    depth: usize,
+    root_uuid: &str,
+    found: &mut Vec<String>,
+) {
+    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
+        return;
+    }
+    let canonical = canonical_schematic_path(current);
+    if !stack.insert(canonical.clone()) {
+        return;
+    }
+
+    if let Ok(schematic) = konnect_schematic_editor::Schematic::load(current) {
+        let directory = current
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        for sheet in &schematic.sheets {
+            let child = directory.join(sheet.file());
+            suffix.push(sheet.uuid.clone());
+            if same_schematic_document(&child, target) {
+                let mut path = format!("/{root_uuid}");
+                for uuid in suffix.iter() {
+                    path.push('/');
+                    path.push_str(uuid);
+                }
+                found.push(path);
+            } else if child.is_file() {
+                collect_sheet_instance_paths(
+                    &child,
+                    target,
+                    suffix,
+                    stack,
+                    depth + 1,
+                    root_uuid,
+                    found,
+                );
+            }
+            suffix.pop();
+        }
+    }
+
+    stack.remove(&canonical);
+}
+
+fn same_schematic_document(left: &std::path::Path, right: &std::path::Path) -> bool {
+    canonical_schematic_path(left) == canonical_schematic_path(right)
+}
+
+fn canonical_schematic_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Resolve `sch_path`'s place in its project.
 ///
-/// Falls back to treating the file as its own root — the standalone-sheet
-/// behaviour — whenever no project can be found, the root sheet cannot be
-/// read, or the file is not reachable from it. That keeps a loose `.kicad_sch`
-/// working exactly as before.
-pub fn sheet_instance_context(
+/// Falls back to treating the file as its own root only when no parsed project
+/// hierarchy owns it. Ambiguous ownership is returned to the caller and must
+/// be exposed as a structured refusal.
+pub(crate) fn sheet_instance_context(
     sch_path: &std::path::Path,
     sch: &mut konnect_schematic_editor::Schematic,
-) -> SheetInstanceContext {
+) -> Result<SheetInstanceContext, SchematicTargetError> {
     let own_root = ensure_root_uuid(sch);
     let standalone = SheetInstanceContext {
         project_name: project_name_for(sch_path),
         instance_path: format!("/{own_root}"),
+        instance_paths: vec![format!("/{own_root}")],
         is_child_sheet: false,
     };
 
-    let Some(project) = nearest_kicad_pro(sch_path) else {
-        return standalone;
+    let Some(ownership) = resolve_schematic_ownership(sch_path)? else {
+        return Ok(standalone);
     };
-    let root_sheet = project.with_extension("kicad_sch");
-    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    if canonical(&root_sheet) == canonical(sch_path) {
-        // This IS the root sheet; only the project name may differ from the
-        // file stem, and here it cannot.
-        return standalone;
-    }
-    let Ok(root) = konnect_schematic_editor::Schematic::load(&root_sheet) else {
-        return standalone;
-    };
-    let Some(root_uuid) = root.uuid.clone() else {
-        return standalone;
-    };
-    let mut sheet_uuids = Vec::new();
-    if !find_sheet_path(&root_sheet, sch_path, &mut sheet_uuids, 0) {
-        return standalone;
-    }
-
-    let mut instance_path = format!("/{root_uuid}");
-    for uuid in &sheet_uuids {
-        instance_path.push('/');
-        instance_path.push_str(uuid);
-    }
-    SheetInstanceContext {
-        project_name: project
+    let instance_path = ownership
+        .instance_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| standalone.instance_path.clone());
+    Ok(SheetInstanceContext {
+        project_name: ownership
+            .project_file
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string(),
         instance_path,
-        is_child_sheet: true,
-    }
-}
-
-/// The `.kicad_pro` governing `file`, from its own directory upwards.
-fn nearest_kicad_pro(file: &std::path::Path) -> Option<std::path::PathBuf> {
-    file.parent()?.ancestors().find_map(|dir| {
-        std::fs::read_dir(dir).ok()?.find_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().and_then(|e| e.to_str()) == Some("kicad_pro")).then_some(path)
-        })
+        instance_paths: ownership.instance_paths,
+        is_child_sheet: !same_schematic_document(&ownership.root_schematic, sch_path),
     })
 }
 
-/// Depth-first walk from `from` looking for `target`, recording the uuid of
-/// each `(sheet …)` node stepped through. Bounded like the hierarchy tools:
-/// a `Sheetfile` cycle would otherwise recurse forever.
-fn find_sheet_path(
-    from: &std::path::Path,
-    target: &std::path::Path,
-    acc: &mut Vec<String>,
-    depth: usize,
-) -> bool {
-    if depth > 32 {
-        return false;
-    }
-    let Ok(sch) = konnect_schematic_editor::Schematic::load(from) else {
-        return false;
-    };
-    let dir = from.parent().unwrap_or(std::path::Path::new("."));
-    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    for sheet in sch.sheets.iter() {
-        let child = dir.join(sheet.file());
-        acc.push(sheet.uuid.clone());
-        if canonical(&child) == canonical(target) {
-            return true;
+/// Prove that every existing placed symbol is keyed to exactly the hierarchy
+/// identities observed from the parsed project root.
+///
+/// A missing, foreign, duplicate, or obsolete path means the file's saved
+/// instance metadata is stale. Adding another symbol in that state would
+/// produce a document where KiCad resolves different components against
+/// different hierarchy instances, so mutation fails closed before the in-memory
+/// schematic is changed.
+pub(crate) fn validate_sheet_instance_state(
+    sch_path: &std::path::Path,
+    schematic: &konnect_schematic_editor::Schematic,
+    context: &SheetInstanceContext,
+) -> Result<(), SchematicTargetError> {
+    let mut expected = context
+        .instance_paths
+        .iter()
+        .map(|path| (context.project_name.clone(), path.clone()))
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    let mut stale_symbols = Vec::new();
+    for symbol in &schematic.symbols {
+        let mut observed = symbol.instance_paths();
+        observed.sort();
+        if observed != expected {
+            let identity = symbol
+                .reference()
+                .filter(|reference| !reference.is_empty())
+                .unwrap_or(symbol.uuid.as_str());
+            let format_paths = |paths: &[(String, String)]| {
+                paths
+                    .iter()
+                    .map(|(project, path)| format!("{project}:{path}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            stale_symbols.push(format!(
+                "{identity} observed [{}], expected [{}]",
+                format_paths(&observed),
+                format_paths(&expected)
+            ));
         }
-        if child.exists() && find_sheet_path(&child, target, acc, depth + 1) {
-            return true;
-        }
-        acc.pop();
     }
-    false
+
+    if stale_symbols.is_empty() {
+        Ok(())
+    } else {
+        Err(SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed-symbol instance metadata disagrees with project '{}': {}",
+                context.project_name,
+                stale_symbols.join("; ")
+            ),
+        })
+    }
+}
+
+#[cfg(test)]
+mod schematic_target_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn write(path: &Path, content: &str) -> PathBuf {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+        path.to_path_buf()
+    }
+
+    fn blank(path: &Path) -> PathBuf {
+        write(path, &blank_schematic_template())
+    }
+
+    fn root_with_child(path: &Path, root_uuid: &str, child: &str, sheet_uuid: &str) -> PathBuf {
+        write(
+            path,
+            &format!(
+                r#"(kicad_sch
+	(version 20250610)
+	(generator "eeschema")
+	(uuid "{root_uuid}")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 20 20)
+		(size 40 20)
+		(uuid "{sheet_uuid}")
+		(property "Sheetname" "Child" (at 20 19.365 0))
+		(property "Sheetfile" "{child}" (at 20 40.635 0))
+	)
+	(sheet_instances (path "/" (page "1")))
+)
+"#,
+            ),
+        )
+    }
+
+    #[test]
+    fn exact_project_root_is_resolved() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("control.kicad_pro"), "{}");
+        let root = blank(&directory.path().join("control.kicad_sch"));
+
+        let owner = resolve_schematic_ownership(&root).unwrap().unwrap();
+
+        assert_eq!(
+            owner.project_file,
+            directory.path().join("control.kicad_pro")
+        );
+        assert_eq!(owner.root_schematic, root);
+        assert_eq!(owner.instance_paths.len(), 1);
+    }
+
+    #[test]
+    fn deep_child_is_proven_through_the_parsed_hierarchy() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("control.kicad_pro"), "{}");
+        root_with_child(
+            &directory.path().join("control.kicad_sch"),
+            "root-uuid",
+            "sheets/mid.kicad_sch",
+            "mid-sheet-uuid",
+        );
+        root_with_child(
+            &directory.path().join("sheets/mid.kicad_sch"),
+            "mid-file-uuid",
+            "deep/child.kicad_sch",
+            "child-sheet-uuid",
+        );
+        let child = blank(&directory.path().join("sheets/deep/child.kicad_sch"));
+
+        let owner = resolve_schematic_ownership(&child).unwrap().unwrap();
+
+        assert_eq!(
+            owner.project_file,
+            directory.path().join("control.kicad_pro")
+        );
+        assert_eq!(
+            owner.instance_paths,
+            ["/root-uuid/mid-sheet-uuid/child-sheet-uuid"]
+        );
+    }
+
+    #[test]
+    fn loose_sheet_under_an_unrelated_project_stays_loose() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("unrelated.kicad_pro"), "{}");
+        blank(&directory.path().join("unrelated.kicad_sch"));
+        let loose = blank(&directory.path().join("work/loose.kicad_sch"));
+
+        assert_eq!(resolve_schematic_ownership(&loose).unwrap(), None);
+        assert_eq!(
+            crate::tools::library::project_root_for(&loose).unwrap(),
+            loose.parent().map(Path::to_path_buf)
+        );
+    }
+
+    #[test]
+    fn two_structural_owners_are_a_typed_ambiguity() {
+        let outer = tempfile::tempdir().unwrap();
+        write(&outer.path().join("outer.kicad_pro"), "{}");
+        root_with_child(
+            &outer.path().join("outer.kicad_sch"),
+            "outer-root",
+            "nested/child.kicad_sch",
+            "outer-path",
+        );
+
+        let nested = outer.path().join("nested");
+        write(&nested.join("inner.kicad_pro"), "{}");
+        root_with_child(
+            &nested.join("inner.kicad_sch"),
+            "inner-root",
+            "child.kicad_sch",
+            "inner-path",
+        );
+        let child = blank(&nested.join("child.kicad_sch"));
+
+        let error = resolve_schematic_ownership(&child).unwrap_err();
+        let SchematicTargetError::AmbiguousProject { target, roots } = error else {
+            panic!("expected ambiguous project error")
+        };
+        assert_eq!(target, child);
+        assert_eq!(roots.len(), 2);
+        let result = SchematicTargetError::AmbiguousProject { target, roots }.into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+    }
+
+    #[test]
+    fn missing_or_unreadable_candidate_root_is_not_ownership_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("missing.kicad_pro"), "{}");
+        write(&directory.path().join("broken.kicad_pro"), "{}");
+        write(
+            &directory.path().join("broken.kicad_sch"),
+            "not a schematic",
+        );
+        let target = blank(&directory.path().join("nested/loose.kicad_sch"));
+
+        assert_eq!(resolve_schematic_ownership(&target).unwrap(), None);
+    }
 }

@@ -28,7 +28,8 @@ records calls through `observability.rs`.
 `crates/konnect-core/src/router/registry.rs` declares toolsets and resolves each
 toolset to its definitions. `router/mod.rs` tracks loaded definitions, and
 `router/meta_tools.rs` implements the always-visible discovery, loading, and
-observability tools.
+observability tools. `runtime_info.rs` supplies the read-only serving-build,
+installation, KiCad, and IPC evidence returned by `get_installation_info`.
 
 `crates/konnect-core/src/tools/mod.rs` owns `ToolDef`, `ToolContext`,
 `ServerConfig`, the `tool!` macro, required-argument helpers, and shared path and
