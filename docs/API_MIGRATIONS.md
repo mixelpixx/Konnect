@@ -3,6 +3,44 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `find_single_pin_nets` counts pins, not labels (minor release)
+
+`find_single_pin_nets` counted label instances per net name, so an ordinary net
+— one label on a wire reaching two or more pins — was reported, and a genuine
+single-pin net disappeared as soon as it carried a second label. Membership now
+comes from the shared net graph: a net is reported when it reaches **at most one
+pin**, zero included, since a label whose net reaches nothing is the orphan label
+and the deleted-component stub the tool is sent looking for. Hierarchical sheet
+pins count as pins; a power symbol's own pin does not, or the rail reaching
+exactly one component pin would be hidden.
+
+Every existing field remains with its existing meaning: `single_pin_net_count`,
+and per net `net`, `x`, `y`, and `type`. `type` is still the kind of the *first*
+label found, so a consumer matching on it is unaffected.
+
+Results add five fields:
+
+- `pin_count` — pins the net reaches, `0` or `1` for a reported net.
+- `label_count` — label instances naming it, the value the old membership rule
+  used. A net with no label at all is a different smell, so the count is kept.
+- `pins` — the reached pin, as a one-or-zero-element array of the same
+  `component_pin` / `sheet_pin` objects the other connectivity tools return.
+- `label_types` — every distinct label kind naming the net, sorted. Local labels
+  are extracted first, so a net carrying both a local and a global label reports
+  `type: "NetLabel"` and says nothing about the global one; this field does.
+- `cross_sheet_unverified` — true when any label naming the net can carry it off
+  this sheet (global, hierarchical, or a power symbol). The answer is per sheet,
+  and a flagged net is a lead rather than a finding. Such nets are still
+  reported: a rail reaching one pin on this sheet is worth showing.
+
+**`single_pin_net_count` changes meaning**: it now counts nets reaching at most
+one actual pin, not nets named by exactly one label instance. A consumer reading
+it as a defect count gets a smaller, truer number and needs no migration; one
+that had learned to ignore this tool's noise can stop. No consumer can keep the
+old set, since it was wrong in both directions.
+
+No tool, argument, or existing response field was renamed or removed.
+
 ## Unreleased: guarded PCB file fallback reports its observed reason
 
 Hybrid PCB mutation tools may use their existing direct-file fallback when

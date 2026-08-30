@@ -306,6 +306,23 @@ fn seed_net_graph(
     graph
 }
 
+/// Each label paired with the graph root it sits on.
+///
+/// Two tools read the one relation from opposite ends — `find_shorted_nets`
+/// root-first, since more than one name on a root is a short, and
+/// `find_single_pin_nets` name-first, pooling the roots one name reaches. The
+/// walk lives here so a refinement to which label anchors which root cannot
+/// land in only one of them.
+pub(crate) fn label_roots<'a>(
+    graph: &mut NetGraph,
+    labels: &'a [Label],
+) -> Vec<((i64, i64), &'a Label)> {
+    labels
+        .iter()
+        .map(|label| (graph.find(pt_key(label.x, label.y)), label))
+        .collect()
+}
+
 /// The net graph for a whole tree, at [`COINCIDENT_TOLERANCE`].
 ///
 /// `labels` must be `extract_all_net_labels` — power symbols name nets too, and

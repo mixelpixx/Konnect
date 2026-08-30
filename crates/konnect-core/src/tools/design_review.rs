@@ -1338,8 +1338,7 @@ async fn handle_check_bom_health_file(
             None => continue,
         };
 
-        // Skip power symbols and sub-units
-        if reference.starts_with('#') {
+        if crate::tools::is_power_symbol_reference(reference) {
             continue;
         }
         total_components += 1;
