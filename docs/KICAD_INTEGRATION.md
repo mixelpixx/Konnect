@@ -71,6 +71,14 @@ object matches in the exact document and sheet instance; duplicates return
 structured candidates, and stale project ownership or symbol-instance paths
 fail closed before any editor mutation.
 
+Selection mutation uses KiCad's typed `ClearSelection`, `AddToSelection`, and
+`RemoveFromSelection` commands only after every non-clear KIID resolves in the
+explicit saved project/document/sheet. The transport response is not treated
+as success: Konnect performs a fresh exact-context `GetSelection`, compares the
+entire observed set with the expected before/after transition, and returns a
+structured `readback_mismatch` if KiCad did not make precisely that change.
+Duplicate or empty KIID requests are rejected before IPC.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **224 registered tools** + **7 always-visible meta-tools** = **231 total**
+- **225 registered tools** + **7 always-visible meta-tools** = **232 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -61,7 +61,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
-### `editor_navigation` · 3 tools
+### `editor_navigation` · 4 tools
 **Purpose:** Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context.
 **Source:** [`crates/konnect-core/src/tools/editor_navigation.rs`](crates/konnect-core/src/tools/editor_navigation.rs)
 
@@ -70,6 +70,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `get_editor_state` | Observe the configured KiCad IPC endpoint's running version, addressable schematic/PCB editors, exact open document identities, capability availability, and explicit active-context limitations. |
 | `get_editor_selection` | Read the selection from one exact editor, project, document, and hierarchical sheet instance with stable KIID/UUID identities and document-readback freshness checks. |
 | `resolve_navigation_target` | Resolve an exact open project/document/sheet object by stable KIID, or by a human reference only when saved KiCad structure yields one unambiguous candidate. |
+| `mutate_editor_selection` | Clear, add to, or remove from one exact editor selection after saved-object validation; report success only when a fresh typed selection readback proves the complete requested set transition. |
 
 ---
 
