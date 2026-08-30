@@ -67,6 +67,15 @@ pub enum ToolErrorKind {
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
+    /// No live editor endpoint is configured or reachable for the requested
+    /// semantic operation.
+    EditorUnavailable { editor: String, reason: String },
+    /// The running KiCad version or the bundled stable protocol does not
+    /// provide a capability the caller requested.
+    UnsupportedCapability {
+        capability: String,
+        kicad_version: Option<String>,
+    },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
     UnsafeFileFallback { path: String, reason: String },
@@ -93,6 +102,8 @@ impl ToolErrorKind {
             Self::AmbiguousTarget { .. } => "ambiguous_target",
             Self::WrongDocument { .. } => "wrong_document",
             Self::StaleTarget { .. } => "stale_target",
+            Self::EditorUnavailable { .. } => "editor_unavailable",
+            Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::HandlerError { .. } => "handler_error",
@@ -229,6 +240,14 @@ mod tests {
             ToolErrorKind::StaleTarget {
                 target: "p".into(),
                 reason: "r".into(),
+            },
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".into(),
+                reason: "closed".into(),
+            },
+            ToolErrorKind::UnsupportedCapability {
+                capability: "activate_sheet".into(),
+                kicad_version: Some("10.0.5".into()),
             },
             ToolErrorKind::UnsafeFileFallback {
                 path: "p".into(),

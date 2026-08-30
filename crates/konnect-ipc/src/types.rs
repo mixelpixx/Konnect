@@ -1,6 +1,115 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// KiCad design editor addressed by the typed IPC API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcEditorKind {
+    Schematic,
+    Pcb,
+}
+
+impl IpcEditorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Schematic => "schematic",
+            Self::Pcb => "pcb",
+        }
+    }
+}
+
+/// Runtime availability of one semantic editor capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcCapabilityAvailability {
+    Available,
+    Unsupported,
+    Unknown,
+}
+
+/// One capability statement and the evidence used to make it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcCapability {
+    pub availability: IpcCapabilityAvailability,
+    pub evidence_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Capabilities relevant to the Priority 1 semantic navigation surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorCapabilities {
+    pub observe_documents: IpcCapability,
+    pub observe_active_context: IpcCapability,
+    pub read_selection: IpcCapability,
+    pub mutate_selection: IpcCapability,
+    pub activate_document: IpcCapability,
+    pub activate_sheet: IpcCapability,
+    pub reveal_object: IpcCapability,
+    pub cross_probe: IpcCapability,
+}
+
+/// Running KiCad version observed through `GetVersion`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcKiCadVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub full_version: String,
+}
+
+/// Project identity carried by a live KiCad `DocumentSpecifier`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcProjectIdentity {
+    pub name: String,
+    pub path: String,
+}
+
+/// Canonical schematic instance identity carried by KiCad IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSheetInstancePath {
+    pub kiids: Vec<String>,
+    pub human_readable: String,
+}
+
+/// One exact live document identity observed through KiCad IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorDocument {
+    pub editor: IpcEditorKind,
+    pub project: Option<IpcProjectIdentity>,
+    /// Exact board path when KiCad provides one. KiCad 10 schematic document
+    /// specifiers carry a sheet path rather than a schematic filename, so this
+    /// is deliberately null for schematics instead of being inferred from disk.
+    pub document_path: Option<String>,
+    pub sheet_instance_path: Option<IpcSheetInstancePath>,
+}
+
+/// Observation for one editor kind on the configured IPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorObservation {
+    pub editor: IpcEditorKind,
+    pub addressable: bool,
+    pub documents: Vec<IpcEditorDocument>,
+    pub capabilities: IpcEditorCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Result of observing the configured KiCad IPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorStateObservation {
+    pub kicad_version: IpcKiCadVersion,
+    pub evidence_source: String,
+    pub editors: Vec<IpcEditorObservation>,
+    /// KiCad 10 has no stable typed foreground-frame or active-document query.
+    /// These fields remain null rather than treating open-document order as
+    /// active state.
+    pub active_editor: Option<IpcEditorKind>,
+    pub active_document: Option<IpcEditorDocument>,
+    pub active_sheet_instance: Option<IpcSheetInstancePath>,
+    pub limitations: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcVector2 {
     pub x: f64,

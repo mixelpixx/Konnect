@@ -36,6 +36,22 @@ Closed-board move, rotate, and flip in `tools/pcb_components.rs` are narrowly
 scoped exceptions with explicit geometry checks. They are not a general license
 to edit a live board file.
 
+### Editor observation
+
+`konnect-ipc::KiCadIpcClient::observe_editor_state` queries the running KiCad
+version and schematic/PCB `GetOpenDocuments` surfaces on the configured
+endpoint. `tools/editor_navigation.rs` exposes that typed observation through
+the provisional `editor_navigation` toolset while design issue #395 is under
+review.
+
+The observation preserves project and `DocumentSpecifier` sheet/board identity
+and labels its evidence as live IPC. KiCad 10 has no stable typed query for the
+foreground frame, active document, or active schematic sheet, so those fields
+remain unavailable; Konnect does not infer active state from open-document
+order. The same capability record reports stable typed activation and reveal
+as unsupported rather than routing callers through arbitrary `RunAction`
+strings.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses

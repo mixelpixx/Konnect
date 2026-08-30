@@ -9,7 +9,8 @@ pub mod transform;
 pub mod types;
 
 pub use client::{
-    is_transport_unreachable, BoardTargetError, IpcFailure, KiCadIpcClient, TransportUnreachable,
+    is_transport_unreachable, ApiStatusError, BoardTargetError, IpcDocumentObservationError,
+    IpcFailure, KiCadIpcClient, TransportUnreachable,
 };
 pub use endpoint::redact_endpoint;
 pub use socket::{candidate_socket_paths, detect_ipc_address};

@@ -103,6 +103,203 @@ fn open_board_response() -> kiapi::common::ApiResponse {
     ))
 }
 
+fn version_response() -> kiapi::common::ApiResponse {
+    let response = kiapi::common::commands::GetVersionResponse {
+        version: Some(kiapi::common::types::KiCadVersion {
+            major: 10,
+            minor: 0,
+            patch: 5,
+            full_version: "10.0.5".to_string(),
+        }),
+    };
+    reply_with(builders::pack_any(
+        &response,
+        "kiapi.common.commands.GetVersionResponse",
+    ))
+}
+
+fn unsupported_response(code: kiapi::common::ApiStatusCode) -> kiapi::common::ApiResponse {
+    kiapi::common::ApiResponse {
+        status: Some(kiapi::common::ApiResponseStatus {
+            status: code as i32,
+            error_message: String::new(),
+        }),
+        header: None,
+        message: None,
+    }
+}
+
+#[test]
+fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_honest() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetVersion") {
+            return Some(version_response());
+        }
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let command =
+                kiapi::common::commands::GetOpenDocuments::decode(message.value.as_slice())
+                    .expect("decode GetOpenDocuments");
+            if command.r#type == kiapi::common::types::DocumentType::DoctypeSchematic as i32 {
+                let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: vec![kiapi::common::types::DocumentSpecifier {
+                        r#type: kiapi::common::types::DocumentType::DoctypeSchematic as i32,
+                        project: Some(kiapi::common::types::ProjectSpecifier {
+                            name: "controller".to_string(),
+                            path: "C:/design/controller".to_string(),
+                        }),
+                        identifier: Some(
+                            kiapi::common::types::document_specifier::Identifier::SheetPath(
+                                kiapi::common::types::SheetPath {
+                                    path: vec![
+                                        kiapi::common::types::Kiid {
+                                            value: "root-kiid".to_string(),
+                                        },
+                                        kiapi::common::types::Kiid {
+                                            value: "power-kiid".to_string(),
+                                        },
+                                    ],
+                                    path_human_readable: "/power".to_string(),
+                                },
+                            ),
+                        ),
+                    }],
+                };
+                return Some(reply_with(builders::pack_any(
+                    &response,
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )));
+            }
+            return Some(unsupported_response(
+                kiapi::common::ApiStatusCode::AsUnhandled,
+            ));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let state = KiCadIpcClient::new(&mock.url)
+        .observe_editor_state()
+        .expect("observe editor state");
+    assert_eq!(state.kicad_version.full_version, "10.0.5");
+    assert_eq!(state.evidence_source, "kicad_ipc");
+    assert_eq!(state.active_editor, None);
+    assert_eq!(state.active_document, None);
+    assert_eq!(state.active_sheet_instance, None);
+
+    let schematic = &state.editors[0];
+    assert_eq!(schematic.editor, konnect_ipc::IpcEditorKind::Schematic);
+    assert!(schematic.addressable);
+    assert_eq!(schematic.documents.len(), 1);
+    assert_eq!(schematic.documents[0].document_path, None);
+    assert_eq!(
+        schematic.documents[0]
+            .sheet_instance_path
+            .as_ref()
+            .expect("sheet path")
+            .kiids,
+        ["root-kiid", "power-kiid"]
+    );
+    assert_eq!(
+        schematic.capabilities.read_selection.availability,
+        konnect_ipc::IpcCapabilityAvailability::Available
+    );
+    assert_eq!(
+        schematic.capabilities.observe_active_context.availability,
+        konnect_ipc::IpcCapabilityAvailability::Unsupported
+    );
+
+    let pcb = &state.editors[1];
+    assert_eq!(pcb.editor, konnect_ipc::IpcEditorKind::Pcb);
+    assert!(!pcb.addressable);
+    assert!(pcb.documents.is_empty());
+    assert!(pcb
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("AS_UNHANDLED")));
+}
+
+#[test]
+fn handled_empty_document_sets_are_not_inferred_as_closed_frames() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetVersion") {
+            return Some(version_response());
+        }
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse { documents: vec![] };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let state = KiCadIpcClient::new(&mock.url)
+        .observe_editor_state()
+        .expect("observe editor state");
+    assert!(state
+        .editors
+        .iter()
+        .all(|editor| editor.addressable && editor.documents.is_empty()));
+}
+
+#[test]
+fn malformed_cross_type_document_identity_is_typed_and_never_retargeted() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetVersion") {
+            return Some(version_response());
+        }
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![kiapi::common::types::DocumentSpecifier {
+                    r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                    project: None,
+                    identifier: Some(
+                        kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                            "wrong.kicad_pcb".to_string(),
+                        ),
+                    ),
+                }],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .observe_editor_state()
+        .expect_err("cross-type document must refuse");
+    assert!(error
+        .chain()
+        .any(|cause| cause.is::<konnect_ipc::IpcDocumentObservationError>()));
+}
+
+#[test]
+fn unsupported_status_is_typed_without_changing_existing_rejection_classification() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        Some(unsupported_response(
+            kiapi::common::ApiStatusCode::AsUnimplemented,
+        ))
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .get_open_documents_for(konnect_ipc::IpcEditorKind::Pcb)
+        .expect_err("unsupported command must fail");
+    let status = konnect_ipc::ApiStatusError::from_error(&error).expect("typed status");
+    assert!(status.is_unsupported());
+    assert_eq!(status.code_name, "AS_UNIMPLEMENTED");
+    assert!(matches!(
+        konnect_ipc::IpcFailure::from_error(error),
+        konnect_ipc::IpcFailure::Rejected(_)
+    ));
+}
+
 #[test]
 fn save_document_to_string_targets_the_named_open_board() {
     let mock = spawn_mock(|request| {

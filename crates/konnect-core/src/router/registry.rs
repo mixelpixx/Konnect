@@ -25,6 +25,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 7,
     },
     ToolsetMeta {
+        name: "editor_navigation",
+        description: "Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context",
+        category: "project",
+        tool_count: 1,
+    },
+    ToolsetMeta {
         name: "sch_components",
         description: "Add, edit, move, rotate, and delete schematic symbols, and set the page size",
         category: "schematic",
@@ -145,6 +151,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
     use crate::tools::*;
     match name {
         "project" => Some(project::tools()),
+        "editor_navigation" => Some(editor_navigation::tools()),
         "sch_components" => Some(sch_components::tools()),
         "sch_wiring" => Some(sch_wiring::tools()),
         "sch_bus" => Some(sch_bus::tools()),

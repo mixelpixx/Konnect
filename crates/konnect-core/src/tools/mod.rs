@@ -4,6 +4,7 @@ mod board_session;
 pub mod cli;
 pub mod config;
 pub mod design_review;
+pub mod editor_navigation;
 mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
