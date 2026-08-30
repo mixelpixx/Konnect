@@ -769,6 +769,124 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Read the selection for one exact live editor/document/sheet context.
+    ///
+    /// The requested identity is matched against `GetOpenDocuments` before
+    /// and after `GetSelection`. KiCad's `SelectionResponse` has no response
+    /// header, so this bounded document readback is the freshness boundary:
+    /// a disappeared or retargeted document is never reported as a valid
+    /// selection from the caller's context.
+    pub fn observe_selection(
+        &self,
+        requested: &IpcEditorDocument,
+    ) -> Result<IpcSelectionObservation> {
+        let before = self.resolve_selection_document(requested)?;
+        let command = kiapi::common::commands::GetSelection {
+            header: Some(header_for(before.clone())),
+            types: Vec::new(),
+        };
+        let response = unpack_required::<kiapi::common::commands::SelectionResponse>(
+            self.send_command(&command, "kiapi.common.commands.GetSelection")?,
+            "GetSelection",
+        )?;
+        let selected_objects = response
+            .items
+            .iter()
+            .map(|item| decode_selected_object(requested.editor, item))
+            .collect::<Result<Vec<_>>>()?;
+
+        let after = self
+            .resolve_selection_document(requested)
+            .map_err(|error| {
+                let (candidates, reason) = IpcSelectionObservationError::from_error(&error)
+                    .map(|selection| (selection.candidates.clone(), selection.reason.clone()))
+                    .unwrap_or_else(|| (Vec::new(), error.to_string()));
+                anyhow::Error::new(IpcSelectionObservationError {
+                    kind: IpcSelectionObservationErrorKind::StaleEditorState,
+                    editor: requested.editor,
+                    requested: editor_document_label(requested),
+                    candidates,
+                    reason: format!("document context changed during selection readback: {reason}"),
+                })
+            })?;
+        if before != after {
+            return Err(anyhow::Error::new(IpcSelectionObservationError {
+                kind: IpcSelectionObservationErrorKind::StaleEditorState,
+                editor: requested.editor,
+                requested: editor_document_label(requested),
+                candidates: vec![document_specifier_label(&after)],
+                reason: "document identity changed during selection readback".to_string(),
+            }));
+        }
+
+        Ok(IpcSelectionObservation {
+            project: requested.project.clone(),
+            document: requested.clone(),
+            editor: requested.editor,
+            sheet_instance_path: requested.sheet_instance_path.clone(),
+            selected_objects,
+            evidence_source: "kicad_ipc_get_selection_with_document_readback".to_string(),
+        })
+    }
+
+    fn resolve_selection_document(
+        &self,
+        requested: &IpcEditorDocument,
+    ) -> Result<kiapi::common::types::DocumentSpecifier> {
+        let raw_documents = self.get_open_documents_for(requested.editor)?;
+        let mut documents = Vec::with_capacity(raw_documents.len());
+        for raw in raw_documents {
+            let observed = editor_document_from_specifier(requested.editor, raw.clone())?;
+            documents.push((raw, observed));
+        }
+
+        let candidate_labels = documents
+            .iter()
+            .map(|(_, document)| editor_document_label(document))
+            .collect::<Vec<_>>();
+        let same_project = documents
+            .iter()
+            .filter(|(_, document)| document.project == requested.project)
+            .collect::<Vec<_>>();
+        if same_project.is_empty() && !documents.is_empty() {
+            return Err(selection_target_error(
+                IpcSelectionObservationErrorKind::WrongProject,
+                requested,
+                candidate_labels,
+                "no open document belongs to the requested project",
+            ));
+        }
+
+        let exact = same_project
+            .into_iter()
+            .filter(|(_, document)| selection_document_identity_matches(requested, document))
+            .collect::<Vec<_>>();
+        if exact.is_empty() {
+            let kind = match requested.editor {
+                IpcEditorKind::Schematic => IpcSelectionObservationErrorKind::WrongSheetInstance,
+                IpcEditorKind::Pcb => IpcSelectionObservationErrorKind::WrongDocument,
+            };
+            return Err(selection_target_error(
+                kind,
+                requested,
+                candidate_labels,
+                "the exact requested document or sheet instance is not open",
+            ));
+        }
+        if exact.len() != 1 {
+            return Err(selection_target_error(
+                IpcSelectionObservationErrorKind::AmbiguousDocument,
+                requested,
+                exact
+                    .iter()
+                    .map(|(_, document)| editor_document_label(document))
+                    .collect(),
+                "KiCad returned duplicate exact document identities",
+            ));
+        }
+        Ok(exact[0].0.clone())
+    }
+
     fn observe_editor(
         &self,
         editor: IpcEditorKind,
@@ -3045,6 +3163,240 @@ fn editor_document_from_specifier(
         project,
         document_path,
         sheet_instance_path,
+    })
+}
+
+fn selection_document_identity_matches(
+    requested: &IpcEditorDocument,
+    observed: &IpcEditorDocument,
+) -> bool {
+    if requested.editor != observed.editor || requested.project != observed.project {
+        return false;
+    }
+    match requested.editor {
+        IpcEditorKind::Pcb => {
+            requested.document_path.is_some()
+                && requested.document_path == observed.document_path
+                && requested.sheet_instance_path.is_none()
+        }
+        IpcEditorKind::Schematic => {
+            requested.document_path.is_none()
+                && requested
+                    .sheet_instance_path
+                    .as_ref()
+                    .is_some_and(|requested_path| {
+                        observed
+                            .sheet_instance_path
+                            .as_ref()
+                            .is_some_and(|observed_path| {
+                                requested_path.kiids == observed_path.kiids
+                            })
+                    })
+        }
+    }
+}
+
+fn selection_target_error(
+    kind: IpcSelectionObservationErrorKind,
+    requested: &IpcEditorDocument,
+    candidates: Vec<String>,
+    reason: &str,
+) -> anyhow::Error {
+    anyhow::Error::new(IpcSelectionObservationError {
+        kind,
+        editor: requested.editor,
+        requested: editor_document_label(requested),
+        candidates,
+        reason: reason.to_string(),
+    })
+}
+
+fn editor_document_label(document: &IpcEditorDocument) -> String {
+    let project = document
+        .project
+        .as_ref()
+        .map(|project| format!("{} at {}", project.name, project.path))
+        .unwrap_or_else(|| "standalone project".to_string());
+    match document.editor {
+        IpcEditorKind::Pcb => format!(
+            "PCB {} in {project}",
+            document
+                .document_path
+                .as_deref()
+                .unwrap_or("<missing path>")
+        ),
+        IpcEditorKind::Schematic => format!(
+            "schematic sheet {} in {project}",
+            document
+                .sheet_instance_path
+                .as_ref()
+                .map(|path| {
+                    if path.human_readable.is_empty() {
+                        path.kiids.join("/")
+                    } else {
+                        path.human_readable.clone()
+                    }
+                })
+                .unwrap_or_else(|| "<missing instance path>".to_string())
+        ),
+    }
+}
+
+fn document_specifier_label(document: &kiapi::common::types::DocumentSpecifier) -> String {
+    let editor = match kiapi::common::types::DocumentType::try_from(document.r#type) {
+        Ok(kiapi::common::types::DocumentType::DoctypeSchematic) => IpcEditorKind::Schematic,
+        _ => IpcEditorKind::Pcb,
+    };
+    editor_document_from_specifier(editor, document.clone())
+        .map(|document| editor_document_label(&document))
+        .unwrap_or_else(|_| "malformed live document".to_string())
+}
+
+fn decode_selected_object(
+    editor: IpcEditorKind,
+    item: &prost_types::Any,
+) -> Result<IpcSelectedObject> {
+    let protocol_type = crate::builders::any_type_name(item);
+    macro_rules! selected {
+        ($message:ty, $kind:literal, $id:expr) => {{
+            let decoded: $message = unpack_any(item).map_err(|error| {
+                malformed_selected_object(editor, protocol_type, format!("decode failed: {error}"))
+            })?;
+            selected_object_from_id(editor, protocol_type, $kind, $id(&decoded))
+        }};
+    }
+
+    match protocol_type {
+        "kiapi.board.types.FootprintInstance" => selected!(
+            kiapi::board::types::FootprintInstance,
+            "pcb_footprint",
+            |value: &kiapi::board::types::FootprintInstance| value.id.clone()
+        ),
+        "kiapi.board.types.Pad" => selected!(
+            kiapi::board::types::Pad,
+            "pcb_pad",
+            |value: &kiapi::board::types::Pad| value.id.clone()
+        ),
+        "kiapi.board.types.BoardGraphicShape" => selected!(
+            kiapi::board::types::BoardGraphicShape,
+            "pcb_shape",
+            |value: &kiapi::board::types::BoardGraphicShape| value.id.clone()
+        ),
+        "kiapi.board.types.BoardText" => selected!(
+            kiapi::board::types::BoardText,
+            "pcb_text",
+            |value: &kiapi::board::types::BoardText| value.id.clone()
+        ),
+        "kiapi.board.types.BoardTextBox" => selected!(
+            kiapi::board::types::BoardTextBox,
+            "pcb_text_box",
+            |value: &kiapi::board::types::BoardTextBox| value.id.clone()
+        ),
+        "kiapi.board.types.Track" => selected!(
+            kiapi::board::types::Track,
+            "pcb_trace",
+            |value: &kiapi::board::types::Track| value.id.clone()
+        ),
+        "kiapi.board.types.Via" => selected!(
+            kiapi::board::types::Via,
+            "pcb_via",
+            |value: &kiapi::board::types::Via| value.id.clone()
+        ),
+        "kiapi.board.types.Arc" => selected!(
+            kiapi::board::types::Arc,
+            "pcb_arc",
+            |value: &kiapi::board::types::Arc| value.id.clone()
+        ),
+        "kiapi.board.types.Dimension" => selected!(
+            kiapi::board::types::Dimension,
+            "pcb_dimension",
+            |value: &kiapi::board::types::Dimension| value.id.clone()
+        ),
+        "kiapi.board.types.Zone" => selected!(
+            kiapi::board::types::Zone,
+            "pcb_zone",
+            |value: &kiapi::board::types::Zone| value.id.clone()
+        ),
+        "kiapi.board.types.Group" => selected!(
+            kiapi::board::types::Group,
+            "pcb_group",
+            |value: &kiapi::board::types::Group| value.id.clone()
+        ),
+        "kiapi.board.types.Field" => selected!(
+            kiapi::board::types::Field,
+            "pcb_field",
+            |value: &kiapi::board::types::Field| value
+                .text
+                .as_ref()
+                .and_then(|text| text.id.clone())
+        ),
+        "kiapi.schematic.types.Line" => selected!(
+            kiapi::schematic::types::Line,
+            "schematic_line",
+            |value: &kiapi::schematic::types::Line| value.id.clone()
+        ),
+        "kiapi.schematic.types.LocalLabel" => selected!(
+            kiapi::schematic::types::LocalLabel,
+            "schematic_label",
+            |value: &kiapi::schematic::types::LocalLabel| value.id.clone()
+        ),
+        "kiapi.schematic.types.GlobalLabel" => selected!(
+            kiapi::schematic::types::GlobalLabel,
+            "schematic_global_label",
+            |value: &kiapi::schematic::types::GlobalLabel| value.id.clone()
+        ),
+        "kiapi.schematic.types.HierarchicalLabel" => selected!(
+            kiapi::schematic::types::HierarchicalLabel,
+            "schematic_hierarchical_label",
+            |value: &kiapi::schematic::types::HierarchicalLabel| value.id.clone()
+        ),
+        "kiapi.schematic.types.DirectiveLabel" => selected!(
+            kiapi::schematic::types::DirectiveLabel,
+            "schematic_directive_label",
+            |value: &kiapi::schematic::types::DirectiveLabel| value.id.clone()
+        ),
+        _ => Err(anyhow::Error::new(IpcSelectionObservationError {
+            kind: IpcSelectionObservationErrorKind::UnsupportedObjectType,
+            editor,
+            requested: protocol_type.to_string(),
+            candidates: Vec::new(),
+            reason: "the bundled stable KiCad protocol cannot decode this selected object type"
+                .to_string(),
+        })),
+    }
+}
+
+fn selected_object_from_id(
+    editor: IpcEditorKind,
+    protocol_type: &str,
+    object_type: &str,
+    id: Option<kiapi::common::types::Kiid>,
+) -> Result<IpcSelectedObject> {
+    let Some(id) = id.filter(|id| !id.value.is_empty()) else {
+        return Err(malformed_selected_object(
+            editor,
+            protocol_type,
+            "selected object has no stable KIID".to_string(),
+        ));
+    };
+    Ok(IpcSelectedObject {
+        kiid: id.value,
+        object_type: object_type.to_string(),
+        protocol_type: protocol_type.to_string(),
+    })
+}
+
+fn malformed_selected_object(
+    editor: IpcEditorKind,
+    protocol_type: &str,
+    reason: String,
+) -> anyhow::Error {
+    anyhow::Error::new(IpcSelectionObservationError {
+        kind: IpcSelectionObservationErrorKind::MalformedSelectedObject,
+        editor,
+        requested: protocol_type.to_string(),
+        candidates: Vec::new(),
+        reason,
     })
 }
 

@@ -64,6 +64,17 @@ pub enum ToolErrorKind {
         requested: String,
         open_documents: Vec<String>,
     },
+    /// No open document belongs to the explicitly requested project.
+    WrongProject {
+        requested: String,
+        open_projects: Vec<String>,
+    },
+    /// The requested schematic hierarchy instance is not the instance set
+    /// observed in the exact live schematic editor context.
+    WrongSheetInstance {
+        requested: String,
+        open_sheet_instances: Vec<String>,
+    },
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
@@ -101,6 +112,8 @@ impl ToolErrorKind {
             Self::Conflict { .. } => "conflict",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
             Self::WrongDocument { .. } => "wrong_document",
+            Self::WrongProject { .. } => "wrong_project",
+            Self::WrongSheetInstance { .. } => "wrong_sheet_instance",
             Self::StaleTarget { .. } => "stale_target",
             Self::EditorUnavailable { .. } => "editor_unavailable",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
@@ -236,6 +249,14 @@ mod tests {
             ToolErrorKind::WrongDocument {
                 requested: "p".into(),
                 open_documents: vec!["a".into()],
+            },
+            ToolErrorKind::WrongProject {
+                requested: "p".into(),
+                open_projects: vec!["a".into()],
+            },
+            ToolErrorKind::WrongSheetInstance {
+                requested: "/root/child".into(),
+                open_sheet_instances: vec!["/root/other".into()],
             },
             ToolErrorKind::StaleTarget {
                 target: "p".into(),

@@ -110,6 +110,70 @@ pub struct IpcEditorStateObservation {
     pub limitations: Vec<String>,
 }
 
+/// One selected object observed from the exact requested live document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSelectedObject {
+    /// Stable KiCad object identifier (KIID/UUID), never a display reference.
+    pub kiid: String,
+    /// Semantic object kind derived from the exact protobuf type URL.
+    pub object_type: String,
+    /// Full protobuf type carried by KiCad, retained as decoding evidence.
+    pub protocol_type: String,
+}
+
+/// Selection readback bound to one exact live editor/document/sheet context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSelectionObservation {
+    pub project: Option<IpcProjectIdentity>,
+    pub document: IpcEditorDocument,
+    pub editor: IpcEditorKind,
+    pub sheet_instance_path: Option<IpcSheetInstancePath>,
+    pub selected_objects: Vec<IpcSelectedObject>,
+    pub evidence_source: String,
+}
+
+/// Stable classification for a fail-closed selection observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcSelectionObservationErrorKind {
+    WrongProject,
+    WrongDocument,
+    WrongSheetInstance,
+    AmbiguousDocument,
+    StaleEditorState,
+    UnsupportedObjectType,
+    MalformedSelectedObject,
+}
+
+/// A selection could not be attributed to the exact requested live context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcSelectionObservationError {
+    pub kind: IpcSelectionObservationErrorKind,
+    pub editor: IpcEditorKind,
+    pub requested: String,
+    pub candidates: Vec<String>,
+    pub reason: String,
+}
+
+impl IpcSelectionObservationError {
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+impl std::fmt::Display for IpcSelectionObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cannot observe {} selection for {}: {}",
+            self.editor.as_str(),
+            self.requested,
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for IpcSelectionObservationError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcVector2 {
     pub x: f64,

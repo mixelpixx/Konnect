@@ -52,6 +52,16 @@ order. The same capability record reports stable typed activation and reveal
 as unsupported rather than routing callers through arbitrary `RunAction`
 strings.
 
+`KiCadIpcClient::observe_selection` accepts one exact editor/document identity
+from that observation, matches it before issuing `GetSelection`, and repeats
+the open-document read afterward because KiCad's `SelectionResponse` carries
+no response header. Every returned item is dispatched by its full protobuf
+type URL and must contain a non-empty KIID; an unknown or malformed selected
+item fails the entire observation rather than being dropped. The vendored
+schematic protobuf currently decodes line and label selections. Schematic
+symbols and other unmodelled types remain explicitly unsupported until KiCad
+provides stable typed serialization for them.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses
