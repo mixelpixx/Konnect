@@ -222,7 +222,7 @@ impl NoLiveBoard {
         match self {
             Self::Unreachable => json!({
                 "kind": "transport_unreachable",
-                "message": "KiCad IPC is unreachable."
+                "message": "KiCad IPC is unreachable and no exact-board sibling lock was present."
             }),
             Self::NotOpen(answer) => json!({
                 "kind": "board_not_open",
@@ -236,7 +236,7 @@ impl NoLiveBoard {
     pub(crate) fn warning(&self) -> String {
         let observed = match self {
             Self::Unreachable => {
-                "KiCad IPC was unreachable, so Konnect could not contact a live editor.".to_string()
+                "KiCad IPC was unreachable, so Konnect could not contact a live editor; no exact-board sibling lock was present.".to_string()
             }
             Self::NotOpen(answer) => format!("KiCad was reachable, and {answer}"),
         };
@@ -289,6 +289,7 @@ where
             if ctx.board_session.was_observed_live(board_path) {
                 Ok(BoardWrite::Refused(unsafe_file_fallback(
                     board_path,
+                    "board_previously_observed_live",
                     "Konnect previously reached KiCad with this board open, and KiCad no longer \
                      has it open.",
                 )))
@@ -300,9 +301,12 @@ where
             crate::tools::ipc_target_error_result(&error),
         )),
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
-            if ctx.board_session.was_observed_live(board_path) {
+            if let Some(refusal) = board_lock_refusal(board_path) {
+                Ok(BoardWrite::Refused(refusal))
+            } else if ctx.board_session.was_observed_live(board_path) {
                 Ok(BoardWrite::Refused(unsafe_file_fallback(
                     board_path,
+                    "board_previously_observed_live",
                     "Konnect previously reached KiCad with this board open, but IPC is now \
                      unreachable.",
                 )))
@@ -313,12 +317,17 @@ where
     }
 }
 
-/// The refusal both gates share: `situation` names what changed since this
-/// server saw KiCad holding the board, and the rest is the same advice.
-fn unsafe_file_fallback(board_path: &std::path::Path, situation: &str) -> CallToolResult {
+/// The refusal both gates share. `reason` is stable machine-readable evidence;
+/// `situation` explains that evidence and the recovery boundary to a person.
+fn unsafe_file_fallback(
+    board_path: &std::path::Path,
+    reason: &str,
+    situation: &str,
+) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::UnsafeFileFallback {
             path: board_path.display().to_string(),
+            reason: reason.to_string(),
         },
         format!(
             "{situation} The saved board file may be older than unsaved editor state, so \
@@ -327,6 +336,44 @@ fn unsafe_file_fallback(board_path: &std::path::Path, situation: &str) -> CallTo
              restart Konnect only after confirming that the saved file is authoritative."
         ),
     )
+}
+
+/// A KiCad sibling lock is persistent evidence that the saved board may not be
+/// authoritative even when this server has never reached the editor. Lock
+/// contents do not prove process ownership or freshness, so both an observed
+/// lock and an inspection failure veto the unreachable-IPC file fallback.
+fn board_lock_refusal(board_path: &std::path::Path) -> Option<CallToolResult> {
+    board_lock_refusal_with(board_path, |path| {
+        std::fs::symlink_metadata(path).map(|_| ())
+    })
+}
+
+fn board_lock_refusal_with(
+    board_path: &std::path::Path,
+    inspect: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Option<CallToolResult> {
+    let lock_path = konnect_sexp::writer::kicad_editor_lock_path(board_path)?;
+    match inspect(&lock_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(()) => Some(unsafe_file_fallback(
+            board_path,
+            "kicad_lock_present",
+            &format!(
+                "KiCad sibling lock '{}' is present; its contents cannot prove whether an editor \
+                 still owns newer in-memory state.",
+                lock_path.display()
+            ),
+        )),
+        Err(error) => Some(unsafe_file_fallback(
+            board_path,
+            "kicad_lock_unreadable",
+            &format!(
+                "KiCad sibling lock '{}' could not be inspected ({error}); its absence cannot be \
+                 established.",
+                lock_path.display()
+            ),
+        )),
+    }
 }
 
 /// Refuse a direct file edit when KiCAD is reachable AND holds this very
@@ -353,6 +400,7 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
             Ok(ctx.board_session.was_observed_live(board_path).then(|| {
                 unsafe_file_fallback(
                     board_path,
+                    "board_previously_observed_live",
                     "Konnect previously reached KiCad with this board open, and KiCad no longer \
                      has it open.",
                 )
@@ -362,12 +410,15 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
             Ok(Some(crate::tools::ipc_target_error_result(&error)))
         }
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
-            Ok(ctx.board_session.was_observed_live(board_path).then(|| {
-                unsafe_file_fallback(
-                    board_path,
-                    "Konnect previously reached KiCad with this board open, but IPC is now \
-                     unreachable.",
-                )
+            Ok(board_lock_refusal(board_path).or_else(|| {
+                ctx.board_session.was_observed_live(board_path).then(|| {
+                    unsafe_file_fallback(
+                        board_path,
+                        "board_previously_observed_live",
+                        "Konnect previously reached KiCad with this board open, but IPC is now \
+                         unreachable.",
+                    )
+                })
             }))
         }
     }
@@ -385,9 +436,10 @@ pub(crate) const DEFAULT_ZONE_MIN_WIDTH_MM: f64 = 0.2;
 /// preflight established only that no live KiCad is holding this board.
 const FILE_ONLY_EDIT_WARNING: &str =
     "No live KiCad is holding this board, and it has not been observed live during the current \
-     Konnect server session, so Konnect edited the saved board file directly. If KiCad crashed \
-     or was force-quit before this server started, reconcile any unsaved work before relying on \
-     this change. Reload the file in KiCad before editing it there.";
+     Konnect server session, and no KiCad sibling lock was present, so Konnect edited the saved \
+     board file directly. If KiCad crashed or was force-quit before this server started without \
+     leaving a lock, reconcile any unsaved work before relying on this change. Reload the file in \
+     KiCad before editing it there.";
 
 /// The `pad_connection` argument in both the representations it needs: the IPC
 /// enum and the token KiCad's `(connect_pads …)` takes.
@@ -2813,6 +2865,102 @@ mod board_session_safety_tests {
         assert!(matches!(outcome, BoardWrite::File(_)));
     }
 
+    fn error_reason(result: &CallToolResult) -> String {
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        body["error"]["reason"]
+            .as_str()
+            .expect("structured refusal reason")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn any_exact_board_lock_refuses_both_offline_fallback_gates_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        let ctx = ctx_talking_to(String::new());
+
+        for body in [
+            r#"{"username":"test","hostname":"host"}"#,
+            r#"{"username":"former","hostname":"retired"}"#,
+            "not parseable lock data",
+        ] {
+            std::fs::write(&lock, body).unwrap();
+            let outcome = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+                .await
+                .unwrap();
+            let BoardWrite::Refused(result) = outcome else {
+                panic!("an exact sibling lock must refuse file mode")
+            };
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("unsafe_file_fallback")
+            );
+            assert_eq!(error_reason(&result), "kicad_lock_present");
+            assert_eq!(std::fs::read(&board).unwrap(), before);
+        }
+
+        let guarded = refuse_if_board_open_in_kicad(&ctx, &board, "file-only test write")
+            .await
+            .unwrap()
+            .expect("the file-only gate must honor the same exact lock");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&guarded).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert_eq!(error_reason(&guarded), "kicad_lock_present");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_lock_for_another_board_does_not_taint_the_requested_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = super::mounting_hole_tests::blank_board(dir.path());
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "(kicad_pcb)\n").unwrap();
+        let other_lock = konnect_sexp::writer::kicad_editor_lock_path(&other).unwrap();
+        std::fs::write(other_lock, "locked").unwrap();
+        let ctx = ctx_talking_to(String::new());
+
+        let outcome = attempt_ipc_write(&ctx, &requested, "test write", |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, BoardWrite::File(_)));
+        assert!(
+            refuse_if_board_open_in_kicad(&ctx, &requested, "file-only test write")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_uninspectable_exact_board_lock_fails_closed_with_distinct_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let result = board_lock_refusal_with(&board, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mock access denied",
+            ))
+        })
+        .expect("inspection failure must refuse");
+
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert_eq!(error_reason(&result), "kicad_lock_unreadable");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn a_file_only_guard_blocks_a_previously_live_board_after_transport_loss() {
         let dir = tempfile::tempdir().unwrap();
@@ -3912,11 +4060,12 @@ mod zone_net_format_tests {
             body["fallback_reason"],
             json!({
                 "kind": "transport_unreachable",
-                "message": "KiCad IPC is unreachable."
+                "message": "KiCad IPC is unreachable and no exact-board sibling lock was present."
             })
         );
         let warning = body["warning"].as_str().expect("a fallback must warn");
         assert!(warning.contains("IPC was unreachable"), "{warning}");
+        assert!(warning.contains("no exact-board sibling lock"), "{warning}");
         assert!(
             warning.contains("current Konnect server session"),
             "{warning}"
