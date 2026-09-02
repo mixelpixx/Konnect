@@ -271,7 +271,8 @@ async fn handle_score_placement(
     }
 
     // ── Decoupling check (C* near a shared-net U*) ──────────────────────────
-    let (decoupling_violations, uncoupled_caps) = decoupling_check(&scan.items, &index, &values);
+    let (decoupling_violations, uncoupled_caps, interface_filter_caps) =
+        decoupling_check(&scan.items, &index, &values);
 
     // ── Soft score (ported weight table — see the module docs) ──────────────
     let overlap_deduction = (overlap_pairs as i64 * OVERLAP_POINTS).min(OVERLAP_CAP);
@@ -355,6 +356,16 @@ async fn handle_score_placement(
         "deductions": deductions,
         "connector_edges": connector_edges,
         "uncoupled_caps": uncoupled_caps,
+        "interface_filter_caps": interface_filter_caps
+            .iter()
+            .map(|f| json!({
+                "reference": f.cap,
+                "value": f.value,
+                "connector": f.connector,
+                "connector_distance_mm": round3(f.distance_mm),
+                "limit_mm": f.limit_mm,
+            }))
+            .collect::<Vec<_>>(),
         "footprints_scored": scan.items.len(),
         "footprints_skipped": scan.skipped,
     })))
@@ -1389,15 +1400,43 @@ struct DecouplingViolation {
     limit_mm: f64,
 }
 
+/// One capacitor exempted from the decoupling rule because it sits on the
+/// pins of a connector it shares a net with — interface/EMI filtering for a
+/// cable, not a bypass cap that drifted away from its IC.
+struct InterfaceFilterCap {
+    cap: String,
+    value: String,
+    connector: String,
+    distance_mm: f64,
+    limit_mm: f64,
+}
+
 /// Check every family-classified capacitor (C*) against the nearest IC (U*)
 /// that shares a net with it. A cap sharing no net with any IC is not a
 /// violation — it is reported separately as uncoupled, because "nothing to
 /// decouple" and "too far from what it decouples" are different findings.
+///
+/// A cap sitting on the pins of a connector (J*) it shares a net with is
+/// interface/EMI filtering for that cable, not a bypass cap that drifted away
+/// from an IC on the same rail, so it is exempted from the distance rule
+/// (#411). The exemption is deliberately narrow — the cap must be within the
+/// *same* family limit of the connector's courtyard that the rule would demand
+/// of an IC, so a cap far from everything still deducts. Exemptions are
+/// returned as the third list rather than dropped, so the response says the
+/// deduction was waived instead of going quiet about a check that ran.
+///
+/// `uncoupled_caps` is intentionally untouched by the exemption: a cap that
+/// shares no net with any IC never reached the distance rule in the first
+/// place, and "nothing to decouple" stays the honest report for it.
 fn decoupling_check(
     items: &[FootprintCourtyard],
     index: &PcbConnectivityIndex,
     values: &HashMap<String, String>,
-) -> (Vec<DecouplingViolation>, Vec<String>) {
+) -> (
+    Vec<DecouplingViolation>,
+    Vec<String>,
+    Vec<InterfaceFilterCap>,
+) {
     // Net set per reference, from the connectivity index — keyed by name, so
     // both file formats resolve identically.
     let mut nets_by_ref: HashMap<&str, BTreeSet<&str>> = HashMap::new();
@@ -1410,16 +1449,12 @@ fn decoupling_check(
         }
     }
 
-    let ics: Vec<(&str, Bbox)> = items
-        .iter()
-        .filter_map(|c| {
-            let reference = c.reference.as_deref()?;
-            (ref_prefix(reference) == "U").then_some((reference, c.bbox))
-        })
-        .collect();
+    let ics = footprints_with_prefix(items, "U");
+    let connectors = footprints_with_prefix(items, "J");
 
     let mut violations = Vec::new();
     let mut uncoupled = Vec::new();
+    let mut interface_filters = Vec::new();
     for c in items {
         let Some(reference) = c.reference.as_deref() else {
             continue;
@@ -1435,42 +1470,89 @@ fn decoupling_check(
         };
         let cap_nets = nets_by_ref.get(reference);
         let center = bbox_center(c.bbox);
-        let nearest = ics
-            .iter()
-            .filter(|(ic, _)| {
-                // Shares at least one named net with this cap.
-                match (cap_nets, nets_by_ref.get(*ic)) {
-                    (Some(a), Some(b)) => !a.is_disjoint(b),
-                    _ => false,
-                }
-            })
-            .map(|(ic, ic_bbox)| {
-                // Distance from the cap's center to the IC's COURTYARD BBOX,
-                // not its center: center-to-center makes a tight limit
-                // unachievable against any physically large IC — a 0402
-                // touching a SOIC-8's courtyard would read 3.8 mm and fail a
-                // 2.5 mm rule it plainly satisfies.
-                let dx = (ic_bbox.0 - center.0).max(0.0).max(center.0 - ic_bbox.2);
-                let dy = (ic_bbox.1 - center.1).max(0.0).max(center.1 - ic_bbox.3);
-                (*ic, dx.hypot(dy))
-            })
-            .min_by(|(_, a), (_, b)| a.total_cmp(b));
-        match nearest {
+        match nearest_shared_net(&ics, cap_nets, &nets_by_ref, center) {
             None => uncoupled.push(reference.to_string()),
             Some((ic, distance_mm)) => {
-                if distance_mm > limit_mm {
-                    violations.push(DecouplingViolation {
+                if distance_mm <= limit_mm {
+                    continue;
+                }
+                // The cap is too far from the IC it shares a rail with. Before
+                // deducting, ask what it is actually sitting on: a cap on a
+                // shared-net connector's own pins is filtering that cable
+                // (#411). Same limit, measured against the connector, so this
+                // cannot swallow a cap that is far from everything.
+                match nearest_shared_net(&connectors, cap_nets, &nets_by_ref, center)
+                    .filter(|(_, connector_distance_mm)| *connector_distance_mm <= limit_mm)
+                {
+                    Some((connector, connector_distance_mm)) => {
+                        interface_filters.push(InterfaceFilterCap {
+                            cap: reference.to_string(),
+                            value: value.clone(),
+                            connector: connector.to_string(),
+                            distance_mm: connector_distance_mm,
+                            limit_mm,
+                        })
+                    }
+                    None => violations.push(DecouplingViolation {
                         cap: reference.to_string(),
                         value: value.clone(),
                         ic: ic.to_string(),
                         distance_mm,
                         limit_mm,
-                    });
+                    }),
                 }
             }
         }
     }
-    (violations, uncoupled)
+    (violations, uncoupled, interface_filters)
+}
+
+/// Footprints whose reference designator carries `prefix` exactly, paired with
+/// their courtyard bboxes. An exact prefix match, so `CN3` is not a capacitor
+/// and `JP1` is not a connector.
+fn footprints_with_prefix<'a>(
+    items: &'a [FootprintCourtyard],
+    prefix: &str,
+) -> Vec<(&'a str, Bbox)> {
+    items
+        .iter()
+        .filter_map(|c| {
+            let reference = c.reference.as_deref()?;
+            (ref_prefix(reference) == prefix).then_some((reference, c.bbox))
+        })
+        .collect()
+}
+
+/// The nearest candidate that shares at least one named net with the cap, and
+/// how far its courtyard bbox is from the cap's center. `None` when no
+/// candidate shares a net.
+fn nearest_shared_net<'a, 'n>(
+    candidates: &[(&'a str, Bbox)],
+    cap_nets: Option<&BTreeSet<&'n str>>,
+    nets_by_ref: &HashMap<&str, BTreeSet<&'n str>>,
+    center: (f64, f64),
+) -> Option<(&'a str, f64)> {
+    candidates
+        .iter()
+        .filter(|(reference, _)| {
+            // Shares at least one named net with this cap.
+            match (cap_nets, nets_by_ref.get(*reference)) {
+                (Some(a), Some(b)) => !a.is_disjoint(b),
+                _ => false,
+            }
+        })
+        .map(|(reference, bbox)| (*reference, distance_to_bbox(center, *bbox)))
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+}
+
+/// Distance from a point to a courtyard BBOX's edge — zero inside it — not to
+/// its center: center-to-center makes a tight limit unachievable against any
+/// physically large part, since a 0402 touching a SOIC-8's courtyard would
+/// read 3.8 mm and fail a 2.5 mm rule it plainly satisfies.
+fn distance_to_bbox((px, py): (f64, f64), (x0, y0, x1, y1): Bbox) -> f64 {
+    let dx = (x0 - px).max(0.0).max(px - x1);
+    let dy = (y0 - py).max(0.0).max(py - y1);
+    dx.hypot(dy)
 }
 
 /// The distance limit for a capacitor value's decoupling family, `None` for
@@ -1702,6 +1784,354 @@ mod tests {
         // Edge distances cannot be computed without an outline.
         assert_eq!(response["connector_edges"].as_array().unwrap().len(), 0);
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+    }
+
+    /// Move ONE footprint's root anchor by string surgery on the
+    /// KiCad-authored fixture, the way
+    /// `overlapping_courtyards_are_a_hard_fail_naming_the_pair` does: the
+    /// geometry changes, every KiCad-written detail around it does not.
+    fn fixture_with_moved_root(from: &str, to: &str) -> String {
+        let fixture = std::fs::read_to_string(FIXTURE).unwrap();
+        assert_eq!(
+            fixture.matches(from).count(),
+            1,
+            "surgery anchor must be unique: {from}"
+        );
+        fixture.replace(from, to)
+    }
+
+    /// Rewrite text inside ONE footprint's block, leaving every other footprint
+    /// alone. Line-scoped like `lock_footprint`: find the block enclosing the
+    /// Reference property, stop at that footprint's own closing paren, so a
+    /// string several parts share is only rewritten here.
+    fn rewrite_inside_footprint(
+        content: &str,
+        reference: &str,
+        rewrites: &[(String, String)],
+    ) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let marker = format!(r#"(property "Reference" "{reference}""#);
+        let r = lines
+            .iter()
+            .position(|l| l.contains(&marker))
+            .expect("reference not present in fixture");
+        let start = lines[..r]
+            .iter()
+            .rposition(|l| l.trim_start().starts_with("(footprint "))
+            .expect("reference has no enclosing footprint");
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| *l == "\t)")
+                .expect("footprint block never closes");
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let mut rewritten = 0usize;
+        for line in &mut out[start..=end] {
+            for (from, to) in rewrites {
+                if line.contains(from.as_str()) {
+                    *line = line.replace(from.as_str(), to.as_str());
+                    rewritten += 1;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            rewritten,
+            rewrites.len(),
+            "every rewrite must land inside {reference}"
+        );
+        let nl = String::from_utf8(vec![10]).unwrap();
+        out.join(&nl)
+    }
+
+    /// Retag one footprint's pad nets, by net name.
+    fn rewrite_footprint_nets(content: &str, reference: &str, rewrites: &[(&str, &str)]) -> String {
+        let rewrites: Vec<(String, String)> = rewrites
+            .iter()
+            .map(|(from, to)| (format!(r#"(net "{from}")"#), format!(r#"(net "{to}")"#)))
+            .collect();
+        rewrite_inside_footprint(content, reference, &rewrites)
+    }
+
+    /// Retag one footprint's `Value` property — the field `decoupling_limit_mm`
+    /// classifies a capacitor's family from, so a fixture cap can be moved to
+    /// another family without inventing a second board.
+    fn rewrite_footprint_value(content: &str, reference: &str, from: &str, to: &str) -> String {
+        let rewrites = vec![(
+            format!(r#"(property "Value" "{from}""#),
+            format!(r#"(property "Value" "{to}""#),
+        )];
+        rewrite_inside_footprint(content, reference, &rewrites)
+    }
+
+    fn write_variant(dir: &tempfile::TempDir, name: &str, content: String) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// #411: a 100nF cap sitting on a connector's own VCC/GND pins is
+    /// interface/EMI filtering for that cable, not a bypass cap that wandered
+    /// away from the MCU across the board. It used to cost 15 points and name
+    /// the distant IC in the detail.
+    ///
+    /// Surgery: C1's root anchor moves from (20, 15) to (16, 20), beside J1 —
+    /// the fixture's 4-pin header, whose pads carry VCC, GND and /SIG_IN, so
+    /// it shares both of C1's nets. Hand arithmetic from the fixture's own
+    /// coordinates:
+    ///
+    /// - C1's courtyard rect (−0.91, −0.460001)..(0.91, 0.46) puts its bbox at
+    ///   (15.09, 19.539999)..(16.91, 20.46), center (16, 19.9999995).
+    /// - J1's bbox is (3.229999, 18.23)..(14.39, 21.77) (hand-computed in
+    ///   `kicad_fixture_passes_at_70_with_only_the_decoupling_deduction`), so
+    ///   0.7 mm of clear air separates the two bboxes — no courtyard overlap.
+    /// - Cap center to J1's bbox edge: dx = 16 − 14.39 = 1.61, dy = 0 (the
+    ///   center's y is inside J1's y span) → 1.61 mm ≤ the 2.5 mm 100nF limit
+    ///   → interface filtering.
+    /// - Cap center to U1's bbox (21.299999, 17.299999)..(28.699999, 22.7):
+    ///   dx = 5.3, dy = 0 → 5.3 mm > 2.5 mm, which is the deduction this
+    ///   exemption suppresses.
+    ///
+    /// C2 is untouched at (30, 15): 2.642 mm from U1 (still over the limit)
+    /// and 15.61 mm from J1, so it still deducts. The exemption silences one
+    /// cap, not the check. Score: 100 − 15 = 85.
+    #[tokio::test]
+    async fn a_cap_on_a_shared_net_connector_is_interface_filtering_not_a_decoupling_defect() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = write_variant(
+            &dir,
+            "cap_on_connector.kicad_pcb",
+            fixture_with_moved_root("(at 20 15)", "(at 16 20)"),
+        );
+
+        let response = score(&board).await;
+        assert_eq!(response["verdict"], "pass", "{response}");
+        assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(response["score"], 85, "only C2 still deducts: {response}");
+
+        // The surviving deduction names C2 alone — C1 is gone from it.
+        let deductions = response["deductions"].as_array().unwrap();
+        assert_eq!(deductions.len(), 1, "{response}");
+        assert_eq!(deductions[0]["kind"], "decoupling");
+        assert_eq!(deductions[0]["points"], 15);
+        assert_eq!(deductions[0]["references"], json!(["C2"]));
+        assert!(
+            !deductions[0]["detail"].as_str().unwrap().contains("C1"),
+            "{response}"
+        );
+
+        // The waiver is reported, not silent: a check that ran and was
+        // exempted must be distinguishable from a check that never fired.
+        let filters = response["interface_filter_caps"].as_array().unwrap();
+        assert_eq!(filters.len(), 1, "{response}");
+        assert_eq!(filters[0]["reference"], "C1");
+        assert_eq!(filters[0]["value"], "100nF");
+        assert_eq!(filters[0]["connector"], "J1");
+        assert_eq!(filters[0]["connector_distance_mm"], 1.61);
+        assert_eq!(filters[0]["limit_mm"], 2.5);
+
+        // C1 shares VCC/GND with U1, so it was never "nothing to decouple".
+        assert_eq!(response["uncoupled_caps"].as_array().unwrap().len(), 0);
+    }
+
+    /// The exemption must not become a way to switch the rule off. Same
+    /// surgery, 2 mm further: C1 lands at (18, 20), which is 3.61 mm from J1's
+    /// bbox and 3.3 mm from U1's — over the 2.5 mm limit on BOTH counts. A cap
+    /// that is far from everything is still a placement defect, so both caps
+    /// deduct and the score stays at the fixture's 70.
+    #[tokio::test]
+    async fn a_cap_far_from_both_its_ic_and_the_connector_still_deducts() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = write_variant(
+            &dir,
+            "cap_far_from_both.kicad_pcb",
+            fixture_with_moved_root("(at 20 15)", "(at 18 20)"),
+        );
+
+        let response = score(&board).await;
+        assert_eq!(response["score"], 70, "{response}");
+        let deductions = response["deductions"].as_array().unwrap();
+        assert_eq!(deductions.len(), 1, "{response}");
+        assert_eq!(deductions[0]["kind"], "decoupling");
+        assert_eq!(deductions[0]["points"], 30);
+        let refs = deductions[0]["references"].as_array().unwrap();
+        assert!(
+            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
+            "{response}"
+        );
+        let detail = deductions[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("3.3"),
+            "hand-computed C1 distance: {detail}"
+        );
+        assert_eq!(
+            response["interface_filter_caps"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    /// Proximity alone is not the exemption — the cap has to be on nets the
+    /// connector actually carries. C1 sits at (16, 20), 1.61 mm from J1 exactly
+    /// as in the #411 repro, but J1's VCC and GND pads are retagged to nets J1
+    /// already owns (/SIG_IN and its unconnected pin 4), leaving J1 and C1
+    /// net-disjoint. C1 still shares VCC/GND with U1 at 5.3 mm, so the
+    /// deduction stands and both caps are named.
+    #[tokio::test]
+    async fn a_cap_beside_a_connector_it_shares_no_net_with_still_deducts() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = fixture_with_moved_root("(at 20 15)", "(at 16 20)");
+        let retagged = rewrite_footprint_nets(
+            &moved,
+            "J1",
+            &[("VCC", "/SIG_IN"), ("GND", "unconnected-(J1-Pin_4-Pad4)")],
+        );
+        let board = write_variant(&dir, "cap_beside_foreign_connector.kicad_pcb", retagged);
+
+        let response = score(&board).await;
+        assert_eq!(response["score"], 70, "{response}");
+        let deductions = response["deductions"].as_array().unwrap();
+        assert_eq!(deductions.len(), 1, "{response}");
+        assert_eq!(deductions[0]["points"], 30);
+        let refs = deductions[0]["references"].as_array().unwrap();
+        assert!(
+            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
+            "{response}"
+        );
+        assert!(
+            deductions[0]["detail"].as_str().unwrap().contains("5.3"),
+            "{response}"
+        );
+        assert_eq!(
+            response["interface_filter_caps"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    /// The exemption deliberately leaves `uncoupled_caps` alone. C1 sits on
+    /// J1's pins, but its own pads are retagged to J1's other two nets, so it
+    /// shares nothing with any IC: it never reaches the distance rule, and
+    /// "nothing to decouple" stays the honest report for it rather than being
+    /// relabelled as a waived deduction. C2 still deducts → 85.
+    #[tokio::test]
+    async fn a_connector_cap_sharing_no_net_with_any_ic_is_still_reported_uncoupled() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = fixture_with_moved_root("(at 20 15)", "(at 16 20)");
+        let retagged = rewrite_footprint_nets(
+            &moved,
+            "C1",
+            &[("VCC", "/SIG_IN"), ("GND", "unconnected-(J1-Pin_4-Pad4)")],
+        );
+        let board = write_variant(&dir, "connector_cap_uncoupled.kicad_pcb", retagged);
+
+        let response = score(&board).await;
+        assert_eq!(response["uncoupled_caps"], json!(["C1"]), "{response}");
+        assert_eq!(
+            response["interface_filter_caps"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(response["score"], 85, "{response}");
+        assert_eq!(response["deductions"][0]["references"], json!(["C2"]));
+    }
+
+    /// `interface_filter_caps` means "a deduction was waived", not "a cap is
+    /// near a connector" — a cap that satisfies the decoupling rule outright
+    /// is reported by neither list.
+    ///
+    /// Two surgeries put one cap inside both limits at once, which the stock
+    /// fixture cannot do (U1 and J1 are 6.91 mm apart in x): U1's anchor moves
+    /// from (25, 20) to (19, 20) — bbox (15.299999, 17.299999)..(22.699999,
+    /// 22.7), still 0.91 mm clear of J1's bbox — and C1's from (20, 15) to
+    /// (14, 16), above both (below is R1's spot at (15, 25)). Hand arithmetic:
+    /// C1's center (14, 15.9999995) is dx 1.3 / dy 1.3 → 1.838 mm from U1's
+    /// bbox and dx 0 / dy 2.23 → 2.23 mm from J1's, both inside the 2.5 mm
+    /// limit. C2 is now 7.654 mm from the relocated U1, so it alone deducts
+    /// → 85.
+    #[tokio::test]
+    async fn a_cap_within_both_limits_is_neither_a_violation_nor_a_reported_waiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved_ic = fixture_with_moved_root("(at 25 20)", "(at 19 20)");
+        assert_eq!(moved_ic.matches("(at 20 15)").count(), 1);
+        let board = write_variant(
+            &dir,
+            "cap_within_both_limits.kicad_pcb",
+            moved_ic.replace("(at 20 15)", "(at 14 16)"),
+        );
+
+        let response = score(&board).await;
+        assert_eq!(response["verdict"], "pass", "{response}");
+        assert_eq!(response["score"], 85, "{response}");
+        assert_eq!(response["deductions"][0]["references"], json!(["C2"]));
+        assert!(
+            response["deductions"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("7.654"),
+            "{response}"
+        );
+        // C1 broke no rule, so nothing was waived on its behalf.
+        assert_eq!(
+            response["interface_filter_caps"].as_array().unwrap().len(),
+            0,
+            "{response}"
+        );
+        assert_eq!(response["uncoupled_caps"].as_array().unwrap().len(), 0);
+    }
+
+    /// The exemption is measured against the cap's OWN family limit, not
+    /// against the 2.5 mm of the 100nF family every other test here uses. With
+    /// only 100nF caps on the board, a hard-coded `2.5` and `limit_mm` are
+    /// indistinguishable, and the claim that this exemption can never be looser
+    /// than the rule it waives would be untested.
+    ///
+    /// So: C1's Value becomes `1uF` (family limit 5.0 mm) and its anchor moves
+    /// from (20, 15) to (16, 15) — off the U1/J1 axis, because the 6.91 mm gap
+    /// between J1's bbox and U1's cannot hold a point that is both > 5 mm from
+    /// U1 and > 2.5 mm from J1 on a straight line between them. Hand arithmetic
+    /// from the fixture's own coordinates, cap center (16, 14.9999995):
+    ///
+    /// - To J1's bbox (3.229999, 18.23)..(14.39, 21.77): dx = 16 − 14.39 =
+    ///   1.61, dy = 18.23 − 15 = 3.23 → √(2.5921 + 10.4329) = 3.609 mm. That is
+    ///   ABOVE 2.5 mm and BELOW the 1uF limit of 5.0 mm — the whole point.
+    /// - To U1's bbox (21.299999, 17.299999)..(28.699999, 22.7): dx = 5.3,
+    ///   dy = 2.3 → √(28.09 + 5.29) = 5.778 mm > 5.0 mm, so the cap really does
+    ///   reach the exemption instead of passing the IC rule outright.
+    /// - C1's bbox (15.09, 14.539999)..(16.91, 15.46) touches nothing: J1
+    ///   starts at y 18.23, U1 at x 21.3, R1 sits at (15, 25).
+    ///
+    /// Real code exempts C1 (3.609 ≤ 5.0) and scores 85 with C2 alone. A build
+    /// that compares against a hard-coded 2.5 deducts for C1 and scores 70.
+    #[tokio::test]
+    async fn the_exemption_uses_the_caps_own_family_limit_not_the_100nf_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = fixture_with_moved_root("(at 20 15)", "(at 16 15)");
+        let board = write_variant(
+            &dir,
+            "bulk_cap_on_connector.kicad_pcb",
+            rewrite_footprint_value(&moved, "C1", "100nF", "1uF"),
+        );
+
+        let response = score(&board).await;
+        assert_eq!(response["verdict"], "pass", "{response}");
+        assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            response["score"], 85,
+            "C1 is 3.609 mm from J1, inside its own 5.0 mm limit: {response}"
+        );
+
+        let filters = response["interface_filter_caps"].as_array().unwrap();
+        assert_eq!(filters.len(), 1, "{response}");
+        assert_eq!(filters[0]["reference"], "C1");
+        assert_eq!(filters[0]["value"], "1uF");
+        assert_eq!(filters[0]["connector"], "J1");
+        // Both numbers matter: the distance is over the 100nF family's 2.5 mm,
+        // and the limit reported is this cap's own 5.0 mm.
+        assert_eq!(filters[0]["connector_distance_mm"], 3.609);
+        assert_eq!(filters[0]["limit_mm"], 5.0);
+
+        // C2 is untouched 100nF and still deducts — the families do not bleed.
+        assert_eq!(response["deductions"][0]["references"], json!(["C2"]));
+        assert_eq!(response["deductions"][0]["points"], 15);
+        assert_eq!(response["uncoupled_caps"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
