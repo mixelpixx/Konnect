@@ -547,6 +547,18 @@ pub(crate) fn placed_pins(
         .collect()
 }
 
+/// Whether a reference belongs to a symbol that names a net rather than
+/// consuming one — a power symbol, a `PWR_FLAG`. KiCAD prefixes those with `#`
+/// and keeps them out of the netlist as components.
+///
+/// Deliberately not `LabelKind::PowerSymbol`, which `extract_power_symbol_labels`
+/// derives from the `(power)` marker plus a `power_in` pin: `PWR_FLAG`'s pin is
+/// `power_out`, so that test lets it through, and a caller counting what a net
+/// actually reaches wants it out too.
+pub(crate) fn is_power_symbol_reference(reference: &str) -> bool {
+    reference.starts_with('#')
+}
+
 /// [`placed_pins`], grouped under the instance that placed each unit, for
 /// callers that report pins by name rather than position. The whole instance
 /// is returned because a caller reporting a pin usually wants its reference
