@@ -41,7 +41,14 @@ macro_rules! ipc {
                     msg
                 )))
             }
-            Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
+            // "Not open" is its own answer, and so is "could not tell": these
+            // tools have no file path, so both are still errors, but neither
+            // must be dressed up as a KiCad refusal — the message from
+            // `find_open_board` names the boards KiCad does hold, or the ones
+            // it could not identify.
+            Err(konnect_ipc::IpcFailure::BoardNotOpen(msg))
+            | Err(konnect_ipc::IpcFailure::Ambiguous(msg))
+            | Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
         }
     }};
 }
@@ -1964,7 +1971,7 @@ pub fn tools() -> Vec<ToolDef> {
             "get_component_pads",
             "Return live board-space pad positions, layers and net assignments for a footprint. \
              Reads the board open in KiCad when it is reachable and falls back to the file only \
-             when KiCad IPC is unreachable — \
+             when no live KiCad holds this board — IPC unreachable, or that board not open — \
              'source' says which, so unsaved placements are visible without a save. \
              A pad's 'net' is its net name, \"\" if the pad carries no net \
              (unconnected), or — reading the file — null if the net node is present \
@@ -2168,7 +2175,7 @@ async fn handle_place_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(_) => {
             // No live KiCad on the other end of this transport: fall back to
             // editing the board file directly.
             if board_contains_reference(&board, &reference)? {
@@ -2234,7 +2241,7 @@ async fn handle_move_component(
             &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
         )),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(_) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2338,7 +2345,7 @@ async fn handle_rotate_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(_) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2439,7 +2446,7 @@ async fn handle_set_component_placements(
             "undo": "One KiCad undo step reverses the whole placement batch."
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => match update_closed_board_footprints(&board, &placements) {
+        BoardWrite::File(_) => match update_closed_board_footprints(&board, &placements) {
             Ok(applied) => Ok(CallToolResult::json(&json!({
                 "count": applied.len(),
                 "placements": applied,
@@ -2480,12 +2487,13 @@ async fn handle_flip_component(
     // `attempt_ipc_write`.
     //
     // The distinction is not cosmetic. Running `ensure_board_is_active` and
-    // then bailing unconditionally produced an `anyhow` with no
-    // `TransportUnreachable` marker, which `IpcFailure::from_error` classifies
-    // as `Rejected` — so *every* reachable KiCAD refused the flip, including
-    // one holding an unrelated project, where this board file is demonstrably
+    // then bailing unconditionally produced an `anyhow` classified as
+    // `Rejected` — so *every* reachable KiCAD refused the flip, including one
+    // holding an unrelated project, where this board file is demonstrably
     // free. It also reported Konnect's own refusal as "KiCAD rejected the
-    // footprint flip over IPC", which is the class fixed in v0.5.0.
+    // footprint flip over IPC", which is the class fixed in v0.5.0. That
+    // misclassification is now gone at the source: "not open" carries the
+    // `BoardNotOpen` marker and classifies as its own answer.
     //
     // The helper refuses only when KiCAD holds *this* board, because that is
     // the only case where the edit would be discarded by its next save.
@@ -3079,9 +3087,11 @@ async fn handle_repair_corrupted_footprints(
     Ok(match outcome {
         BoardWrite::Ipc(value) => CallToolResult::json(&value),
         BoardWrite::Refused(result) => result,
-        BoardWrite::File => CallToolResult::error(
-            "KiCad IPC is unreachable. repair_corrupted_footprints is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry.",
-        ),
+        BoardWrite::File(reason) => CallToolResult::error(format!(
+            "{} repair_corrupted_footprints is live-IPC-only and never edits the board file \
+             directly. Open the requested board in KiCad and retry.",
+            reason.premise()
+        )),
     })
 }
 
@@ -3199,7 +3209,22 @@ async fn handle_get_component_pads(
                 "Footprint '{reference}' not found on the board open in KiCad"
             )))
         }
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {}
+        // Unreachable, or reachable and holding some other board: either way
+        // no live KiCad can be answering about this one, so read the file.
+        Err(konnect_ipc::IpcFailure::Unreachable(_))
+        | Err(konnect_ipc::IpcFailure::BoardNotOpen(_)) => {}
+        // Not that, though. The file is the fallback for a board no editor
+        // holds, and an open-document list Konnect could not read does not
+        // establish that — a live KiCad may hold newer state, so answering
+        // from the file would present a stale board as the board.
+        Err(konnect_ipc::IpcFailure::Ambiguous(message)) => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::AmbiguousOpenBoard {
+                    path: board_path.display().to_string(),
+                },
+                message,
+            ));
+        }
         Err(konnect_ipc::IpcFailure::Rejected(message)) => {
             return Ok(CallToolResult::error(message));
         }

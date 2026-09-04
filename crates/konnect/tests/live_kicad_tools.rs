@@ -623,3 +623,63 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
         "{drc}"
     );
 }
+
+/// What a real KiCad puts in `DocumentSpecifier`, recorded rather than assumed.
+///
+/// The ambiguity gate in `find_open_board` refuses whenever an open PCB
+/// document cannot be placed on disk, and the shapes it refuses were derived
+/// from the vendored proto's own contract — `board_filename` is documented as
+/// "a PCB with a given filename, e.g. `board.kicad_pcb`", with
+/// `ProjectSpecifier.path` supplying the directory. A gate built on that
+/// reading is only as good as the reading, so this prints every field of every
+/// open document and then asserts the property the gate depends on: a live
+/// KiCad's open-document list is one Konnect can resolve in full.
+///
+/// Run it against a KiCad holding the disposable board:
+///
+/// ```text
+/// KICAD_API_SOCKET=… KONNECT_LIVE_KICAD_BOARD=… \
+///   cargo test -p konnect --test live_kicad_tools -- --ignored --nocapture \
+///   real_kicad_open_documents_resolve_to_comparable_paths
+/// ```
+#[test]
+#[ignore = "requires a running KiCad GUI with a board open and its API socket"]
+fn real_kicad_open_documents_resolve_to_comparable_paths() {
+    let board = std::path::PathBuf::from(
+        std::env::var("KONNECT_LIVE_KICAD_BOARD")
+            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let ipc = KiCadIpcClient::new(&socket);
+
+    let documents = ipc.get_open_documents().expect("KiCad answered");
+    assert!(
+        !documents.is_empty(),
+        "open the disposable board in KiCad before running this"
+    );
+    for document in &documents {
+        println!(
+            "open PCB document: type={} identifier={:?} project={:?}",
+            document.r#type, document.identifier, document.project
+        );
+    }
+
+    // The property the gate rests on: against a real KiCad, the requested
+    // board is positively identified rather than refused as ambiguous.
+    ipc.find_open_board(&board)
+        .unwrap_or_else(|error| panic!("KiCad's open-document list was not resolvable: {error:#}"));
+
+    // And a board that is genuinely not open is reported as such, not as an
+    // ambiguity — the distinction that decides whether a file write may run.
+    let absent = board.with_file_name("konnect-not-open-probe.kicad_pcb");
+    let error = ipc
+        .find_open_board(&absent)
+        .expect_err("that board is not open");
+    assert!(
+        matches!(
+            konnect_ipc::IpcFailure::from_error(error),
+            konnect_ipc::IpcFailure::BoardNotOpen(_)
+        ),
+        "a complete open-document list must prove absence, not merely fail to confirm it"
+    );
+}

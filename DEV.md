@@ -261,6 +261,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `file_not_found` | Referenced file or project-discovery directory does not exist or cannot be read |
 | `conflict` | The file changed, a write would replace existing paths, or schematic project ownership cannot be proven uniquely — carries the affected paths; ownership conflicts include the schematic directory and all candidate roots |
 | `stale_target` | Saved symbol instance metadata disagrees with the proven hierarchy, or placement readback lacks the expected document/symbol evidence — carries `target` and `reason`; preflight refuses before writing, while a readback failure may follow a committed write |
+| `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler

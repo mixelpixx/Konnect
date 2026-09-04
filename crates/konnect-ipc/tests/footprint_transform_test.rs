@@ -159,7 +159,10 @@ fn spawn_footprints_mock(
             let resp = kiapi::common::commands::GetOpenDocumentsResponse {
                 documents: vec![kiapi::common::types::DocumentSpecifier {
                     r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                    project: None,
+                    project: Some(kiapi::common::types::ProjectSpecifier {
+                        name: "konnect-mock".to_string(),
+                        path: mock_project_dir().to_string(),
+                    }),
                     identifier: Some(
                         kiapi::common::types::document_specifier::Identifier::BoardFilename(
                             "test.kicad_pcb".to_string(),
@@ -361,7 +364,7 @@ fn footprint_pad_readback_observes_the_updated_live_state_after_a_move() {
 
     client.move_footprint("R1", 50.0, 50.0).unwrap();
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&std::path::PathBuf::from(mock_project_dir()).join("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
     let pads = client
         .get_footprint_pads_in(document, "R1")
@@ -441,4 +444,15 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
         .collect();
     assert_eq!(placements, vec![(50.0, 50.0, 90.0), (250.0, 150.0, 180.0)]);
     assert_eq!(pad_positions_mm(&sent[0]), vec![(50.0, 51.0), (50.0, 49.0)]);
+}
+
+/// Absolute on the platform running the test — a POSIX-rooted path is not
+/// absolute on Windows, and only an absolute project directory can place the
+/// bare board filename KiCad sends.
+fn mock_project_dir() -> &'static str {
+    if cfg!(windows) {
+        r"C:\konnect-mock-project"
+    } else {
+        "/konnect-mock-project"
+    }
 }

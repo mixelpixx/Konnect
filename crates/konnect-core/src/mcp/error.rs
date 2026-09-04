@@ -58,6 +58,10 @@ pub enum ToolErrorKind {
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
     UnsafeFileFallback { path: String },
+    /// KiCad answered, and its open-document list could not be read as a
+    /// complete set of comparable board identities — so whether it holds this
+    /// board is unknown, and neither a live edit nor a file edit is safe.
+    AmbiguousOpenBoard { path: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -76,6 +80,7 @@ impl ToolErrorKind {
             Self::Conflict { .. } => "conflict",
             Self::StaleTarget { .. } => "stale_target",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
+            Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::HandlerError { .. } => "handler_error",
         }
     }
@@ -180,6 +185,7 @@ mod tests {
                 reason: "r".into(),
             },
             ToolErrorKind::UnsafeFileFallback { path: "p".into() },
+            ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {

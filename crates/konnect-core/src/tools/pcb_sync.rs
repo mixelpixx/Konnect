@@ -328,10 +328,11 @@ pub(crate) async fn handle_update_pcb_from_schematic(
 
     Ok(match result {
         BoardWrite::Ipc(result) => result,
-        BoardWrite::File => conflict_result(
-            "KiCad IPC is unreachable. update_pcb_from_schematic is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry."
-                .to_string(),
-        ),
+        BoardWrite::File(reason) => conflict_result(format!(
+            "{} update_pcb_from_schematic is live-IPC-only and never edits the board file \
+             directly. Open the requested board in KiCad and retry.",
+            reason.premise()
+        )),
         BoardWrite::Refused(result) => {
             let message = result
                 .content

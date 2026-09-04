@@ -309,6 +309,82 @@ impl std::fmt::Display for TransportUnreachable {
 
 impl std::error::Error for TransportUnreachable {}
 
+/// Marker error carried (via anyhow's error chain) when KiCad answered and
+/// does not hold the requested board: another project is open, or no board is.
+///
+/// It carries its own message rather than taking one from `.context()`, so
+/// the classified failure reads as the one sentence a caller shows the user
+/// — a context line *and* a marker `Display` would say it twice.
+///
+/// Callers must classify with [`IpcFailure::from_error`], never by matching
+/// error text.
+#[derive(Debug)]
+pub struct BoardNotOpen(String);
+
+impl BoardNotOpen {
+    fn err(message: String) -> anyhow::Error {
+        anyhow::Error::new(Self(message))
+    }
+}
+
+impl std::fmt::Display for BoardNotOpen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BoardNotOpen {}
+
+/// The "nothing is open" half of [`BoardNotOpen`], shared by the two lookups
+/// that can hit it.
+fn no_board_open() -> anyhow::Error {
+    BoardNotOpen::err("No PCB document is open in KiCAD. Open a board file first.".to_string())
+}
+
+/// Marker error carried when KiCad's open-document list cannot be read as a
+/// complete set of comparable board identities — so whether it holds the
+/// requested board is *unknown*, not answered.
+///
+/// It exists because the alternative is worse than a wrong error message.
+/// [`BoardNotOpen`] tells a caller that KiCad has no unsaved state for this
+/// board and the saved file is authoritative, which is what permits a direct
+/// file write. Reaching that conclusion by discarding the records that could
+/// not be resolved turns "we could not tell" into "it is safe to overwrite".
+///
+/// Like [`BoardNotOpen`], it carries its own message and is classified by
+/// walking the error chain.
+#[derive(Debug)]
+pub struct AmbiguousOpenBoards(String);
+
+impl AmbiguousOpenBoards {
+    fn err(message: String) -> anyhow::Error {
+        anyhow::Error::new(Self(message))
+    }
+}
+
+impl std::fmt::Display for AmbiguousOpenBoards {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousOpenBoards {}
+
+/// Whether `error` says KiCad's open-board list could not be read as a
+/// complete, comparable set. Walks the chain, never the message text.
+fn is_ambiguous_open_boards(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<AmbiguousOpenBoards>())
+}
+
+/// Whether `error` says KiCad is not holding the requested board.
+///
+/// Private: nothing outside the classification needs to ask this yet, and a
+/// caller that does can match [`IpcFailure::BoardNotOpen`]. Like
+/// [`IpcFailure::from_error`], it walks the chain — never the message text.
+fn is_board_not_open(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<BoardNotOpen>())
+}
+
 /// Why an IPC operation failed, for callers deciding whether a file-based
 /// fallback is safe.
 ///
@@ -317,6 +393,20 @@ impl std::error::Error for TransportUnreachable {}
 /// KiCad can be holding the board, and editing the board file directly
 /// cannot race an editor.
 ///
+/// `BoardNotOpen` means KiCad answered and does not have the requested board
+/// open — a different project, or none at all. KiCad cannot be holding
+/// unsaved state for a board it never opened, so this is as safe to edit on
+/// disk as `Unreachable`, and it must not be reported as a refusal: KiCad
+/// declined nothing.
+///
+/// `Ambiguous` means KiCad answered and the answer could not be read as a
+/// complete set of comparable board identities, so whether it holds the
+/// requested board is unknown. It is deliberately not `BoardNotOpen`: absence
+/// has to be *proven* before a saved file may be treated as authoritative.
+/// It is not `Rejected` either, because KiCad declined nothing — reporting a
+/// refusal it never made is the misreading this classification exists to end.
+/// Fail closed, and say which it was.
+///
 /// `Rejected` is everything else, including any error after a request was
 /// delivered (a receive timeout may mean KiCad is still processing it).
 /// KiCad is — or may be — alive on the other end, so a file edit could be
@@ -324,6 +414,8 @@ impl std::error::Error for TransportUnreachable {}
 #[derive(Debug)]
 pub enum IpcFailure {
     Unreachable(String),
+    BoardNotOpen(String),
+    Ambiguous(String),
     Rejected(String),
 }
 
@@ -338,6 +430,10 @@ impl IpcFailure {
             .any(|cause| cause.is::<TransportUnreachable>())
         {
             IpcFailure::Unreachable(message)
+        } else if is_ambiguous_open_boards(&error) {
+            IpcFailure::Ambiguous(message)
+        } else if is_board_not_open(&error) {
+            IpcFailure::BoardNotOpen(message)
         } else {
             IpcFailure::Rejected(message)
         }
@@ -345,7 +441,10 @@ impl IpcFailure {
 
     pub fn message(&self) -> &str {
         match self {
-            IpcFailure::Unreachable(message) | IpcFailure::Rejected(message) => message,
+            IpcFailure::Unreachable(message)
+            | IpcFailure::BoardNotOpen(message)
+            | IpcFailure::Ambiguous(message)
+            | IpcFailure::Rejected(message) => message,
         }
     }
 }
@@ -534,9 +633,7 @@ impl KiCadIpcClient {
     /// Get the first open PCB's DocumentSpecifier (needed for most commands).
     fn get_board_document(&self) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;
-        docs.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("No PCB document is open in KiCAD. Open a board file first.")
-        })
+        docs.into_iter().next().ok_or_else(no_board_open)
     }
 
     /// Find the open document matching `requested`, so a path-bearing MCP
@@ -551,22 +648,79 @@ impl KiCadIpcClient {
     ) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;
         if docs.is_empty() {
-            anyhow::bail!("No PCB document is open in KiCAD. Open a board file first.");
+            return Err(no_board_open());
         }
-        let mut open_names = Vec::new();
-        for doc in docs {
-            if let Some(path) = board_document_path(&doc) {
-                if paths_refer_to_same_board(requested, &path) {
-                    return Ok(doc);
-                }
-                open_names.push(path.display().to_string());
-            }
+
+        // Resolve the whole list before deciding anything. A record that could
+        // not be resolved is not evidence that the requested board is absent,
+        // and dropping it where it is produced is what turned "we cannot tell"
+        // into "the saved file is authoritative" (#426).
+        let identities: Vec<_> = docs.iter().map(board_document_identity).collect::<Vec<_>>();
+        let requested_identity = comparable_identity(requested).map_err(|reason| {
+            AmbiguousOpenBoards::err(format!(
+                "the requested board '{}' {reason}, so KiCad's open boards cannot be compared \
+                 against it",
+                requested.display()
+            ))
+        })?;
+
+        // A positive match is the safe direction — it sends the operation to
+        // KiCad rather than to the file — but only when exactly one open
+        // document claims to be this board.
+        let matched: Vec<usize> = identities
+            .iter()
+            .enumerate()
+            .filter(|(_, identity)| identity.as_ref().is_ok_and(|id| *id == requested_identity))
+            .map(|(index, _)| index)
+            .collect();
+        if matched.len() == 1 {
+            return Ok(docs[matched[0]].clone());
         }
-        anyhow::bail!(
+        if matched.len() > 1 {
+            return Err(AmbiguousOpenBoards::err(format!(
+                "KiCAD reports board '{}' open {} times, so Konnect cannot tell which document \
+                 an edit would reach",
+                requested.display(),
+                matched.len()
+            )));
+        }
+
+        // No match. Absence is only proven by a list that was read in full.
+        let unresolved: Vec<&str> = identities
+            .iter()
+            .filter_map(|identity| identity.as_ref().err().map(String::as_str))
+            .collect();
+        if !unresolved.is_empty() {
+            return Err(AmbiguousOpenBoards::err(format!(
+                "KiCAD has {} PCB document(s) open that Konnect cannot identify ({}), so it \
+                 cannot prove that board '{}' is closed",
+                unresolved.len(),
+                unresolved.join("; "),
+                requested.display()
+            )));
+        }
+
+        let open: Vec<&PathBuf> = identities
+            .iter()
+            .filter_map(|id| id.as_ref().ok())
+            .collect();
+        if let Some(duplicated) = first_duplicate(&open) {
+            return Err(AmbiguousOpenBoards::err(format!(
+                "KiCAD reports board '{}' open more than once, so its open-document list is not \
+                 one Konnect can read; it cannot prove that board '{}' is closed",
+                duplicated.display(),
+                requested.display()
+            )));
+        }
+
+        Err(BoardNotOpen::err(format!(
             "requested board '{}' is not open in KiCAD (open boards: {})",
             requested.display(),
-            open_names.join(", ")
-        )
+            open.iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 
     /// Fail closed unless the requested board is open in the IPC session.
@@ -2640,58 +2794,267 @@ fn board_document_path(document: &kiapi::common::types::DocumentSpecifier) -> Op
         .or(Some(path))
 }
 
-fn paths_refer_to_same_board(requested: &Path, active: &Path) -> bool {
-    match (requested.canonicalize(), active.canonicalize()) {
-        (Ok(requested), Ok(active)) => requested == active,
-        _ if active.components().count() == 1 => {
-            requested.components().count() == 1 && requested.file_name() == active.file_name()
+/// One open PCB document as a path that can be compared with a requested
+/// board, or the reason it cannot be.
+///
+/// The reason is returned rather than logged because it is the whole point: an
+/// identity that cannot be compared has to reach the decision, or absence gets
+/// concluded from a list that was never read (#426).
+///
+/// KiCad's own contract is a bare filename plus the project directory —
+/// `board_filename` is documented as "a PCB with a given filename, e.g.
+/// `board.kicad_pcb`", with `ProjectSpecifier.path` supplying the directory —
+/// so a bare name *with* a project path is the ordinary case, and a bare name
+/// *without* one is a record Konnect cannot place on disk.
+fn board_document_identity(
+    document: &kiapi::common::types::DocumentSpecifier,
+) -> std::result::Result<PathBuf, String> {
+    use kiapi::common::types::document_specifier::Identifier;
+
+    let filename = match document.identifier.as_ref() {
+        Some(Identifier::BoardFilename(filename)) => filename,
+        Some(Identifier::LibId(_)) => {
+            return Err("a PCB document identified by a library id".to_string())
         }
-        _ => requested == active,
+        Some(Identifier::SheetPath(_)) => {
+            return Err("a PCB document identified by a sheet path".to_string())
+        }
+        None => return Err("a PCB document that reports no identifier".to_string()),
+    };
+    if filename.trim().is_empty() {
+        return Err("a PCB document with an empty board filename".to_string());
     }
+
+    let path = PathBuf::from(filename);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        match document.project.as_ref().map(|project| &project.path) {
+            Some(project_path) if Path::new(project_path).is_absolute() => {
+                Path::new(project_path).join(&path)
+            }
+            _ => {
+                return Err(format!(
+                    "the bare filename '{filename}' with no project directory"
+                ))
+            }
+        }
+    };
+    comparable_identity(&absolute).map_err(|reason| format!("'{filename}' {reason}"))
+}
+
+/// An absolute path reduced to the form two paths can be compared in, or the
+/// reason the filesystem could not say.
+///
+/// A path that does not exist is still comparable — it is normalized
+/// lexically, so a board deleted out from under an open editor still compares
+/// equal to itself. Any *other* failure (a permission denied on a parent
+/// directory, a symlink loop) means the two paths might name one file and
+/// might not, which is exactly the case that must fail closed rather than
+/// resolve to "different".
+fn comparable_identity(path: &Path) -> std::result::Result<PathBuf, String> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(lexically_normalized(path))
+        }
+        Err(error) => Err(format!("cannot be resolved on this filesystem: {error}")),
+    }
+}
+
+/// `.` and `..` removed without touching the filesystem. Only used for paths
+/// that do not exist, where `canonicalize` cannot do it.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(Component::ParentDir);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The first identity that appears twice, if any. KiCad opening one board
+/// twice is not a list Konnect models, so it is not one absence can be read
+/// from either.
+fn first_duplicate<'a>(paths: &[&'a PathBuf]) -> Option<&'a PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    paths.iter().copied().find(|path| !seen.insert(*path))
 }
 
 #[cfg(test)]
 mod document_path_tests {
     use super::*;
 
-    #[test]
-    fn relative_board_filename_is_resolved_against_project_path() {
-        let document = kiapi::common::types::DocumentSpecifier {
+    /// An absolute project directory on the platform running the test.
+    ///
+    /// `Path::is_absolute` is what decides whether a project directory can
+    /// place a bare board filename, and a POSIX-rooted path is *not* absolute
+    /// on Windows — it is relative to the current drive. Keeping the rule
+    /// strict is deliberate; the fixture has to speak the local dialect.
+    fn project_dir() -> &'static str {
+        if cfg!(windows) {
+            r"C:\work\controller"
+        } else {
+            "/work/controller"
+        }
+    }
+
+    fn expected_board() -> PathBuf {
+        PathBuf::from(project_dir()).join("controller.kicad_pcb")
+    }
+
+    fn board_document(
+        filename: &str,
+        project_path: Option<&str>,
+    ) -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
             r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
             identifier: Some(
                 kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                    "controller.kicad_pcb".to_string(),
+                    filename.to_string(),
                 ),
             ),
+            project: project_path.map(|path| kiapi::common::types::ProjectSpecifier {
+                name: "controller".to_string(),
+                path: path.to_string(),
+            }),
+        }
+    }
+
+    /// KiCad's documented form: a bare filename plus the project directory.
+    #[test]
+    fn relative_board_filename_is_resolved_against_project_path() {
+        assert_eq!(
+            board_document_path(&board_document("controller.kicad_pcb", Some(project_dir())))
+                .unwrap(),
+            expected_board()
+        );
+        assert_eq!(
+            board_document_identity(&board_document("controller.kicad_pcb", Some(project_dir())))
+                .unwrap(),
+            expected_board()
+        );
+    }
+
+    /// The record that used to be dropped. A bare filename with no project
+    /// directory names no file on disk, and the old lookup skipped it and then
+    /// reported the requested board absent — which is what let a file write
+    /// proceed past evidence nobody had read.
+    #[test]
+    fn a_bare_filename_with_no_project_directory_is_not_an_identity() {
+        let reason = board_document_identity(&board_document("controller.kicad_pcb", None))
+            .expect_err("a bare filename places no file on disk");
+
+        assert!(reason.contains("controller.kicad_pcb"), "{reason}");
+        assert!(reason.contains("no project directory"), "{reason}");
+    }
+
+    #[test]
+    fn a_relative_project_path_is_not_an_identity() {
+        assert!(board_document_identity(&board_document(
+            "controller.kicad_pcb",
+            Some("controller")
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn an_empty_board_filename_is_not_an_identity() {
+        assert!(board_document_identity(&board_document("", Some(project_dir()))).is_err());
+        assert!(board_document_identity(&board_document("   ", Some(project_dir()))).is_err());
+    }
+
+    #[test]
+    fn a_document_with_no_identifier_is_not_an_identity() {
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: None,
             project: Some(kiapi::common::types::ProjectSpecifier {
                 name: "controller".to_string(),
-                path: "/work/controller".to_string(),
+                path: project_dir().to_string(),
             }),
         };
 
+        assert!(board_document_identity(&document)
+            .expect_err("no identifier")
+            .contains("no identifier"));
+    }
+
+    /// A PCB document identified as something other than a board filename is
+    /// a shape Konnect does not model. It is not a board that is absent.
+    #[test]
+    fn a_non_board_identifier_is_not_an_identity() {
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::SheetPath(
+                    kiapi::common::types::SheetPath {
+                        path: vec![],
+                        path_human_readable: "/".to_string(),
+                    },
+                ),
+            ),
+            project: None,
+        };
+
+        assert!(board_document_identity(&document).is_err());
+    }
+
+    /// A board deleted out from under an open editor still has to compare
+    /// equal to itself — `canonicalize` cannot resolve it, so the identity is
+    /// normalized lexically instead.
+    #[test]
+    fn a_missing_path_is_still_comparable_to_itself() {
         assert_eq!(
-            board_document_path(&document).unwrap(),
-            PathBuf::from("/work/controller/controller.kicad_pcb")
+            comparable_identity(&PathBuf::from(project_dir()).join("./gone.kicad_pcb")).unwrap(),
+            comparable_identity(&PathBuf::from(project_dir()).join("sub/../gone.kicad_pcb"))
+                .unwrap()
+        );
+        assert_ne!(
+            comparable_identity(&PathBuf::from(project_dir()).join("gone.kicad_pcb")).unwrap(),
+            comparable_identity(&PathBuf::from(project_dir()).join("other.kicad_pcb")).unwrap()
+        );
+    }
+
+    /// Two paths through a symlink are one board. `canonicalize` is what makes
+    /// them compare equal, and losing it would turn a board KiCad *has* open
+    /// into one it does not.
+    #[test]
+    fn a_symlinked_path_resolves_to_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.kicad_pcb");
+        std::fs::write(&real, "(kicad_pcb)").unwrap();
+        let link = dir.path().join("link.kicad_pcb");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&real, &link).unwrap();
+
+        #[cfg(unix)]
+        assert_eq!(
+            comparable_identity(&real).unwrap(),
+            comparable_identity(&link).unwrap()
         );
     }
 
     #[test]
-    fn bare_kicad_filename_is_not_enough_to_authorize_an_absolute_request() {
-        assert!(!paths_refer_to_same_board(
-            Path::new("/work/controller/controller.kicad_pcb"),
-            Path::new("controller.kicad_pcb")
-        ));
-        assert!(paths_refer_to_same_board(
-            Path::new("controller.kicad_pcb"),
-            Path::new("controller.kicad_pcb")
-        ));
-        assert!(!paths_refer_to_same_board(
-            Path::new("/work/controller/other.kicad_pcb"),
-            Path::new("controller.kicad_pcb")
-        ));
+    fn first_duplicate_finds_a_repeated_identity() {
+        let a = PathBuf::from(project_dir()).join("a.kicad_pcb");
+        let b = PathBuf::from(project_dir()).join("b.kicad_pcb");
+
+        assert_eq!(first_duplicate(&[&a, &b]), None);
+        assert_eq!(first_duplicate(&[&a, &b, &a]), Some(&a));
     }
 }
-
 #[cfg(test)]
 mod footprint_graphics_tests {
     use super::*;

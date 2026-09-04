@@ -95,15 +95,7 @@ fn reply_with(inner: prost_types::Any) -> kiapi::common::ApiResponse {
 
 fn open_board_response() -> kiapi::common::ApiResponse {
     let response = kiapi::common::commands::GetOpenDocumentsResponse {
-        documents: vec![kiapi::common::types::DocumentSpecifier {
-            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-            project: None,
-            identifier: Some(
-                kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                    "test.kicad_pcb".to_string(),
-                ),
-            ),
-        }],
+        documents: vec![doc_for("test.kicad_pcb")],
     };
     reply_with(builders::pack_any(
         &response,
@@ -145,7 +137,7 @@ fn save_document_to_string_targets_the_named_open_board() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
     let snapshot = client
         .save_document_to_string_in(document)
@@ -220,7 +212,7 @@ fn effective_routing_rules_preserve_complete_kicad_values() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
     let rules = client
         .get_effective_routing_rules_in(document)
@@ -572,7 +564,7 @@ fn place_footprint_sends_graphics_children() {
     let client = KiCadIpcClient::new(&mock.url);
     let placed = client
         .place_footprint(
-            std::path::Path::new("test.kicad_pcb"),
+            &mock_board("test.kicad_pcb"),
             "Resistor_SMD:R_0402",
             "R1",
             "R_0402",
@@ -817,6 +809,55 @@ fn a_live_kicad_that_says_no_classifies_as_rejected() {
     assert!(failure.message().contains("no board open"), "{failure:?}");
 }
 
+/// A KiCad holding some other project has rejected nothing — it was asked
+/// about a board it does not have. Classifying that as `Rejected` made every
+/// board-file write refuse itself while KiCad sat on an unrelated project.
+#[test]
+fn a_kicad_holding_another_board_classifies_as_not_open() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        Some(ok_response())
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .find_open_board(&mock_board("other.kicad_pcb"))
+            .unwrap_err(),
+    );
+    assert!(
+        matches!(failure, konnect_ipc::IpcFailure::BoardNotOpen(_)),
+        "unexpected classification: {failure:?}"
+    );
+    assert!(failure.message().contains("test.kicad_pcb"), "{failure:?}");
+}
+
+#[test]
+fn a_kicad_with_nothing_open_classifies_as_not_open() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetOpenDocumentsResponse { documents: vec![] },
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        Some(ok_response())
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .find_open_board(&mock_board("test.kicad_pcb"))
+            .unwrap_err(),
+    );
+    assert!(
+        matches!(failure, konnect_ipc::IpcFailure::BoardNotOpen(_)),
+        "unexpected classification: {failure:?}"
+    );
+}
+
 /// The regression the recv timeout exists for: a server that accepts the
 /// request and never replies. The predecessor project hung >600 s here; the
 /// client must give up at its recv timeout instead.
@@ -900,7 +941,7 @@ fn placement_targets_the_named_board_among_several_open() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let _ = client.place_footprint(
-        std::path::Path::new("target.kicad_pcb"),
+        &mock_board("target.kicad_pcb"),
         "Resistor_SMD:R_0402",
         "R1",
         "R_0402",
@@ -924,10 +965,34 @@ fn placement_targets_the_named_board_among_several_open() {
     );
 }
 
+/// The project directory the mock's open documents report.
+///
+/// KiCad identifies an open PCB by a *bare* `board_filename` plus its
+/// `ProjectSpecifier.path` — the form its own proto documents ("a PCB with a
+/// given filename, e.g. `board.kicad_pcb`"). A mock sending `project: None`
+/// was reproducing a document form KiCad does not emit, and it was the one
+/// form Konnect cannot place on disk.
+/// Absolute on the platform running the test: `Path::is_absolute` is what
+/// lets a project directory place a bare board filename, and a POSIX-rooted
+/// path is not absolute on Windows.
+const MOCK_PROJECT_DIR: &str = if cfg!(windows) {
+    r"C:\konnect-mock-project"
+} else {
+    "/konnect-mock-project"
+};
+
+/// The absolute path a caller asks about, for a board the mock reports open.
+fn mock_board(filename: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(MOCK_PROJECT_DIR).join(filename)
+}
+
 fn doc_for(filename: &str) -> kiapi::common::types::DocumentSpecifier {
     kiapi::common::types::DocumentSpecifier {
         r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-        project: None,
+        project: Some(kiapi::common::types::ProjectSpecifier {
+            name: "konnect-mock".to_string(),
+            path: MOCK_PROJECT_DIR.to_string(),
+        }),
         identifier: Some(
             kiapi::common::types::document_specifier::Identifier::BoardFilename(
                 filename.to_string(),
@@ -1205,7 +1270,7 @@ fn a_failed_item_read_is_an_error_not_an_empty_board() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let error = client
@@ -1228,7 +1293,7 @@ fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
     )]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let pads = client
@@ -1257,7 +1322,7 @@ fn an_unreadable_live_pad_is_reported_instead_of_silently_dropped() {
     )]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let error = client
@@ -1278,7 +1343,7 @@ fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
     let mock = spawn_kicad_holding_items(vec![footprint_with_pads("U1", vec![pad])]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let error = client
@@ -1295,7 +1360,7 @@ fn a_footprint_absent_from_the_live_board_reads_as_none() {
     )]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     assert!(client
@@ -1342,7 +1407,7 @@ fn pad_reads_target_the_named_board_among_several_open() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .find_open_board(&mock_board("target.kicad_pcb"))
         .expect("target.kicad_pcb is open");
     let _ = client.get_footprint_pads_in(document, "R1");
 
@@ -1380,7 +1445,7 @@ fn board_graphics_come_back_with_their_kind_layer_and_identifier() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let graphics = client
@@ -1442,7 +1507,7 @@ fn deletes_target_the_named_board_among_several_open() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .find_open_board(&mock_board("target.kicad_pcb"))
         .expect("target.kicad_pcb is open");
     client
         .delete_items_in(document, vec!["edge-top".to_string()])
@@ -1503,7 +1568,7 @@ fn verified_trace_delete_refuses_a_non_trace_before_delete_items() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let deleted = client
-        .delete_trace_segment_verified(std::path::Path::new("test.kicad_pcb"), "via-or-zone")
+        .delete_trace_segment_verified(&mock_board("test.kicad_pcb"), "via-or-zone")
         .expect("a non-trace is an observed outcome, not an IPC failure");
 
     assert!(deleted.is_none());
@@ -1581,7 +1646,7 @@ fn verified_trace_delete_targets_one_board_and_returns_observed_preimage() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let observed = client
-        .delete_trace_segment_verified(std::path::Path::new("target.kicad_pcb"), "segment-1")
+        .delete_trace_segment_verified(&mock_board("target.kicad_pcb"), "segment-1")
         .expect("verified deletion")
         .expect("the segment existed");
 
@@ -1638,7 +1703,7 @@ fn verified_trace_delete_refuses_success_when_readback_still_contains_the_segmen
 
     let client = KiCadIpcClient::new(&mock.url);
     let error = client
-        .delete_trace_segment_verified(std::path::Path::new("test.kicad_pcb"), "segment-1")
+        .delete_trace_segment_verified(&mock_board("test.kicad_pcb"), "segment-1")
         .unwrap_err()
         .to_string();
 

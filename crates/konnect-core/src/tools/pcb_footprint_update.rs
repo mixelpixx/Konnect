@@ -310,10 +310,11 @@ pub(crate) async fn handle_update_footprints_from_library(
 
     Ok(match result {
         BoardWrite::Ipc(response) => response,
-        BoardWrite::File => preflight_conflict(
-            "KiCad IPC is unreachable. update_footprints_from_library is live-IPC-only and \
-             never edits the board file directly. Open the requested board in KiCad and retry.",
-        ),
+        BoardWrite::File(reason) => preflight_conflict(format!(
+            "{} update_footprints_from_library is live-IPC-only and never edits the board \
+             file directly. Open the requested board in KiCad and retry.",
+            reason.premise()
+        )),
         BoardWrite::Refused(result) => {
             let message = result
                 .content

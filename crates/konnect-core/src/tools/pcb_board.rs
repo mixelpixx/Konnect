@@ -188,12 +188,34 @@ pub(crate) enum BoardWrite<T = ()> {
     /// IPC call returned, for tools that echo it back — the placed footprint,
     /// for instance.
     Ipc(T),
-    /// No live KiCad on this transport and this board was not observed live
+    /// No live KiCad is holding this board and it was not observed live
     /// during the current server session; proceed with the S-expression path.
-    File,
+    /// Carries *why*, because the caller's user has a different next move for
+    /// each — start KiCad, or open this board in the one already running.
+    File(NoLiveBoard),
     /// KiCAD answered and refused. The caller must return this result and must
     /// NOT touch the file.
     Refused(CallToolResult),
+}
+
+/// Why no live KiCad took the write, for the callers that say so.
+#[derive(Debug)]
+pub(crate) enum NoLiveBoard {
+    /// The request never reached KiCad.
+    Unreachable,
+    /// KiCad answered and holds another project, or none. Carries that
+    /// answer, which names the boards it does hold.
+    NotOpen(String),
+}
+
+impl NoLiveBoard {
+    /// The premise sentence an IPC-only tool leads its refusal with.
+    pub(crate) fn premise(&self) -> String {
+        match self {
+            Self::Unreachable => "KiCad IPC is unreachable.".to_string(),
+            Self::NotOpen(answer) => format!("KiCad is reachable but {answer}."),
+        }
+    }
 }
 
 /// Run `f` over IPC against the board named by `board_path`, deciding what the
@@ -210,6 +232,9 @@ pub(crate) enum BoardWrite<T = ()> {
 ///   classification, never a text match. A KiCad that answers — even with an
 ///   error — fails closed. An unreachable transport permits the file path only
 ///   when this server has never observed the requested board live.
+/// * A reachable KiCAD that does not hold this board is a third answer, not a
+///   refusal: it has no unsaved state for a board it never opened, so the file
+///   is authoritative and the edit proceeds there.
 pub(crate) async fn attempt_ipc_write<T, F>(
     ctx: &ToolContext,
     board_path: &std::path::Path,
@@ -229,26 +254,65 @@ where
                  board open, so editing the file directly could be silently overwritten."
             ))))
         }
+        // KiCad answered, and the answer did not say. Not a refusal — it
+        // declined nothing — and emphatically not "not open": the file path
+        // is unlocked by *proving* the board closed, and this is the case
+        // where that proof does not exist.
+        Err(konnect_ipc::IpcFailure::Ambiguous(message)) => {
+            Ok(BoardWrite::Refused(CallToolResult::error_kind(
+                ToolErrorKind::AmbiguousOpenBoard {
+                    path: board_path.display().to_string(),
+                },
+                format!(
+                    "Konnect could not confirm whether KiCAD has this board open, so it did not \
+                     apply the {what}: {message}. The board file was not modified. Close the \
+                     documents KiCAD cannot identify, or open this board in KiCAD and retry."
+                ),
+            )))
+        }
+        // KiCad up on another project, or freshly launched with nothing open.
+        // Gated on the same observation as `Unreachable`: KiCad no longer
+        // holding a board this session already saw it hold is the #240
+        // hazard — a crash-and-restart, or a close mid-operation — and a
+        // reachable transport says nothing about the work that board carried.
+        Err(konnect_ipc::IpcFailure::BoardNotOpen(answer)) => {
+            if ctx.board_session.was_observed_live(board_path) {
+                Ok(BoardWrite::Refused(unsafe_file_fallback(
+                    board_path,
+                    "Konnect previously reached KiCad with this board open, and KiCad no longer \
+                     has it open.",
+                )))
+            } else {
+                Ok(BoardWrite::File(NoLiveBoard::NotOpen(answer)))
+            }
+        }
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
             if ctx.board_session.was_observed_live(board_path) {
-                Ok(BoardWrite::Refused(unsafe_file_fallback(board_path)))
+                Ok(BoardWrite::Refused(unsafe_file_fallback(
+                    board_path,
+                    "Konnect previously reached KiCad with this board open, but IPC is now \
+                     unreachable.",
+                )))
             } else {
-                Ok(BoardWrite::File)
+                Ok(BoardWrite::File(NoLiveBoard::Unreachable))
             }
         }
     }
 }
 
-fn unsafe_file_fallback(board_path: &std::path::Path) -> CallToolResult {
+/// The refusal both gates share: `situation` names what changed since this
+/// server saw KiCad holding the board, and the rest is the same advice.
+fn unsafe_file_fallback(board_path: &std::path::Path, situation: &str) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::UnsafeFileFallback {
             path: board_path.display().to_string(),
         },
-        "Konnect previously reached KiCad with this board open, but IPC is now unreachable. \
-         The saved board file may be older than unsaved editor state, so Konnect did not \
-         modify it. Reopen or recover the board in KiCad, reconcile it, and save the \
-         authoritative state. If KiCad was deliberately closed cleanly, restart Konnect \
-         only after confirming that the saved file is authoritative.",
+        format!(
+            "{situation} The saved board file may be older than unsaved editor state, so \
+             Konnect did not modify it. Reopen or recover the board in KiCad, reconcile it, \
+             and save the authoritative state. If KiCad was deliberately closed cleanly, \
+             restart Konnect only after confirming that the saved file is authoritative."
+        ),
     )
 }
 
@@ -272,10 +336,37 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
              there) and retry — this tool has no IPC path for a live board yet."
         )))),
         Err(konnect_ipc::IpcFailure::Rejected(_)) => Ok(None),
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => Ok(ctx
-            .board_session
-            .was_observed_live(board_path)
-            .then(|| unsafe_file_fallback(board_path))),
+        // Unlike `Rejected` — where KiCad answered about *this* board and said
+        // no, leaving the file demonstrably free — an unreadable open-document
+        // list says nothing about this board. Refuse rather than write.
+        Err(konnect_ipc::IpcFailure::Ambiguous(message)) => Ok(Some(CallToolResult::error_kind(
+            ToolErrorKind::AmbiguousOpenBoard {
+                path: board_path.display().to_string(),
+            },
+            format!(
+                "Konnect could not confirm whether KiCAD has this board open, so it did not \
+                     write the {what} to the file: {message}. Close the documents KiCAD cannot \
+                     identify, or make the edit in KiCAD."
+            ),
+        ))),
+        Err(konnect_ipc::IpcFailure::BoardNotOpen(_)) => {
+            Ok(ctx.board_session.was_observed_live(board_path).then(|| {
+                unsafe_file_fallback(
+                    board_path,
+                    "Konnect previously reached KiCad with this board open, and KiCad no longer \
+                     has it open.",
+                )
+            }))
+        }
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            Ok(ctx.board_session.was_observed_live(board_path).then(|| {
+                unsafe_file_fallback(
+                    board_path,
+                    "Konnect previously reached KiCad with this board open, but IPC is now \
+                     unreachable.",
+                )
+            }))
+        }
     }
 }
 
@@ -290,10 +381,11 @@ pub(crate) const DEFAULT_ZONE_MIN_WIDTH_MM: f64 = 0.2;
 /// What the caller gets back when no live KiCAD could be reached and the zone
 /// went into the file instead.
 pub(crate) const FILE_FALLBACK_WARNING: &str =
-    "KiCad IPC was unreachable and this board has not been observed live during the current \
-     Konnect server session, so Konnect edited the saved board file directly. If KiCad \
-     crashed or was force-quit before this server started, reconcile any unsaved work \
-     before relying on this change.";
+    "No live KiCad is holding this board — the IPC transport was unreachable, or KiCad has \
+     this board closed — and it has not been observed live during the current Konnect \
+     server session, so Konnect edited the saved board file directly. If KiCad crashed or \
+     was force-quit before this server started, reconcile any unsaved work before relying \
+     on this change. Reload the file in KiCad before editing it there.";
 
 /// The `pad_connection` argument in both the representations it needs: the IPC
 /// enum and the token KiCad's `(connect_pads …)` takes.
@@ -1067,7 +1159,7 @@ async fn handle_set_board_size(
             return Ok(outline_not_replaceable(&kinds))
         }
         BoardWrite::Refused(err) => return Ok(err),
-        BoardWrite::File => {}
+        BoardWrite::File(_) => {}
     }
 
     let content = std::fs::read_to_string(&board_path)?;
@@ -1567,7 +1659,7 @@ async fn handle_add_board_outline(
             })))
         }
         BoardWrite::Refused(err) => return Ok(err),
-        BoardWrite::File => {}
+        BoardWrite::File(_) => {}
     }
 
     let outline = format_outline(&primitives, "Edge.Cuts", w);
@@ -1698,7 +1790,7 @@ async fn handle_delete_graphics(
             "ipc",
         ),
         BoardWrite::Refused(result) => return Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(_) => {
             let content = std::fs::read_to_string(&board_path)?;
             let matched: Vec<FileGraphic> = read_file_graphics(&content)
                 .into_iter()
@@ -1786,7 +1878,7 @@ async fn handle_add_mounting_hole(
             "source": "ipc"
         }))),
         BoardWrite::Refused(err) => Ok(err),
-        BoardWrite::File => {
+        BoardWrite::File(_) => {
             // No live KiCad now, and this board was not observed live during
             // the current server session: use the guarded file path.
             let fp_sexp = format_npth_footprint(x, y, drill_d, &reference);
@@ -1842,7 +1934,7 @@ async fn handle_add_board_text(
             })))
         }
         BoardWrite::Refused(err) => return Ok(err),
-        BoardWrite::File => {}
+        BoardWrite::File(_) => {}
     }
 
     let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
@@ -1945,7 +2037,7 @@ pub(crate) async fn add_zone_impl(
             };
             return Ok(CallToolResult::json(&body));
         }
-        BoardWrite::File => {}
+        BoardWrite::File(_) => {}
     }
 
     let content = std::fs::read_to_string(&board_path)?;
@@ -2186,6 +2278,45 @@ pub(crate) mod board_mock {
         board: &std::path::Path,
         respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
     ) -> String {
+        spawn_kicad_holding_boards(&[board], respond)
+    }
+
+    /// As [`spawn_kicad_holding_board`], for the two answers that are not
+    /// "the board you asked about": some other project, and nothing at all.
+    pub fn spawn_kicad_holding_boards(
+        boards: &[&std::path::Path],
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> String {
+        spawn_kicad_reporting_documents(
+            boards
+                .iter()
+                .map(|board| board_document(&board.to_string_lossy()))
+                .collect(),
+            respond,
+        )
+    }
+
+    /// One open PCB document in the form KiCad sends: a `board_filename` and,
+    /// when the name is relative, the project directory that places it.
+    pub fn board_document(filename: &str) -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    filename.to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// As [`spawn_kicad_holding_boards`], but the caller supplies the open
+    /// documents verbatim — including the shapes Konnect cannot place on
+    /// disk, which is the whole subject of the ambiguity gate.
+    pub fn spawn_kicad_reporting_documents(
+        documents: Vec<kiapi::common::types::DocumentSpecifier>,
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> String {
         use nng::options::Options;
 
         let port = {
@@ -2199,7 +2330,6 @@ pub(crate) mod board_mock {
             .unwrap();
         socket.listen(&url).expect("mock listen");
 
-        let board = board.to_string_lossy().to_string();
         std::thread::spawn(move || {
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
@@ -2207,15 +2337,7 @@ pub(crate) mod board_mock {
                 let body = if command.type_url.ends_with("GetOpenDocuments") {
                     Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                project: None,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        board.clone(),
-                                    ),
-                                ),
-                            }],
+                            documents: documents.clone(),
                         },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
                     ))
@@ -2239,6 +2361,257 @@ pub(crate) mod board_mock {
             }
         });
         url
+    }
+}
+
+/// The gate between "KiCad answered" and "the saved file is authoritative".
+///
+/// `BoardNotOpen` is what unlocks a direct file write, so it may only be
+/// reached from an open-document list that was read in full. Every shape that
+/// cannot be placed on disk — no identifier, an empty or bare filename, a
+/// duplicate — has to stop there instead, because a record Konnect skipped is
+/// not evidence that the board is closed (#426).
+#[cfg(test)]
+mod open_document_ambiguity_tests {
+    use super::board_mock::{board_document, ctx_talking_to, spawn_kicad_reporting_documents};
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn kind_of(result: &CallToolResult) -> Option<String> {
+        crate::mcp::error::extract_error_kind(result)
+    }
+
+    /// A document KiCad reports that Konnect cannot place on disk: a bare
+    /// filename with no project directory. KiCad's own contract pairs a bare
+    /// `board_filename` with `ProjectSpecifier.path`; without one there is no
+    /// directory, and the record names no file.
+    fn unplaceable_document() -> kiapi::common::types::DocumentSpecifier {
+        board_document("mystery.kicad_pcb")
+    }
+
+    fn document_without_identifier() -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: None,
+        }
+    }
+
+    /// Run a write against a KiCad reporting `documents`, and report both the
+    /// outcome and whether the write closure was ever entered.
+    async fn write_against(
+        board: &std::path::Path,
+        documents: Vec<kiapi::common::types::DocumentSpecifier>,
+    ) -> (BoardWrite<()>, bool) {
+        let ctx = ctx_talking_to(spawn_kicad_reporting_documents(documents, |_| None));
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = entered.clone();
+        let outcome = attempt_ipc_write(&ctx, board, "test write", move |_| {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        (outcome, entered.load(Ordering::SeqCst))
+    }
+
+    /// The defect: the unresolvable record was skipped, the requested board
+    /// was then "not open", and a file write proceeded on evidence nobody had
+    /// read.
+    #[tokio::test]
+    async fn an_unplaceable_open_document_refuses_and_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+
+        let (outcome, entered) = write_against(&board, vec![unplaceable_document()]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("an unidentifiable open document must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert!(!entered, "the IPC write closure must not run");
+        assert_eq!(std::fs::read(&board).unwrap(), before, "board bytes");
+    }
+
+    #[tokio::test]
+    async fn a_document_with_no_identifier_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, entered) = write_against(&board, vec![document_without_identifier()]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("a document with no identifier must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert!(!entered);
+    }
+
+    #[tokio::test]
+    async fn an_empty_board_filename_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, _) = write_against(&board, vec![board_document("")]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("an empty board filename must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+    }
+
+    /// One unreadable record poisons the verdict even beside a readable one.
+    /// "Board A is open" says nothing about board B, so a list containing a
+    /// record that might be B cannot prove B closed.
+    #[tokio::test]
+    async fn one_unplaceable_document_beside_a_readable_one_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+
+        let (outcome, entered) = write_against(
+            &board,
+            vec![
+                board_document(&elsewhere.to_string_lossy()),
+                unplaceable_document(),
+            ],
+        )
+        .await;
+
+        assert!(matches!(outcome, BoardWrite::Refused(_)));
+        assert!(!entered);
+    }
+
+    /// KiCad opening one board twice is not a list Konnect models, so it is
+    /// not one absence can be read from either.
+    #[tokio::test]
+    async fn a_duplicated_open_document_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let twice = board_document(&elsewhere.to_string_lossy());
+
+        let (outcome, entered) = write_against(&board, vec![twice.clone(), twice]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("a duplicated open document must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert!(!entered);
+    }
+
+    /// And the requested board itself reported twice: there is no single
+    /// document an edit would reach, so neither path may run.
+    #[tokio::test]
+    async fn the_requested_board_reported_twice_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let twice = board_document(&board.to_string_lossy());
+
+        let (outcome, entered) = write_against(&board, vec![twice.clone(), twice]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("the requested board open twice must not be resolved by order")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert!(!entered, "no single document to address");
+    }
+
+    /// A positive identification is the safe direction — the operation goes to
+    /// KiCad, not to the file — so it is not withheld because some *other*
+    /// open document is unreadable.
+    #[tokio::test]
+    async fn a_positive_match_is_not_blocked_by_another_unreadable_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, entered) = write_against(
+            &board,
+            vec![
+                unplaceable_document(),
+                board_document(&board.to_string_lossy()),
+            ],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, BoardWrite::Ipc(())),
+            "KiCad holds this board; the edit belongs there"
+        );
+        assert!(entered);
+    }
+
+    /// The empty list is its own answer and always was: KiCad is running with
+    /// nothing open, which is what a freshly launched editor looks like.
+    #[tokio::test]
+    async fn an_empty_open_document_list_edits_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, entered) = write_against(&board, vec![]).await;
+
+        assert!(matches!(outcome, BoardWrite::File(NoLiveBoard::NotOpen(_))));
+        assert!(!entered, "there was no board to address over IPC");
+    }
+
+    /// The file-only guard reaches the same verdict from the same evidence.
+    #[tokio::test]
+    async fn the_file_only_guard_refuses_an_unplaceable_open_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let ctx = ctx_talking_to(spawn_kicad_reporting_documents(
+            vec![unplaceable_document()],
+            |_| None,
+        ));
+
+        let result = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap()
+            .expect("an unidentifiable open document must refuse the edit");
+
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    /// Ambiguity is not a rejection either. KiCad declined nothing — it was
+    /// never asked — and reporting a refusal it did not make is the same
+    /// misreading in the other direction.
+    #[tokio::test]
+    async fn ambiguity_is_reported_as_itself_not_as_a_kicad_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, _) = write_against(&board, vec![unplaceable_document()]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("expected a refusal")
+        };
+        let text = super::mounting_hole_tests::result_text(&result);
+        assert!(!text.contains("rejected"), "{text}");
+        assert!(text.contains("could not confirm"), "{text}");
+    }
+
+    /// A board this session watched KiCad hold stays protected: an unreadable
+    /// list cannot release it any more than a proven-closed one can.
+    #[tokio::test]
+    async fn a_previously_live_board_stays_refused_under_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let ctx = ctx_talking_to(spawn_kicad_reporting_documents(
+            vec![unplaceable_document()],
+            |_| None,
+        ));
+        ctx.board_session.observe_live(&board);
+
+        let outcome = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, BoardWrite::Refused(_)));
     }
 }
 
@@ -2340,7 +2713,7 @@ mod board_session_safety_tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, BoardWrite::File));
+        assert!(matches!(outcome, BoardWrite::File(_)));
     }
 
     #[tokio::test]
@@ -2428,7 +2801,7 @@ mod board_session_safety_tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, BoardWrite::File));
+        assert!(matches!(outcome, BoardWrite::File(_)));
     }
 
     #[tokio::test]
@@ -2491,6 +2864,120 @@ mod board_session_safety_tests {
 
         assert!(matches!(result, Err(konnect_ipc::IpcFailure::Rejected(_))));
         assert!(!ctx.board_session.was_observed_live(&board));
+    }
+
+    /// KiCad up on another project is the ordinary state of a machine where
+    /// one board is being edited by hand and another by Konnect. It used to
+    /// classify as a rejection, so every `attempt_ipc_write` caller refused
+    /// and wrote nothing, quoting a KiCad that had said no such thing.
+    #[tokio::test]
+    async fn a_kicad_holding_another_project_edits_this_board_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(
+            &[elsewhere.as_path()],
+            |_| None,
+        ));
+
+        let result = handle_add_mounting_hole(
+            &json!({
+                "board": board.to_str().unwrap(),
+                "x": 5.0, "y": 6.0, "drill_diameter": 3.2, "reference": "H1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "handler errored: {:?}", result.content);
+        let body: serde_json::Value =
+            serde_json::from_str(&super::mounting_hole_tests::result_text(&result)).unwrap();
+        assert_eq!(body["source"], json!("file"));
+        assert!(std::fs::read_to_string(&board).unwrap().contains("H1"));
+        assert!(
+            body["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("closed")),
+            "the warning must cover the path taken, not only an unreachable transport: {}",
+            body["warning"]
+        );
+        assert!(
+            !ctx.board_session.was_observed_live(&board),
+            "KiCad never had this board, so it must not count as observed live"
+        );
+    }
+
+    /// The other half: KiCad running with nothing open, which is what a user
+    /// who has just launched it has.
+    #[tokio::test]
+    async fn a_kicad_with_no_board_open_edits_the_board_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(&[], |_| None));
+
+        let write = attempt_ipc_write(&ctx, &board, "test edit", |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(write, BoardWrite::File(_)),
+            "an empty document list is not a refusal"
+        );
+    }
+
+    /// The board this session watched KiCad hold, which KiCad no longer has:
+    /// a crash and restart, or a close mid-operation. The transport being
+    /// reachable again says nothing about the work that board carried, so
+    /// this stays the #240 refusal rather than joining the file path.
+    #[tokio::test]
+    async fn a_board_closed_since_konnect_saw_it_live_still_refuses_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(
+            &[elsewhere.as_path()],
+            |_| None,
+        ));
+        ctx.board_session.observe_live(&board);
+
+        let write = attempt_ipc_write(&ctx, &board, "next write", |_| Ok(()))
+            .await
+            .unwrap();
+
+        let BoardWrite::Refused(result) = write else {
+            panic!("a board KiCad has since closed must not take the file path")
+        };
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert!(
+            super::mounting_hole_tests::result_text(&result).contains("no longer has it open"),
+            "the refusal must name what actually changed"
+        );
+    }
+
+    /// The same distinction for the no-IPC-path gate beside it, whose doc
+    /// comment has always claimed it — until now nothing held it to it (#241).
+    #[tokio::test]
+    async fn a_file_only_edit_proceeds_while_kicad_holds_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(
+            &[elsewhere.as_path()],
+            |_| None,
+        ));
+
+        let refusal = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap();
+
+        assert!(
+            refusal.is_none(),
+            "a KiCad holding a different board does not interfere with this file"
+        );
     }
 }
 
