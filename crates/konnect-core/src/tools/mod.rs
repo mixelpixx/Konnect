@@ -124,6 +124,11 @@ pub struct ToolContext {
     /// Boards positively observed open through IPC during this server process.
     /// Sticky state prevents an unsafe file fallback after KiCad disappears.
     pub(crate) board_session: board_session::BoardSessionMemory,
+    /// Which configuration file configured this process, captured at startup
+    /// and reported read-only by `get_installation_info` (#419). Defaults to
+    /// `unavailable` so a caller that does not track the load reports absence
+    /// rather than a fabricated `defaults`.
+    pub config_resolution: crate::config_resolution::ConfigResolution,
 }
 
 impl ToolContext {
@@ -136,6 +141,7 @@ impl ToolContext {
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
         }
     }
 
@@ -152,7 +158,19 @@ impl ToolContext {
             observer,
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
         }
+    }
+
+    /// Attach the startup configuration decision. Separate from the constructors
+    /// so the 60-plus existing `ServerConfig` call sites keep their signatures;
+    /// only the real server entry point records provenance.
+    pub fn with_config_resolution(
+        mut self,
+        resolution: crate::config_resolution::ConfigResolution,
+    ) -> Self {
+        self.config_resolution = resolution;
+        self
     }
 }
 

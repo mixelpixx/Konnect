@@ -36,11 +36,27 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
 
     rt.spawn(async move {
         use crate::config::{Config, TransportMode};
+        use konnect_core::config_resolution::ConfigResolution;
         use konnect_core::mcp::handler::McpHandler;
 
-        let config = match config_path_str.as_deref() {
-            Some(p) => Config::load_from(std::path::Path::new(p)).unwrap_or_default(),
-            None => Config::load().unwrap_or_default(),
+        // A failed load still falls back to defaults here, unchanged: that is a
+        // separate defect, tracked apart from #419 to keep this change to one
+        // reviewable outcome. What #419 requires is that provenance must not
+        // *lie* about it. A load that failed is reported as `unavailable`, never
+        // as a clean `defaults` selection, which would be exactly the fabricated
+        // answer this change exists to remove.
+        let (config, config_resolution) = match config_path_str.as_deref() {
+            Some(p) => {
+                let path = std::path::Path::new(p);
+                match Config::load_from(path) {
+                    Ok(config) => (config, ConfigResolution::explicit_path(path)),
+                    Err(_) => (Config::default(), ConfigResolution::unavailable()),
+                }
+            }
+            None => match Config::load_with_resolution() {
+                Ok(resolved) => resolved,
+                Err(_) => (Config::default(), ConfigResolution::unavailable()),
+            },
         };
         let server_config = konnect_core::tools::ServerConfig {
             kicad_cli: config.kicad_cli.clone(),
@@ -51,7 +67,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             auto_load_toolsets: config.auto_load_toolsets,
             eager_toolsets: config.eager_toolsets,
         };
-        match McpHandler::new(server_config).await {
+        match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {
                     let _ = crate::transport::stdio::run_stdio(handler).await;

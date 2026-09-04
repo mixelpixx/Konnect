@@ -1,4 +1,5 @@
 use anyhow::Result;
+use konnect_core::config_resolution::ConfigResolution;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -97,26 +98,33 @@ fn default_log_level() -> String {
 }
 
 impl Config {
-    /// Load config from the default search path.
-    pub fn load() -> Result<Self> {
-        let mut config_paths = vec![
-            PathBuf::from("konnect.toml"),
-            PathBuf::from("settings.json"),
-        ];
-        config_paths.extend(exe_relative_settings_paths());
-        config_paths.push(dirs_config_path());
+    /// Load config from the default search path, reporting which file was
+    /// selected and which later existing files it shadowed, so
+    /// `get_installation_info` can say what configured the process instead of
+    /// leaving the user to guess (#419).
+    ///
+    /// This replaces the previous `load()`, which returned the config alone.
+    /// `mod config` is private in both the binary and the cdylib entry point, so
+    /// that function was not reachable outside this crate and both call sites
+    /// moved here rather than keeping a wrapper with no callers.
+    ///
+    /// Behaviour is unchanged: the first existing candidate wins, a malformed
+    /// selected file is an error rather than permission to fall through to a
+    /// later one, no candidates means defaults, and the environment fallback is
+    /// applied after file or default resolution.
+    pub fn load_with_resolution() -> Result<(Self, ConfigResolution)> {
+        let (selected, skipped) = select_config_candidate(&default_config_paths());
 
-        let mut config = None;
-        for path in &config_paths {
-            if path.exists() {
-                config = Some(Self::load_from(path)?);
-                break;
+        let (mut config, resolution) = match selected {
+            Some(path) => {
+                let config = Self::load_from(&path)?;
+                (config, ConfigResolution::search_path(&path, &skipped))
             }
-        }
+            None => (Self::default(), ConfigResolution::defaults()),
+        };
 
-        let mut config = config.unwrap_or_default();
         config.apply_env_fallbacks();
-        Ok(config)
+        Ok((config, resolution))
     }
 
     /// Env var wins over an unset/blank ipc_address either way. Must run on
@@ -166,6 +174,43 @@ impl Default for Config {
             eager_toolsets: false,
         }
     }
+}
+
+/// The configuration search list, in precedence order. Only the first existing
+/// entry is loaded; the rest are shadowed, never merged.
+fn default_config_paths() -> Vec<PathBuf> {
+    let mut config_paths = vec![
+        PathBuf::from("konnect.toml"),
+        PathBuf::from("settings.json"),
+    ];
+    config_paths.extend(exe_relative_settings_paths());
+    config_paths.push(dirs_config_path());
+    config_paths
+}
+
+/// Pick the first existing candidate, and report the later ones that exist and
+/// are therefore shadowed by it.
+///
+/// Split out from `Config::load` so precedence is testable against a supplied
+/// list: the real list depends on the process working directory and
+/// `current_exe()`, neither of which a test can change without affecting the
+/// whole process.
+fn select_config_candidate(candidates: &[PathBuf]) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let mut selected: Option<PathBuf> = None;
+    let mut skipped = Vec::new();
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        if selected.is_none() {
+            selected = Some(path.clone());
+        } else {
+            skipped.push(path.clone());
+        }
+    }
+
+    (selected, skipped)
 }
 
 /// settings.json next to the binary, and one dir up (covers <plugin_dir>/bin/konnect).
@@ -346,5 +391,97 @@ mod tests {
         let f = write_temp("conf", "log_level = \"debug\"\n");
         let c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.log_level, "debug");
+    }
+
+    // ─── Config provenance (#419) ─────────────────────────────────────────
+    //
+    // The candidate list is supplied rather than discovered so precedence is
+    // testable: the real list depends on the working directory and
+    // `current_exe()`, and changing either is process-wide.
+
+    fn touch(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "").expect("write candidate");
+        path
+    }
+
+    #[test]
+    fn no_candidate_exists_selects_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidates = vec![dir.path().join("konnect.toml"), dir.path().join("a.json")];
+
+        let (selected, skipped) = select_config_candidate(&candidates);
+
+        assert!(selected.is_none(), "nothing exists, so nothing is selected");
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn first_missing_second_existing_selects_the_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = touch(dir.path(), "settings.json");
+        let candidates = vec![dir.path().join("konnect.toml"), second.clone()];
+
+        let (selected, skipped) = select_config_candidate(&candidates);
+
+        assert_eq!(selected.as_ref(), Some(&second));
+        assert!(skipped.is_empty(), "nothing exists after the selected file");
+    }
+
+    #[test]
+    fn first_wins_and_a_later_existing_file_is_reported_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = touch(dir.path(), "konnect.toml");
+        let missing = dir.path().join("settings.json");
+        let third = touch(dir.path(), "config.toml");
+        let candidates = vec![first.clone(), missing, third.clone()];
+
+        let (selected, skipped) = select_config_candidate(&candidates);
+
+        assert_eq!(selected.as_ref(), Some(&first), "first existing wins");
+        assert_eq!(
+            skipped,
+            vec![third],
+            "the shadowed file is named, not merged"
+        );
+    }
+
+    #[test]
+    fn a_malformed_selected_file_is_an_error_not_a_fall_through() {
+        // The behaviour most worth pinning: a broken file must not silently hand
+        // over to a later valid one, which would load settings the user never
+        // pointed at while their real file sat unreported.
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("konnect.toml");
+        std::fs::write(&broken, "this is not = valid toml [[[").unwrap();
+        let valid = dir.path().join("settings.json");
+        std::fs::write(&valid, "{}").unwrap();
+
+        let (selected, _) = select_config_candidate(&[broken.clone(), valid]);
+        assert_eq!(selected.as_ref(), Some(&broken));
+        assert!(
+            Config::load_from(&broken).is_err(),
+            "the selected file is malformed, so loading it must fail"
+        );
+    }
+
+    #[test]
+    fn defaults_resolution_reports_no_path() {
+        let resolution = ConfigResolution::defaults();
+        assert_eq!(resolution.source().as_str(), "defaults");
+        assert!(resolution.selected_path().is_none());
+    }
+
+    #[test]
+    fn an_explicit_config_does_not_report_the_automatic_list_as_skipped() {
+        // --config bypasses discovery, so reporting search candidates as
+        // "skipped" would claim they took part in a search that never ran.
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = touch(dir.path(), "explicit.toml");
+
+        let resolution = ConfigResolution::explicit_path(&explicit);
+
+        assert_eq!(resolution.source().as_str(), "explicit_path");
+        assert!(resolution.skipped_existing_paths().is_empty());
     }
 }

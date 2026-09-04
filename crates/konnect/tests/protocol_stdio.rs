@@ -21,12 +21,43 @@ impl McpProcess {
     }
 
     /// Spawn with the process working directory set to `dir`, so
-    /// `Config::load()`'s first search path (`konnect.toml` in cwd) picks up
+    /// the config search's first path (`konnect.toml` in cwd) picks up
     /// a test config file placed there.
     fn spawn_in_dir(dir: Option<&std::path::Path>) -> Self {
+        Self::spawn_configured(dir, false)
+    }
+
+    /// Spawn with the working directory set to `dir` and, when `isolate_home`,
+    /// the platform config directory redirected there too.
+    ///
+    /// `dirs_config_path()` is the last search candidate and is built from
+    /// `HOME` (`APPDATA` on Windows), so on a developer machine that already has
+    /// `~/Library/Application Support/konnect/config.toml` a "no config exists"
+    /// test silently resolves to that real file instead. Redirecting HOME makes
+    /// the candidate list depend only on the temp dir.
+    fn spawn_configured(dir: Option<&std::path::Path>, isolate_home: bool) -> Self {
+        Self::spawn_with_env(dir, isolate_home, &[])
+    }
+
+    /// As `spawn_configured`, with extra environment variables for the child.
+    /// Set on the child rather than this process because `std::env::set_var` is
+    /// process-wide and the unit tests run in parallel — doing it in-process
+    /// raced the #39 env-fallback test.
+    fn spawn_with_env(
+        dir: Option<&std::path::Path>,
+        isolate_home: bool,
+        env: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        for (key, value) in env {
+            command.env(key, value);
+        }
         if let Some(dir) = dir {
             command.current_dir(dir);
+            if isolate_home {
+                command.env("HOME", dir);
+                command.env("APPDATA", dir);
+            }
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -452,5 +483,198 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
     assert!(
         saw_notification,
         "expected notifications/tools/list_changed after auto-load; saw: {lines:#?}"
+    );
+}
+
+// ─── Config provenance over the protocol (#419) ───────────────────────────────
+//
+// These spawn the real binary, so they prove what a client actually receives —
+// not what the resolver returns in isolation. Paths are compared after
+// `canonicalize` because macOS resolves a temp dir under /var to /private/var,
+// and the server reports the resolved form.
+
+fn canonical(path: &std::path::Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn configuration_block(p: &mut McpProcess) -> Value {
+    let result = p.call_tool("get_installation_info", json!({}));
+    assert_ne!(result["isError"], json!(true), "{result:#?}");
+    McpProcess::tool_body(&result)["configuration"].clone()
+}
+
+#[test]
+fn installation_info_names_the_config_file_that_configured_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let selected = tmp.path().join("konnect.toml");
+    std::fs::write(&selected, "log_level = \"debug\"\n").unwrap();
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let configuration = configuration_block(&mut p);
+
+    assert_eq!(configuration["source"], "search_path");
+    assert_eq!(configuration["selected_path"], canonical(&selected));
+    assert_eq!(configuration["search_policy"], "first_existing_no_merge");
+    assert_eq!(configuration["skipped_existing_paths"], json!([]));
+}
+
+#[test]
+fn installation_info_reports_a_shadowed_later_candidate() {
+    // konnect.toml precedes settings.json, so the second exists but is not read.
+    // Naming it is the whole point: "my settings.json is ignored" was
+    // indistinguishable from "my settings.json is malformed" (#419).
+    let tmp = tempfile::tempdir().unwrap();
+    let selected = tmp.path().join("konnect.toml");
+    let shadowed = tmp.path().join("settings.json");
+    std::fs::write(&selected, "log_level = \"debug\"\n").unwrap();
+    std::fs::write(&shadowed, "{\"log_level\": \"trace\"}").unwrap();
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let configuration = configuration_block(&mut p);
+
+    assert_eq!(configuration["source"], "search_path");
+    assert_eq!(configuration["selected_path"], canonical(&selected));
+    assert_eq!(
+        configuration["skipped_existing_paths"],
+        json!([canonical(&shadowed)]),
+        "the shadowed file must be named, not merged and not hidden"
+    );
+}
+
+#[test]
+fn installation_info_reports_startup_state_not_a_fresh_search() {
+    // Start with only settings.json, then create the higher-priority
+    // konnect.toml while the server runs. The answer must not change: the
+    // question is what configured this process, not what would configure a new
+    // one.
+    let tmp = tempfile::tempdir().unwrap();
+    let selected = tmp.path().join("settings.json");
+    std::fs::write(&selected, "{\"log_level\": \"debug\"}").unwrap();
+
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    assert_eq!(
+        configuration_block(&mut p)["selected_path"],
+        canonical(&selected)
+    );
+
+    std::fs::write(tmp.path().join("konnect.toml"), "log_level = \"trace\"\n").unwrap();
+
+    let after = configuration_block(&mut p);
+    assert_eq!(
+        after["selected_path"],
+        canonical(&selected),
+        "a file created after launch must not be reported as having configured this process"
+    );
+    assert_eq!(after["skipped_existing_paths"], json!([]));
+}
+
+#[test]
+fn installation_info_reports_defaults_when_no_config_file_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+
+    let configuration = configuration_block(&mut p);
+
+    assert_eq!(configuration["source"], "defaults");
+    assert_eq!(configuration["selected_path"], Value::Null);
+    assert_eq!(configuration["skipped_existing_paths"], json!([]));
+}
+
+#[test]
+fn env_fallback_applies_without_disturbing_reported_provenance() {
+    // Acceptance row: a selected file with a blank ipc_address plus
+    // KICAD_API_SOCKET in the environment. The env fallback must still be
+    // applied after file resolution (#39), and provenance must still name the
+    // file that was selected -- the env var configures a value, not a source.
+    let tmp = tempfile::tempdir().unwrap();
+    let selected = tmp.path().join("konnect.toml");
+    std::fs::write(&selected, "ipc_address = \"\"\n").unwrap();
+
+    let mut p = McpProcess::spawn_with_env(
+        Some(tmp.path()),
+        true,
+        &[("KICAD_API_SOCKET", "ipc://konnect-419-env.sock")],
+    );
+
+    let result = p.call_tool("get_installation_info", json!({}));
+    assert_ne!(result["isError"], json!(true), "{result:#?}");
+    let body = McpProcess::tool_body(&result);
+
+    assert_eq!(body["configuration"]["source"], "search_path");
+    assert_eq!(body["configuration"]["selected_path"], canonical(&selected));
+    assert_eq!(
+        body["ipc"]["configured"],
+        json!(true),
+        "the blank ipc_address should have been filled from the environment"
+    );
+}
+
+/// Run the server to completion with the given args, returning (exit ok, stderr).
+/// Used for the cases where startup must FAIL: the MCP harness above expects a
+/// handshake, and there deliberately is not one.
+fn run_expecting_startup_failure(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("APPDATA", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run konnect binary");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn a_malformed_selected_file_stops_startup_instead_of_falling_through() {
+    // konnect.toml is selected and is broken; settings.json is valid and later.
+    // Falling through would silently run on a configuration the user never
+    // pointed at, while their real file went unreported — the failure #419 is
+    // about, in its worst form.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("konnect.toml"), "not = valid toml [[[").unwrap();
+    std::fs::write(
+        tmp.path().join("settings.json"),
+        "{\"log_level\":\"trace\"}",
+    )
+    .unwrap();
+
+    let (ok, stderr) = run_expecting_startup_failure(tmp.path(), &[]);
+
+    assert!(!ok, "a malformed selected file must not start the server");
+    assert!(
+        !stderr.contains("configuration: search_path"),
+        "startup must not report a selection it never completed: {stderr}"
+    );
+}
+
+#[test]
+fn a_malformed_explicit_config_stops_startup_instead_of_falling_back() {
+    // --config bypasses discovery, so a valid settings.json sitting next to it
+    // must not rescue a broken explicit file either.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("bad.toml"), "not = valid toml [[[").unwrap();
+    std::fs::write(
+        tmp.path().join("settings.json"),
+        "{\"log_level\":\"trace\"}",
+    )
+    .unwrap();
+
+    let (ok, stderr) = run_expecting_startup_failure(tmp.path(), &["--config", "bad.toml"]);
+
+    assert!(
+        !ok,
+        "a malformed explicit --config must not start the server"
+    );
+    assert!(
+        !stderr.contains("configuration:"),
+        "startup must not report any configuration selection: {stderr}"
     );
 }

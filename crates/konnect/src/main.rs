@@ -6,6 +6,7 @@ mod transport;
 
 use anyhow::Result;
 use config::{Config, TransportMode};
+use konnect_core::config_resolution::{ConfigResolution, ConfigSource};
 use konnect_core::mcp::handler::McpHandler;
 use std::io::IsTerminal;
 use tracing::info;
@@ -120,14 +121,14 @@ async fn main() -> Result<()> {
         .and_then(|pos| args.get(pos + 1))
         .map(std::path::PathBuf::from);
 
-    let config = if let Some(ref path) = config_path {
+    let (config, config_resolution) = if let Some(ref path) = config_path {
         // KiCAD launches the server this way (with KICAD_API_SOCKET set), so
         // the env fallback for a blank ipc_address must apply here too (#39).
         let mut c = Config::load_from(path)?;
         c.apply_env_fallbacks();
-        c
+        (c, ConfigResolution::explicit_path(path))
     } else {
-        Config::load()?
+        Config::load_with_resolution()?
     };
 
     // ─── Initialize tracing (stderr only — stdout is MCP protocol) ──
@@ -141,6 +142,34 @@ async fn main() -> Result<()> {
 
     info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
 
+    // Name the configuration that actually started this process. A user whose
+    // settings appear to be ignored otherwise has nothing to go on before the
+    // first tool call, and `get_installation_info` may not be reachable at all
+    // if the transport is the thing misconfigured (#419). One record, not one
+    // per shadowed file: first-match is the intended policy, so a warning per
+    // skipped file would be noise.
+    match (
+        config_resolution.source(),
+        config_resolution.selected_path(),
+    ) {
+        // An explicit --config bypasses discovery, so a count of "later
+        // candidates" would claim a search ran that never did.
+        (ConfigSource::ExplicitPath, Some(path)) => info!(
+            "configuration: explicit_path from {} (search list not consulted)",
+            path.display(),
+        ),
+        (_, Some(path)) => info!(
+            "configuration: {} from {} ({} later candidate(s) exist and were not merged)",
+            config_resolution.source().as_str(),
+            path.display(),
+            config_resolution.skipped_existing_paths().len(),
+        ),
+        (_, None) => info!(
+            "configuration: {} (no configuration file was loaded)",
+            config_resolution.source().as_str(),
+        ),
+    }
+
     let server_config = konnect_core::tools::ServerConfig {
         kicad_cli: config.kicad_cli.clone(),
         kicad_binary: config.kicad_binary.clone(),
@@ -150,7 +179,7 @@ async fn main() -> Result<()> {
         auto_load_toolsets: config.auto_load_toolsets,
         eager_toolsets: config.eager_toolsets,
     };
-    let handler = McpHandler::new(server_config).await?;
+    let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
 
     match config.transport {
         TransportMode::Stdio => {
