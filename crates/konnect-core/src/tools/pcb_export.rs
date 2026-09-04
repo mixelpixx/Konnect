@@ -7,29 +7,13 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_array, ToolContext, ToolDef};
+use crate::tools::{get_path, require_array, with_ipc, ToolContext, ToolDef};
 use anyhow::Context;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::task;
 
 use super::cli;
-
-// ─── IPC helpers (mirrors pcb_board / pcb_components) ───────────────────────
-
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
-where
-    T: Send + 'static,
-    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
-{
-    let result = task::spawn_blocking(move || {
-        let client = konnect_ipc::client::KiCadIpcClient::new(&addr);
-        f(&client).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
-    Ok(result)
-}
 
 // ─── Severity filter helpers ──────────────────────────────────────────────────
 
