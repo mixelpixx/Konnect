@@ -1,5 +1,6 @@
 //! Read-only runtime and installation provenance for the serving process.
 
+use crate::config_resolution::{ConfigResolution, SEARCH_POLICY};
 use crate::tools::ServerConfig;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -10,7 +11,7 @@ use tokio::process::Command;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const PCM_IDENTIFIER: &str = "com.github.mixelpixx.konnect";
 
-pub(crate) async fn collect(config: &ServerConfig) -> Value {
+pub(crate) async fn collect(config: &ServerConfig, resolution: &ConfigResolution) -> Value {
     let running_version = env!("CARGO_PKG_VERSION");
     let executable_path = std::env::current_exe().ok();
     let installation = executable_path
@@ -73,7 +74,27 @@ pub(crate) async fn collect(config: &ServerConfig) -> Value {
             "source": "resolved_server_config",
             "endpoint": ipc_endpoint,
         },
+        "configuration": configuration_block(resolution),
         "restart_guidance": restart_guidance(installation.name, newer_than_running),
+    })
+}
+
+/// Report which configuration file configured this process (#419).
+///
+/// Derived from the resolution captured at startup, never from a fresh search:
+/// a file created after launch must not be reported as the one that configured
+/// the running process. Paths only — no configuration values, file contents or
+/// IPC credentials.
+fn configuration_block(resolution: &ConfigResolution) -> Value {
+    json!({
+        "source": resolution.source().as_str(),
+        "selected_path": resolution.selected_path().map(display_path),
+        "search_policy": SEARCH_POLICY,
+        "skipped_existing_paths": resolution
+            .skipped_existing_paths()
+            .iter()
+            .map(|path| display_path(path.as_path()))
+            .collect::<Vec<_>>(),
     })
 }
 

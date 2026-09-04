@@ -32,6 +32,21 @@ pub struct McpHandler {
 
 impl McpHandler {
     pub async fn new(config: crate::tools::ServerConfig) -> anyhow::Result<Self> {
+        Self::new_with_config_resolution(
+            config,
+            crate::config_resolution::ConfigResolution::unavailable(),
+        )
+        .await
+    }
+
+    /// As `new`, but recording which configuration file configured this process
+    /// so `get_installation_info` can report it (#419). The real server entry
+    /// point uses this; `new` keeps its signature for the many callers that do
+    /// not resolve a config file and would otherwise have to invent one.
+    pub async fn new_with_config_resolution(
+        config: crate::tools::ServerConfig,
+        config_resolution: crate::config_resolution::ConfigResolution,
+    ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
@@ -48,11 +63,10 @@ impl McpHandler {
         }
 
         let observer = CallObserver::new(Some(default_calls_log_path()));
-        let ctx = Arc::new(crate::tools::ToolContext::new_with_observer(
-            config,
-            router,
-            observer.clone(),
-        ));
+        let ctx = Arc::new(
+            crate::tools::ToolContext::new_with_observer(config, router, observer.clone())
+                .with_config_resolution(config_resolution),
+        );
 
         Ok(McpHandler {
             ctx,

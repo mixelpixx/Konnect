@@ -310,7 +310,7 @@ async fn handle_server_stats(ctx: &std::sync::Arc<ToolContext>) -> CallToolResul
 }
 
 async fn handle_get_installation_info(ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
-    let info = crate::runtime_info::collect(&ctx.config).await;
+    let info = crate::runtime_info::collect(&ctx.config, &ctx.config_resolution).await;
     CallToolResult::json(&info)
 }
 

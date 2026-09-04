@@ -146,7 +146,13 @@ result is not what you expect.
 
 Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
-in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. A file under any other name is only read when passed with `--config`.
+in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. **Only the first existing file is loaded — later ones are not merged in**, so a `kicad_cli` set in a lower-priority file is ignored while a higher-priority file exists. A file under any other name is only read when passed with `--config`.
+
+If a setting appears to be ignored, call `get_installation_info` and read its
+`configuration` block: `selected_path` is the file that configured the running
+process and `skipped_existing_paths` lists the ones it shadowed. That
+distinguishes "my file was never read" from "my file was read and the value is
+wrong", which otherwise look identical.
 
 ## Native Specctra export used the Rust fallback
 
