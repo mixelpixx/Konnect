@@ -120,6 +120,8 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 - Group components by functional block (power, digital, analog, connectors)
 - Place ICs first, then their associated passives
 - Decoupling caps: within 2mm of their IC power pins, on same layer
+- Cable/EMI filter caps: on the connector's own pins, and judged against that
+  connector rather than the nearest IC
 - Connectors: at board edges, accessible for cables
 - High-frequency components: minimize trace lengths between them
 - Thermal considerations: power components away from sensitive analog
@@ -144,7 +146,11 @@ after its own plan, so a change is judged before it is made:
 
 1. `score_placement` — 0-100 with named deductions; hard failures (courtyard
    overlaps, parts outside the outline) decide the verdict regardless of the
-   number, and a board with no outline can never pass.
+   number, and a board with no outline can never pass. `interface_filter_caps`
+   lists caps that were within their family limit of a connector carrying every
+   one of their nets: that is cable filtering, so the decoupling rule was
+   answered rather than skipped. They are not defects to "fix" by dragging them
+   toward an IC.
 2. `auto_place_from_schematic` — deterministic first placement by net
    clusters; explicitly a starting point, not a final layout.
 3. `refine_placement_force_directed` — deterministic spring embedder; pass

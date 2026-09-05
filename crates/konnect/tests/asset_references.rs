@@ -714,6 +714,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "files_generated",
         // Structured hierarchy-audit response field, not a callable tool.
         "sheet_instance_path",
+        // Structured placement-score response field, not a callable tool.
+        "interface_filter_caps",
     ];
 
     let mut phantom = Vec::new();
