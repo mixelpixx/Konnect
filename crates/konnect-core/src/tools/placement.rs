@@ -1416,14 +1416,18 @@ struct InterfaceFilterCap {
 /// violation — it is reported separately as uncoupled, because "nothing to
 /// decouple" and "too far from what it decouples" are different findings.
 ///
-/// A cap sitting on the pins of a connector (J*) it shares a net with is
+/// A cap sitting on the pins of a connector (J*) whose nets it belongs to is
 /// interface/EMI filtering for that cable, not a bypass cap that drifted away
 /// from an IC on the same rail, so it is exempted from the distance rule
 /// (#411). The exemption is deliberately narrow — the cap must be within the
 /// *same* family limit of the connector's courtyard that the rule would demand
-/// of an IC, so a cap far from everything still deducts. Exemptions are
-/// returned as the third list rather than dropped, so the response says the
-/// deduction was waived instead of going quiet about a check that ran.
+/// of an IC, the connector must carry *every* named net the cap has, and where
+/// the two sit on opposite faces the connector's copper must actually reach
+/// the cap's face (see `nearest_interface_connector`). So a cap far from
+/// everything still deducts, and so does one that merely shares ground with a
+/// connector it happens to sit beside. Exemptions are returned as the third
+/// list rather than dropped, so the response says the deduction was waived
+/// instead of going quiet about a check that ran.
 ///
 /// `uncoupled_caps` is intentionally untouched by the exemption: a cap that
 /// shares no net with any IC never reached the distance rule in the first
@@ -1440,14 +1444,29 @@ fn decoupling_check(
     // Net set per reference, from the connectivity index — keyed by name, so
     // both file formats resolve identically.
     let mut nets_by_ref: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    // The subset of those nets a part carries on copper that reaches both
+    // faces of the board — what decides whether a part on the far face is
+    // electrically on these pins or only above them.
+    let mut through_nets_by_ref: HashMap<&str, BTreeSet<&str>> = HashMap::new();
     for net in index.nets() {
         for pad in index.pads_of_net(net) {
             nets_by_ref
                 .entry(pad.reference.as_str())
                 .or_default()
                 .insert(net);
+            if pad.reaches_both_faces {
+                through_nets_by_ref
+                    .entry(pad.reference.as_str())
+                    .or_default()
+                    .insert(net);
+            }
         }
     }
+
+    let side_by_ref: HashMap<&str, Side> = items
+        .iter()
+        .filter_map(|c| Some((c.reference.as_deref()?, c.layer_side)))
+        .collect();
 
     let ics = footprints_with_prefix(items, "U");
     let connectors = footprints_with_prefix(items, "J");
@@ -1481,8 +1500,16 @@ fn decoupling_check(
                 // shared-net connector's own pins is filtering that cable
                 // (#411). Same limit, measured against the connector, so this
                 // cannot swallow a cap that is far from everything.
-                match nearest_shared_net(&connectors, cap_nets, &nets_by_ref, center)
-                    .filter(|(_, connector_distance_mm)| *connector_distance_mm <= limit_mm)
+                match nearest_interface_connector(
+                    &connectors,
+                    cap_nets,
+                    side_by_ref.get(reference).copied(),
+                    &nets_by_ref,
+                    &through_nets_by_ref,
+                    &side_by_ref,
+                    center,
+                )
+                .filter(|(_, connector_distance_mm)| *connector_distance_mm <= limit_mm)
                 {
                     Some((connector, connector_distance_mm)) => {
                         interface_filters.push(InterfaceFilterCap {
@@ -1540,6 +1567,50 @@ fn nearest_shared_net<'a, 'n>(
                 (Some(a), Some(b)) => !a.is_disjoint(b),
                 _ => false,
             }
+        })
+        .map(|(reference, bbox)| (*reference, distance_to_bbox(center, *bbox)))
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+}
+
+/// The nearest connector this capacitor is filtering for, and how far its
+/// courtyard bbox is from the cap's center. Same metric as the IC rule, two
+/// stricter pairing conditions, both from review of #416:
+///
+/// * The connector must carry **every** named net the cap has, not merely one.
+///   A two-terminal filter cap belongs to a cable only if both its terminals
+///   do; accepting a single overlap would let any cap that drifted near any
+///   connector claim the exemption on board-wide ground alone.
+/// * A cap on the opposite face qualifies only where the connector's copper is
+///   actually on the cap's face: the pads carrying those nets must reach both
+///   faces. Board side alone cannot answer this. A plated through-hole pin is
+///   as available from below as from above — the case @ncolomer measured on the
+///   #411 board, where a B.Cu cap filters an F.Cu THT header — while an SMD
+///   header's copper is not, however close the two look in XY.
+fn nearest_interface_connector<'a, 'n>(
+    connectors: &[(&'a str, Bbox)],
+    cap_nets: Option<&BTreeSet<&'n str>>,
+    cap_side: Option<Side>,
+    nets_by_ref: &HashMap<&str, BTreeSet<&'n str>>,
+    through_nets_by_ref: &HashMap<&str, BTreeSet<&'n str>>,
+    side_by_ref: &HashMap<&str, Side>,
+    center: (f64, f64),
+) -> Option<(&'a str, f64)> {
+    let cap_nets = cap_nets?;
+    connectors
+        .iter()
+        .filter(|(reference, _)| {
+            let carries_every_net = nets_by_ref
+                .get(*reference)
+                .is_some_and(|connector_nets| cap_nets.is_subset(connector_nets));
+            if !carries_every_net {
+                return false;
+            }
+            if side_by_ref.get(*reference).copied() == cap_side {
+                return true;
+            }
+            through_nets_by_ref
+                .get(*reference)
+                .is_some_and(|through_nets| cap_nets.is_subset(through_nets))
         })
         .map(|(reference, bbox)| (*reference, distance_to_bbox(center, *bbox)))
         .min_by(|(_, a), (_, b)| a.total_cmp(b))
@@ -1800,16 +1871,10 @@ mod tests {
         fixture.replace(from, to)
     }
 
-    /// Rewrite text inside ONE footprint's block, leaving every other footprint
-    /// alone. Line-scoped like `lock_footprint`: find the block enclosing the
-    /// Reference property, stop at that footprint's own closing paren, so a
-    /// string several parts share is only rewritten here.
-    fn rewrite_inside_footprint(
-        content: &str,
-        reference: &str,
-        rewrites: &[(String, String)],
-    ) -> String {
-        let lines: Vec<&str> = content.lines().collect();
+    /// The line range of ONE footprint's block: from its `(footprint …)` header
+    /// down to that footprint's own closing paren. Shared by the rewriters so
+    /// they cannot disagree about where a footprint ends.
+    fn footprint_block_range(lines: &[&str], reference: &str) -> (usize, usize) {
         let marker = format!(r#"(property "Reference" "{reference}""#);
         let r = lines
             .iter()
@@ -1824,6 +1889,79 @@ mod tests {
                 .iter()
                 .position(|l| *l == "\t)")
                 .expect("footprint block never closes");
+        (start, end)
+    }
+
+    /// Replace EVERY occurrence of each pattern inside one footprint's block,
+    /// unlike `rewrite_inside_footprint`, which demands exactly one hit per
+    /// pattern. A footprint's layer names repeat once per pad and per graphic,
+    /// which is precisely what flipping a part to the far face has to rewrite.
+    fn replace_all_inside_footprint(
+        content: &str,
+        reference: &str,
+        rewrites: &[(&str, &str)],
+    ) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let (start, end) = footprint_block_range(&lines, reference);
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        for (from, to) in rewrites {
+            let mut hits = 0usize;
+            for line in &mut out[start..=end] {
+                if line.contains(from) {
+                    *line = line.replace(from, to);
+                    hits += 1;
+                }
+            }
+            assert!(hits > 0, "{from} never appears inside {reference}");
+        }
+        let nl = String::from_utf8(vec![10]).unwrap();
+        out.join(&nl)
+    }
+
+    /// Move one footprint to the far face the way KiCad's own flip does —
+    /// every front layer it draws on becomes the back one, `(layer "F.Cu")`
+    /// included, which is where `FootprintCourtyard::layer_side` is read from.
+    /// The courtyard survives the move: the scan accepts `B.CrtYd` alongside
+    /// `F.CrtYd` (board.rs:596), so the bbox and every distance in these tests
+    /// are unchanged by the flip.
+    fn flip_footprint_to_back(content: &str, reference: &str) -> String {
+        replace_all_inside_footprint(
+            content,
+            reference,
+            &[
+                (r#""F.Cu""#, r#""B.Cu""#),
+                (r#""F.Mask""#, r#""B.Mask""#),
+                (r#""F.Paste""#, r#""B.Paste""#),
+                (r#""F.SilkS""#, r#""B.SilkS""#),
+                (r#""F.CrtYd""#, r#""B.CrtYd""#),
+                (r#""F.Fab""#, r#""B.Fab""#),
+            ],
+        )
+    }
+
+    /// Turn one footprint's plated-through pads into single-face SMD pads,
+    /// leaving its geometry and nets alone. `*.Cu` is KiCad's "every copper
+    /// layer" wildcard, which is what makes a through-hole pin reachable from
+    /// the far face at all.
+    fn make_pads_surface_mount(content: &str, reference: &str) -> String {
+        replace_all_inside_footprint(
+            content,
+            reference,
+            &[(r#"(layers "*.Cu" "*.Mask")"#, r#"(layers "F.Cu" "F.Mask")"#)],
+        )
+    }
+
+    /// Rewrite text inside ONE footprint's block, leaving every other footprint
+    /// alone. Line-scoped like `lock_footprint`: find the block enclosing the
+    /// Reference property, stop at that footprint's own closing paren, so a
+    /// string several parts share is only rewritten here.
+    fn rewrite_inside_footprint(
+        content: &str,
+        reference: &str,
+        rewrites: &[(String, String)],
+    ) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let (start, end) = footprint_block_range(&lines, reference);
         let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         let mut rewritten = 0usize;
         for line in &mut out[start..=end] {
@@ -1986,6 +2124,100 @@ mod tests {
             &[("VCC", "/SIG_IN"), ("GND", "unconnected-(J1-Pin_4-Pad4)")],
         );
         let board = write_variant(&dir, "cap_beside_foreign_connector.kicad_pcb", retagged);
+
+        let response = score(&board).await;
+        assert_eq!(response["score"], 70, "{response}");
+        let deductions = response["deductions"].as_array().unwrap();
+        assert_eq!(deductions.len(), 1, "{response}");
+        assert_eq!(deductions[0]["points"], 30);
+        let refs = deductions[0]["references"].as_array().unwrap();
+        assert!(
+            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
+            "{response}"
+        );
+        assert!(
+            deductions[0]["detail"].as_str().unwrap().contains("5.3"),
+            "{response}"
+        );
+        assert_eq!(
+            response["interface_filter_caps"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    /// A cap on the FAR face of a plated-through connector is still filtering
+    /// that cable (@ncolomer's board on #411: C1 on B.Cu under an F.Cu JST
+    /// header). The connector's copper is present on both faces, so a cap
+    /// below its pins is electrically on them; only horizontal distance
+    /// decides. Same 1.61 mm geometry as the #411 repro, C1 flipped to the
+    /// back: J1's pads are `(layers "*.Cu" "*.Mask")`, so the exemption holds
+    /// and the score stays 85.
+    #[tokio::test]
+    async fn a_cap_on_the_far_face_of_a_through_hole_connector_is_still_interface_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = fixture_with_moved_root("(at 20 15)", "(at 16 20)");
+        let flipped = flip_footprint_to_back(&moved, "C1");
+        let board = write_variant(&dir, "cap_under_tht_connector.kicad_pcb", flipped);
+
+        let response = score(&board).await;
+        assert_eq!(response["score"], 85, "{response}");
+        let deductions = response["deductions"].as_array().unwrap();
+        assert_eq!(deductions.len(), 1, "{response}");
+        assert_eq!(deductions[0]["references"], json!(["C2"]));
+
+        let filters = response["interface_filter_caps"].as_array().unwrap();
+        assert_eq!(filters.len(), 1, "{response}");
+        assert_eq!(filters[0]["reference"], "C1");
+        assert_eq!(filters[0]["connector"], "J1");
+        assert_eq!(filters[0]["connector_distance_mm"], 1.61);
+    }
+
+    /// The far-face allowance is the through-hole copper, not the geometry.
+    /// Identical board to the test above, except J1's pads are retagged from
+    /// `*.Cu` to `F.Cu` — an SMD header, whose copper a cap on B.Cu cannot
+    /// touch however close it looks from above. The exemption must not fire,
+    /// so C1 deducts again at its 5.3 mm from U1 and the score returns to 70.
+    #[tokio::test]
+    async fn a_cap_on_the_far_face_of_a_surface_mount_connector_is_not_interface_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = fixture_with_moved_root("(at 20 15)", "(at 16 20)");
+        let flipped = flip_footprint_to_back(&moved, "C1");
+        let smd_header = make_pads_surface_mount(&flipped, "J1");
+        let board = write_variant(&dir, "cap_under_smd_connector.kicad_pcb", smd_header);
+
+        let response = score(&board).await;
+        assert_eq!(response["score"], 70, "{response}");
+        let deductions = response["deductions"].as_array().unwrap();
+        assert_eq!(deductions.len(), 1, "{response}");
+        assert_eq!(deductions[0]["points"], 30);
+        let refs = deductions[0]["references"].as_array().unwrap();
+        assert!(
+            refs.contains(&json!("C1")) && refs.contains(&json!("C2")),
+            "{response}"
+        );
+        assert!(
+            deductions[0]["detail"].as_str().unwrap().contains("5.3"),
+            "{response}"
+        );
+        assert_eq!(
+            response["interface_filter_caps"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    /// One shared net is not enough. A two-terminal filter cap belongs to the
+    /// cable only if the connector carries BOTH of its nets; sharing just the
+    /// board-wide ground makes any cap that drifts near any connector look
+    /// like interface filtering. J1's VCC pad is retagged to /SIG_IN, a net J1
+    /// already owns, leaving GND as the single overlap with C1. Geometry is
+    /// untouched — 1.61 mm from J1, 5.3 mm from U1 — so only the net rule can
+    /// decide, and it deducts.
+    #[tokio::test]
+    async fn a_cap_sharing_only_ground_with_the_connector_still_deducts() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = fixture_with_moved_root("(at 20 15)", "(at 16 20)");
+        let ground_only = rewrite_footprint_nets(&moved, "J1", &[("VCC", "/SIG_IN")]);
+        let board = write_variant(&dir, "cap_sharing_only_ground.kicad_pcb", ground_only);
 
         let response = score(&board).await;
         assert_eq!(response["score"], 70, "{response}");
