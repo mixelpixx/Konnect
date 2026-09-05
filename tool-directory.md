@@ -284,7 +284,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 
 | Tool | Description |
 |------|-------------|
-| `score_placement` | Score the placement 0-100 with named deductions (courtyard overlaps, off-board parts, connector edge distance, decoupling distance). Hard failures decide the verdict regardless of the numeric score; a missing outline blocks a pass rather than passing silently. |
+| `score_placement` | Score the placement 0-100 with named deductions (courtyard overlaps, off-board parts, connector edge distance, decoupling distance). Hard failures decide the verdict regardless of the numeric score; a missing outline blocks a pass rather than passing silently. A cap sitting on a connector's own pins for cable filtering is judged against that connector instead of the nearest IC, and every such waiver is listed in `interface_filter_caps` — evidence that the check ran and was answered, not a separate score. |
 | `place_decoupling_caps` | Plan (dry-run default) or apply a row of decoupling caps beside an IC, paired by shared nets, never reference guessing; the response carries the board score before and after the plan. |
 | `plan_bga_fanout` | Plan a BGA fanout with the pitch detected from the pad grid: dogbone or inline vias for inner pads, stub traces, conservative via sizes. Apply executes the whole plan as one KiCad undo commit over live IPC. |
 | `auto_place_from_schematic` | Deterministic first placement: net-clustered groups laid out as grids inside the outline, courtyards non-overlapping; explicitly a starting point, with before/after scores in the response. |

@@ -3,6 +3,25 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `score_placement` reports interface filter caps (minor release)
+
+`score_placement`'s decoupling deduction no longer fires on a capacitor placed on
+a connector's own pins for cable/EMI filtering (#411). A cap beyond its value
+family's limit from the nearest shared-net IC is exempted only when a `J*`
+connector carries **every** net that cap carries and its courtyard edge is within
+that same limit of the cap's center. The cap must be on the connector's face,
+unless the connector's pads carrying those nets reach both copper faces — a
+plated through-hole pin, not an SMD one.
+
+Results add `interface_filter_caps`: one entry per exempted cap, with
+`reference`, `value`, `connector`, `connector_distance_mm`, and `limit_mm`. It is
+evidence rather than a score — an exempted cap deducts nothing, and a waiver that
+vanished silently would be indistinguishable from a check that never ran. The
+array is empty on boards without such caps.
+
+No tool, argument, or existing response field was renamed or removed. This
+additive response field is planned for the next minor release.
+
 ## Unreleased: type-safe trace deletion (minor release)
 
 `delete_trace` now accepts only a UUID observed in the requested live board's
