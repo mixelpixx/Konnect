@@ -791,6 +791,37 @@ pub struct PadSite {
     /// reachable from both sides regardless; this records where its
     /// footprint sits.
     pub layer_side: Side,
+    /// Whether this pad's own copper reaches both faces of the board — true
+    /// for a plated through-hole pin, false for surface-mount copper. Read
+    /// from the pad's `(layers …)` stack: `*.Cu` is KiCad's every-copper-layer
+    /// wildcard, and an explicit stack qualifies only when it names both
+    /// `F.Cu` and `B.Cu`. This is what `layer_side` cannot answer — a part on
+    /// the far face can touch a through-hole pin's copper and cannot touch an
+    /// SMD pad's.
+    pub reaches_both_faces: bool,
+}
+
+/// Does this pad's copper reach both faces of the board?
+///
+/// `*.Cu` is KiCad's wildcard for every copper layer, which is how it writes a
+/// plated through-hole pin; an explicit stack has to name both outer coppers to
+/// mean the same thing. A pad with no `(layers …)` at all is read as
+/// single-face: absent evidence of a plated hole is not evidence of one.
+fn pad_reaches_both_faces(pad: &SexpNode) -> bool {
+    let Some(children) = pad.find("layers").and_then(SexpNode::children) else {
+        return false;
+    };
+    let mut front = false;
+    let mut back = false;
+    for layer in children.iter().skip(1).filter_map(SexpNode::as_str) {
+        match layer {
+            "*.Cu" => return true,
+            "F.Cu" => front = true,
+            "B.Cu" => back = true,
+            _ => {}
+        }
+    }
+    front && back
 }
 
 /// Net-keyed index over a board's pads and routed segments.
@@ -852,6 +883,7 @@ impl PcbConnectivityIndex {
                         pad_number,
                         at,
                         layer_side,
+                        reaches_both_faces: pad_reaches_both_faces(pad),
                     })
                 })();
                 let Some(site) = site else {
