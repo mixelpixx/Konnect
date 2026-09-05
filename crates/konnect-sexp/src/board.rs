@@ -31,6 +31,7 @@
 
 use crate::net;
 use crate::parser::SexpNode;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Every footprint on a board, in file order.
@@ -940,6 +941,107 @@ impl PcbConnectivityIndex {
     }
 }
 
+// ─── UUID ownership index ─────────────────────────────────────────────────────
+
+/// What owns one UUID-addressable item on a board.
+///
+/// The distinction is structural, never inferred from prose: a node that is a
+/// direct child of `(kicad_pcb …)` is board-owned, and a node nested inside a
+/// `(footprint …)` is owned by that footprint. Nothing here reads a
+/// human-readable description like `"Circle of J1"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ItemOwner {
+    /// A top-level board item. A `(footprint …)` node is itself one of these:
+    /// the footprint is placed on the board, so the node indexes as
+    /// board-owned with `item_kind: "footprint"`, while everything inside it
+    /// indexes as footprint-owned.
+    Board,
+    /// An item inside a footprint — its pads, its `fp_*` artwork, its
+    /// properties. Fabrication geometry here is still fabrication geometry; a
+    /// footprint-owned `Edge.Cuts` circle is a real cutout. Ownership decides
+    /// the remedy (edit the footprint) rather than the validity of a finding.
+    Footprint {
+        /// The reference designator, when the footprint declares one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+        /// The footprint's own UUID, when it has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
+}
+
+/// One entry of a board's UUID index: what the item is, where it is drawn, and
+/// what owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemIdentity {
+    /// The node's head, exactly as the board file spells it — `gr_line`,
+    /// `fp_circle`, `pad`, `segment`, `via`, `footprint`, `property`, …
+    pub item_kind: String,
+    /// The item's `(layer "…")`, when it names exactly one.
+    ///
+    /// Multi-layer items spell `(layers "F.Cu" "F.Mask" "F.Paste")` instead;
+    /// those are left `None` rather than reporting the first of several, which
+    /// would be a guess dressed as a fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Board or footprint. See [`ItemOwner`].
+    pub owner: ItemOwner,
+}
+
+/// Index every UUID-carrying node of a board by its UUID.
+///
+/// This is the lookup behind DRC ownership reporting (#413): KiCad's report
+/// items carry the UUID of the offending item but nothing about what owns it,
+/// so a `copper_edge_clearance` hit on a connector's own locking-peg cutout
+/// reads exactly like one on the board's real outline — and the remedies are
+/// opposite. Resolving the report's UUID here answers it structurally.
+///
+/// Every node with a direct `(uuid "…")` child is indexed, at any depth. A
+/// footprint's own UUID maps to the footprint node (board-owned,
+/// `item_kind: "footprint"`); its children map to that footprint.
+///
+/// A board with duplicate UUIDs is malformed; the first occurrence in file
+/// order wins and later ones are ignored.
+pub fn uuid_index(tree: &SexpNode) -> HashMap<String, ItemIdentity> {
+    let mut out = HashMap::new();
+    index_into(tree, &ItemOwner::Board, &mut out);
+    out
+}
+
+fn index_into(node: &SexpNode, owner: &ItemOwner, out: &mut HashMap<String, ItemIdentity>) {
+    let Some(children) = node.children() else {
+        return;
+    };
+    let head = node.head();
+
+    // The node's own UUID belongs to the *enclosing* owner: a footprint's uuid
+    // identifies the footprint, which sits on the board.
+    if let (Some(head), Some(uuid)) = (head, node.find_str("uuid")) {
+        out.entry(uuid.to_string()).or_insert_with(|| ItemIdentity {
+            item_kind: head.to_string(),
+            layer: node.find_str("layer").map(str::to_string),
+            owner: owner.clone(),
+        });
+    }
+
+    // Children of a footprint are owned by it; everything else inherits.
+    let inner;
+    let child_owner = if head == Some("footprint") {
+        inner = ItemOwner::Footprint {
+            reference: footprint_reference(node),
+            uuid: node.find_str("uuid").map(str::to_string),
+        };
+        &inner
+    } else {
+        owner
+    };
+
+    for child in children {
+        index_into(child, child_owner, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1528,5 +1630,141 @@ mod tests {
         assert_eq!(ix.skipped_pads(), 2);
         assert_eq!(ix.pads_of_net("N").len(), 1);
         assert_eq!(ix.pads_of_net("N")[0].reference, "U1");
+    }
+
+    /// A board with the two ownership cases side by side: a top-level
+    /// `Edge.Cuts` outline segment, and a footprint carrying its own
+    /// `Edge.Cuts` circle plus a pad.
+    const OWNERSHIP_BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(generator \"pcbnew\")\n\
+        \t(footprint \"Conn:PinSocket_1x04\"\n\
+        \t\t(layer \"F.Cu\")\n\
+        \t\t(uuid \"fp-j1\")\n\
+        \t\t(at 140 93.375)\n\
+        \t\t(property \"Reference\" \"J1\"\n\t\t\t(uuid \"prop-ref\")\n\t\t)\n\
+        \t\t(fp_circle\n\t\t\t(center 0 -3.81)\n\t\t\t(end 0.5 -3.81)\n\
+        \t\t\t(layer \"Edge.Cuts\")\n\t\t\t(uuid \"peg-hole\")\n\t\t)\n\
+        \t\t(pad \"1\" smd rect\n\t\t\t(at -1.49 -3.81 90)\n\
+        \t\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t\t(uuid \"pad-1\")\n\t\t)\n\
+        \t)\n\
+        \t(gr_line\n\t\t(start 120 56.5)\n\t\t(end 160 56.5)\n\
+        \t\t(layer \"Edge.Cuts\")\n\t\t(uuid \"outline-top\")\n\t)\n\
+        \t(gr_line\n\t\t(start 125 60)\n\t\t(end 135 60)\n\
+        \t\t(layer \"F.SilkS\")\n\t\t(uuid \"silk-note\")\n\t)\n\
+        )";
+
+    /// The board's own outline and an unrelated board graphic are top-level
+    /// children of `(kicad_pcb …)`, so both are board-owned — and the layer
+    /// they are drawn on has nothing to do with it.
+    #[test]
+    fn top_level_items_are_board_owned() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+
+        assert_eq!(
+            index.get("outline-top"),
+            Some(&ItemIdentity {
+                item_kind: "gr_line".to_string(),
+                layer: Some("Edge.Cuts".to_string()),
+                owner: ItemOwner::Board,
+            })
+        );
+        assert_eq!(
+            index.get("silk-note"),
+            Some(&ItemIdentity {
+                item_kind: "gr_line".to_string(),
+                layer: Some("F.SilkS".to_string()),
+                owner: ItemOwner::Board,
+            })
+        );
+    }
+
+    /// The whole point of #413: an `Edge.Cuts` circle nested in J1 is
+    /// indistinguishable from the board outline by layer, by node shape, and by
+    /// KiCad's prose. Only its position in the tree tells them apart.
+    #[test]
+    fn footprint_children_name_their_footprint() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+
+        let owner = ItemOwner::Footprint {
+            reference: Some("J1".to_string()),
+            uuid: Some("fp-j1".to_string()),
+        };
+        assert_eq!(
+            index.get("peg-hole"),
+            Some(&ItemIdentity {
+                item_kind: "fp_circle".to_string(),
+                layer: Some("Edge.Cuts".to_string()),
+                owner: owner.clone(),
+            })
+        );
+        // A pad spells `(layers …)`, not `(layer …)`; naming one of its three
+        // would be a guess, so the layer stays unset while ownership does not.
+        assert_eq!(
+            index.get("pad-1"),
+            Some(&ItemIdentity {
+                item_kind: "pad".to_string(),
+                layer: None,
+                owner: owner.clone(),
+            })
+        );
+        // Properties are footprint children too — the index is by depth, not
+        // by a list of interesting node names.
+        assert_eq!(index.get("prop-ref").map(|i| &i.owner), Some(&owner));
+    }
+
+    /// A `(footprint …)` node is itself a top-level board item. Indexing it as
+    /// footprint-owned would make it its own owner, which is not a statement
+    /// about where it sits.
+    #[test]
+    fn the_footprint_node_itself_is_a_board_item() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+
+        assert_eq!(
+            index.get("fp-j1"),
+            Some(&ItemIdentity {
+                item_kind: "footprint".to_string(),
+                layer: Some("F.Cu".to_string()),
+                owner: ItemOwner::Board,
+            })
+        );
+    }
+
+    /// A UUID the board does not carry has no entry. Returning a board-owned
+    /// default would be the exact wrong answer for the case #413 is about.
+    #[test]
+    fn an_unknown_uuid_has_no_entry() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+        assert!(!index.contains_key("ffffffff-ffff-4fff-8fff-ffffffffffff"));
+    }
+
+    /// `owner` serialises as the maintainer specified in #413: a `kind`
+    /// discriminant, with the footprint's reference and UUID beside it.
+    #[test]
+    fn owner_serialises_with_a_kind_discriminant() {
+        assert_eq!(
+            serde_json::to_value(ItemOwner::Board).unwrap(),
+            serde_json::json!({ "kind": "board" })
+        );
+        assert_eq!(
+            serde_json::to_value(ItemOwner::Footprint {
+                reference: Some("J1".to_string()),
+                uuid: Some("fp-j1".to_string()),
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "footprint", "reference": "J1", "uuid": "fp-j1" })
+        );
+        assert_eq!(
+            serde_json::to_value(ItemOwner::Footprint {
+                reference: None,
+                uuid: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "footprint" })
+        );
     }
 }

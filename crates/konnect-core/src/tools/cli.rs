@@ -9,7 +9,9 @@
 //!   pcb render
 
 use anyhow::{Context, Result};
+use konnect_sexp::board::{ItemIdentity, ItemOwner};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -52,6 +54,11 @@ pub struct ErcViolation {
 
 /// One item involved in an ERC or DRC violation. Both reports use the same
 /// item shape, so both parsers decode it the same way.
+///
+/// The four ownership fields are filled in by [`enrich_drc_items`] on the DRC
+/// path only — ERC has no board to index — and every one of them serialises
+/// away when it was never set, so the ERC response and any caller that ignores
+/// them see exactly the shape they saw before (#413).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportItem {
     pub description: String,
@@ -60,6 +67,73 @@ pub struct ReportItem {
     /// shape both the ERC and DRC responses have always had.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
+    /// Whether ownership was resolved, and if not, why. Absent when ownership
+    /// enrichment did not run at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_status: Option<OwnershipStatus>,
+    /// The board node's head — `fp_circle`, `gr_line`, `pad`, `segment`, … —
+    /// as the `.kicad_pcb` spells it. Only set when the item resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_kind: Option<String>,
+    /// The resolved item's single `(layer …)`, when it names one. Only set
+    /// when the item resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Three states, which is why this is nested:
+    ///
+    /// - outer `None` — enrichment never ran (ERC, or the board could not be
+    ///   re-read); the key is absent from the JSON entirely.
+    /// - `Some(None)` — enrichment ran and could not resolve the item; the key
+    ///   serialises as `"owner": null`, paired with an `ownership_status` that
+    ///   says why.
+    /// - `Some(Some(owner))` — resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Option<ItemOwner>>,
+}
+
+/// Why a DRC report item does or does not name an owner.
+///
+/// Only ever set from an exact UUID lookup against the saved board. There is
+/// deliberately no "guessed" state: inferring ownership from a description
+/// like `"Circle of J1"` is what this field exists to replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipStatus {
+    /// The item's UUID was found in the board; `owner` names what owns it.
+    Resolved,
+    /// KiCad reported this item without a UUID, so there is nothing to look
+    /// up. `owner` is null.
+    UuidMissing,
+    /// The item's UUID is not in the board Konnect indexed — a stale report,
+    /// or a board saved after the run. `owner` is null.
+    NotFound,
+}
+
+impl ReportItem {
+    /// Resolve this item against a board's UUID index, in place.
+    ///
+    /// Exact UUID match or nothing: an unmatched item is left explicitly
+    /// unresolved rather than defaulted to `board`, because "we could not tell"
+    /// and "the board owns it" lead to opposite repairs.
+    fn resolve_ownership(&mut self, index: &HashMap<String, ItemIdentity>) {
+        let Some(uuid) = self.uuid.as_deref() else {
+            self.ownership_status = Some(OwnershipStatus::UuidMissing);
+            self.owner = Some(None);
+            return;
+        };
+        match index.get(uuid) {
+            Some(identity) => {
+                self.ownership_status = Some(OwnershipStatus::Resolved);
+                self.item_kind = Some(identity.item_kind.clone());
+                self.layer = identity.layer.clone();
+                self.owner = Some(Some(identity.owner.clone()));
+            }
+            None => {
+                self.ownership_status = Some(OwnershipStatus::NotFound);
+                self.owner = Some(None);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -113,6 +187,15 @@ impl DrcReport {
             .iter()
             .chain(self.unconnected_items.iter().flatten())
             .chain(self.schematic_parity.iter().flatten())
+    }
+
+    /// Every finding across every category, mutably — the enrichment pass
+    /// walks this so no category can be left behind (#413).
+    fn all_mut(&mut self) -> impl Iterator<Item = &mut DrcViolation> {
+        self.violations
+            .iter_mut()
+            .chain(self.unconnected_items.iter_mut().flatten())
+            .chain(self.schematic_parity.iter_mut().flatten())
     }
 
     pub fn error_count(&self) -> usize {
@@ -400,6 +483,12 @@ fn parse_report_item(item: &serde_json::Value) -> ReportItem {
         description: item["description"].as_str().unwrap_or("").to_string(),
         pos: parse_item_pos(item),
         uuid: item["uuid"].as_str().map(String::from),
+        // Filled in on the DRC path by `enrich_drc_items`; ERC leaves them
+        // unset and they serialise away.
+        ownership_status: None,
+        item_kind: None,
+        layer: None,
+        owner: None,
     }
 }
 
@@ -437,7 +526,55 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     let raw: serde_json::Value = serde_json::from_str(&json_str)?;
     let _ = tokio::fs::remove_file(&out_path).await;
 
-    parse_drc_report(&raw)
+    let mut report = parse_drc_report(&raw)?;
+
+    // Ownership comes from the exact board this DRC ran on, and it is attached
+    // here — the one path `run_drc` and `get_drc_violations` share — so the two
+    // tools cannot report different ownership for the same violation (#413).
+    //
+    // A report with nothing to annotate does not pay for the board re-read and
+    // parse: a clean board is the common case, and `run_drc` is called once per
+    // candidate inside the routing loop.
+    if report.all().any(|violation| !violation.items.is_empty()) {
+        match tokio::fs::read_to_string(pcb).await {
+            Ok(source) => enrich_drc_items(&mut report, &source),
+            Err(error) => warn!(
+                "[BETA] DRC ownership enrichment skipped: could not re-read {}: {error}",
+                pcb.display()
+            ),
+        }
+    }
+
+    Ok(report)
+}
+
+/// Name what owns every item of every violation, by exact UUID.
+///
+/// A `copper_edge_clearance` item reads identically whether the offending
+/// `Edge.Cuts` geometry is the board outline or a cutout that a footprint
+/// carries in its own artwork, and the repairs are opposite: move the part, or
+/// edit the part's footprint. Footprint ownership does not make the finding
+/// false — a footprint-owned cutout is still fabrication geometry, still cut
+/// out of the board — it selects the remedy (#413).
+///
+/// Best effort by design: a board that will not parse leaves every item exactly
+/// as KiCad reported it, because withholding DRC results over a failed lookup
+/// would be a worse answer than an unannotated one. Split out of [`run_drc`] so
+/// it is testable against a board/report pair with no `kicad-cli` present.
+fn enrich_drc_items(report: &mut DrcReport, board_source: &str) {
+    let tree = match konnect_sexp::parse_sexp(board_source) {
+        Ok(tree) => tree,
+        Err(error) => {
+            warn!("[BETA] DRC ownership enrichment skipped: board did not parse: {error}");
+            return;
+        }
+    };
+    let index = konnect_sexp::board::uuid_index(&tree);
+    for violation in report.all_mut() {
+        for item in &mut violation.items {
+            item.resolve_ownership(&index);
+        }
+    }
 }
 
 /// Split out so it can be tested against a real `kicad-cli` report without
@@ -1887,5 +2024,372 @@ mod bom_export_tests {
                 "/s.kicad_sch"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod drc_ownership_tests {
+    //! Issue #413: a `copper_edge_clearance` item reads the same whether the
+    //! offending `Edge.Cuts` geometry is the board outline or a cutout a
+    //! footprint carries in its own artwork, and the two need opposite repairs.
+    //!
+    //! Footprint ownership is not a false positive. J1's circles below are real
+    //! cutouts in real copper; naming their owner says *edit the footprint*
+    //! rather than *move the part*, nothing more.
+    //!
+    //! The fixture pair's provenance — which bytes KiCad wrote and which were
+    //! added by hand — is in `tests/fixtures/drc_ownership_j1.README.md`.
+
+    use super::*;
+
+    const BOARD: &str = include_str!("../../tests/fixtures/drc_ownership_j1.kicad_pcb");
+    const REPORT: &str = include_str!("../../tests/fixtures/drc_ownership_j1.drc.json");
+
+    /// UUIDs KiCad itself wrote, quoted from the fixture.
+    const J1_FOOTPRINT: &str = "b432574a-bdcd-4387-8d5e-65f34938c3a0";
+    const J1_PEG_CIRCLE: &str = "7b970478-1e4a-48b6-b01a-35348027ca5e";
+    const J1_PAD_1: &str = "5bc25fc3-1886-4e08-a602-7e08cc66255e";
+    /// UUIDs of the hand-added board-level items (see the fixture README).
+    const BOARD_OUTLINE: &str = "e0000000-0000-4000-8000-000000000004";
+    const BOARD_SILK: &str = "50000000-0000-4000-8000-000000000001";
+    const UNKNOWN: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+
+    fn enriched() -> DrcReport {
+        let raw: serde_json::Value = serde_json::from_str(REPORT).unwrap();
+        let mut report = parse_drc_report(&raw).unwrap();
+        enrich_drc_items(&mut report, BOARD);
+        report
+    }
+
+    fn by_uuid<'a>(report: &'a DrcReport, uuid: &str) -> &'a ReportItem {
+        report
+            .all()
+            .flat_map(|violation| violation.items.iter())
+            .find(|item| item.uuid.as_deref() == Some(uuid))
+            .unwrap_or_else(|| panic!("no report item carries uuid {uuid}"))
+    }
+
+    fn footprint_j1() -> ItemOwner {
+        ItemOwner::Footprint {
+            reference: Some("J1".to_string()),
+            uuid: Some(J1_FOOTPRINT.to_string()),
+        }
+    }
+
+    /// The reported case. `"Circle of J1 on Edge.Cuts"` is prose; the structured
+    /// answer has to come from the board, and it has to say J1.
+    #[test]
+    fn a_footprint_owned_edge_cuts_circle_names_its_footprint() {
+        let report = enriched();
+        let circle = by_uuid(&report, J1_PEG_CIRCLE);
+
+        assert_eq!(circle.description, "Circle of J1 on Edge.Cuts");
+        assert_eq!(circle.ownership_status, Some(OwnershipStatus::Resolved));
+        assert_eq!(circle.item_kind.as_deref(), Some("fp_circle"));
+        assert_eq!(circle.layer.as_deref(), Some("Edge.Cuts"));
+        assert_eq!(circle.owner, Some(Some(footprint_j1())));
+    }
+
+    /// The other half of the violation. Pad and cutout belonging to the same
+    /// footprint is exactly what makes "move J1" the wrong advice: they move
+    /// together, so their mutual clearance cannot change.
+    #[test]
+    fn a_pad_names_the_footprint_that_carries_it() {
+        let report = enriched();
+        let pad = by_uuid(&report, J1_PAD_1);
+
+        assert_eq!(pad.description, "Pad 1 [GND] of J1 on F.Cu");
+        assert_eq!(pad.ownership_status, Some(OwnershipStatus::Resolved));
+        assert_eq!(pad.item_kind.as_deref(), Some("pad"));
+        assert_eq!(pad.owner, Some(Some(footprint_j1())));
+
+        let circle = by_uuid(&report, J1_PEG_CIRCLE);
+        assert_eq!(
+            pad.owner, circle.owner,
+            "same footprint owns both items of this violation"
+        );
+    }
+
+    /// The board's real outline sits beside J1's cutouts on the same layer,
+    /// with the same node shape. Only ownership separates them.
+    #[test]
+    fn the_boards_own_outline_is_board_owned() {
+        let report = enriched();
+        let outline = by_uuid(&report, BOARD_OUTLINE);
+
+        assert_eq!(outline.ownership_status, Some(OwnershipStatus::Resolved));
+        assert_eq!(outline.item_kind.as_deref(), Some("gr_line"));
+        assert_eq!(outline.layer.as_deref(), Some("Edge.Cuts"));
+        assert_eq!(outline.owner, Some(Some(ItemOwner::Board)));
+
+        let circle = by_uuid(&report, J1_PEG_CIRCLE);
+        assert_eq!(outline.layer, circle.layer, "same layer, opposite remedy");
+        assert_ne!(outline.owner, circle.owner);
+    }
+
+    /// An unrelated board graphic, on a different layer, is board-owned too —
+    /// ownership follows the tree, not the layer.
+    #[test]
+    fn an_unrelated_board_graphic_is_board_owned() {
+        let report = enriched();
+        let silk = by_uuid(&report, BOARD_SILK);
+
+        assert_eq!(silk.ownership_status, Some(OwnershipStatus::Resolved));
+        assert_eq!(silk.layer.as_deref(), Some("F.SilkS"));
+        assert_eq!(silk.owner, Some(Some(ItemOwner::Board)));
+    }
+
+    /// KiCad reported an item with no `uuid`. There is nothing to look up, so
+    /// the answer is "unresolved", said out loud — never a board default.
+    #[test]
+    fn an_item_without_a_uuid_stays_explicitly_unresolved() {
+        let report = enriched();
+        let orphan = report
+            .all()
+            .flat_map(|violation| violation.items.iter())
+            .find(|item| item.uuid.is_none())
+            .expect("the fixture carries one item with no uuid");
+
+        assert_eq!(orphan.ownership_status, Some(OwnershipStatus::UuidMissing));
+        assert_eq!(orphan.owner, Some(None), "explicitly null, not board");
+        assert_eq!(orphan.item_kind, None);
+        assert_eq!(orphan.layer, None);
+        assert_eq!(
+            serde_json::to_value(orphan).unwrap()["owner"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A UUID the board does not carry — a stale report, or a board saved after
+    /// the run. Also unresolved, and distinguishable from the case above.
+    #[test]
+    fn an_unknown_uuid_stays_explicitly_unresolved() {
+        let report = enriched();
+        let stale = by_uuid(&report, UNKNOWN);
+
+        assert_eq!(stale.ownership_status, Some(OwnershipStatus::NotFound));
+        assert_eq!(stale.owner, Some(None), "explicitly null, not board");
+        assert_eq!(stale.item_kind, None);
+    }
+
+    /// No ownership answer is ever derived from `"Circle of J1"`. Rename every
+    /// reference designator in the board and the same items stop resolving to a
+    /// footprint reference, because only the UUID index is consulted.
+    #[test]
+    fn ownership_never_comes_from_the_description() {
+        let renamed = BOARD.replace("\"Reference\" \"J1\"", "\"Reference\" \"J9\"");
+        assert_ne!(renamed, BOARD, "the fixture must contain J1's reference");
+
+        let raw: serde_json::Value = serde_json::from_str(REPORT).unwrap();
+        let mut report = parse_drc_report(&raw).unwrap();
+        enrich_drc_items(&mut report, &renamed);
+
+        let circle = by_uuid(&report, J1_PEG_CIRCLE);
+        assert_eq!(
+            circle.description, "Circle of J1 on Edge.Cuts",
+            "KiCad's prose is passed through untouched"
+        );
+        assert_eq!(
+            circle.owner,
+            Some(Some(ItemOwner::Footprint {
+                reference: Some("J9".to_string()),
+                uuid: Some(J1_FOOTPRINT.to_string()),
+            })),
+            "the reference comes from the board, never from the description"
+        );
+    }
+
+    /// The raw KiCad text is API. Enrichment is additive or it is a breaking
+    /// change wearing a feature's clothes.
+    #[test]
+    fn the_raw_kicad_fields_are_untouched() {
+        let raw: serde_json::Value = serde_json::from_str(REPORT).unwrap();
+        let plain = parse_drc_report(&raw).unwrap();
+        let report = enriched();
+
+        for (before, after) in plain.all().zip(report.all()) {
+            assert_eq!(before.description, after.description);
+            assert_eq!(before.rule, after.rule);
+            assert_eq!(before.severity, after.severity);
+            assert_eq!(before.items.len(), after.items.len());
+            for (before, after) in before.items.iter().zip(after.items.iter()) {
+                assert_eq!(before.description, after.description);
+                assert_eq!(before.uuid, after.uuid);
+                assert_eq!(
+                    before.pos.map(|p| (p.x, p.y)),
+                    after.pos.map(|p| (p.x, p.y))
+                );
+            }
+        }
+    }
+
+    /// The exact JSON a caller sees. Named fields, `owner: null` where
+    /// unresolved, and nothing removed from what shipped before.
+    #[test]
+    fn the_response_shape_is_additive() {
+        let report = enriched();
+
+        assert_eq!(
+            serde_json::to_value(by_uuid(&report, J1_PEG_CIRCLE)).unwrap(),
+            serde_json::json!({
+                "description": "Circle of J1 on Edge.Cuts",
+                "pos": { "x": 136.19, "y": 93.375 },
+                "uuid": J1_PEG_CIRCLE,
+                "ownership_status": "resolved",
+                "item_kind": "fp_circle",
+                "layer": "Edge.Cuts",
+                "owner": { "kind": "footprint", "reference": "J1", "uuid": J1_FOOTPRINT },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(by_uuid(&report, BOARD_OUTLINE)).unwrap(),
+            serde_json::json!({
+                "description": "Segment on Edge.Cuts",
+                "pos": { "x": 120.0, "y": 100.0 },
+                "uuid": BOARD_OUTLINE,
+                "ownership_status": "resolved",
+                "item_kind": "gr_line",
+                "layer": "Edge.Cuts",
+                "owner": { "kind": "board" },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(by_uuid(&report, UNKNOWN)).unwrap(),
+            serde_json::json!({
+                "description": "Track [SDA] on F.Cu",
+                "pos": { "x": 159.9, "y": 57.0 },
+                "uuid": UNKNOWN,
+                "ownership_status": "not_found",
+                "owner": serde_json::Value::Null,
+            })
+        );
+    }
+
+    /// ERC shares `ReportItem` and has no board to index. Its items must
+    /// serialise exactly as they did before this change.
+    #[test]
+    fn erc_items_carry_no_ownership_fields() {
+        let item = parse_report_item(&serde_json::json!({
+            "description": "Symbol R1 Pin 1",
+            "pos": { "x": 1.0, "y": 2.0 },
+            "uuid": "erc-item"
+        }));
+
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            serde_json::json!({
+                "description": "Symbol R1 Pin 1",
+                "pos": { "x": 1.0, "y": 2.0 },
+                "uuid": "erc-item",
+            }),
+            "an unenriched item must not grow keys"
+        );
+
+        let no_uuid = parse_report_item(&serde_json::json!({ "description": "Pin" }));
+        assert_eq!(
+            serde_json::to_value(&no_uuid).unwrap(),
+            serde_json::json!({ "description": "Pin", "pos": serde_json::Value::Null })
+        );
+    }
+
+    /// `unconnected_items` and `schematic_parity` are DRC findings too. Missing
+    /// them would reintroduce the split this change exists to close.
+    #[test]
+    fn every_drc_category_is_enriched() {
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/drc_report_kicad10.json"))
+                .unwrap();
+        let mut report = parse_drc_report(&raw).unwrap();
+        assert!(!report.unconnected_items.as_ref().unwrap().is_empty());
+        enrich_drc_items(&mut report, BOARD);
+
+        let statuses: Vec<_> = report
+            .all()
+            .flat_map(|violation| violation.items.iter())
+            .map(|item| item.ownership_status)
+            .collect();
+        assert!(!statuses.is_empty());
+        assert!(
+            statuses.iter().all(|status| status.is_some()),
+            "every item of every category is answered: {statuses:?}"
+        );
+        // That report came from a different board, so nothing resolves — which
+        // is the honest answer, not a board default.
+        assert!(statuses
+            .iter()
+            .all(|status| *status == Some(OwnershipStatus::NotFound)));
+    }
+
+    /// A board Konnect cannot parse must not cost the caller their DRC results.
+    /// The items come back exactly as KiCad reported them, with no ownership
+    /// keys at all — which is also how a caller tells "unanswered" from
+    /// "answered: unresolved".
+    #[test]
+    fn an_unparseable_board_leaves_the_report_untouched() {
+        let raw: serde_json::Value = serde_json::from_str(REPORT).unwrap();
+        let mut report = parse_drc_report(&raw).unwrap();
+        enrich_drc_items(&mut report, "");
+
+        let item = by_uuid(&report, J1_PEG_CIRCLE);
+        assert_eq!(item.ownership_status, None);
+        assert_eq!(item.owner, None);
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            serde_json::json!({
+                "description": "Circle of J1 on Edge.Cuts",
+                "pos": { "x": 136.19, "y": 93.375 },
+                "uuid": J1_PEG_CIRCLE,
+            })
+        );
+    }
+
+    /// The same assertions against a report `kicad-cli` produces right now,
+    /// rather than one committed months ago. Needs a real KiCad, so it is
+    /// ignored like the other live tests:
+    ///
+    ///     cargo test -p konnect-core --lib drc_ownership -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli on PATH"]
+    async fn run_drc_enriches_items_from_the_board_it_ran_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("drc_ownership_j1.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let report = run_drc(&cli, &board, false)
+            .await
+            .expect("kicad-cli pcb drc on the fixture board");
+
+        let items: Vec<&ReportItem> = report
+            .all()
+            .flat_map(|violation| violation.items.iter())
+            .collect();
+        assert!(!items.is_empty(), "the fixture board is not DRC-clean");
+        assert!(
+            items.iter().all(|item| item.ownership_status.is_some()),
+            "run_drc must answer ownership for every item it returns"
+        );
+
+        let j1 = ItemOwner::Footprint {
+            reference: Some("J1".to_string()),
+            uuid: Some(J1_FOOTPRINT.to_string()),
+        };
+        assert!(
+            items
+                .iter()
+                .any(|item| item.owner == Some(Some(j1.clone()))),
+            "J1's own Edge.Cuts cutouts and pads are footprint-owned"
+        );
+        for item in &items {
+            if item.uuid.as_deref() == Some(J1_FOOTPRINT) {
+                continue;
+            }
+            if let Some(Some(ItemOwner::Board)) = &item.owner {
+                assert!(
+                    item.item_kind.as_deref() != Some("fp_circle"),
+                    "a footprint's circle can never be board-owned: {item:?}"
+                );
+            }
+        }
     }
 }

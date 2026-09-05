@@ -3,6 +3,46 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: DRC item ownership (minor release)
+
+`run_drc` and `get_drc_violations` now say what owns each item of each
+violation. Both tools go through the same `cli::run_drc`, and the enrichment
+lives there, so they cannot report different ownership for the same finding.
+
+Every item of every category — `violations`, `unconnected_items`, and
+`schematic_parity` — gains up to four additive fields:
+
+- `ownership_status`: `"resolved"`, `"uuid_missing"`, or `"not_found"`.
+- `owner`: `{"kind": "board"}` or
+  `{"kind": "footprint", "reference": "J1", "uuid": "…"}` when resolved, and
+  `null` when it is not. `reference` and `uuid` are omitted when the footprint
+  declares neither.
+- `item_kind`: the board node's head — `fp_circle`, `gr_line`, `pad`,
+  `segment`, `via`, … — when resolved.
+- `layer`: the item's single `(layer …)` when it has one. Multi-layer items
+  such as pads spell `(layers …)` and leave this unset rather than naming one
+  of several.
+
+Ownership is resolved by exact UUID against the saved `.kicad_pcb` that DRC
+just ran on. It is never inferred from KiCad's prose: an item described as
+`"Circle of J1 on Edge.Cuts"` whose UUID is absent from the board comes back
+`"ownership_status": "not_found"` with `"owner": null`, not a board default.
+An item KiCad reports without a `uuid` comes back `"uuid_missing"`.
+
+Footprint ownership does not make a finding false. A footprint-owned
+`Edge.Cuts` circle is real fabrication geometry — a real cutout in the finished
+board. Ownership selects the remedy: a pad and a cutout carried by the same
+footprint move together, so repositioning the component cannot change their
+mutual clearance and the footprint definition or the rule is what needs review.
+
+KiCad's `description`, `pos`, `uuid`, `severity`, and `rule` are unchanged. All
+four fields are omitted entirely when they were not set, so ERC results — which
+share the same item shape but have no board to index — and any caller that
+ignores the new keys see exactly the previous response. If the board cannot be
+re-read or parsed, DRC results are still returned in full, without the
+ownership fields and with a warning in the log. This additive response change is
+planned for the next minor release; no tool or argument was renamed or removed.
+
 ## Unreleased: type-safe trace deletion (minor release)
 
 `delete_trace` now accepts only a UUID observed in the requested live board's
