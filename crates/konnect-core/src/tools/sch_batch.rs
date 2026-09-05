@@ -497,7 +497,7 @@ async fn handle_batch_place_components(
         Err(error) => return Ok(error.into_tool_result()),
     };
 
-    let mut placed_uuids = Vec::new();
+    let mut placements = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for comp in &components {
@@ -527,17 +527,23 @@ async fn handle_batch_place_components(
             unit,
             &src,
         ) {
-            Ok(uuid) => placed_uuids.push(uuid),
+            Ok(uuid) => {
+                let (expected_x, expected_y) = snap_point(x, y, 1.27);
+                placements.push(super::sch_components::ComponentTargetUnit::placement(
+                    &uuid, &context, lib_id, expected_x, expected_y, rotation, reference, value,
+                    unit,
+                ));
+            }
             Err(e) => errors.push(error_text(&e)),
         }
     }
 
     let mut placed = Vec::new();
-    if !placed_uuids.is_empty() {
+    if !placements.is_empty() {
         sch.overwrite()?;
         let committed = cse::Schematic::load(&sch_path)?;
-        for uuid in &placed_uuids {
-            match placed_component_readback(&sch_path, &committed, uuid, &context) {
+        for placement in &placements {
+            match placed_component_readback(&sch_path, &committed, placement, &context) {
                 Ok(result) => placed.push(result),
                 Err(error) => return Ok(error),
             }
@@ -1803,7 +1809,7 @@ mod connectivity_safe_batch_delete_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_top_level_uuid_is_stale_and_unchanged() {
+    async fn duplicate_top_level_uuid_is_ambiguous_and_unchanged() {
         let closing = CONNECTIVITY.rfind("\n)").unwrap();
         let duplicate =
             "\t(junction\n\t\t(at 1 1)\n\t\t(uuid \"6f08a78f-7ec2-45e6-ba39-1d930be32b74\")\n\t)\n";
@@ -1821,7 +1827,10 @@ mod connectivity_safe_batch_delete_tests {
         .await
         .unwrap();
 
-        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 

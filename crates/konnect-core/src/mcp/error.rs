@@ -52,6 +52,12 @@ pub enum ToolErrorKind {
     /// A mutation conflicts with filesystem state, or schematic ownership
     /// cannot be proven uniquely. Paths identify the conflicting evidence.
     Conflict { paths: Vec<String> },
+    /// More than one observed object identifies a requested target. Clients
+    /// must choose from the returned stable candidates rather than guessing.
+    AmbiguousTarget {
+        target: String,
+        candidates: Vec<String>,
+    },
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
@@ -74,6 +80,7 @@ impl ToolErrorKind {
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
+            Self::AmbiguousTarget { .. } => "ambiguous_target",
             Self::StaleTarget { .. } => "stale_target",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::HandlerError { .. } => "handler_error",
@@ -158,6 +165,30 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_target_preserves_candidates_through_the_observer() {
+        let result = CallToolResult::error_kind(
+            ToolErrorKind::AmbiguousTarget {
+                target: "component U1".into(),
+                candidates: vec!["uuid-a".into(), "uuid-b".into()],
+            },
+            "Component U1 is ambiguous.",
+        );
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("structured error must be text JSON");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["target"], "component U1");
+        assert_eq!(
+            body["error"]["candidates"],
+            serde_json::json!(["uuid-a", "uuid-b"])
+        );
+    }
+
+    #[test]
     fn short_code_matches_serialized_kind_field() {
         // If these ever drift, clients that match on the `kind` string will
         // silently break. Pin them here.
@@ -174,6 +205,10 @@ mod tests {
             ToolErrorKind::FileNotFound { path: "p".into() },
             ToolErrorKind::Conflict {
                 paths: vec!["p".into()],
+            },
+            ToolErrorKind::AmbiguousTarget {
+                target: "t".into(),
+                candidates: vec!["a".into(), "b".into()],
             },
             ToolErrorKind::StaleTarget {
                 target: "p".into(),

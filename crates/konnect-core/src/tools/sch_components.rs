@@ -577,6 +577,10 @@ async fn handle_add_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    let (expected_x, expected_y) = snap_point(x, y, 1.27);
+    let placement = ComponentTargetUnit::placement(
+        &uuid, &context, &lib_id, expected_x, expected_y, rotation, ref_str, value, unit,
+    );
     sch.overwrite()?;
 
     // A pin landing mid-segment on an existing wire needs a junction dot, or
@@ -585,7 +589,7 @@ async fn handle_add_schematic_component(
     // path can do one junction pass for the whole batch instead of one per part.
     let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
     let committed = cse::Schematic::load(&sch_path)?;
-    let mut result = match placed_component_readback(&sch_path, &committed, &uuid, &context) {
+    let mut result = match placed_component_readback(&sch_path, &committed, &placement, &context) {
         Ok(result) => result,
         Err(error) => return Ok(error),
     };
@@ -714,13 +718,619 @@ pub(crate) fn place_one_component(
     Ok(uuid)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ComponentTargetUnit {
+    uuid: String,
+    unit: u32,
+    fields: BTreeMap<String, String>,
+    lib_id: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    instances: Vec<(String, String)>,
+}
+
+impl ComponentTargetUnit {
+    /// Bind placement intent independently of the model produced by the writer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn placement(
+        uuid: &str,
+        context: &crate::tools::SheetInstanceContext,
+        lib_id: &str,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        reference: &str,
+        value: Option<&str>,
+        unit: u32,
+    ) -> Self {
+        let mut instances = context
+            .instance_paths
+            .iter()
+            .map(|path| (context.project_name.clone(), path.clone()))
+            .collect::<Vec<_>>();
+        instances.sort();
+        Self {
+            uuid: uuid.to_owned(),
+            unit,
+            lib_id: lib_id.to_owned(),
+            x,
+            y,
+            rotation,
+            fields: BTreeMap::from([
+                ("Reference".to_owned(), reference.to_owned()),
+                (
+                    "Value".to_owned(),
+                    value
+                        .unwrap_or_else(|| lib_id.rsplit(':').next().unwrap_or(lib_id))
+                        .to_owned(),
+                ),
+            ]),
+            instances,
+        }
+    }
+}
+
+/// Inspect every record before sorting: duplicate identities and conflicting
+/// project/unit records must not be collapsed into a plausible first answer.
+fn checked_instance_paths(
+    path: &std::path::Path,
+    symbol: &cse::Symbol,
+) -> Result<Vec<(String, String)>, ComponentDeleteTargetError> {
+    let mut identities = BTreeSet::new();
+    let mut projects = BTreeSet::new();
+    for instance in symbol.instances() {
+        let (Some(project), Some(instance_path), Some(reference), Some(unit)) = (
+            instance.project,
+            instance.path,
+            instance.reference,
+            instance.unit,
+        ) else {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "component UUID {} has incomplete instance metadata",
+                    symbol.uuid
+                ),
+            ));
+        };
+        if symbol.reference() != Some(reference.as_str()) {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "component UUID {} has a conflicting instance reference",
+                    symbol.uuid
+                ),
+            ));
+        }
+        projects.insert(project.clone());
+        if unit != symbol.unit || !identities.insert((project, instance_path)) || projects.len() > 1
+        {
+            return Err(ComponentDeleteTargetError::Ambiguous {
+                target: format!("component UUID {} instance records", symbol.uuid),
+                candidates: symbol
+                    .instances()
+                    .iter()
+                    .map(|entry| format!("{entry:?}"))
+                    .collect(),
+            });
+        }
+    }
+    Ok(identities.into_iter().collect())
+}
+
+fn verify_component_expectations(
+    path: &std::path::Path,
+    observed: &serde_json::Value,
+    expected: &[ComponentTargetUnit],
+) -> Result<(), CallToolResult> {
+    for target in expected {
+        let unit = observed["units"]
+            .as_array()
+            .and_then(|units| {
+                units
+                    .iter()
+                    .find(|unit| unit["uuid"].as_str() == Some(&target.uuid))
+            })
+            .ok_or_else(|| {
+                ComponentDeleteTargetError::stale(path, "bound unit missing from readback")
+                    .into_result()
+            })?;
+        // Separate comparisons keep each identity/intent obligation explicit.
+        for (field, matches) in [
+            (
+                "unit",
+                unit["unit"].as_u64() == Some(u64::from(target.unit)),
+            ),
+            ("lib_id", unit["lib_id"].as_str() == Some(&target.lib_id)),
+            (
+                "x",
+                unit["x"]
+                    .as_f64()
+                    .is_some_and(|v| (v - target.x).abs() < 1e-6),
+            ),
+            (
+                "y",
+                unit["y"]
+                    .as_f64()
+                    .is_some_and(|v| (v - target.y).abs() < 1e-6),
+            ),
+            (
+                "rotation",
+                unit["rotation"]
+                    .as_f64()
+                    .is_some_and(|v| (v - target.rotation).abs() < 1e-6),
+            ),
+            (
+                "instance_paths",
+                unit["instance_paths"] == json!(target.instances),
+            ),
+        ] {
+            if !matches {
+                return Err(ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "post-write {field} differs from bound intent for UUID {}",
+                        target.uuid
+                    ),
+                )
+                .into_result());
+            }
+        }
+        for (field, value) in &target.fields {
+            if unit["fields"][field].as_str() != Some(value) {
+                return Err(ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "post-write property {field} differs from bound intent for UUID {}",
+                        target.uuid
+                    ),
+                )
+                .into_result());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ComponentTarget {
+    reference: String,
+    units: Vec<ComponentTargetUnit>,
+}
+
+impl ComponentTarget {
+    fn with_fields(&self, fields: &BTreeMap<String, String>) -> Self {
+        let mut expected = self.clone();
+        if let Some(reference) = fields.get("Reference") {
+            expected.reference = reference.clone();
+        }
+        for unit in &mut expected.units {
+            unit.fields.extend(fields.clone());
+        }
+        expected
+    }
+
+    fn uuids(&self) -> Vec<String> {
+        self.units.iter().map(|unit| unit.uuid.clone()).collect()
+    }
+
+    fn item_ids(&self) -> Result<Vec<ItemId>, ComponentDeleteTargetError> {
+        self.units
+            .iter()
+            .map(|unit| {
+                ItemId::new(unit.uuid.clone()).map_err(|error| ComponentDeleteTargetError::Stale {
+                    target: format!("component {}", self.reference),
+                    reason: error.to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+fn component_target_from_source(
+    path: &std::path::Path,
+    content: &str,
+    reference: &str,
+) -> Result<ComponentTarget, ComponentDeleteTargetError> {
+    let tree =
+        parse_sexp(content).map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+    let indexed = indexed_uuid_items(path, content)?;
+    let instances = extract_symbol_instances(&tree)
+        .into_iter()
+        .filter(|instance| instance.reference == reference)
+        .collect::<Vec<_>>();
+    if instances.is_empty() {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            format!("component {reference} is not present"),
+        ));
+    }
+
+    let mut by_unit: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut units = Vec::new();
+    for instance in instances {
+        let uuid = instance.uuid.ok_or_else(|| {
+            ComponentDeleteTargetError::stale(
+                path,
+                format!("component {reference} unit {} has no UUID", instance.unit),
+            )
+        })?;
+        let Some(item) = indexed.get(&uuid) else {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("component {reference} UUID {uuid} is not a top-level item"),
+            ));
+        };
+        if item.kind != "symbol" {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("component {reference} UUID {uuid} identifies {}", item.kind),
+            ));
+        }
+        let node = parse_sexp(&item.source)
+            .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+        let mut fields = BTreeMap::new();
+        for property in node.find_all("property") {
+            let Some(name) = property.get(1).and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let value = property
+                .get(2)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if fields.insert(name.to_owned(), value.to_owned()).is_some() {
+                return Err(ComponentDeleteTargetError::Ambiguous {
+                    target: format!("component {reference} unit {} field {name}", instance.unit),
+                    candidates: vec![uuid.clone(), uuid],
+                });
+            }
+        }
+        for instances in node.find_all("instances") {
+            for project in instances.find_all("project") {
+                for path_node in project.find_all("path") {
+                    let Some(instance_reference) = path_node.find_str("reference") else {
+                        return Err(ComponentDeleteTargetError::stale(
+                            path,
+                            format!(
+                                "component {reference} UUID {uuid} has an instance path without a reference"
+                            ),
+                        ));
+                    };
+                    if instance_reference != reference {
+                        return Err(ComponentDeleteTargetError::stale(
+                            path,
+                            format!(
+                                "component {reference} UUID {uuid} has an instance path naming {instance_reference}"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        by_unit.entry(instance.unit).or_default().push(uuid.clone());
+        let symbol = cse::sexp::parser::parse(&item.source)
+            .and_then(|node| cse::Symbol::from_sexp(&node))
+            .map_err(|error| ComponentDeleteTargetError::stale(path, error.to_string()))?;
+        let instance_paths = checked_instance_paths(path, &symbol)?;
+        units.push(ComponentTargetUnit {
+            uuid,
+            unit: instance.unit,
+            fields,
+            lib_id: instance.lib_id,
+            x: instance.x,
+            y: instance.y,
+            rotation: instance.rotation,
+            instances: instance_paths,
+        });
+    }
+    if let Some((unit, uuids)) = by_unit.iter().find(|(_, uuids)| uuids.len() > 1) {
+        return Err(ComponentDeleteTargetError::Ambiguous {
+            target: format!("component {reference} unit {unit}"),
+            candidates: uuids.clone(),
+        });
+    }
+    if units
+        .iter()
+        .any(|unit| unit.instances != units[0].instances)
+    {
+        return Err(ComponentDeleteTargetError::Ambiguous {
+            target: format!("component {reference} hierarchy instances"),
+            candidates: units
+                .iter()
+                .map(|unit| format!("{}: {:?}", unit.uuid, unit.instances))
+                .collect(),
+        });
+    }
+    units.sort_by(|left, right| {
+        left.unit
+            .cmp(&right.unit)
+            .then_with(|| left.uuid.cmp(&right.uuid))
+    });
+    Ok(ComponentTarget {
+        reference: reference.to_owned(),
+        units,
+    })
+}
+
+fn component_mutation_readback_from_schematic(
+    path: &std::path::Path,
+    committed: &cse::Schematic,
+    expected_uuids: &[String],
+    expected_reference: Option<&str>,
+) -> Result<serde_json::Value, CallToolResult> {
+    if !super::same_schematic_document(path, committed.filepath()) {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            "component mutation readback came from a different schematic",
+        )
+        .into_result());
+    }
+    if expected_uuids.is_empty() {
+        return Err(
+            ComponentDeleteTargetError::stale(path, "no component UUIDs were bound").into_result(),
+        );
+    }
+    let expected = expected_uuids.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.len() != expected_uuids.len() {
+        return Err(ComponentDeleteTargetError::Ambiguous {
+            target: path.display().to_string(),
+            candidates: expected_uuids.to_vec(),
+        }
+        .into_result());
+    }
+    let committed_source = committed.to_source();
+    let indexed =
+        indexed_uuid_items(path, &committed_source).map_err(|error| error.into_result())?;
+    for uuid in &expected {
+        if indexed.get(uuid).is_none_or(|item| item.kind != "symbol") {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("bound UUID {uuid} no longer identifies one top-level symbol"),
+            )
+            .into_result());
+        }
+    }
+
+    let mut observed = Vec::new();
+    for uuid in &expected {
+        let matches = committed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.uuid == *uuid)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("component UUID {uuid} is absent from post-write readback"),
+            )
+            .into_result());
+        }
+        if matches.len() > 1 {
+            return Err(ComponentDeleteTargetError::Ambiguous {
+                target: format!("schematic symbol UUID {uuid}"),
+                candidates: matches.iter().map(|symbol| symbol.uuid.clone()).collect(),
+            }
+            .into_result());
+        }
+        observed.push(matches[0]);
+    }
+
+    let references = observed
+        .iter()
+        .filter_map(|symbol| symbol.reference().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    if observed.iter().any(|symbol| symbol.reference().is_none()) {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            "a bound component UUID has no observed Reference field",
+        )
+        .into_result());
+    }
+    if references.len() != 1 {
+        return Err(ComponentDeleteTargetError::Ambiguous {
+            target: path.display().to_string(),
+            candidates: references.iter().cloned().collect(),
+        }
+        .into_result());
+    }
+    let reference = references.iter().next().expect("one reference").clone();
+    if expected_reference.is_some_and(|expected| expected != reference) {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            format!(
+                "bound component UUIDs resolve to {reference}, not {}",
+                expected_reference.unwrap_or_default()
+            ),
+        )
+        .into_result());
+    }
+
+    observed.sort_by(|left, right| {
+        left.unit
+            .cmp(&right.unit)
+            .then_with(|| left.uuid.cmp(&right.uuid))
+    });
+    let mut units = Vec::new();
+    let mut component_instances = None;
+    for symbol in &observed {
+        let mut fields = BTreeMap::new();
+        for property in &symbol.properties {
+            if fields
+                .insert(property.name.clone(), property.value.clone())
+                .is_some()
+            {
+                return Err(ComponentDeleteTargetError::Ambiguous {
+                    target: format!(
+                        "component {reference} unit {} field {}",
+                        symbol.unit, property.name
+                    ),
+                    candidates: vec![symbol.uuid.clone(), symbol.uuid.clone()],
+                }
+                .into_result());
+            }
+        }
+        let instance_paths =
+            checked_instance_paths(path, symbol).map_err(|error| error.into_result())?;
+        if component_instances
+            .as_ref()
+            .is_some_and(|expected| expected != &instance_paths)
+        {
+            return Err(ComponentDeleteTargetError::Ambiguous {
+                target: format!("component {reference} hierarchy instances"),
+                candidates: observed
+                    .iter()
+                    .map(|symbol| format!("{}: {:?}", symbol.uuid, symbol.instance_paths()))
+                    .collect(),
+            }
+            .into_result());
+        }
+        component_instances = Some(instance_paths.clone());
+        let mut instance_references = Vec::new();
+        for instances in symbol
+            .raw_sub_nodes
+            .iter()
+            .filter(|node| node.tag() == Some("instances"))
+        {
+            for project in instances.find_all("project") {
+                for path_node in project.find_all("path") {
+                    let Some(instance_reference) = path_node.get_value("reference") else {
+                        return Err(ComponentDeleteTargetError::stale(
+                            path,
+                            format!(
+                                "component UUID {} has an instance path without a reference",
+                                symbol.uuid
+                            ),
+                        )
+                        .into_result());
+                    };
+                    instance_references.push(instance_reference.to_owned());
+                }
+            }
+        }
+        instance_references.sort();
+        instance_references.dedup();
+        if let Some(stale_reference) = instance_references
+            .iter()
+            .find(|instance_reference| **instance_reference != reference)
+        {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "component UUID {} renders as {reference} but an instance path still names {stale_reference}",
+                    symbol.uuid
+                ),
+            )
+            .into_result());
+        }
+        units.push(json!({
+            "uuid": symbol.uuid,
+            "unit": symbol.unit,
+            "x": symbol.at.x,
+            "y": symbol.at.y,
+            "rotation": symbol.at.rotation.unwrap_or(0.0),
+            "lib_id": symbol.lib_id,
+            "fields": fields,
+            "instance_paths": instance_paths,
+            "instance_references": instance_references
+        }));
+    }
+    let anchor = observed[0];
+    let fields = units[0]["fields"].clone();
+    Ok(json!({
+        "schematic": committed.filepath().display().to_string(),
+        "reference": reference,
+        "value": anchor.value_str().unwrap_or(""),
+        "footprint": anchor.footprint().unwrap_or(""),
+        "datasheet": anchor.datasheet().unwrap_or(""),
+        "lib_id": anchor.lib_id,
+        "uuid": anchor.uuid,
+        "x": anchor.at.x,
+        "y": anchor.at.y,
+        "rotation": anchor.at.rotation.unwrap_or(0.0),
+        "unit_count": units.len(),
+        "units": units,
+        "fields": fields
+    }))
+}
+
+fn load_component_mutation_readback(
+    path: &std::path::Path,
+    expected: &ComponentTarget,
+) -> anyhow::Result<Result<serde_json::Value, CallToolResult>> {
+    let committed = cse::Schematic::load(path)?;
+    Ok(verified_component_readback(path, &committed, expected))
+}
+
+fn verified_component_readback(
+    path: &std::path::Path,
+    committed: &cse::Schematic,
+    expected: &ComponentTarget,
+) -> Result<serde_json::Value, CallToolResult> {
+    let observed = component_mutation_readback_from_schematic(
+        path,
+        committed,
+        &expected.uuids(),
+        Some(&expected.reference),
+    )?;
+    verify_component_expectations(path, &observed, &expected.units)?;
+    Ok(observed)
+}
+
+fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_json::Value) {
+    for key in [
+        "schematic",
+        "reference",
+        "value",
+        "footprint",
+        "datasheet",
+        "lib_id",
+        "uuid",
+        "x",
+        "y",
+        "rotation",
+        "unit_count",
+        "units",
+        "fields",
+    ] {
+        result[key] = observed[key].clone();
+    }
+}
+
+fn verify_observed_field(
+    path: &std::path::Path,
+    observed: &serde_json::Value,
+    field: &str,
+    expected: &str,
+) -> Result<(), CallToolResult> {
+    let mismatches = observed["units"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|unit| unit["fields"][field].as_str() != Some(expected))
+        .map(|unit| unit["uuid"].as_str().unwrap_or("unknown").to_owned())
+        .collect::<Vec<_>>();
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(ComponentDeleteTargetError::stale(
+            path,
+            format!(
+                "post-write readback did not observe {field}={expected:?} on UUIDs {}",
+                mismatches.join(", ")
+            ),
+        )
+        .into_result())
+    }
+}
+
 /// Build a placement response only from the committed schematic that was read
 /// back after the write. The UUID is the mutation's stable identity; requested
 /// coordinates, fields, and hierarchy paths are never echoed as proof.
 pub(crate) fn placed_component_readback(
     sch_path: &std::path::Path,
     committed: &cse::Schematic,
-    uuid: &str,
+    expected: &ComponentTargetUnit,
     context: &crate::tools::SheetInstanceContext,
 ) -> Result<serde_json::Value, CallToolResult> {
     if !super::same_schematic_document(sch_path, committed.filepath()) {
@@ -730,63 +1340,43 @@ pub(crate) fn placed_component_readback(
         }
         .into_tool_result());
     }
+    let uuid = &expected.uuid;
+    let mut result = component_mutation_readback_from_schematic(
+        sch_path,
+        committed,
+        &[uuid.to_owned()],
+        expected.fields.get("Reference").map(String::as_str),
+    )?;
+    verify_component_expectations(sch_path, &result, std::slice::from_ref(expected))?;
     if let Err(error) = crate::tools::validate_sheet_instance_state(sch_path, committed, context) {
         return Err(error.into_tool_result());
     }
-    let Some(symbol) = committed.symbols.iter().find(|symbol| symbol.uuid == uuid) else {
-        return Err(crate::tools::SchematicTargetError::StaleTarget {
-            target: sch_path.to_path_buf(),
-            reason: format!("placed symbol UUID '{uuid}' is absent from post-write readback"),
-        }
-        .into_tool_result());
-    };
-    let Some(reference) = symbol.reference() else {
-        return Err(crate::tools::SchematicTargetError::StaleTarget {
-            target: sch_path.to_path_buf(),
-            reason: format!(
-                "placed symbol UUID '{}' has no Reference in post-write readback",
-                symbol.uuid
-            ),
-        }
-        .into_tool_result());
-    };
-    let Some(value) = symbol.value_str() else {
-        return Err(crate::tools::SchematicTargetError::StaleTarget {
-            target: sch_path.to_path_buf(),
-            reason: format!(
-                "placed symbol UUID '{}' has no Value in post-write readback",
-                symbol.uuid
-            ),
-        }
-        .into_tool_result());
-    };
-    let observed_instances = symbol.instance_paths();
-    let Some((project, _)) = observed_instances.first() else {
-        return Err(crate::tools::SchematicTargetError::StaleTarget {
-            target: sch_path.to_path_buf(),
-            reason: format!("placed symbol UUID '{uuid}' has no project in post-write readback"),
-        }
-        .into_tool_result());
-    };
-    let mut instance_paths = observed_instances
+    let symbol = committed
+        .symbols
         .iter()
-        .map(|(_, path)| path.clone())
+        .find(|symbol| symbol.uuid == *uuid)
+        .expect("shared readback proved this UUID");
+    let mut observed_instances = symbol.instance_paths();
+    observed_instances.sort();
+    let Some((project, _)) = observed_instances.first() else {
+        return Err(ComponentDeleteTargetError::stale(
+            committed.filepath(),
+            format!("placed symbol UUID '{uuid}' has no project in post-write readback"),
+        )
+        .into_result());
+    };
+    let project = project.clone();
+    let mut instance_paths = observed_instances
+        .into_iter()
+        .map(|(_, path)| path)
         .collect::<Vec<_>>();
     instance_paths.sort();
 
-    Ok(json!({
-        "schematic": committed.filepath().display().to_string(),
-        "added": symbol.lib_id,
-        "reference": reference,
-        "value": value,
-        "x": symbol.at.x,
-        "y": symbol.at.y,
-        "rotation": symbol.at.rotation.unwrap_or(0.0),
-        "unit": symbol.unit,
-        "uuid": symbol.uuid,
-        "project": project,
-        "instance_paths": instance_paths
-    }))
+    result["added"] = result["lib_id"].clone();
+    result["unit"] = json!(symbol.unit);
+    result["project"] = json!(project);
+    result["instance_paths"] = json!(instance_paths);
+    Ok(result)
 }
 
 async fn handle_delete_schematic_component(
@@ -883,11 +1473,11 @@ impl ComponentDeleteTargetError {
                     candidates.join(", ")
                 );
                 CallToolResult::error_kind(
-                    ToolErrorKind::StaleTarget {
+                    ToolErrorKind::AmbiguousTarget {
                         target: target.clone(),
-                        reason: reason.clone(),
+                        candidates,
                     },
-                    format!("cannot safely delete from {target}: {reason}"),
+                    format!("cannot safely resolve {target}: {reason}"),
                 )
             }
             Self::Stale { target, reason } => CallToolResult::error_kind(
@@ -895,7 +1485,7 @@ impl ComponentDeleteTargetError {
                     target: target.clone(),
                     reason: reason.clone(),
                 },
-                format!("cannot safely delete from {target}: {reason}"),
+                format!("cannot safely resolve {target}: {reason}"),
             ),
         }
     }
@@ -1517,7 +2107,13 @@ async fn handle_edit_schematic_component(
 
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
+    let target = match component_target_from_source(&sch_path, &expected, &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
+    };
     let mut changed = Vec::new();
+    let mut expected_fields = BTreeMap::new();
+    let mut edit_reference = reference.as_str();
 
     let mut errors: Vec<String> = Vec::new();
     // A macro rather than a closure: the body also needs `changed`/`errors`
@@ -1525,9 +2121,10 @@ async fn handle_edit_schematic_component(
     // and a closure capturing them mutably would lock both for its lifetime.
     macro_rules! apply {
         ($field:expr, $new_val:expr) => {
-            match set_property_value(&content, &reference, $field, $new_val, false) {
+            match set_property_value(&content, edit_reference, $field, $new_val, false) {
                 Ok((updated, counts)) => {
                     content = updated;
+                    expected_fields.insert($field.to_owned(), $new_val.to_owned());
                     changed.push(format!(
                         "{} → {} ({} unit(s))",
                         $field, $new_val, counts.updated
@@ -1539,6 +2136,9 @@ async fn handle_edit_schematic_component(
     }
 
     if let Some(new_ref) = opt_str(args, "new_reference") {
+        let before_rename = content.clone();
+        let before_changes = changed.len();
+        let before_expected_fields = expected_fields.clone();
         apply!("Reference", new_ref);
         // A designator lives in TWO places. The (property "Reference" …) is
         // what renders; the (reference …) inside (instances …) is what KiCad
@@ -1548,9 +2148,15 @@ async fn handle_edit_schematic_component(
         match rewrite_instance_references(&content, &reference, new_ref) {
             Ok((updated, count)) => {
                 content = updated;
+                edit_reference = new_ref;
                 changed.push(format!("instances reference → {new_ref} ({count})"));
             }
-            Err(why) => errors.push(format!("instances reference: {why}")),
+            Err(why) => {
+                content = before_rename;
+                changed.truncate(before_changes);
+                expected_fields = before_expected_fields;
+                errors.push(format!("instances reference: {why}"));
+            }
         }
     }
     if let Some(val) = opt_str(args, "value") {
@@ -1581,9 +2187,10 @@ async fn handle_edit_schematic_component(
                 ));
                 continue;
             }
-            match set_property_value(&content, &reference, name, value, true) {
+            match set_property_value(&content, edit_reference, name, value, true) {
                 Ok((updated, counts)) => {
                     content = updated;
+                    expected_fields.insert(name.clone(), value.to_owned());
                     changed.push(format!(
                         "{name} → {value} ({} updated, {} added)",
                         counts.updated, counts.added
@@ -1613,7 +2220,10 @@ async fn handle_edit_schematic_component(
     }
 
     if !changed.is_empty() {
-        let item_ids = symbol_item_ids(&expected, &reference)?;
+        let item_ids = match target.item_ids() {
+            Ok(item_ids) => item_ids,
+            Err(error) => return Ok(error.into_result()),
+        };
         let command = SchematicCommand::replace_items_from_document(
             &expected,
             &content,
@@ -1623,10 +2233,19 @@ async fn handle_edit_schematic_component(
         commit_command(&sch_path, &command)?;
     }
 
+    let observed =
+        match load_component_mutation_readback(&sch_path, &target.with_fields(&expected_fields))? {
+            Ok(observed) => observed,
+            Err(error) => return Ok(error),
+        };
     let mut result = json!({
-        "reference": reference,
+        "reference": observed["reference"],
         "changes": changed
     });
+    if observed["reference"] != reference {
+        result["requested_reference"] = json!(reference);
+    }
+    copy_component_observation(&mut result, &observed);
     if !errors.is_empty() {
         result["errors"] = json!(errors);
     }
@@ -1757,41 +2376,48 @@ async fn handle_move_schematic_component(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-
-    let Some(anchor) = sch
+    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let target_uuids = target.uuids();
+    let selected = target_uuids.iter().cloned().collect::<BTreeSet<_>>();
+    let anchor_uuid = &target.units[0].uuid;
+    let anchor = sch
         .symbols
         .iter()
-        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
-        .min_by_key(|symbol| symbol.unit)
-    else {
-        return Err(anyhow::anyhow!("Component '{}' not found", reference));
-    };
+        .find(|symbol| symbol.uuid == *anchor_uuid)
+        .expect("structural target UUID is present in the loaded schematic");
     let (old_x, old_y) = anchor.position();
     let (dx, dy) = (new_x - old_x, new_y - old_y);
-    let mut placements = Vec::new();
+    for unit in &mut target.units {
+        unit.x += dx;
+        unit.y += dy;
+    }
     for symbol in sch
         .symbols
         .iter_mut()
-        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+        .filter(|symbol| selected.contains(&symbol.uuid))
     {
         symbol.translate(dx, dy);
-        placements.push(json!({
-            "unit": symbol.unit,
-            "x": symbol.at.x,
-            "y": symbol.at.y
-        }));
     }
     sch.overwrite()?;
     let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
-    Ok(CallToolResult::json(&json!({
-        "moved": reference,
-        "x": new_x,
-        "y": new_y,
-        "moved_units": placements.len(),
-        "placements": placements,
+    let observed = match load_component_mutation_readback(&sch_path, &target)? {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
+    let mut result = json!({
+        "moved": observed["reference"],
+        "x": observed["x"],
+        "y": observed["y"],
+        "moved_units": observed["unit_count"],
+        "placements": observed["units"],
         "junctions_added_count": added,
         "junctions_pruned_count": pruned
-    })))
+    });
+    copy_component_observation(&mut result, &observed);
+    Ok(CallToolResult::json(&result))
 }
 
 /// Pin endpoints on the sheet as it currently stands on disk, or empty if it
@@ -1855,21 +2481,26 @@ async fn handle_rotate_schematic_component(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-
-    let Some(anchor) = sch
+    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let target_uuids = target.uuids();
+    let selected = target_uuids.iter().cloned().collect::<BTreeSet<_>>();
+    let anchor_uuid = &target.units[0].uuid;
+    let anchor = sch
         .symbols
         .iter()
-        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
-        .min_by_key(|symbol| symbol.unit)
-    else {
-        return Err(anyhow::anyhow!("Component '{}' not found", reference));
-    };
+        .find(|symbol| symbol.uuid == *anchor_uuid)
+        .expect("structural target UUID is present in the loaded schematic");
     let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
-    let mut placements = Vec::new();
+    for unit in &mut target.units {
+        unit.rotation = (unit.rotation + rotation_delta).rem_euclid(360.0);
+    }
     for symbol in sch
         .symbols
         .iter_mut()
-        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+        .filter(|symbol| selected.contains(&symbol.uuid))
     {
         // The delta lands each unit at its own angle, so a unit already at
         // 270° asked to follow a +90° turn computes 360° — normalize into
@@ -1879,15 +2510,20 @@ async fn handle_rotate_schematic_component(
         // this response reported.
         let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
         symbol.set_rotation(new_rotation);
-        placements.push(json!({ "unit": symbol.unit, "rotation": new_rotation }));
     }
     sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({
-        "rotated": reference,
-        "rotation": rotation,
-        "rotated_units": placements.len(),
-        "placements": placements
-    })))
+    let observed = match load_component_mutation_readback(&sch_path, &target)? {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
+    let mut result = json!({
+        "rotated": observed["reference"],
+        "rotation": observed["rotation"],
+        "rotated_units": observed["unit_count"],
+        "placements": observed["units"]
+    });
+    copy_component_observation(&mut result, &observed);
+    Ok(CallToolResult::json(&result))
 }
 
 async fn handle_move_connected(
@@ -2192,6 +2828,10 @@ async fn handle_add_component_annotation(
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
+    let target = match component_target_from_source(&sch_path, &expected, &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
+    };
 
     // An existing key is updated in place; appending a second `(property
     // "KEY" …)` gives eeschema two fields with one name — it shows both,
@@ -2199,11 +2839,14 @@ async fn handle_add_component_annotation(
     // A new key is anchored separately at every unit's own position and uses
     // that block's indentation. A partially populated legacy component is
     // repaired by updating existing copies and adding only the missing ones.
-    let (new_content, counts) = match set_property_value(&content, &reference, &key, &value, true) {
+    let (new_content, _) = match set_property_value(&content, &reference, &key, &value, true) {
         Ok(updated) => updated,
         Err(why) => return Ok(CallToolResult::error(format!("{key}: {why}"))),
     };
-    let item_ids = symbol_item_ids(&expected, &reference)?;
+    let item_ids = match target.item_ids() {
+        Ok(item_ids) => item_ids,
+        Err(error) => return Ok(error.into_result()),
+    };
     let command = SchematicCommand::replace_items_from_document(
         &expected,
         &new_content,
@@ -2212,31 +2855,34 @@ async fn handle_add_component_annotation(
     )?;
     commit_command(&sch_path, &command)?;
 
-    Ok(CallToolResult::json(&json!({
-        "reference": reference,
-        "added_property": key,
-        "value": value,
-        "updated_existing": counts.updated > 0,
-        "updated_units": counts.updated,
-        "added_units": counts.added
-    })))
-}
-
-fn symbol_item_ids(content: &str, reference: &str) -> anyhow::Result<Vec<ItemId>> {
-    let blocks = find_all_symbol_instance_blocks(content, reference);
-    if blocks.is_empty() {
-        anyhow::bail!("component '{reference}' not found");
+    let observed = match load_component_mutation_readback(
+        &sch_path,
+        &target.with_fields(&BTreeMap::from([(key.clone(), value.clone())])),
+    )? {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
+    if let Err(error) = verify_observed_field(&sch_path, &observed, &key, &value) {
+        return Ok(error);
     }
-    blocks
-        .into_iter()
-        .map(|(start, end)| {
-            let symbol = parse_sexp(&content[start..end])?;
-            let uuid = symbol.find_str("uuid").ok_or_else(|| {
-                anyhow::anyhow!("component '{reference}' has a unit without UUID")
-            })?;
-            ItemId::new(uuid.to_owned()).map_err(Into::into)
-        })
-        .collect()
+    let updated_units = target
+        .units
+        .iter()
+        .filter(|unit| unit.fields.contains_key(&key))
+        .count();
+    let added_units = target.units.len() - updated_units;
+    let mut result = json!({
+        "reference": observed["reference"],
+        "added_property": key,
+        "value": observed["fields"][key.as_str()],
+        "updated_existing": updated_units > 0,
+        "updated_units": updated_units,
+        "added_units": added_units
+    });
+    copy_component_observation(&mut result, &observed);
+    result["component_value"] = observed["value"].clone();
+    result["value"] = observed["fields"][key.as_str()].clone();
+    Ok(CallToolResult::json(&result))
 }
 
 async fn handle_group_components(
@@ -2248,14 +2894,10 @@ async fn handle_group_components(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let refs = args["references"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let refs = match require_array(args, "references") {
+        Ok(values) => values,
+        Err(error) => return Ok(error),
+    };
 
     if refs.is_empty() {
         return Ok(CallToolResult::error("No references provided"));
@@ -2263,34 +2905,94 @@ async fn handle_group_components(
 
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let mut grouped = Vec::new();
     let mut item_ids = Vec::new();
+    let mut targets = Vec::new();
+    let mut errors = Vec::new();
+    let mut seen = BTreeSet::new();
 
-    for reference in &refs {
+    for value in refs {
+        let Some(reference) = value.as_str() else {
+            errors.push("Component reference must be a string".to_owned());
+            continue;
+        };
+        if !seen.insert(reference.to_owned()) {
+            continue;
+        }
+        let target = match component_target_from_source(&sch_path, &expected, reference) {
+            Ok(target) => target,
+            Err(ComponentDeleteTargetError::Stale { reason, .. })
+                if reason.contains("is not present") =>
+            {
+                errors.push(format!("Component '{reference}' not found"));
+                continue;
+            }
+            Err(error) => return Ok(error.into_result()),
+        };
         match set_property_value(&content, reference, "Group", &group_name, true) {
             Ok((updated, _)) => {
                 content = updated;
-                item_ids.extend(symbol_item_ids(&expected, reference)?);
-                grouped.push(reference.clone());
+                item_ids.extend(match target.item_ids() {
+                    Ok(item_ids) => item_ids,
+                    Err(error) => return Ok(error.into_result()),
+                });
+                targets.push(target);
             }
-            Err(_) => continue,
+            Err(error) => errors.push(format!("{reference}: {error}")),
         }
     }
 
-    if !item_ids.is_empty() {
-        let command = SchematicCommand::replace_items_from_document(
-            &expected,
-            &content,
-            item_ids,
-            format!("Group components as {group_name}"),
-        )?;
-        commit_command(&sch_path, &command)?;
+    if item_ids.is_empty() {
+        return Ok(ComponentDeleteTargetError::stale(
+            &sch_path,
+            if errors.is_empty() {
+                "no components were selected".to_owned()
+            } else {
+                errors.join("; ")
+            },
+        )
+        .into_result());
     }
+    let command = SchematicCommand::replace_items_from_document(
+        &expected,
+        &content,
+        item_ids,
+        format!("Group components as {group_name}"),
+    )?;
+    commit_command(&sch_path, &command)?;
+
+    let committed = cse::Schematic::load(&sch_path)?;
+    let mut grouped = Vec::new();
+    let mut components = Vec::new();
+    for target in &targets {
+        let observed = match verified_component_readback(
+            &sch_path,
+            &committed,
+            &target.with_fields(&BTreeMap::from([("Group".to_owned(), group_name.clone())])),
+        ) {
+            Ok(observed) => observed,
+            Err(error) => return Ok(error),
+        };
+        if let Err(error) = verify_observed_field(&sch_path, &observed, "Group", &group_name) {
+            return Ok(error);
+        }
+        grouped.push(
+            observed["reference"]
+                .as_str()
+                .expect("readback reference is a string")
+                .to_owned(),
+        );
+        components.push(observed);
+    }
+    let observed_group_name = components[0]["fields"]["Group"].clone();
+    let observed_schematic = components[0]["schematic"].clone();
 
     Ok(CallToolResult::json(&json!({
-        "group_name": group_name,
+        "group_name": observed_group_name,
         "grouped_count": grouped.len(),
-        "grouped": grouped
+        "grouped": grouped,
+        "components": components,
+        "schematic": observed_schematic,
+        "errors": errors
     })))
 }
 
@@ -3058,6 +3760,13 @@ mod tests {
         .await
         .unwrap();
         assert!(!result.is_error, "unit 3 of a 3-unit part must be accepted");
+        let response: serde_json::Value =
+            serde_json::from_str(&content_text(&result)).expect("placement JSON");
+        assert_eq!(response["schematic"], path.display().to_string());
+        assert_eq!(response["unit"], 3);
+        assert_eq!(response["unit_count"], 1);
+        assert_eq!(response["units"][0]["unit"], 3);
+        assert_eq!(response["units"][0]["fields"]["Reference"], "U1");
 
         let sch = cse::Schematic::load(&path).unwrap();
         let sym = sch.symbols.by_reference("U1").unwrap();
@@ -4791,7 +5500,7 @@ mod component_delete_connectivity_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_reference_and_unit_is_stale_and_does_not_write() {
+    async fn duplicate_reference_and_unit_is_ambiguous_and_does_not_write() {
         let original = CONNECTIVITY.replacen(
             "(property \"Reference\" \"R3\"",
             "(property \"Reference\" \"R1\"",
@@ -4805,7 +5514,10 @@ mod component_delete_connectivity_tests {
         .await
         .unwrap();
 
-        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
@@ -4849,7 +5561,7 @@ mod component_delete_connectivity_tests {
 #[cfg(test)]
 mod multi_unit_component_tests {
     use super::*;
-    use crate::mcp::protocol::ToolContent;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
@@ -4953,6 +5665,240 @@ mod multi_unit_component_tests {
         (directory, path)
     }
 
+    fn native_readback_intent_mismatch(field: &str) {
+        let (_directory, path) = eeschema_fixture();
+        let mut committed = cse::Schematic::load(&path).unwrap();
+        let target = component_target_from_source(&path, &committed.to_source(), "U1").unwrap();
+        assert!(verified_component_readback(&path, &committed, &target).is_ok());
+        // Keep UUID and Reference intact. Change every unit's hierarchy together
+        // so the expected-path comparison, not a cross-unit conflict, must fire.
+        for symbol in committed
+            .symbols
+            .iter_mut()
+            .filter(|symbol| symbol.reference() == Some("U1"))
+        {
+            match field {
+                "unit" => {
+                    symbol.unit += 10;
+                    for (project, instance_path) in symbol.instance_paths() {
+                        symbol.set_instance_path(&project, &instance_path, "U1", symbol.unit);
+                    }
+                }
+                "lib_id" => symbol.lib_id = "Device:WRONG".to_owned(),
+                "x" => symbol.at.x += 1.27,
+                "y" => symbol.at.y += 1.27,
+                "rotation" => symbol.at.rotation = Some(symbol.at.rotation.unwrap_or(0.0) + 90.0),
+                "project" | "path" => {
+                    let previous = symbol.instance_paths();
+                    symbol
+                        .raw_sub_nodes
+                        .retain(|node| node.tag() != Some("instances"));
+                    for (project, instance_path) in previous {
+                        symbol.set_instance_path(
+                            if field == "project" {
+                                "wrong-project"
+                            } else {
+                                &project
+                            },
+                            if field == "path" {
+                                "/wrong/path"
+                            } else {
+                                &instance_path
+                            },
+                            "U1",
+                            symbol.unit,
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        committed.overwrite().unwrap();
+        let reloaded = cse::Schematic::load(&path).unwrap();
+        let error = verified_component_readback(&path, &reloaded, &target).unwrap_err();
+        assert_eq!(
+            extract_error_kind(&error).as_deref(),
+            Some("stale_target"),
+            "{field}: {error:?}"
+        );
+    }
+
+    #[test]
+    fn native_readback_intent_unit() {
+        native_readback_intent_mismatch("unit");
+    }
+    #[test]
+    fn native_readback_intent_library() {
+        native_readback_intent_mismatch("lib_id");
+    }
+    #[test]
+    fn native_readback_intent_x() {
+        native_readback_intent_mismatch("x");
+    }
+    #[test]
+    fn native_readback_intent_y() {
+        native_readback_intent_mismatch("y");
+    }
+    #[test]
+    fn native_readback_intent_rotation() {
+        native_readback_intent_mismatch("rotation");
+    }
+    #[test]
+    fn native_readback_intent_project() {
+        native_readback_intent_mismatch("project");
+    }
+    #[test]
+    fn native_readback_intent_path() {
+        native_readback_intent_mismatch("path");
+    }
+
+    #[test]
+    fn native_readback_intent_requested_properties() {
+        for field in ["Value", "Footprint", "Datasheet", "MPN", "Group"] {
+            let (_directory, path) = eeschema_fixture();
+            let mut committed = cse::Schematic::load(&path).unwrap();
+            let target = component_target_from_source(&path, &committed.to_source(), "U1")
+                .unwrap()
+                .with_fields(&BTreeMap::from([(
+                    field.to_owned(),
+                    "requested-value".to_owned(),
+                )]));
+            for symbol in committed
+                .symbols
+                .iter_mut()
+                .filter(|symbol| symbol.reference() == Some("U1"))
+            {
+                symbol.set_property(field, "requested-value");
+            }
+            committed.overwrite().unwrap();
+            assert!(verified_component_readback(
+                &path,
+                &cse::Schematic::load(&path).unwrap(),
+                &target
+            )
+            .is_ok());
+            committed
+                .symbols
+                .iter_mut()
+                .find(|symbol| symbol.reference() == Some("U1"))
+                .unwrap()
+                .set_property(field, "wrong-value");
+            committed.overwrite().unwrap();
+            let error =
+                verified_component_readback(&path, &cse::Schematic::load(&path).unwrap(), &target)
+                    .unwrap_err();
+            assert_eq!(
+                extract_error_kind(&error).as_deref(),
+                Some("stale_target"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_readback_instance_conflicts() {
+        for corruption in ["project", "duplicate", "unit", "cross-unit"] {
+            let (_directory, path) = eeschema_fixture();
+            let mut committed = cse::Schematic::load(&path).unwrap();
+            let target = component_target_from_source(&path, &committed.to_source(), "U1").unwrap();
+            let symbol = committed
+                .symbols
+                .iter_mut()
+                .find(|symbol| symbol.reference() == Some("U1"))
+                .unwrap();
+            let (project, instance_path) = symbol.instance_paths()[0].clone();
+            match corruption {
+                "project" => {
+                    symbol.set_instance_path("other-project", &instance_path, "U1", symbol.unit)
+                }
+                "unit" => symbol.set_instance_path(&project, &instance_path, "U1", symbol.unit + 1),
+                "cross-unit" => {
+                    symbol
+                        .raw_sub_nodes
+                        .retain(|node| node.tag() != Some("instances"));
+                    symbol.set_instance_path(&project, "/other/path", "U1", symbol.unit);
+                }
+                "duplicate" => {
+                    let instances = symbol
+                        .raw_sub_nodes
+                        .iter()
+                        .find(|node| node.tag() == Some("instances"))
+                        .unwrap()
+                        .clone();
+                    symbol.raw_sub_nodes.push(instances);
+                }
+                _ => unreachable!(),
+            }
+            if corruption != "cross-unit" {
+                let error = checked_instance_paths(&path, symbol)
+                    .unwrap_err()
+                    .into_result();
+                assert_eq!(
+                    extract_error_kind(&error).as_deref(),
+                    Some("ambiguous_target"),
+                    "{corruption}"
+                );
+            }
+            committed.overwrite().unwrap();
+            let reloaded = cse::Schematic::load(&path).unwrap();
+            let error = verified_component_readback(&path, &reloaded, &target).unwrap_err();
+            assert_eq!(
+                extract_error_kind(&error).as_deref(),
+                Some("ambiguous_target"),
+                "{corruption}"
+            );
+            let preflight = component_target_from_source(&path, &reloaded.to_source(), "U1")
+                .unwrap_err()
+                .into_result();
+            assert_eq!(
+                extract_error_kind(&preflight).as_deref(),
+                Some("ambiguous_target"),
+                "{corruption}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_mutations_verify_each_units_intended_state() {
+        let (_directory, path) = eeschema_fixture();
+        body(
+            handle_move_schematic_component(
+                &json!({"schematic": path, "reference": "U1", "x": 110.1, "y": 120.2}),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        body(
+            handle_rotate_schematic_component(
+                &json!({"schematic": path, "reference": "U1", "rotation": 450.0}),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let edited = body(handle_edit_schematic_component(&json!({"schematic": path, "reference": "U1", "new_reference": "U99", "value": "updated", "footprint": "Package:New", "datasheet": "https://example.invalid/datasheet", "fields": {"MPN": "requested"}}), &context()).await.unwrap());
+        assert_eq!(edited["reference"], "U99");
+        for unit in edited["units"].as_array().unwrap() {
+            assert_eq!(unit["fields"]["MPN"], "requested");
+            assert_eq!(unit["fields"]["Value"], "updated");
+            assert_eq!(unit["fields"]["Footprint"], "Package:New");
+            assert_eq!(
+                unit["fields"]["Datasheet"],
+                "https://example.invalid/datasheet"
+            );
+        }
+        let grouped = body(
+            handle_group_components(
+                &json!({"schematic": path, "references": ["U99"], "group_name": "native-group"}),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(grouped["grouped_count"], 1);
+    }
+
     #[tokio::test]
     async fn a_real_eeschema_multi_unit_component_is_seen_whole() {
         let (_directory, path) = eeschema_fixture();
@@ -5013,7 +5959,7 @@ mod multi_unit_component_tests {
     }
 
     fn body(result: CallToolResult) -> serde_json::Value {
-        assert!(!result.is_error, "mutation unexpectedly failed");
+        assert!(!result.is_error, "mutation unexpectedly failed: {result:?}");
         let ToolContent::Text { text } = &result.content[0] else {
             panic!("expected text result");
         };
@@ -5060,6 +6006,9 @@ mod multi_unit_component_tests {
             .unwrap(),
         );
         assert_eq!(result["moved_units"], 2);
+        assert_eq!(result["schematic"], path.display().to_string());
+        assert_eq!(result["units"].as_array().unwrap().len(), 2);
+        assert_eq!(result["placements"], result["units"]);
         let mut placed = instances(&path);
         placed.sort_by_key(|instance| instance.unit);
         assert!((placed[0].x - placed[1].x).abs() < 0.001);
@@ -5082,6 +6031,11 @@ mod multi_unit_component_tests {
             .unwrap(),
         );
         assert_eq!(result["rotated_units"], 2);
+        assert_eq!(result["rotation"], 90.0);
+        assert_eq!(result["placements"], result["units"]);
+        assert!(result["units"].as_array().unwrap().iter().any(|unit| {
+            unit["uuid"] == "33333333-3333-4333-8333-333333333333" && unit["rotation"] == 270.0
+        }));
         let mut placed = instances(&path);
         placed.sort_by_key(|instance| instance.unit);
         assert_eq!(placed[0].rotation, 90.0);
@@ -5127,7 +6081,7 @@ mod multi_unit_component_tests {
     #[tokio::test]
     async fn edit_updates_shared_fields_on_every_unit() {
         let (_directory, path) = fixture();
-        body(
+        let result = body(
             handle_edit_schematic_component(
                 &json!({
                     "schematic": path,
@@ -5140,6 +6094,13 @@ mod multi_unit_component_tests {
             .await
             .unwrap(),
         );
+        assert_eq!(result["value"], "NEW");
+        assert_eq!(result["fields"]["MPN"], "A\\\"B");
+        assert!(result["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|unit| unit["fields"]["Value"] == "NEW" && unit["fields"]["MPN"] == "A\\\"B"));
         let source = std::fs::read_to_string(&path).unwrap();
         assert_eq!(source.matches("(property \"Value\" \"NEW\"").count(), 2);
         assert_eq!(
@@ -5151,7 +6112,7 @@ mod multi_unit_component_tests {
     #[tokio::test]
     async fn rename_updates_rendered_and_netlist_references_on_every_unit() {
         let (_directory, path) = fixture();
-        body(
+        let result = body(
             handle_edit_schematic_component(
                 &json!({
                     "schematic": path,
@@ -5163,6 +6124,14 @@ mod multi_unit_component_tests {
             .await
             .unwrap(),
         );
+        assert_eq!(result["reference"], "U9");
+        assert_eq!(result["requested_reference"], "U1");
+        assert!(result["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|unit| unit["fields"]["Reference"] == "U9"
+                && unit["instance_references"] == json!(["U9"])));
         let source = std::fs::read_to_string(&path).unwrap();
         assert_eq!(source.matches("(property \"Reference\" \"U9\"").count(), 2);
         assert_eq!(source.matches("(reference \"U9\")").count(), 2);
@@ -5187,6 +6156,11 @@ mod multi_unit_component_tests {
         );
         assert_eq!(result["updated_units"], 1);
         assert_eq!(result["added_units"], 1);
+        assert!(result["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|unit| unit["fields"]["Note"] == "NEW"));
         let source = std::fs::read_to_string(&path).unwrap();
         assert_eq!(source.matches("(property \"Note\" \"NEW\"").count(), 2);
     }
@@ -5194,7 +6168,7 @@ mod multi_unit_component_tests {
     #[tokio::test]
     async fn grouping_adds_one_property_to_every_unit() {
         let (_directory, path) = fixture();
-        body(
+        let result = body(
             handle_group_components(
                 &json!({
                     "schematic": path,
@@ -5206,6 +6180,17 @@ mod multi_unit_component_tests {
             .await
             .unwrap(),
         );
+        assert_eq!(result["grouped"], json!(["U1"]));
+        assert_eq!(result["schematic"], result["components"][0]["schematic"]);
+        assert_eq!(
+            result["components"][0]["schematic"],
+            path.display().to_string()
+        );
+        assert!(result["components"][0]["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|unit| unit["fields"]["Group"] == "Logic"));
         let source = std::fs::read_to_string(&path).unwrap();
         assert_eq!(source.matches("(property \"Group\" \"Logic\"").count(), 2);
     }
@@ -5332,5 +6317,225 @@ mod multi_unit_component_tests {
         placed.sort_by_key(|instance| instance.unit);
         assert_eq!(placed[0].x, 100.0, "unit 1 must stay put");
         assert_ne!(placed[1].x, 100.0, "selected unit 2 must move");
+    }
+
+    #[test]
+    fn shared_readback_refuses_missing_or_renamed_bound_identity() {
+        let (_directory, path) = fixture();
+        let committed = cse::Schematic::load(&path).unwrap();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+
+        let wrong_reference = component_mutation_readback_from_schematic(
+            &path,
+            &committed,
+            &target.uuids(),
+            Some("U404"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            extract_error_kind(&wrong_reference).as_deref(),
+            Some("stale_target")
+        );
+
+        let missing_uuid = component_mutation_readback_from_schematic(
+            &path,
+            &committed,
+            &["missing-uuid".to_owned()],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            extract_error_kind(&missing_uuid).as_deref(),
+            Some("stale_target")
+        );
+    }
+
+    #[test]
+    fn shared_readback_refuses_wrong_document_and_mismatched_fields() {
+        let (directory, path) = fixture();
+        let other = directory.path().join("other.kicad_sch");
+        std::fs::write(&other, SCHEMATIC).unwrap();
+        let committed = cse::Schematic::load(&path).unwrap();
+        let committed_other = cse::Schematic::load(&other).unwrap();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+
+        let wrong_document = component_mutation_readback_from_schematic(
+            &path,
+            &committed_other,
+            &target.uuids(),
+            Some("U1"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            extract_error_kind(&wrong_document).as_deref(),
+            Some("stale_target")
+        );
+
+        let observed = component_mutation_readback_from_schematic(
+            &path,
+            &committed,
+            &target.uuids(),
+            Some("U1"),
+        )
+        .unwrap();
+        let mismatched_field =
+            verify_observed_field(&path, &observed, "Value", "NOT-COMMITTED").unwrap_err();
+        assert_eq!(
+            extract_error_kind(&mismatched_field).as_deref(),
+            Some("stale_target")
+        );
+    }
+
+    #[test]
+    fn shared_readback_reports_the_committed_models_document_path() {
+        let (_directory, path) = fixture();
+        let committed = cse::Schematic::load(&path).unwrap();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+        let differently_spelled = path
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(path.file_name().unwrap());
+        assert_ne!(
+            differently_spelled.display().to_string(),
+            committed.filepath().display().to_string()
+        );
+
+        let observed = component_mutation_readback_from_schematic(
+            &differently_spelled,
+            &committed,
+            &target.uuids(),
+            Some("U1"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed["schematic"],
+            committed.filepath().display().to_string()
+        );
+        assert_ne!(
+            observed["schematic"],
+            differently_spelled.display().to_string()
+        );
+    }
+
+    #[test]
+    fn duplicate_bound_uuid_and_property_identities_are_ambiguous() {
+        let (_directory, path) = fixture();
+        let committed = cse::Schematic::load(&path).unwrap();
+        let uuid = "22222222-2222-4222-8222-222222222222".to_owned();
+        let duplicate_bound_uuid = component_mutation_readback_from_schematic(
+            &path,
+            &committed,
+            &[uuid.clone(), uuid.clone()],
+            Some("U1"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            extract_error_kind(&duplicate_bound_uuid).as_deref(),
+            Some("ambiguous_target")
+        );
+
+        let property = "    (property \"Note\" \"OLD\" (at 100 100 0) (hide yes))\n";
+        let duplicate_source = SCHEMATIC.replacen(property, &format!("{property}{property}"), 1);
+        assert_ne!(duplicate_source, SCHEMATIC);
+        std::fs::write(&path, duplicate_source).unwrap();
+        let committed = cse::Schematic::load(&path).unwrap();
+        let duplicate_property =
+            component_mutation_readback_from_schematic(&path, &committed, &[uuid], Some("U1"))
+                .unwrap_err();
+        assert_eq!(
+            extract_error_kind(&duplicate_property).as_deref(),
+            Some("ambiguous_target")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_reference_unit_is_ambiguous_before_a_move() {
+        let original = SCHEMATIC.replacen("    (unit 2)\n", "    (unit 1)\n", 1);
+        assert_ne!(original, SCHEMATIC);
+        let (directory, path) = fixture();
+        std::fs::write(&path, &original).unwrap();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "x": 110.0, "y": 110.0 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        drop(directory);
+    }
+
+    #[tokio::test]
+    async fn missing_reference_is_stale_and_does_not_mutate_either_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.kicad_sch");
+        let other = directory.path().join("other.kicad_sch");
+        std::fs::write(&target, SCHEMATIC).unwrap();
+        std::fs::write(&other, SCHEMATIC).unwrap();
+        let result = handle_rotate_schematic_component(
+            &json!({ "schematic": target, "reference": "MISSING", "rotation": 90.0 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), SCHEMATIC);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), SCHEMATIC);
+    }
+
+    #[tokio::test]
+    async fn successful_move_names_only_the_requested_document_from_readback() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.kicad_sch");
+        let other = directory.path().join("other.kicad_sch");
+        std::fs::write(&target, SCHEMATIC).unwrap();
+        std::fs::write(&other, SCHEMATIC).unwrap();
+        let result = body(
+            handle_move_schematic_component(
+                &json!({ "schematic": target, "reference": "U1", "x": 110.0, "y": 110.0 }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(result["schematic"], target.display().to_string());
+        assert_ne!(std::fs::read_to_string(&target).unwrap(), SCHEMATIC);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), SCHEMATIC);
+    }
+
+    #[test]
+    fn stale_target_revision_refuses_a_prepared_component_edit() {
+        let (_directory, path) = fixture();
+        let target = component_target_from_source(&path, SCHEMATIC, "U1").unwrap();
+        let candidate = set_property_value(SCHEMATIC, "U1", "Value", "PLANNED", false)
+            .unwrap()
+            .0;
+        let command = SchematicCommand::replace_items_from_document(
+            SCHEMATIC,
+            &candidate,
+            target.item_ids().unwrap(),
+            "planned edit",
+        )
+        .unwrap();
+        let newer = SCHEMATIC.replacen(
+            "(property \"Value\" \"OLD\"",
+            "(property \"Value\" \"NEWER\"",
+            1,
+        );
+        std::fs::write(&path, &newer).unwrap();
+
+        assert!(matches!(
+            commit_command(&path, &command).unwrap_err(),
+            SexpError::Conflict { .. } | SexpError::ItemConflict { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
     }
 }

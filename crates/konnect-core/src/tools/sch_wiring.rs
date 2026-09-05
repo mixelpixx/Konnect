@@ -1686,6 +1686,17 @@ async fn handle_add_power_symbol(
     }
 
     let uuid = sym.uuid.clone();
+    let placement = super::sch_components::ComponentTargetUnit::placement(
+        &uuid,
+        &context,
+        &lib_id,
+        x,
+        y,
+        rotation,
+        &pwr_ref,
+        Some(&power_net),
+        1,
+    );
     sch.add_symbol(sym);
     sch.overwrite()?;
 
@@ -1694,7 +1705,7 @@ async fn handle_add_power_symbol(
     let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref)?;
     let committed = cse::Schematic::load(&sch_path)?;
     let mut observed = match super::sch_components::placed_component_readback(
-        &sch_path, &committed, &uuid, &context,
+        &sch_path, &committed, &placement, &context,
     ) {
         Ok(result) => result,
         Err(error) => return Ok(error),

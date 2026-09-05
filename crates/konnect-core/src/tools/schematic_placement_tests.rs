@@ -180,6 +180,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
                     .unwrap();
                 let mut identities = symbol.instance_paths();
                 identities.sort();
+                let observed_project = identities[0].0.clone();
                 assert_eq!(
                     identities,
                     expected
@@ -192,7 +193,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
                     entry["schematic"],
                     committed.filepath().display().to_string()
                 );
-                assert_eq!(entry["project"], "complex_hierarchy");
+                assert_eq!(entry["project"], observed_project);
                 assert_eq!(entry["added"], symbol.lib_id);
                 assert_eq!(entry["reference"], symbol.reference().unwrap());
                 assert_eq!(entry["value"], symbol.value_str().unwrap());
@@ -364,6 +365,18 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
         let mut schematic = Schematic::load(&child).unwrap();
         let context = sheet_instance_context(&child, &mut schematic).unwrap();
         let uuid = schematic.symbols.get(0).unwrap().uuid.clone();
+        let symbol = schematic.symbols.get(0).unwrap();
+        let expected = sch_components::ComponentTargetUnit::placement(
+            &uuid,
+            &context,
+            &symbol.lib_id,
+            symbol.at.x,
+            symbol.at.y,
+            symbol.at.rotation.unwrap_or(0.0),
+            symbol.reference().unwrap(),
+            symbol.value_str(),
+            symbol.unit,
+        );
         match missing {
             "symbol" => {
                 schematic.symbols.remove_by_uuid(&uuid).unwrap();
@@ -396,12 +409,47 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
             &child
         })
         .unwrap();
-        let result = sch_components::placed_component_readback(&child, &committed, &uuid, &context)
-            .expect_err("incomplete readback must not return success");
+        let result =
+            sch_components::placed_component_readback(&child, &committed, &expected, &context)
+                .expect_err("incomplete readback must not return success");
         assert_eq!(body(&result)["error"]["kind"], "stale_target", "{missing}");
         assert!(!body(&result)["message"]
             .as_str()
             .unwrap()
             .contains("did not modify"));
+    }
+}
+
+#[test]
+fn native_placement_readback_requires_requested_values() {
+    for mismatch in ["unit", "lib_id", "x", "y", "rotation", "Value"] {
+        let (_directory, _root, child) = fixture(true);
+        let mut schematic = Schematic::load(&child).unwrap();
+        let context = sheet_instance_context(&child, &mut schematic).unwrap();
+        let symbol = schematic.symbols.get(0).unwrap();
+        let expected = sch_components::ComponentTargetUnit::placement(
+            &symbol.uuid,
+            &context,
+            if mismatch == "lib_id" {
+                "Device:WRONG"
+            } else {
+                &symbol.lib_id
+            },
+            symbol.at.x + if mismatch == "x" { 1.27 } else { 0.0 },
+            symbol.at.y + if mismatch == "y" { 1.27 } else { 0.0 },
+            symbol.at.rotation.unwrap_or(0.0) + if mismatch == "rotation" { 90.0 } else { 0.0 },
+            symbol.reference().unwrap(),
+            if mismatch == "Value" {
+                Some("wrong-value")
+            } else {
+                symbol.value_str()
+            },
+            symbol.unit + u32::from(mismatch == "unit"),
+        );
+        let committed = Schematic::load(&child).unwrap();
+        let error =
+            sch_components::placed_component_readback(&child, &committed, &expected, &context)
+                .unwrap_err();
+        assert_eq!(body(&error)["error"]["kind"], "stale_target", "{mismatch}");
     }
 }
