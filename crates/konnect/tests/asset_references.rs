@@ -714,6 +714,11 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "files_generated",
         // Structured hierarchy-audit response field, not a callable tool.
         "sheet_instance_path",
+        // Structured DRC ownership response field and its two unresolved
+        // values, not callable tools (#413).
+        "ownership_status",
+        "uuid_missing",
+        "not_found",
     ];
 
     let mut phantom = Vec::new();

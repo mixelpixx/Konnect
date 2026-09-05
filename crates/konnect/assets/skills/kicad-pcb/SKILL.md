@@ -347,6 +347,24 @@ Common DRC errors and fixes:
 - **Courtyard overlap**: increase spacing between components
 - **Zone fill error**: run `refill_zones`
 
+### Read `owner` before deciding on a board-edge violation
+
+Every violation item carries `owner` and `ownership_status`. Read them before
+choosing a fix — `"Circle of J1 on Edge.Cuts"` reads identically whether that
+geometry is the board outline or a cutout the footprint carries itself.
+
+- `owner.kind: "board"` — the item is the board's own geometry. Move the
+  offending copper inward, or change the outline.
+- `owner.kind: "footprint"` — the geometry belongs to that footprint
+  (`owner.reference` names it), typically a connector's locking-peg cutout. It
+  is still real fabrication geometry and the violation is still real, but the
+  pad and the cutout move together, so **repositioning the component cannot fix
+  it**. Review the footprint definition or the rule instead.
+- `ownership_status` other than `"resolved"` (`"uuid_missing"`,
+  `"not_found"`) — ownership is unknown, and `owner` is `null`. Do not assume
+  the board owns it; check with `list_board_footprint_graphics` before advising
+  a move.
+
 ---
 
 ## Rules

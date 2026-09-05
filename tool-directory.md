@@ -311,7 +311,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
 | `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
-| `get_drc_violations` | Run the Design Rule Check and return a list of violations. |
+| `get_drc_violations` | Run the Design Rule Check and return a list of violations. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. |
 
 ---
 
@@ -376,7 +376,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
@@ -472,6 +472,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 3. **Cross-toolset cleanups** (historical notes):
    - `search_footprints` and `get_symbol_info` were originally in `verification`; moved to `library` where they belong semantically. Users who were loading `verification` for these will be auto-redirected by the smart "tool not loaded" error.
    - `get_drc_violations` (`pcb_export`) and `run_drc` (`verification`) run the same kicad-cli check. Their tool descriptions now cross-reference each other and steer the LLM toward `run_drc` for interactive use (cleaner summary with error/warning counts) and `get_drc_violations` for bundling into a build package.
+     Both go through `cli::run_drc`, which is also where item ownership is resolved, so the two cannot disagree about who owns a violation.
 
 ### Implementation notes
 
