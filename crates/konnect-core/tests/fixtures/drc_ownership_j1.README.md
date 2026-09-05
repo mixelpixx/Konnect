@@ -1,0 +1,103 @@
+# DRC ownership fixture (issue #413)
+
+`drc_ownership_j1.kicad_pcb` and `drc_ownership_j1.drc.json` are the board and
+report pair used to prove that a DRC report item names what owns it.
+
+## Provenance — read this before trusting a byte of it
+
+The board is KiCad-reserialized; the committed report combines a real KiCad DRC
+report with clearly marked parser-only edge cases. The split matters, so it is
+spelled out exactly.
+
+### KiCad-authored, verbatim
+
+Everything except the additions listed below is byte-identical to the board and
+report `ncolomer` pasted inline in a comment on
+[mixelpixx/Konnect#413](https://github.com/mixelpixx/Konnect/issues/413) (no
+file was attached; the bytes are in the comment's `j1-repro.kicad_pcb` and
+`raw_kicad_cli_drc.json` code blocks), produced on Konnect 0.10.0 / KiCad
+10.0.5 / macOS 26.6.2 arm64 with:
+
+```text
+kicad-cli pcb drc --format json --severity-all --output raw_kicad_cli_drc.json j1-repro.kicad_pcb
+```
+
+The reporter states that the `(footprint …)` block was copied byte-for-byte
+from a real board (only two absolute `model` paths redacted), so the J1
+footprint, its four `Edge.Cuts` `fp_circle` nodes, its four pads, and every
+UUID in them are KiCad's own. That is the load-bearing evidence for this
+issue: it shows KiCad **does** emit the nested footprint-graphic UUID
+(`7b970478-1e4a-48b6-b01a-35348027ca5e` and its three siblings), so the
+`copper_edge_clearance` items can be resolved by exact UUID with no guessing.
+
+The report's `source` field still reads `j1-repro.kicad_pcb` — the reporter's
+filename — because the surrounding bytes were left untouched. `date` and
+`kicad_version` are likewise the reporter's.
+
+### Board-owned acceptance geometry
+
+The board-owned outline and unrelated graphic were initially added to the
+reporter's minimal board, then the complete board was force-resaved by KiCad
+10.0.6 on Windows with:
+
+```text
+kicad-cli pcb upgrade --force drc_ownership_j1.kicad_pcb
+```
+
+The committed `.kicad_pcb` is therefore KiCad's serialization, not a
+hand-authored format approximation. The synthetic-looking UUIDs are retained so
+the acceptance items remain obvious.
+
+Added to the board, as top-level children of `(kicad_pcb …)`:
+
+- four `Edge.Cuts` `gr_line` segments forming a `(120, 56.5)`–`(160, 100)`
+  rectangle, UUIDs `e0000000-0000-4000-8000-00000000000{1,2,3,4}` — the board's
+  own outline, so the fixture has a `owner.kind: "board"` `Edge.Cuts` item
+  standing beside J1's footprint-owned ones;
+- one `F.SilkS` `gr_line` from `(125, 60)` to `(135, 60)`, UUID
+  `50000000-0000-4000-8000-000000000001` — the unrelated board graphic.
+
+### Parser-only report cases
+
+The last two entries of the committed `.drc.json` were deliberately constructed
+because a current KiCad run cannot naturally report a missing or unknown UUID:
+
+- a `silk_edge_clearance` warning naming the outline segment
+  `e0000000-…-000000000004` and the silkscreen segment
+  `50000000-…-000000000001`, i.e. two board-owned items;
+- a `copper_edge_clearance` error whose first item carries **no** `uuid` at all
+  and whose second carries `ffffffff-ffff-4fff-8fff-ffffffffffff`, a UUID that
+  appears nowhere in the board. These two items exist only to exercise
+  `ownership_status: "uuid_missing"` and `ownership_status: "not_found"`.
+
+No `kicad-cli` run produced those two report violations. They are parser-only
+fixtures and are not evidence of what KiCad emits. The live ignored test runs
+DRC against the KiCad-reserialized board and supplies the independent real-tool
+path.
+
+## What the pair covers
+
+| acceptance case (#413)                | fixture item                                              |
+| ------------------------------------- | --------------------------------------------------------- |
+| board's top-level `Edge.Cuts` outline | `gr_line` `e0000000-…-000000000004`, `owner.kind: board`   |
+| `Edge.Cuts` circle nested in J1       | `fp_circle` `7b970478-…`, `owner.kind: footprint`, ref J1  |
+| a pad belonging to J1                 | `pad` `5bc25fc3-…`, `owner.kind: footprint`, ref J1        |
+| an unrelated board graphic            | `gr_line` `50000000-…-000000000001` on `F.SilkS`           |
+| a report item with no UUID            | first item of the last violation, `uuid_missing`           |
+| a report item with an unknown UUID    | `ffffffff-ffff-4fff-8fff-ffffffffffff`, `not_found`        |
+
+Footprint ownership does not make a finding false. J1's `Edge.Cuts` circles are
+still fabrication geometry — real cutouts at footprint-relative positions.
+Ownership tells a caller which remedy applies: moving J1 moves the pad and the
+cutout together and cannot change their mutual clearance, so the footprint
+definition or the rule is what needs review.
+
+## Tests using this fixture
+
+- `crates/konnect-core/src/tools/cli.rs`, module `drc_ownership_tests` — parses
+  the committed pair and asserts the ownership of every item. No `kicad-cli`.
+- `crates/konnect-core/src/tools/cli.rs`,
+  `run_drc_enriches_items_from_the_board_it_ran_on` — `#[ignore]`d, needs a real
+  `kicad-cli` on PATH. Copies the board to a temp directory, runs the real
+  `pcb drc`, and asserts ownership on whatever KiCad reports that run. It does
+  not compare against the committed JSON.

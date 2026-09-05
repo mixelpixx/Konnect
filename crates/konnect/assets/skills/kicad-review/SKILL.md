@@ -50,6 +50,14 @@ A weaker finding may ask a question; it does not override stronger contradictory
 evidence. Any required check that did not run, returned impossible coverage, or
 remains inconsistent with stronger evidence makes the verdict `INCOMPLETE`.
 
+DRC violation items carry `owner` and `ownership_status`. That is direct
+evidence, not a heuristic: `owner.kind: "footprint"` means the offending
+geometry belongs to `owner.reference`'s own artwork, so the remedy is a
+footprint or rule change rather than a placement change — the finding itself
+stands either way. When `ownership_status` is not `"resolved"`, ownership is
+unknown and `owner` is `null`; corroborate with
+`list_board_footprint_graphics` rather than assuming the board owns it.
+
 ## References by review branch
 
 - Read [`references/design-checklist.md`](references/design-checklist.md) for a

@@ -1,0 +1,190 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-09-04T09:36:36",
+    "ignored_checks": [
+        {
+            "description": "Footprint has no courtyard defined",
+            "key": "missing_courtyard"
+        },
+        {
+            "description": "Track endpoint not centered on via",
+            "key": "track_not_centered_on_via"
+        },
+        {
+            "description": "Tuning profile track geometries",
+            "key": "tuning_profile_track_geometries"
+        },
+        {
+            "description": "Footprint doesn't match symbol's footprint filters",
+            "key": "footprint_filters_mismatch"
+        },
+        {
+            "description": "Footprint component type doesn't match footprint pads",
+            "key": "footprint_type_mismatch"
+        }
+    ],
+    "included_severities": [
+        "error",
+        "warning",
+        "exclusion"
+    ],
+    "kicad_version": "10.0.5",
+    "schematic_parity": [],
+    "source": "j1-repro.kicad_pcb",
+    "unconnected_items": [],
+    "violations": [
+        {
+            "description": "Board edge clearance violation (board setup constraints edge clearance 0.5000 mm; actual 0.1000 mm)",
+            "items": [
+                {
+                    "description": "Circle of J1 on Edge.Cuts",
+                    "pos": {
+                        "x": 136.19,
+                        "y": 93.375
+                    },
+                    "uuid": "7b970478-1e4a-48b6-b01a-35348027ca5e"
+                },
+                {
+                    "description": "Pad 1 [GND] of J1 on F.Cu",
+                    "pos": {
+                        "x": 136.19,
+                        "y": 94.865
+                    },
+                    "uuid": "5bc25fc3-1886-4e08-a602-7e08cc66255e"
+                }
+            ],
+            "severity": "error",
+            "type": "copper_edge_clearance"
+        },
+        {
+            "description": "Board edge clearance violation (board setup constraints edge clearance 0.5000 mm; actual 0.1000 mm)",
+            "items": [
+                {
+                    "description": "Circle of J1 on Edge.Cuts",
+                    "pos": {
+                        "x": 138.73,
+                        "y": 93.375
+                    },
+                    "uuid": "5480471a-80a9-4087-b1bb-5820a43bc37e"
+                },
+                {
+                    "description": "Pad 2 [VCC] of J1 on F.Cu",
+                    "pos": {
+                        "x": 138.73,
+                        "y": 91.885
+                    },
+                    "uuid": "909332de-07b2-478e-aef4-f0eacb8aa7ed"
+                }
+            ],
+            "severity": "error",
+            "type": "copper_edge_clearance"
+        },
+        {
+            "description": "Board edge clearance violation (board setup constraints edge clearance 0.5000 mm; actual 0.1000 mm)",
+            "items": [
+                {
+                    "description": "Circle of J1 on Edge.Cuts",
+                    "pos": {
+                        "x": 141.27,
+                        "y": 93.375
+                    },
+                    "uuid": "d974e677-146d-4d20-ba87-97bbf3244250"
+                },
+                {
+                    "description": "Pad 3 [SCL] of J1 on F.Cu",
+                    "pos": {
+                        "x": 141.27,
+                        "y": 94.865
+                    },
+                    "uuid": "c478f8e6-457c-4d11-a0a8-6ad9316ac5be"
+                }
+            ],
+            "severity": "error",
+            "type": "copper_edge_clearance"
+        },
+        {
+            "description": "Board edge clearance violation (board setup constraints edge clearance 0.5000 mm; actual 0.1000 mm)",
+            "items": [
+                {
+                    "description": "Circle of J1 on Edge.Cuts",
+                    "pos": {
+                        "x": 143.81,
+                        "y": 93.375
+                    },
+                    "uuid": "e052f2ec-907f-4c92-b5dc-ba51e6db24cb"
+                },
+                {
+                    "description": "Pad 4 [SDA] of J1 on F.Cu",
+                    "pos": {
+                        "x": 143.81,
+                        "y": 91.885
+                    },
+                    "uuid": "ee491ce7-d8ad-4347-b3d6-05f22e4ac0fe"
+                }
+            ],
+            "severity": "error",
+            "type": "copper_edge_clearance"
+        },
+        {
+            "description": "Footprint 'PinSocket_1x04_P2.54mm_Vertical_SMD_low_profile_Pin1Left' not found in library 'Connector_PinSocket_2.54mm'",
+            "items": [
+                {
+                    "description": "Footprint J1",
+                    "pos": {
+                        "x": 140.0,
+                        "y": 93.375
+                    },
+                    "uuid": "b432574a-bdcd-4387-8d5e-65f34938c3a0"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "Silkscreen clipped by board edge",
+            "items": [
+                {
+                    "description": "Segment on Edge.Cuts",
+                    "pos": {
+                        "x": 120.0,
+                        "y": 100.0
+                    },
+                    "uuid": "e0000000-0000-4000-8000-000000000004"
+                },
+                {
+                    "description": "Segment on F.Silkscreen",
+                    "pos": {
+                        "x": 125.0,
+                        "y": 60.0
+                    },
+                    "uuid": "50000000-0000-4000-8000-000000000001"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_edge_clearance"
+        },
+        {
+            "description": "Board edge clearance violation (board setup constraints edge clearance 0.5000 mm; actual 0.1000 mm)",
+            "items": [
+                {
+                    "description": "Segment on Edge.Cuts",
+                    "pos": {
+                        "x": 160.0,
+                        "y": 56.5
+                    }
+                },
+                {
+                    "description": "Track [SDA] on F.Cu",
+                    "pos": {
+                        "x": 159.9,
+                        "y": 57.0
+                    },
+                    "uuid": "ffffffff-ffff-4fff-8fff-ffffffffffff"
+                }
+            ],
+            "severity": "error",
+            "type": "copper_edge_clearance"
+        }
+    ]
+}
