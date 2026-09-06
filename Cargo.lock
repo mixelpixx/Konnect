@@ -2462,6 +2462,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dirs",
+ "fs4",
  "konnect-core",
  "konnect-ipc",
  "konnect-sexp",
