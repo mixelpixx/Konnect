@@ -9,11 +9,21 @@
 //! server at all. An HTTP server compounds it: `run_http` never reads stdin,
 //! so the parent's death is invisible to it and it outlives the session.
 //!
-//! The record therefore lives here, written by the server about itself:
-//! `<konnect_dir>/run/<pid>.lock`, held under an exclusive advisory lock for
-//! the whole process lifetime. The lock, not the PID number, is the liveness
-//! proof — a PID can be recycled onto an unrelated process, and `kill(pid, 0)`
-//! is not a probe on Windows.
+//! The record therefore lives here, written by the server about itself, as a
+//! pair under `<konnect_dir>/run/`:
+//!
+//! - `<pid>.lock` — empty, held under an exclusive advisory lock for the whole
+//!   process lifetime. The lock, not the PID number, is the liveness proof: a
+//!   PID can be recycled onto an unrelated process, and `kill(pid, 0)` is not
+//!   a probe on Windows.
+//! - `<pid>.json` — the readable body, never locked.
+//!
+//! The split is not tidiness. `LockFileEx` is **mandatory** on Windows, so a
+//! body written inside the locked file cannot be read while its owner is
+//! alive — `fs::read` fails with `ERROR_LOCK_VIOLATION` (os error 33), which
+//! is precisely the moment the record is worth reading. `flock` is advisory
+//! and hides this on Unix. Keeping the locked token empty means the body is
+//! readable on every platform, by a person or by whatever reads these next.
 //!
 //! The sweep deletes *records* and nothing else. It never signals a process.
 //! Konnect is also spawned directly by external MCP clients (Claude Desktop,
@@ -27,13 +37,12 @@ use crate::config::TransportMode;
 use fs4::FileExt;
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
-/// Body of one `<pid>.lock`. Enough to tell a stranger's server from ours
-/// when reading the directory by hand — the file's existence plus its lock
-/// state is what the sweep actually acts on.
+/// Body of one `<pid>.json`. Enough to tell a stranger's server from ours
+/// when reading the directory by hand — the lock file's state is what the
+/// sweep actually acts on.
 #[derive(Serialize)]
 struct RunRecord<'a> {
     pid: u32,
@@ -46,21 +55,23 @@ struct RunRecord<'a> {
     exe: Option<String>,
 }
 
-/// Holds the process's own record open for as long as it lives, and removes
-/// it on a clean exit.
+/// Holds the process's own lock open for as long as it lives, and removes the
+/// pair on a clean exit.
 ///
 /// A killed process drops nothing — that is the orphan case, and the sweep in
 /// the next server's startup is what covers it.
 pub struct RunGuard {
     /// `None` when registration was skipped; the guard is then inert.
-    path: Option<PathBuf>,
+    lock_path: Option<PathBuf>,
+    body_path: Option<PathBuf>,
     lock: Option<File>,
 }
 
 impl RunGuard {
     fn inert() -> Self {
         RunGuard {
-            path: None,
+            lock_path: None,
+            body_path: None,
             lock: None,
         }
     }
@@ -68,17 +79,19 @@ impl RunGuard {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let Some(path) = self.path.take() else {
-            return;
-        };
         // Release and close before unlinking: Windows refuses to delete a file
         // that is still open without FILE_SHARE_DELETE.
         if let Some(file) = self.lock.take() {
             let _ = <File as FileExt>::unlock(&file);
             drop(file);
         }
-        if let Err(err) = std::fs::remove_file(&path) {
-            debug!(path = %path.display(), %err, "could not remove run record");
+        for path in [self.body_path.take(), self.lock_path.take()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(err) = std::fs::remove_file(&path) {
+                debug!(path = %path.display(), %err, "could not remove run record");
+            }
         }
     }
 }
@@ -87,6 +100,11 @@ impl Drop for RunGuard {
 /// path scheme.
 fn run_dir() -> PathBuf {
     konnect_core::observability::konnect_dir().join("run")
+}
+
+/// The body that belongs to a `<pid>.lock`.
+fn body_for(lock: &Path) -> PathBuf {
+    lock.with_extension("json")
 }
 
 /// Reap stale records, then register this process. Sweep first, so our own
@@ -111,8 +129,8 @@ pub fn sweep_and_register(transport: &TransportMode) -> RunGuard {
 /// be another KiCad window's server, or an MCP client's, and this function has
 /// no way to tell them apart and no business acting on either.
 fn sweep(dir: &Path) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
         Err(err) => {
             // Missing on a first run, which is not worth a warning.
             debug!(dir = %dir.display(), %err, "no run directory to sweep");
@@ -120,16 +138,11 @@ fn sweep(dir: &Path) {
         }
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
-            continue;
-        }
-
-        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    for path in entries.iter().filter(|p| has_extension(p, "lock")) {
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => file,
             Err(err) => {
-                warn!(path = %path.display(), %err, "could not open run record");
+                warn!(path = %path.display(), %err, "could not open run lock");
                 continue;
             }
         };
@@ -142,9 +155,43 @@ fn sweep(dir: &Path) {
 
         let _ = <File as FileExt>::unlock(&file);
         drop(file);
-        match std::fs::remove_file(&path) {
+        // Only the lock is removed here. Its body is then a body with no
+        // lock, which the pass below already deletes — a second call to do it
+        // from here is unreachable code that looks like a safeguard.
+        match std::fs::remove_file(path) {
             Ok(()) => debug!(path = %path.display(), "reaped stale run record"),
-            Err(err) => warn!(path = %path.display(), %err, "could not reap run record"),
+            Err(err) => warn!(path = %path.display(), %err, "could not reap run lock"),
+        }
+    }
+
+    // A body whose lock is gone describes nothing. This runs after the pass
+    // above, so a live server's body still has its lock and is not a match.
+    // Restricted to `<digits>.json` so the sweep can only ever delete a name
+    // it could itself have written.
+    for path in entries.iter().filter(|p| is_orphaned_body(p)) {
+        debug!(path = %path.display(), "reaped body with no lock");
+        remove_quietly(path);
+    }
+}
+
+fn has_extension(path: &Path, want: &str) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some(want)
+}
+
+/// A `<digits>.json` with no `<digits>.lock` beside it any more.
+fn is_orphaned_body(path: &Path) -> bool {
+    has_extension(path, "json")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
+        && !path.with_extension("lock").exists()
+}
+
+fn remove_quietly(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            debug!(path = %path.display(), %err, "could not remove run record body");
         }
     }
 }
@@ -161,20 +208,18 @@ fn register(dir: &Path, transport: &str) -> RunGuard {
     }
 
     let pid = std::process::id();
-    let path = dir.join(format!("{pid}.lock"));
+    let lock_path = dir.join(format!("{pid}.lock"));
 
-    // Truncating: a same-numbered record can survive a sweep that could not
-    // delete it, and its contents describe a different process.
     let file = match OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(true)
-        .open(&path)
+        .open(&lock_path)
     {
         Ok(file) => file,
         Err(err) => {
-            warn!(path = %path.display(), %err, "could not create run record");
+            warn!(path = %lock_path.display(), %err, "could not create run lock");
             return RunGuard::inert();
         }
     };
@@ -184,7 +229,7 @@ fn register(dir: &Path, transport: &str) -> RunGuard {
     // this module already tolerates everywhere else; it cannot cost a process,
     // because the sweep never signals one.
     if let Err(err) = <File as FileExt>::try_lock(&file) {
-        warn!(path = %path.display(), %err, "run record already locked");
+        warn!(path = %lock_path.display(), %err, "run lock already held");
         return RunGuard::inert();
     }
 
@@ -197,18 +242,22 @@ fn register(dir: &Path, transport: &str) -> RunGuard {
             .ok()
             .map(|p| p.display().to_string()),
     };
+    let body_path = body_for(&lock_path);
     match serde_json::to_vec(&record) {
+        // Truncating write: a same-numbered body can survive a sweep that
+        // could not delete it, and it describes a different process.
         Ok(body) => {
-            if let Err(err) = (&file).write_all(&body) {
-                debug!(path = %path.display(), %err, "run record body not written");
+            if let Err(err) = std::fs::write(&body_path, &body) {
+                debug!(path = %body_path.display(), %err, "run record body not written");
             }
         }
         Err(err) => debug!(%err, "run record body not serialized"),
     }
 
-    debug!(path = %path.display(), "registered run record");
+    debug!(path = %lock_path.display(), "registered run record");
     RunGuard {
-        path: Some(path),
+        lock_path: Some(lock_path),
+        body_path: Some(body_path),
         lock: Some(file),
     }
 }
@@ -231,35 +280,48 @@ mod tests {
             .write(true)
             .truncate(true)
             .open(path)
-            .expect("open record");
+            .expect("open lock");
         <File as FileExt>::try_lock(&file).expect("lock must be free");
         file
+    }
+
+    /// A `<pid>.lock` plus its `<pid>.json`, as `register` leaves them.
+    fn pair(dir: &Path, pid: u32) -> (PathBuf, PathBuf) {
+        let lock = dir.join(format!("{pid}.lock"));
+        let body = dir.join(format!("{pid}.json"));
+        std::fs::write(&body, b"{}").unwrap();
+        (lock, body)
     }
 
     #[test]
     fn stale_record_is_reaped() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join("4242.lock");
+        let (lock, body) = pair(dir.path(), 4242);
         // Locked and then released — exactly the state a killed server leaves,
         // since the OS drops its locks whether or not it exited cleanly.
-        drop(hold(&stale));
+        drop(hold(&lock));
 
         sweep(dir.path());
 
-        assert!(!stale.exists(), "stale record survived the sweep");
+        assert!(!lock.exists(), "stale lock survived the sweep");
+        assert!(!body.exists(), "stale body survived the sweep");
     }
 
     #[test]
     fn record_with_a_live_owner_survives() {
         let dir = tempfile::tempdir().unwrap();
-        let live = dir.path().join("4243.lock");
-        let held = hold(&live);
+        let (lock, body) = pair(dir.path(), 4243);
+        let held = hold(&lock);
 
         sweep(dir.path());
 
         assert!(
-            live.exists(),
-            "sweep deleted the record of a process that is still running"
+            lock.exists(),
+            "sweep deleted the lock of a process that is still running"
+        );
+        assert!(
+            body.exists(),
+            "sweep deleted the body of a process that is still running"
         );
         drop(held);
     }
@@ -269,28 +331,32 @@ mod tests {
     #[test]
     fn a_sweep_separates_the_live_record_from_the_stale_one() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join("4244.lock");
-        let live = dir.path().join("4245.lock");
+        let (stale, stale_body) = pair(dir.path(), 4244);
+        let (live, live_body) = pair(dir.path(), 4245);
         drop(hold(&stale));
         let held = hold(&live);
 
         sweep(dir.path());
 
         assert!(!stale.exists(), "stale record survived");
+        assert!(!stale_body.exists(), "stale body survived");
         assert!(live.exists(), "live record was reaped");
+        assert!(live_body.exists(), "live body was reaped");
         drop(held);
     }
 
     #[test]
-    fn sweep_touches_nothing_but_lock_files() {
+    fn sweep_touches_nothing_it_did_not_write() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("server.log");
         let pid = dir.path().join("server.pid");
         let bare = dir.path().join("lock");
+        let notes = dir.path().join("notes.json");
         let subdir = dir.path().join("nested.lock.d");
         std::fs::write(&log, "text").unwrap();
         std::fs::write(&pid, "4246").unwrap();
         std::fs::write(&bare, "no extension").unwrap();
+        std::fs::write(&notes, "{}").unwrap();
         std::fs::create_dir(&subdir).unwrap();
 
         sweep(dir.path());
@@ -298,7 +364,24 @@ mod tests {
         assert!(log.exists(), "sweep deleted an unrelated file");
         assert!(pid.exists(), "sweep deleted the legacy PID file");
         assert!(bare.exists(), "sweep deleted an extensionless entry");
+        assert!(
+            notes.exists(),
+            "sweep deleted a .json whose name it could never have written"
+        );
         assert!(subdir.exists(), "sweep deleted an unrelated directory");
+    }
+
+    /// A body left behind without its lock describes nothing, and would
+    /// otherwise sit in the directory claiming a server that is gone.
+    #[test]
+    fn a_body_with_no_lock_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("4247.json");
+        std::fs::write(&body, b"{}").unwrap();
+
+        sweep(dir.path());
+
+        assert!(!body.exists(), "orphaned body survived the sweep");
     }
 
     #[test]
@@ -314,10 +397,29 @@ mod tests {
 
         let guard = register(&run, "stdio");
 
-        let path = run.join(format!("{}.lock", std::process::id()));
-        assert!(path.exists(), "record not written");
+        let lock = run.join(format!("{}.lock", std::process::id()));
+        let body = run.join(format!("{}.json", std::process::id()));
+        assert!(lock.exists(), "lock not written");
+        assert!(body.exists(), "record not written");
+        drop(guard);
+    }
+
+    /// The Windows regression, and the reason the lock and the body are two
+    /// files. `LockFileEx` is mandatory, so a body written inside the locked
+    /// file is unreadable exactly while its owner is alive: CI failed here
+    /// with `Os { code: 33, "another process has locked a portion of the
+    /// file" }` when this module kept both in one file. `flock` is advisory,
+    /// so on Unix this test passes either way and only Windows CI proves it.
+    #[test]
+    fn the_body_is_readable_while_its_owner_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = register(dir.path(), "stdio");
+        let body_path = dir.path().join(format!("{}.json", std::process::id()));
+
         let body: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&body_path).expect("body must be readable"))
+                .expect("body must parse");
+
         assert_eq!(body["pid"], std::process::id());
         assert_eq!(body["transport"], "stdio");
         drop(guard);
@@ -341,11 +443,13 @@ mod tests {
     fn the_guard_removes_its_record_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let guard = register(dir.path(), "both");
-        let path = dir.path().join(format!("{}.lock", std::process::id()));
-        assert!(path.exists(), "record not written");
+        let lock = dir.path().join(format!("{}.lock", std::process::id()));
+        let body = dir.path().join(format!("{}.json", std::process::id()));
+        assert!(lock.exists() && body.exists(), "record not written");
 
         drop(guard);
 
-        assert!(!path.exists(), "record outlived its guard");
+        assert!(!lock.exists(), "lock outlived its guard");
+        assert!(!body.exists(), "body outlived its guard");
     }
 }
