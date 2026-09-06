@@ -18,6 +18,17 @@
 //!   a probe on Windows.
 //! - `<pid>.json` — the readable body, never locked.
 //!
+//! A record is *published*, not built in place: the file is created and locked
+//! as `<pid>.tmp` and only then renamed to `<pid>.lock`. The sweep judges a
+//! record by whether its lock is free, so a record that existed under its final
+//! name before it was locked would read as stale to a startup happening at the
+//! same moment — and two simultaneous launches are ordinary here. Renaming a
+//! file that is already locked closes that window instead of narrowing it.
+//!
+//! Both sweep passes also filter on a `<digits>` stem. The lock pass acquires
+//! an exclusive lock on each candidate to test it, and "this lock is free" is a
+//! true statement about somebody else's lock file too.
+//!
 //! The split is not tidiness. `LockFileEx` is **mandatory** on Windows, so a
 //! body written inside the locked file cannot be read while its owner is
 //! alive — `fs::read` fails with `ERROR_LOCK_VIOLATION` (os error 33), which
@@ -107,6 +118,28 @@ fn body_for(lock: &Path) -> PathBuf {
     lock.with_extension("json")
 }
 
+/// Where a registration lives between `open` and the lock it is about to take.
+///
+/// `.tmp`, not `.lock`: the sweep only ever considers `<digits>.lock` and
+/// `<digits>.json`, so a record is invisible to it for the whole window in
+/// which it is not yet locked. The name is per-PID and opened truncating, so a
+/// process killed inside that window leaves at most one empty file, which its
+/// own PID slot overwrites on the next start.
+fn staging_path(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("{pid}.tmp"))
+}
+
+/// `<digits>` — a stem this registry could itself have written, i.e. a PID.
+///
+/// Both sweep passes filter on it. Without it the lock pass takes an exclusive
+/// lock on every `*.lock` in the directory and deletes the ones that are free,
+/// which is a correct description of another tool's lock file too.
+fn is_our_stem(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Reap stale records, then register this process. Sweep first, so our own
 /// record is never a candidate for it.
 pub fn sweep_and_register(transport: &TransportMode) -> RunGuard {
@@ -138,7 +171,10 @@ fn sweep(dir: &Path) {
         }
     };
 
-    for path in entries.iter().filter(|p| has_extension(p, "lock")) {
+    for path in entries
+        .iter()
+        .filter(|p| has_extension(p, "lock") && is_our_stem(p))
+    {
         let file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => file,
             Err(err) => {
@@ -180,12 +216,7 @@ fn has_extension(path: &Path, want: &str) -> bool {
 
 /// A `<digits>.json` with no `<digits>.lock` beside it any more.
 fn is_orphaned_body(path: &Path) -> bool {
-    has_extension(path, "json")
-        && path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
-        && !path.with_extension("lock").exists()
+    has_extension(path, "json") && is_our_stem(path) && !path.with_extension("lock").exists()
 }
 
 fn remove_quietly(path: &Path) {
@@ -209,27 +240,43 @@ fn register(dir: &Path, transport: &str) -> RunGuard {
 
     let pid = std::process::id();
     let lock_path = dir.join(format!("{pid}.lock"));
+    let staged = staging_path(dir, pid);
 
+    // Create and lock under `<pid>.tmp`, then publish under `<pid>.lock` by
+    // rename. A sweep running concurrently in another startup only ever sees
+    // the final name, and by the time that name exists the lock behind it is
+    // already held — so the "free lock means the owner is gone" test it makes
+    // can no longer be true of a record that is still being written.
+    //
+    // The rename does not disturb the lock: on Unix a `flock` belongs to the
+    // open file description, not to the path, and on Windows `File` is opened
+    // with FILE_SHARE_DELETE, so the entry can be moved under the open handle.
     let file = match OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(true)
-        .open(&lock_path)
+        .open(&staged)
     {
         Ok(file) => file,
         Err(err) => {
-            warn!(path = %lock_path.display(), %err, "could not create run lock");
+            warn!(path = %staged.display(), %err, "could not create run lock");
             return RunGuard::inert();
         }
     };
 
-    // A concurrent sweeper can see this file in the gap between create and
-    // lock and delete it as stale. That costs a record, which is the failure
-    // this module already tolerates everywhere else; it cannot cost a process,
-    // because the sweep never signals one.
     if let Err(err) = <File as FileExt>::try_lock(&file) {
-        warn!(path = %lock_path.display(), %err, "run lock already held");
+        // Another live process already owns this PID's staging file, which
+        // means this one is not what it claims to be. Leave it alone.
+        warn!(path = %staged.display(), %err, "run lock already held");
+        return RunGuard::inert();
+    }
+
+    if let Err(err) = std::fs::rename(&staged, &lock_path) {
+        warn!(path = %staged.display(), %err, "could not publish run record");
+        let _ = <File as FileExt>::unlock(&file);
+        drop(file);
+        remove_quietly(&staged);
         return RunGuard::inert();
     }
 
@@ -352,8 +399,14 @@ mod tests {
         let pid = dir.path().join("server.pid");
         let bare = dir.path().join("lock");
         let notes = dir.path().join("notes.json");
+        // A `.lock` this registry could never have written. The contract is
+        // `<pid>.lock`, and the sweep takes a lock on every candidate before
+        // deleting it — so an unrelated lock file that happens to be free is
+        // exactly the thing a name filter has to keep it away from.
+        let foreign_lock = dir.path().join("notes.lock");
         let subdir = dir.path().join("nested.lock.d");
         std::fs::write(&log, "text").unwrap();
+        std::fs::write(&foreign_lock, "not ours").unwrap();
         std::fs::write(&pid, "4246").unwrap();
         std::fs::write(&bare, "no extension").unwrap();
         std::fs::write(&notes, "{}").unwrap();
@@ -368,7 +421,58 @@ mod tests {
             notes.exists(),
             "sweep deleted a .json whose name it could never have written"
         );
+        assert!(
+            foreign_lock.exists(),
+            "sweep deleted a .lock whose name it could never have written"
+        );
         assert!(subdir.exists(), "sweep deleted an unrelated directory");
+    }
+
+    /// The create-before-lock race, as a property rather than a schedule.
+    ///
+    /// A registration is unavoidably visible on disk for an instant before it
+    /// holds its lock. If that instant is spent under a name the sweep
+    /// considers, a concurrent startup reaps a record that is about to become
+    /// live — and Konnect is back to an untracked running server, which is the
+    /// state this module exists to remove. Two simultaneous launches are the
+    /// ordinary case in #103, not a corner.
+    ///
+    /// Testing it by racing threads would prove nothing on a green run: the
+    /// window is microseconds and a passing schedule is not evidence. The
+    /// invariant is checkable without a schedule — put the directory in the
+    /// mid-registration state and sweep it.
+    #[test]
+    fn a_registration_in_progress_survives_a_concurrent_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staging_path(dir.path(), 4248);
+        // Created, not yet locked: exactly what another process can observe
+        // between our `open` and our `try_lock`.
+        std::fs::write(&staged, b"").unwrap();
+
+        sweep(dir.path());
+
+        assert!(
+            staged.exists(),
+            "a concurrent sweep reaped a registration that had not locked yet"
+        );
+    }
+
+    /// The published record is the locked one, so the rename is the moment the
+    /// record becomes visible to a sweep — never before.
+    #[test]
+    fn registration_leaves_no_staging_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = register(dir.path(), "stdio");
+
+        let staged = staging_path(dir.path(), std::process::id());
+        assert!(!staged.exists(), "staging file outlived the registration");
+        assert!(
+            dir.path()
+                .join(format!("{}.lock", std::process::id()))
+                .exists(),
+            "record was not published under its final name"
+        );
+        drop(guard);
     }
 
     /// A body left behind without its lock describes nothing, and would
