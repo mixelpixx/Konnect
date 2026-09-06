@@ -590,6 +590,7 @@ async fn handle_export_bom(
         // The schema has advertised this default since the tool shipped; the
         // handler never read it, so DNP parts landed in every BOM.
         exclude_dnp: args["exclude_dnp"].as_bool().unwrap_or(true),
+        ref_range_delimiter: None,
     };
 
     let cli = &ctx.config.kicad_cli;

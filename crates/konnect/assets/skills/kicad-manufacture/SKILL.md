@@ -96,6 +96,15 @@ Pass `schematic` when assembly output requires a BOM. The tool attempts Gerber,
 drill, position, and BOM exports according to the request; individual failures
 can still leave a partial directory.
 
+For `fab_house="jlcpcb"`, use millimetres (the default) and provide the BOM
+fields, labels, and grouping required by the current order contract. The tool
+emits `BOM-<project>.csv` plus `CPL-<project>.csv`; the CPL uses JLCPCB's
+`Designator,Mid X,Mid Y,Layer,Rotation` schema, and KiCad is instructed to
+enumerate grouped BOM references instead of compressing them into ranges. A
+BOM/CPL designator mismatch makes the package incomplete. This conversion does
+not apply package-specific rotation corrections, so the order preview remains
+an assembly release gate.
+
 ### Artifact acceptance gate
 
 1. Inspect `warnings` and `files_generated`. Any warning or missing requested
@@ -113,12 +122,11 @@ can still leave a partial directory.
 6. For assembly, inspect BOM contents, DNP handling, designator coverage, CPL
    side/units/origin/rotation, and the fabricator's export preview.
 
-The current `files` field is a directory listing and can include pre-existing
-entries; `files_generated` records successful export calls but does not prove
-that every reported output is fresh and non-empty. If a later tool response
-provides an explicit verified artifact manifest, accept that stronger evidence
-only for the artifacts and postconditions it names. Preserve the viewer and
-order-preview checks.
+The `files` field is derived from regular, non-empty artifacts verified at the
+export boundary; `files_generated` describes each successful export. That
+evidence does not establish vendor acceptance, correct component rotations, or
+that unrelated stale files elsewhere in a reused directory are safe to upload.
+Preserve the viewer and order-preview checks.
 
 Completion criterion: an accepted manifest accounts for every required output,
 every accepted path is fresh and non-empty, and visual/order previews agree with
