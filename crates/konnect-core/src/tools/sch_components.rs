@@ -1244,10 +1244,22 @@ fn component_mutation_readback_from_schematic(
         // file so a move can be checked rather than taken on trust.
         let mut field_placements = serde_json::Map::new();
         for property in &symbol.properties {
-            let hidden = property
-                .sub_nodes
-                .iter()
-                .any(|node| node.tag() == Some("hide") && node.value() == Some("yes"));
+            // KiCad writes a *placement's* hidden flag inside the property's
+            // `(effects …)`; the property-level token is what `lib_symbols`
+            // definitions carry. Reading only direct children therefore
+            // reports every field KiCad itself hid as visible — and, because
+            // the writer's own check is textual and does see the nested
+            // token, it also turned "hide an already-hidden field" into a
+            // post-write refusal over a file that was already correct.
+            // Both forms render identically in KiCad 10.0.6, and a file may
+            // hold either, so accept both.
+            fn hide_yes(node: &cse::sexp::SexpNode) -> bool {
+                node.tag() == Some("hide") && node.value() == Some("yes")
+            }
+            let hidden = property.sub_nodes.iter().any(|node| {
+                hide_yes(node)
+                    || (node.tag() == Some("effects") && node.children().iter().any(hide_yes))
+            });
             if let Some(at) = property
                 .sub_nodes
                 .iter()
@@ -2188,16 +2200,26 @@ fn set_property_placement(
                 "'{reference}' has no '{field}' property on one of its placed units"
             ));
         };
-        let (prop_start, prop_end) =
+        let (_prop_start, prop_end) =
             konnect_sexp::writer::find_enclosing_block(content, "property", start + relative)
                 .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
-        let property = &content[prop_start..prop_end];
+
+        // Everything below searches for tokens *after* the property's value
+        // string. A field value is arbitrary text and may contain "(at " or
+        // "(hide " — searching the whole property block rewrites the value
+        // instead of the placement, and the result is still valid
+        // S-expression, so nothing downstream notices.
+        let value_start = start + relative + field_search.len();
+        let value_end = closing_quote(content, value_start)
+            .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
+        let body_start = value_end + 1;
+        let property = &content[body_start..prop_end];
 
         // The field's own (at x y [rot]); a property carries exactly one.
         let at_rel = property
             .find("(at ")
             .ok_or_else(|| format!("'{field}' property on '{reference}' carries no (at …)"))?;
-        let at_start = prop_start + at_rel;
+        let at_start = body_start + at_rel;
         let at_end = at_start
             + content[at_start..prop_end]
                 .find(')')
@@ -2224,18 +2246,13 @@ fn set_property_placement(
         }
 
         if let Some(hide) = placement.hide {
-            // eeschema writes `(hide yes)` as a direct child of the placed
-            // symbol's property — the `(effects (hide yes))` form belongs to
-            // lib_symbols definitions. Verified against KiCad 10.0.6: its own
-            // writer round-trips the property-level token unchanged.
-            let existing_hide = property
-                .match_indices("(hide ")
-                .map(|(rel, _)| prop_start + rel)
-                .find(|&at| {
-                    content[at..prop_end]
-                        .find(')')
-                        .is_some_and(|to| !content[at..at + to].contains("(effects"))
-                });
+            // Written as a direct child of the property. KiCad's own writer
+            // nests the flag inside `(effects …)` on a placement and puts it
+            // at property level in `lib_symbols`, but the two are equivalent
+            // to it: at 10.0.6 a file in either form exports byte-identical
+            // SVG, and its writer round-trips this one unchanged. The
+            // readback accepts both, so a field KiCad hid reads as hidden.
+            let existing_hide = property.find("(hide ").map(|rel| body_start + rel);
             match (hide, existing_hide) {
                 (true, None) => {
                     // Match the indentation of the (at …) it follows, so the
@@ -2249,8 +2266,23 @@ fn set_property_placement(
                         at + content[at..prop_end].find(')').ok_or_else(|| {
                             format!("'{field}' hide flag on '{reference}' is malformed")
                         })? + 1;
-                    let line_start = content[..at].rfind('\n').map_or(at, |nl| nl);
-                    edits.push(SexpEdit::replace(line_start, token_end, String::new()));
+                    // Take the indentation before the token, and the newline
+                    // too *only* if the token had the line to itself. Deleting
+                    // back to the newline unconditionally eats whatever shares
+                    // the line — on a file that writes `(at …) (hide yes)`
+                    // together, that is the field's own position.
+                    let bytes = content.as_bytes();
+                    let mut from = at;
+                    while from > 0 && matches!(bytes[from - 1], b' ' | b'\t') {
+                        from -= 1;
+                    }
+                    if from == 0 || bytes[from - 1] != b'\n' {
+                        // Shared line: leave the neighbours and their spacing.
+                        from = at;
+                    } else {
+                        from -= 1;
+                    }
+                    edits.push(SexpEdit::replace(from, token_end, String::new()));
                 }
                 _ => {}
             }
@@ -6377,10 +6409,13 @@ mod multi_unit_component_tests {
         );
     }
 
-    /// `hide` writes the token eeschema uses on a placed symbol's property —
-    /// a direct child, not inside `(effects ...)`, which is the lib_symbols
-    /// form. Verified against KiCad 10.0.6, whose own writer round-trips the
-    /// property-level token unchanged.
+    /// `hide` writes `(hide yes)` as a direct child of the placed symbol's
+    /// property. That is not the form KiCad's own writer uses on a placement
+    /// — it nests the flag in `(effects ...)` there, and uses the direct
+    /// child in `lib_symbols` — but the two are equivalent to KiCad 10.0.6,
+    /// which exports byte-identical SVG from either and round-trips this one
+    /// unchanged. The other form is covered by
+    /// `field_placement_reads_the_hidden_flag_kicad_nests_in_effects`.
     #[tokio::test]
     async fn field_placement_hides_then_shows_a_field() {
         let (_directory, path) = eeschema_fixture();
@@ -6413,6 +6448,105 @@ mod multi_unit_component_tests {
                 "hide={hide} produced {block}"
             );
         }
+    }
+
+    /// KiCad nests a *placement's* hidden flag inside the property's
+    /// `(effects …)`; the property-level token is what `lib_symbols`
+    /// definitions carry. Reading only the property's direct children
+    /// therefore reported every field KiCad itself hid as visible, and —
+    /// because the writer's own check is textual and does see the nested
+    /// token — turned "hide an already-hidden field" into a post-write
+    /// refusal over a file that was already correct. This fixture is real
+    /// KiCad output and hides Datasheet and Description in KiCad's own form.
+    #[tokio::test]
+    async fn field_placement_reads_the_hidden_flag_kicad_nests_in_effects() {
+        let (_directory, path) = eeschema_fixture();
+        // Scope every count to R1's own placement. No whole-file count and no
+        // `unwrap_or(0)`: a search that finds nothing must fail the test.
+        let hidden_tokens = |content: &str| {
+            let blocks = find_all_symbol_instance_blocks(content, "R1");
+            assert_eq!(blocks.len(), 1, "R1 is placed exactly once here");
+            let (start, end) = blocks[0];
+            content[start..end].matches("(hide yes)").count()
+        };
+        assert_eq!(
+            hidden_tokens(&std::fs::read_to_string(&path).unwrap()),
+            2,
+            "the fixture hides Datasheet and Description"
+        );
+
+        // The readback describes the file, not merely its direct children.
+        let observed = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "field_placements": { "Value": { "rotation": 90.0 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        for field in ["Datasheet", "Description"] {
+            assert_eq!(
+                observed["units"][0]["field_placements"][field]["hide"],
+                json!(true),
+                "{field} is hidden in the file"
+            );
+        }
+
+        // Hiding one again is a no-op the post-write comparison must accept,
+        // and it must not write a second token beside KiCad's.
+        let before = hidden_tokens(&std::fs::read_to_string(&path).unwrap());
+        let observed = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "field_placements": { "Datasheet": { "hide": true } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            observed["units"][0]["field_placements"]["Datasheet"]["hide"],
+            json!(true)
+        );
+        assert_eq!(
+            hidden_tokens(&std::fs::read_to_string(&path).unwrap()),
+            before,
+            "hiding an already-hidden field must not add a second token"
+        );
+
+        // Showing it removes KiCad's nested token, leaving the other alone.
+        let observed = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "field_placements": { "Datasheet": { "hide": false } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            observed["units"][0]["field_placements"]["Datasheet"]["hide"],
+            json!(false)
+        );
+        assert_eq!(
+            observed["units"][0]["field_placements"]["Description"]["hide"],
+            json!(true),
+            "the neighbouring hidden field is untouched"
+        );
+        assert_eq!(
+            hidden_tokens(&std::fs::read_to_string(&path).unwrap()),
+            before - 1
+        );
     }
 
     /// The post-write comparison, tested directly: a silent write failure
@@ -6450,6 +6584,84 @@ mod multi_unit_component_tests {
             &json!(null),
             &want(Some(10.0), None, None, None)
         ));
+    }
+
+    /// A field's value is arbitrary text and may itself contain "(at " or
+    /// "(hide ". Searching the whole property block finds the token inside the
+    /// quoted value and rewrites *that* — the result is still valid
+    /// S-expression, so nothing downstream notices and the field's text is
+    /// silently changed. Found by adversarial review, not by the happy path.
+    #[tokio::test]
+    async fn field_placement_never_rewrites_a_value_that_looks_like_a_placement() {
+        let (_directory, path) = eeschema_fixture();
+        for (field, value) in [("Note", "mounted (at 45 deg)"), ("Trap", "see (hide yes)")] {
+            let result = handle_edit_schematic_component(
+                &json!({ "schematic": path, "reference": "P3", "fields": { field: value } }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+        }
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "P3",
+                "field_placements": { "Note": { "x": 11.0, "y": 22.0 }, "Trap": { "hide": false } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(r#""mounted (at 45 deg)""#),
+            "the value must survive a move of its own placement"
+        );
+        assert!(
+            after.contains(r#""see (hide yes)""#),
+            "the value must survive a change to its own visibility"
+        );
+        assert!(
+            after.contains("(at 11 22 0)"),
+            "the placement must still move"
+        );
+    }
+
+    /// Removing the hide token must not take whatever shares its line. Files
+    /// are not all written one node per line — this fixture is deliberately
+    /// not KiCad's own layout, because the hazard only exists in layouts KiCad
+    /// does not produce but is still asked to read.
+    #[tokio::test]
+    async fn field_placement_hide_removal_keeps_a_neighbour_on_the_same_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sameline.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(uuid \"u\")\n\t(lib_symbols)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 10 10 0)\n\t\t(unit 1)\n\t\t(uuid \"s\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 1 2 0) (hide yes)\n\t\t\t(effects (font (size 1 1)))\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "field_placements": { "Reference": { "hide": false } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(at 1 2 0)"),
+            "the field's own position must survive: {after}"
+        );
+        assert!(
+            !after.contains("(hide yes)"),
+            "the flag must be gone: {after}"
+        );
     }
 
     /// A field position is absolute, so one coordinate cannot be right for a
