@@ -602,7 +602,7 @@ async fn handle_add_schematic_component(
 
     let (expected_x, expected_y) = snap_point(x, y, 1.27);
     let placement = ComponentTargetUnit::placement(
-        &uuid, &context, &lib_id, expected_x, expected_y, rotation, ref_str, value, unit,
+        &uuid, &context, &lib_id, expected_x, expected_y, rotation, mirror, ref_str, value, unit,
     );
     sch.overwrite()?;
 
@@ -789,6 +789,9 @@ pub(crate) struct ComponentTargetUnit {
     x: f64,
     y: f64,
     rotation: f64,
+    /// The placement's `(mirror ...)` axis, bound like rotation so a
+    /// reflection that fails to reach the file cannot pass the readback.
+    mirror: Option<String>,
     instances: Vec<(String, String)>,
 }
 
@@ -802,6 +805,7 @@ impl ComponentTargetUnit {
         x: f64,
         y: f64,
         rotation: f64,
+        mirror: Option<&str>,
         reference: &str,
         value: Option<&str>,
         unit: u32,
@@ -819,6 +823,7 @@ impl ComponentTargetUnit {
             x,
             y,
             rotation,
+            mirror: mirror.map(str::to_owned),
             fields: BTreeMap::from([
                 ("Reference".to_owned(), reference.to_owned()),
                 (
@@ -922,6 +927,13 @@ fn verify_component_expectations(
                 unit["rotation"]
                     .as_f64()
                     .is_some_and(|v| (v - target.rotation).abs() < 1e-6),
+            ),
+            (
+                "mirror",
+                unit["mirror_x"].as_bool()
+                    == Some(target.mirror.as_deref().is_some_and(|m| m.contains('x')))
+                    && unit["mirror_y"].as_bool()
+                        == Some(target.mirror.as_deref().is_some_and(|m| m.contains('y'))),
             ),
             (
                 "instance_paths",
@@ -1083,6 +1095,10 @@ fn component_target_from_source(
             x: instance.x,
             y: instance.y,
             rotation: instance.rotation,
+            // Observed, not requested: rotate/move/delete do not change the
+            // mirror, so binding what the file already carries makes the
+            // readback assert they left it alone.
+            mirror: symbol.mirror.clone(),
             instances: instance_paths,
         });
     }
@@ -6198,6 +6214,7 @@ mod multi_unit_component_tests {
                 "x" => symbol.at.x += 1.27,
                 "y" => symbol.at.y += 1.27,
                 "rotation" => symbol.at.rotation = Some(symbol.at.rotation.unwrap_or(0.0) + 90.0),
+                "mirror" => symbol.set_mirror(Some("y")),
                 "project" | "path" => {
                     let previous = symbol.instance_paths();
                     symbol
@@ -6252,6 +6269,14 @@ mod multi_unit_component_tests {
     #[test]
     fn native_readback_intent_rotation() {
         native_readback_intent_mismatch("rotation");
+    }
+    /// A reflection that reaches the response but not the file — or one that
+    /// appears in the file without being asked for — must be caught by the
+    /// same readback that already guards rotation. Mirror was bound as
+    /// placement intent for exactly this (#450).
+    #[test]
+    fn native_readback_intent_mirror() {
+        native_readback_intent_mismatch("mirror");
     }
     #[test]
     fn native_readback_intent_project() {

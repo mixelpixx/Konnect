@@ -549,8 +549,8 @@ async fn handle_batch_place_components(
             Ok(uuid) => {
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
                 placements.push(super::sch_components::ComponentTargetUnit::placement(
-                    &uuid, &context, lib_id, expected_x, expected_y, rotation, reference, value,
-                    unit,
+                    &uuid, &context, lib_id, expected_x, expected_y, rotation, mirror, reference,
+                    value, unit,
                 ));
             }
             Err(e) => errors.push(error_text(&e)),
