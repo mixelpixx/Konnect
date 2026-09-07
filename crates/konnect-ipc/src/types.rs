@@ -46,6 +46,8 @@ pub struct IpcEditorCapabilities {
     pub activate_document: IpcCapability,
     pub activate_sheet: IpcCapability,
     pub reveal_object: IpcCapability,
+    pub center_object: IpcCapability,
+    pub fit_view: IpcCapability,
     pub cross_probe: IpcCapability,
 }
 
