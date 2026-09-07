@@ -7,7 +7,10 @@
 
 use konnect_ipc::builders;
 use konnect_ipc::gen::kiapi;
-use konnect_ipc::KiCadIpcClient;
+use konnect_ipc::{
+    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionObservationError,
+    IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient,
+};
 use nng::options::Options;
 use prost::Message;
 use std::sync::{Arc, Mutex};
@@ -2242,4 +2245,293 @@ fn generic_reobservation_cannot_replace_the_bound_typed_document() {
             ..
         }
     ));
+}
+
+fn navigation_project_path() -> &'static str {
+    if cfg!(windows) {
+        r"C:\design"
+    } else {
+        "/design"
+    }
+}
+
+fn navigation_project() -> kiapi::common::types::ProjectSpecifier {
+    kiapi::common::types::ProjectSpecifier {
+        name: "navigation".to_string(),
+        path: navigation_project_path().to_string(),
+    }
+}
+
+fn navigation_board_document() -> kiapi::common::types::DocumentSpecifier {
+    kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                "navigation.kicad_pcb".to_string(),
+            ),
+        ),
+        project: Some(navigation_project()),
+    }
+}
+
+fn navigation_sheet_document(ids: &[&str]) -> kiapi::common::types::DocumentSpecifier {
+    kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypeSchematic as i32,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::SheetPath(
+                kiapi::common::types::SheetPath {
+                    path: ids.iter().map(|id| kiid(id)).collect(),
+                    path_human_readable: "/child".to_string(),
+                },
+            ),
+        ),
+        project: Some(navigation_project()),
+    }
+}
+
+fn open_navigation_documents_response(
+    documents: Vec<kiapi::common::types::DocumentSpecifier>,
+) -> kiapi::common::ApiResponse {
+    reply_with(builders::pack_any(
+        &kiapi::common::commands::GetOpenDocumentsResponse { documents },
+        "kiapi.common.commands.GetOpenDocumentsResponse",
+    ))
+}
+
+fn selection_response(items: Vec<prost_types::Any>) -> kiapi::common::ApiResponse {
+    reply_with(builders::pack_any(
+        &kiapi::common::commands::SelectionResponse { items },
+        "kiapi.common.commands.SelectionResponse",
+    ))
+}
+
+fn navigation_project_identity() -> Option<IpcProjectIdentity> {
+    Some(IpcProjectIdentity {
+        name: "navigation".to_string(),
+        path: navigation_project_path().to_string(),
+    })
+}
+
+fn navigation_board_target() -> IpcEditorDocument {
+    let document_path = std::path::Path::new(navigation_project_path())
+        .join("navigation.kicad_pcb")
+        .display()
+        .to_string();
+    IpcEditorDocument {
+        editor: IpcEditorKind::Pcb,
+        project: navigation_project_identity(),
+        document_path: Some(document_path),
+        sheet_instance_path: None,
+    }
+}
+
+fn navigation_sheet_target(ids: &[&str]) -> IpcEditorDocument {
+    IpcEditorDocument {
+        editor: IpcEditorKind::Schematic,
+        project: navigation_project_identity(),
+        document_path: None,
+        sheet_instance_path: Some(IpcSheetInstancePath {
+            kiids: ids.iter().map(|id| (*id).to_string()).collect(),
+            human_readable: "/child".to_string(),
+        }),
+    }
+}
+
+fn selection_kind(error: &anyhow::Error) -> IpcSelectionObservationErrorKind {
+    IpcSelectionObservationError::from_error(error)
+        .expect("typed selection observation error")
+        .kind
+}
+
+#[test]
+fn selection_observation_is_bound_to_the_exact_board_and_returns_stable_kiids() {
+    let captured = Arc::new(Mutex::new(None));
+    let captured_in_mock = captured.clone();
+    let footprint = kiapi::board::types::FootprintInstance {
+        id: Some(kiid("footprint-kiid")),
+        ..Default::default()
+    };
+    let selected = builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_board_document(),
+            ]));
+        }
+        if message.type_url.ends_with("GetSelection") {
+            let request = kiapi::common::commands::GetSelection::decode(message.value.as_slice())
+                .expect("selection request");
+            record_doc(&captured_in_mock, &request.header);
+            return Some(selection_response(vec![selected.clone()]));
+        }
+        panic!("unexpected request {}", message.type_url);
+    });
+
+    let observation = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_board_target())
+        .expect("selection observation");
+    assert_eq!(observation.editor, IpcEditorKind::Pcb);
+    assert_eq!(observation.project, navigation_project_identity());
+    assert_eq!(observation.selected_objects.len(), 1);
+    assert_eq!(observation.selected_objects[0].kiid, "footprint-kiid");
+    assert_eq!(observation.selected_objects[0].object_type, "pcb_footprint");
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some("navigation.kicad_pcb")
+    );
+}
+
+#[test]
+fn schematic_selection_preserves_the_exact_sheet_instance_and_label_kiid() {
+    let label = kiapi::schematic::types::LocalLabel {
+        id: Some(kiid("label-kiid")),
+        ..Default::default()
+    };
+    let selected = builders::pack_any(&label, "kiapi.schematic.types.LocalLabel");
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_sheet_document(&["root", "child"]),
+            ]));
+        }
+        if message.type_url.ends_with("GetSelection") {
+            return Some(selection_response(vec![selected.clone()]));
+        }
+        panic!("unexpected request {}", message.type_url);
+    });
+    let target = navigation_sheet_target(&["root", "child"]);
+    let observation = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&target)
+        .expect("schematic selection is valid");
+    assert_eq!(observation.selected_objects[0].kiid, "label-kiid");
+    assert_eq!(
+        observation.selected_objects[0].object_type,
+        "schematic_label"
+    );
+    assert_eq!(observation.sheet_instance_path, target.sheet_instance_path);
+}
+
+#[test]
+fn selection_refuses_wrong_project_document_and_sheet_without_retargeting() {
+    let cases = [
+        (
+            navigation_board_target(),
+            vec![kiapi::common::types::DocumentSpecifier {
+                project: Some(kiapi::common::types::ProjectSpecifier {
+                    name: "other".to_string(),
+                    path: r"C:\other".to_string(),
+                }),
+                ..navigation_board_document()
+            }],
+            IpcSelectionObservationErrorKind::WrongProject,
+        ),
+        (
+            navigation_board_target(),
+            vec![kiapi::common::types::DocumentSpecifier {
+                identifier: Some(
+                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                        "other.kicad_pcb".to_string(),
+                    ),
+                ),
+                ..navigation_board_document()
+            }],
+            IpcSelectionObservationErrorKind::WrongDocument,
+        ),
+        (
+            navigation_sheet_target(&["root", "requested"]),
+            vec![navigation_sheet_document(&["root", "other"])],
+            IpcSelectionObservationErrorKind::WrongSheetInstance,
+        ),
+    ];
+    for (target, documents, expected) in cases {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("command");
+            assert!(message.type_url.ends_with("GetOpenDocuments"));
+            Some(open_navigation_documents_response(documents.clone()))
+        });
+        let error = KiCadIpcClient::new(&mock.url)
+            .observe_selection(&target)
+            .expect_err("target mismatch must fail closed");
+        assert_eq!(selection_kind(&error), expected, "{error:#}");
+    }
+}
+
+#[test]
+fn duplicate_document_identity_is_ambiguous_not_first_match() {
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        Some(open_navigation_documents_response(vec![
+            navigation_board_document(),
+            navigation_board_document(),
+        ]))
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_board_target())
+        .expect_err("duplicates must be ambiguous");
+    assert_eq!(
+        selection_kind(&error),
+        IpcSelectionObservationErrorKind::AmbiguousDocument
+    );
+}
+
+#[test]
+fn malformed_or_unsupported_selected_objects_fail_the_whole_observation() {
+    let items = [
+        builders::pack_any(
+            &kiapi::board::types::FootprintInstance::default(),
+            "kiapi.board.types.FootprintInstance",
+        ),
+        prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.ReferenceImage".to_string(),
+            value: Vec::new(),
+        },
+    ];
+    let expected = [
+        IpcSelectionObservationErrorKind::MalformedSelectedObject,
+        IpcSelectionObservationErrorKind::UnsupportedObjectType,
+    ];
+    for (item, expected) in items.into_iter().zip(expected) {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("command");
+            if message.type_url.ends_with("GetOpenDocuments") {
+                return Some(open_navigation_documents_response(vec![
+                    navigation_board_document(),
+                ]));
+            }
+            Some(selection_response(vec![item.clone()]))
+        });
+        let error = KiCadIpcClient::new(&mock.url)
+            .observe_selection(&navigation_board_target())
+            .expect_err("unverifiable selected object must fail closed");
+        assert_eq!(selection_kind(&error), expected, "{error:#}");
+    }
+}
+
+#[test]
+fn document_disappearing_during_selection_readback_is_stale_editor_state() {
+    let open_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reads_in_mock = open_reads.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let read = reads_in_mock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let documents = if read == 0 {
+                vec![navigation_board_document()]
+            } else {
+                Vec::new()
+            };
+            return Some(open_navigation_documents_response(documents));
+        }
+        Some(selection_response(Vec::new()))
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_board_target())
+        .expect_err("disappeared document is stale state");
+    assert_eq!(
+        selection_kind(&error),
+        IpcSelectionObservationErrorKind::StaleEditorState
+    );
 }

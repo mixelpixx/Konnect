@@ -110,6 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/board/board.proto",
         "proto/board/board_commands.proto",
         "proto/board/board_types.proto",
+        "proto/schematic/schematic_types.proto",
     ];
 
     let mut includes: Vec<PathBuf> = vec![PathBuf::from("proto/")];
