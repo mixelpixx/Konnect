@@ -211,6 +211,23 @@ fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_ho
         schematic.capabilities.observe_active_context.availability,
         konnect_ipc::IpcCapabilityAvailability::Unsupported
     );
+    for capability in [
+        &schematic.capabilities.activate_document,
+        &schematic.capabilities.activate_sheet,
+        &schematic.capabilities.reveal_object,
+        &schematic.capabilities.center_object,
+        &schematic.capabilities.fit_view,
+    ] {
+        assert_eq!(
+            capability.availability,
+            konnect_ipc::IpcCapabilityAvailability::Unsupported
+        );
+        assert_eq!(capability.evidence_source, "konnect_bundled_kicad_protocol");
+        assert!(capability
+            .reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("no stable typed") }));
+    }
 
     let pcb = &state.editors[1];
     assert_eq!(pcb.editor, konnect_ipc::IpcEditorKind::Pcb);
