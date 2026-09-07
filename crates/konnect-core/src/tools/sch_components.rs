@@ -578,8 +578,19 @@ async fn handle_add_schematic_component(
     };
 
     let (expected_x, expected_y) = snap_point(x, y, 1.27);
+    // Bind the intent against the same rule the writer used, or the readback
+    // rejects every placement that takes its Value from the library.
+    let intent_value = resolved_placement_value(&lib_id, value, &source);
     let placement = ComponentTargetUnit::placement(
-        &uuid, &context, &lib_id, expected_x, expected_y, rotation, ref_str, value, unit,
+        &uuid,
+        &context,
+        &lib_id,
+        expected_x,
+        expected_y,
+        rotation,
+        ref_str,
+        Some(&intent_value),
+        unit,
     );
     sch.overwrite()?;
 
@@ -605,6 +616,35 @@ async fn handle_add_schematic_component(
 /// the unit, and adds the positioned instance. Does not write the file --
 /// callers own the read/write cycle (single-add and batch-add alike).
 #[allow(clippy::too_many_arguments)]
+/// The Value a placed instance gets: an explicit argument wins, then the
+/// library symbol's own Value, and only then the bare symbol name.
+///
+/// Placement writes the properties and `ComponentTargetUnit::placement` binds
+/// the intent they are verified against, independently. Both must agree on
+/// this rule or every placement fails its own post-write readback, so the rule
+/// lives here once rather than being spelled out on each side.
+pub(crate) fn resolved_placement_value(
+    lib_id: &str,
+    value: Option<&str>,
+    src: &dyn cse::library::SymbolLibrarySource,
+) -> String {
+    if let Some(v) = value {
+        return v.to_owned();
+    }
+    let from_lib = cse::library::resolve_lib_symbol_flattened_node(lib_id, src).and_then(|node| {
+        node.find_all("property")
+            .into_iter()
+            .find(|p| p.value() == Some("Value"))
+            .and_then(|p| p.args().get(1))
+            .and_then(cse::sexp::SexpNode::text)
+            .map(str::to_owned)
+    });
+    match from_lib {
+        Some(v) if !v.is_empty() => v,
+        _ => lib_id.rsplit(':').next().unwrap_or(lib_id).to_owned(),
+    }
+}
+
 pub(crate) fn place_one_component(
     sch: &mut cse::Schematic,
     instance_paths: &[String],
@@ -667,12 +707,8 @@ pub(crate) fn place_one_component(
 
     // An explicit `value` argument wins; otherwise take the library's Value,
     // falling back to the bare symbol name only when the library has none.
-    let lib_value = lib_field("Value").to_string();
-    let val_str = match value {
-        Some(v) => v,
-        None if !lib_value.is_empty() => lib_value.as_str(),
-        None => lib_id.split(':').next_back().unwrap_or("?"),
-    };
+    let resolved_value = resolved_placement_value(lib_id, value, src);
+    let val_str = resolved_value.as_str();
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the

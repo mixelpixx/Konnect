@@ -548,8 +548,17 @@ async fn handle_batch_place_components(
         ) {
             Ok(uuid) => {
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
+                let intent_value =
+                    super::sch_components::resolved_placement_value(lib_id, value, &src);
                 placements.push(super::sch_components::ComponentTargetUnit::placement(
-                    &uuid, &context, lib_id, expected_x, expected_y, rotation, reference, value,
+                    &uuid,
+                    &context,
+                    lib_id,
+                    expected_x,
+                    expected_y,
+                    rotation,
+                    reference,
+                    Some(&intent_value),
                     unit,
                 ));
             }
