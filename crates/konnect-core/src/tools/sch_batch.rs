@@ -85,6 +85,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "lib_id": { "type": "string" },
                                 "x": { "type": "number" }, "y": { "type": "number" },
                                 "rotation": { "type": "number", "default": 0 },
+                                "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
                                 "unit": { "type": "integer", "default": 1 }
@@ -514,6 +515,19 @@ async fn handle_batch_place_components(
             continue;
         };
         let rotation = comp["rotation"].as_f64().unwrap_or(0.0);
+        // One malformed entry refuses only itself, as every other per-entry
+        // problem in this loop does; the batch is not abandoned because a
+        // caller misspelled one axis.
+        let mirror = match super::sch_components::mirror_arg(comp, "mirror") {
+            Ok(mirror) => mirror,
+            Err(_) => {
+                errors.push(format!(
+                    "Invalid 'mirror' for '{}': expected \"x\", \"y\" or \"none\"",
+                    lib_id
+                ));
+                continue;
+            }
+        };
         let reference = comp["reference"].as_str().unwrap_or("?");
         let value = comp["value"].as_str();
         let unit = comp["unit"].as_f64().unwrap_or(1.0) as u32;
@@ -526,6 +540,7 @@ async fn handle_batch_place_components(
             x,
             y,
             rotation,
+            mirror,
             reference,
             value,
             unit,
@@ -1966,6 +1981,48 @@ mod batch_place_and_connect_tests {
         assert!(sch.symbols.by_reference("R1").is_some());
         assert!(sch.symbols.by_reference("R3").is_some());
         assert!(sch.symbols.by_reference("R2").is_none());
+    }
+
+    /// Per-component `mirror` reaches the file, and a misspelled axis refuses
+    /// only its own entry — the batch's other placements still land, as they
+    /// do for every other per-item problem here. Silently placing the third
+    /// symbol unmirrored would be the failure the argument exists to end
+    /// (#450).
+    #[tokio::test]
+    async fn batch_place_components_mirrors_per_component_and_refuses_a_bad_axis() {
+        let (_d, path) = seeded_schematic();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1" },
+                    { "lib_id": "Device:R", "x": 110.0, "y": 100.0, "reference": "R2", "mirror": "y" },
+                    { "lib_id": "Device:R", "x": 120.0, "y": 100.0, "reference": "R3", "mirror": "Y" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["placed_count"], 2);
+        assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(sch.symbols.by_reference("R3").is_none());
+        assert_eq!(
+            sch.symbols.by_reference("R1").unwrap().mirror.as_deref(),
+            None
+        );
+        assert_eq!(
+            sch.symbols.by_reference("R2").unwrap().mirror.as_deref(),
+            Some("y")
+        );
     }
 
     #[tokio::test]

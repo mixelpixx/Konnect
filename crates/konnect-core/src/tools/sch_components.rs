@@ -96,6 +96,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
                     "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
+                    "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                     "reference": { "type": "string", "description": "Optional override for reference designator" },
                     "value": { "type": "string", "description": "Optional override for value field" },
                     "unit": { "type": "integer", "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
@@ -552,6 +553,10 @@ async fn handle_add_schematic_component(
         Err(e) => return Ok(e),
     };
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let mirror = match mirror_arg(args, "mirror") {
+        Ok(mirror) => mirror,
+        Err(e) => return Ok(e),
+    };
     let reference = opt_str(args, "reference");
     let value = opt_str(args, "value");
     let unit = opt_f64(args, "unit").unwrap_or(1.0) as u32;
@@ -585,6 +590,7 @@ async fn handle_add_schematic_component(
         x,
         y,
         rotation,
+        mirror,
         ref_str,
         value,
         unit,
@@ -618,6 +624,39 @@ async fn handle_add_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+/// Read a placement `mirror` argument in eeschema's own vocabulary.
+///
+/// `"x"` and `"y"` are the axis names the file format uses; `"none"` and an
+/// absent argument both mean unmirrored, which eeschema records by omitting
+/// the token rather than writing one. Anything else is refused rather than
+/// silently dropped: a caller that misspells the axis is asking for a
+/// reflection, and placing the symbol unmirrored while reporting success is
+/// the failure this argument exists to end.
+///
+/// Returns `Ok(None)` for unmirrored so it can be handed straight to
+/// [`cse::Symbol::set_mirror`].
+pub(crate) fn mirror_arg<'a>(
+    args: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a str>, CallToolResult> {
+    match &args[key] {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(axis) => match axis.as_str() {
+            "x" => Ok(Some("x")),
+            "y" => Ok(Some("y")),
+            "none" => Ok(None),
+            other => Err(crate::tools::invalid_arg(
+                key,
+                &format!("expected \"x\", \"y\" or \"none\", got {other:?}"),
+            )),
+        },
+        _ => Err(crate::tools::invalid_arg(
+            key,
+            "expected a string: \"x\", \"y\" or \"none\"",
+        )),
+    }
+}
+
 /// Place one symbol into `sch`: embeds the lib_symbols definition, validates
 /// the unit, and adds the positioned instance. Does not write the file --
 /// callers own the read/write cycle (single-add and batch-add alike).
@@ -630,6 +669,7 @@ pub(crate) fn place_one_component(
     x: f64,
     y: f64,
     rotation: f64,
+    mirror: Option<&str>,
     reference: &str,
     value: Option<&str>,
     unit: u32,
@@ -659,6 +699,7 @@ pub(crate) fn place_one_component(
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(lib_id, x, y);
     sym.at.rotation = Some(rotation);
+    sym.set_mirror(mirror);
     sym.unit = unit;
 
     // Reference and Value go where the library anchors them, carried through
@@ -671,12 +712,16 @@ pub(crate) fn place_one_component(
     // #PWR designator is never shown on the sheet.
     let hide_reference = lib_id.starts_with("power:") || reference.starts_with("#PWR");
     let anchors = cse::library::field_anchors(sch, lib_id);
+    // The anchors follow the placement, mirror included: a mirrored body puts
+    // its Reference and Value where the reflection lands them, exactly as a
+    // rotated body already did (#101). Hardcoding `false` here left a mirrored
+    // symbol's fields sitting on the unmirrored side of it.
     let t = konnect_sexp::geometry::PinTransform {
         comp_x: x,
         comp_y: y,
         rotation_deg: rotation,
-        mirror_x: false,
-        mirror_y: false,
+        mirror_x: mirror == Some("x"),
+        mirror_y: mirror == Some("y"),
     };
     let (ref_x, ref_y, ref_rot) =
         crate::tools::field_at(anchors.reference_at, crate::tools::FALLBACK_REFERENCE_AT, t);
@@ -1277,12 +1322,15 @@ fn component_mutation_readback_from_schematic(
                 );
             }
         }
+        let unit_mirror = symbol.mirror.as_deref().unwrap_or("");
         units.push(json!({
             "uuid": symbol.uuid,
             "unit": symbol.unit,
             "x": symbol.at.x,
             "y": symbol.at.y,
             "rotation": symbol.at.rotation.unwrap_or(0.0),
+            "mirror_x": unit_mirror.contains('x'),
+            "mirror_y": unit_mirror.contains('y'),
             "lib_id": symbol.lib_id,
             "fields": fields,
             "field_placements": field_placements,
@@ -1292,6 +1340,7 @@ fn component_mutation_readback_from_schematic(
     }
     let anchor = observed[0];
     let fields = units[0]["fields"].clone();
+    let anchor_mirror = anchor.mirror.as_deref().unwrap_or("");
     Ok(json!({
         "schematic": committed.filepath().display().to_string(),
         "reference": reference,
@@ -1303,6 +1352,8 @@ fn component_mutation_readback_from_schematic(
         "x": anchor.at.x,
         "y": anchor.at.y,
         "rotation": anchor.at.rotation.unwrap_or(0.0),
+        "mirror_x": anchor_mirror.contains('x'),
+        "mirror_y": anchor_mirror.contains('y'),
         "unit_count": units.len(),
         "units": units,
         "fields": fields
@@ -1344,6 +1395,8 @@ fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_j
         "x",
         "y",
         "rotation",
+        "mirror_x",
+        "mirror_y",
         "unit_count",
         "units",
         "fields",
@@ -7006,6 +7059,129 @@ mod multi_unit_component_tests {
         placed.sort_by_key(|instance| instance.unit);
         assert_eq!(placed[0].rotation, 90.0);
         assert_eq!(placed[1].rotation, 270.0);
+    }
+
+    /// A misspelled axis is a caller asking for a reflection. Placing the
+    /// symbol unmirrored and reporting success is exactly the failure this
+    /// argument exists to end, so the placement refuses and writes nothing.
+    #[tokio::test]
+    async fn placing_with_an_unknown_mirror_axis_refuses_without_writing() {
+        let (_directory, path) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path,
+                "lib_id": "Device:R",
+                "x": 100.0,
+                "y": 40.0,
+                "reference": "R8",
+                "mirror": "Y"
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// `"none"` is the explicit way to say unmirrored. It must place the
+    /// symbol without a `(mirror ...)` token at all — eeschema has no
+    /// `(mirror none)` and would not load one.
+    #[tokio::test]
+    async fn placing_with_mirror_none_writes_no_token() {
+        let (_directory, path) = fixture();
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path,
+                "lib_id": "Device:R",
+                "x": 100.0,
+                "y": 40.0,
+                "reference": "R8",
+                "mirror": "none"
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !source.contains("(mirror"),
+            "no mirror token may be written"
+        );
+    }
+
+    /// The placement argument, and the #101 half of it: a mirrored body puts
+    /// its Reference and Value where the reflection lands them. The site that
+    /// builds this transform hardcoded `mirror_x: false, mirror_y: false`, so
+    /// a mirrored symbol's fields sat on its unmirrored side.
+    #[tokio::test]
+    async fn placing_mirrored_reflects_the_body_and_its_field_anchors() {
+        let (_directory, path) = fixture();
+        for (reference, x, mirror) in [("R8", 100.0, None), ("R9", 140.0, Some("y"))] {
+            let mut args = json!({
+                "schematic": path,
+                "lib_id": "Device:R",
+                "x": x,
+                "y": 40.0,
+                "reference": reference
+            });
+            if let Some(mirror) = mirror {
+                args["mirror"] = json!(mirror);
+            }
+            let result = handle_add_schematic_component(&args, &context())
+                .await
+                .unwrap();
+            assert!(!result.is_error, "placement failed for {reference}");
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(source.matches("(mirror y)").count(), 1);
+        let committed = cse::Schematic::load(&path).unwrap();
+        let field_x = |reference: &str| -> f64 {
+            let symbol = committed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.reference() == Some(reference))
+                .expect("placed symbol");
+            let property = symbol
+                .properties
+                .iter()
+                .find(|property| property.name == "Reference")
+                .expect("Reference property");
+            property
+                .sub_nodes
+                .iter()
+                .filter(|node| node.tag() == Some("at"))
+                .find_map(cse::At::from_sexp)
+                .expect("Reference carries an (at ...) node")
+                .x
+        };
+        let origin_x = |reference: &str| -> f64 {
+            committed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.reference() == Some(reference))
+                .expect("placed symbol")
+                .at
+                .x
+        };
+        // Compare each anchor against its own origin, not against the other
+        // placement: the requested coordinates snap to the 1.27mm grid, so
+        // the two origins are not the 40mm apart they were asked for, and a
+        // test comparing raw field coordinates passes whatever the transform
+        // does.
+        let plain = field_x("R8") - origin_x("R8");
+        let mirrored = field_x("R9") - origin_x("R9");
+        assert!(
+            plain.abs() > 1e-6,
+            "the unmirrored anchor must be off-origin for this comparison to mean anything"
+        );
+        assert!(
+            (mirrored + plain).abs() < 1e-6,
+            "(mirror y) must negate the Reference anchor's screen-X: \
+             unmirrored {plain}, mirrored {mirrored}"
+        );
     }
 
     /// The delta arithmetic can push a trailing unit past 360° — a unit at
