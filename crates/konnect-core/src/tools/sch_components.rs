@@ -639,13 +639,59 @@ pub(crate) fn place_one_component(
 ) -> Result<String, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
-    let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
 
     // Embed the library symbol definition
     if !cse::library::ensure_lib_symbol(sch, lib_id, src) {
         return Err(crate::tools::lib_symbol_not_found_error(lib_id, src));
     }
     let metadata = cse::library::symbol_metadata(sch, lib_id);
+
+    // Copy the library symbol's own fields onto the instance, the way eeschema
+    // does when you place a part. Upstream copies only Datasheet and
+    // Description (#226) and hardcodes an EMPTY Footprint, so a placed part
+    // never reaches the board, and its Value is the symbol name rather than the
+    // part's actual value -- which makes the BOM meaningless. Any BOM metadata
+    // the library carries (Manufacturer, MPN, LCSC, distributor links, ...) is
+    // copied too.
+    //
+    // Uses the flattened node so a derived symbol (`(extends ...)`) inherits
+    // its parent's fields, and the caller's `src` so project-scoped
+    // (${KIPRJMOD}) libraries resolve exactly as they do for ensure_lib_symbol.
+    // `ki_*` properties are library-only metadata eeschema does not copy.
+    let lib_fields: Vec<(String, String)> =
+        cse::library::resolve_lib_symbol_flattened_node(lib_id, src)
+            .map(|node| {
+                node.find_all("property")
+                    .into_iter()
+                    .filter_map(|property| {
+                        let name = property.value()?.to_string();
+                        let val = property
+                            .args()
+                            .get(1)
+                            .and_then(cse::sexp::SexpNode::text)
+                            .unwrap_or_default()
+                            .to_string();
+                        Some((name, val))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    let lib_field = |name: &str| -> &str {
+        lib_fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    };
+
+    // An explicit `value` argument wins; otherwise take the library's Value,
+    // falling back to the bare symbol name only when the library has none.
+    let lib_value = lib_field("Value").to_string();
+    let val_str = match value {
+        Some(v) => v,
+        None if !lib_value.is_empty() => lib_value.as_str(),
+        None => lib_id.split(':').next_back().unwrap_or("?"),
+    };
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
@@ -704,8 +750,15 @@ pub(crate) fn place_one_component(
         false,
         anchors.value_justify,
     ));
-    sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true, centred));
+    sym.properties.push(positioned(
+        "Footprint",
+        lib_field("Footprint"),
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
     sym.properties.push(positioned(
         "Datasheet",
         &metadata.datasheet,
@@ -724,6 +777,21 @@ pub(crate) fn place_one_component(
         true,
         centred,
     ));
+
+    // Everything else the library carries (Manufacturer, MPN, LCSC,
+    // distributor links, ...). The five fields above are already written, and
+    // `ki_*` is library-only metadata eeschema keeps out of instances.
+    for (name, val) in &lib_fields {
+        if matches!(
+            name.as_str(),
+            "Reference" | "Value" | "Footprint" | "Datasheet" | "Description"
+        ) || name.starts_with("ki_")
+        {
+            continue;
+        }
+        sym.properties
+            .push(positioned(name, val, x, y, 0.0, true, centred));
+    }
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
