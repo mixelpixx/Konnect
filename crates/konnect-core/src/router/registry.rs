@@ -28,7 +28,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "editor_navigation",
         description: "Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context",
         category: "project",
-        tool_count: 4,
+        tool_count: 5,
     },
     ToolsetMeta {
         name: "sch_components",

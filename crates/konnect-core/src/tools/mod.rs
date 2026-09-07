@@ -3,6 +3,7 @@
 mod board_session;
 pub mod cli;
 pub mod config;
+pub(crate) mod cross_probe;
 pub mod design_review;
 pub mod editor_navigation;
 mod footprint_graphics;

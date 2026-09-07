@@ -79,6 +79,17 @@ entire observed set with the expected before/after transition, and returns a
 structured `readback_mismatch` if KiCad did not make precisely that change.
 Duplicate or empty KIID requests are rejected before IPC.
 
+`resolve_cross_probe_target` maps an exact schematic symbol to its PCB
+footprint, or the footprint back to the symbol, from KiCad's saved footprint
+symbol-path linkage. It requires the explicit project, both saved documents,
+the schematic hierarchy instance, and the source KIID; reference agreement is
+checked as an additional consistency guard. Both requested editor documents
+must also be proven open through typed `GetOpenDocuments` readback. Missing,
+duplicate, malformed, or instance-inconsistent links return a structured
+`unresolved_cross_probe_destination` instead of guessing. The operation is
+resolve-only: it does not activate an editor or mutate selection, and pin/pad/
+net expansion remains unsupported until one stable destination can be proven.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses

@@ -3613,10 +3613,14 @@ fn editor_capabilities(
         "konnect_bundled_kicad_protocol",
         "selection is typed, but reveal/center/fit has no stable typed command",
     );
-    let no_cross_probe = unsupported(
-        "konnect_navigation_mvp",
-        "semantic cross-probe resolution is not implemented in this slice",
-    );
+    let cross_probe = if addressable && version.major >= 10 {
+        available("konnect_saved_structure_and_typed_live_context")
+    } else {
+        unsupported(
+            "konnect_saved_structure_and_typed_live_context",
+            "cross-probe resolution requires an addressable KiCad 10-or-newer editor endpoint",
+        )
+    };
 
     IpcEditorCapabilities {
         observe_documents: documents,
@@ -3628,7 +3632,7 @@ fn editor_capabilities(
         reveal_object: no_reveal.clone(),
         center_object: no_reveal.clone(),
         fit_view: no_reveal,
-        cross_probe: no_cross_probe,
+        cross_probe,
     }
 }
 
