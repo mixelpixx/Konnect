@@ -829,6 +829,19 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Prove that one exact editor/document/sheet identity is currently open.
+    ///
+    /// This is the read-only context gate used by semantic target resolution;
+    /// it shares the same no-fallback matching rules as selection observation
+    /// without issuing a selection query.
+    pub fn observe_exact_open_document(
+        &self,
+        requested: &IpcEditorDocument,
+    ) -> Result<IpcEditorDocument> {
+        let document = self.resolve_selection_document(requested)?;
+        editor_document_from_specifier(requested.editor, document)
+    }
+
     fn resolve_selection_document(
         &self,
         requested: &IpcEditorDocument,

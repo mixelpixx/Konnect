@@ -13,6 +13,11 @@ use konnect_ipc::{
     IpcSheetInstancePath,
 };
 use serde_json::json;
+use std::path::PathBuf;
+
+use super::navigation_target::{
+    resolve_navigation_target, NavigationTargetErrorKind, NavigationTargetRequest,
+};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -46,6 +51,25 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["editor", "project_name", "project_path"]
             }),
             |args, ctx| async move { handle_get_editor_selection(args, ctx).await }
+        ),
+        tool!(
+            "resolve_navigation_target",
+            "Deterministically resolve one exact saved KiCad object in an explicitly open project, document, editor, and schematic hierarchy instance. Stable KIID/UUID identity is primary; a human reference is accepted only when it resolves uniquely and ambiguity is returned with candidates.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "editor": { "type": "string", "enum": ["schematic", "pcb"] },
+                    "project_name": { "type": "string" },
+                    "project_path": { "type": "string" },
+                    "document_path": { "type": "string", "description": "Exact saved .kicad_sch or .kicad_pcb document" },
+                    "sheet_instance_path": { "type": "array", "items": { "type": "string" } },
+                    "sheet_path_human_readable": { "type": "string" },
+                    "object_kiid": { "type": "string", "description": "Preferred stable KIID/UUID" },
+                    "human_reference": { "type": "string", "description": "Fallback reference such as C10; must resolve uniquely" }
+                },
+                "required": ["editor", "project_name", "project_path", "document_path"]
+            }),
+            |args, ctx| async move { handle_resolve_navigation_target(args, ctx).await }
         ),
     ]
 }
@@ -283,6 +307,151 @@ fn selection_error_result(error: anyhow::Error) -> CallToolResult {
     }
 }
 
+async fn handle_resolve_navigation_target(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let request = match parse_navigation_target_request(args) {
+        Ok(request) => request,
+        Err(result) => return Ok(result),
+    };
+    let live_document = IpcEditorDocument {
+        editor: request.editor,
+        project: Some(request.project.clone()),
+        document_path: (request.editor == IpcEditorKind::Pcb)
+            .then(|| request.document_path.display().to_string()),
+        sheet_instance_path: request.sheet_instance_path.clone(),
+    };
+    let address = ctx.config.ipc_address.clone();
+    if address.is_empty() {
+        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    }
+    let observed = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(address).observe_exact_open_document(&live_document)
+    })
+    .await?;
+    let observed = match observed {
+        Ok(observed) => observed,
+        Err(error) => return Ok(selection_error_result(error)),
+    };
+
+    let resolved = tokio::task::spawn_blocking(move || resolve_navigation_target(&request)).await?;
+    match resolved {
+        Ok(target) => Ok(CallToolResult::json(&json!({
+            "target": target,
+            "live_context_evidence": {
+                "source": "kicad_ipc_get_open_documents",
+                "document": observed
+            }
+        }))),
+        Err(error) => Ok(navigation_target_error_result(error)),
+    }
+}
+
+fn parse_navigation_target_request(
+    args: &serde_json::Value,
+) -> Result<NavigationTargetRequest, CallToolResult> {
+    let editor = match require_str(args, "editor")? {
+        "schematic" => IpcEditorKind::Schematic,
+        "pcb" => IpcEditorKind::Pcb,
+        _ => return Err(invalid_arg("editor", "expected 'schematic' or 'pcb'")),
+    };
+    let project_name = require_str(args, "project_name")?;
+    let project_path = require_str(args, "project_path")?;
+    let document_path = require_str(args, "document_path")?;
+    if project_name.is_empty() || project_path.is_empty() || document_path.is_empty() {
+        return Err(invalid_arg(
+            "project_name",
+            "project and document identity strings must not be empty",
+        ));
+    }
+
+    let sheet_instance_path = match editor {
+        IpcEditorKind::Pcb => {
+            if !args["sheet_instance_path"].is_null()
+                || !args["sheet_path_human_readable"].is_null()
+            {
+                return Err(invalid_arg(
+                    "sheet_instance_path",
+                    "PCB targets cannot carry schematic sheet identity",
+                ));
+            }
+            None
+        }
+        IpcEditorKind::Schematic => {
+            let ids = require_array(args, "sheet_instance_path")?
+                .iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    invalid_arg("sheet_instance_path", "every entry must be a string")
+                })?;
+            if ids.is_empty() || ids.iter().any(String::is_empty) {
+                return Err(invalid_arg(
+                    "sheet_instance_path",
+                    "must contain non-empty root-to-leaf KIIIDs",
+                ));
+            }
+            Some(IpcSheetInstancePath {
+                kiids: ids,
+                human_readable: opt_str(args, "sheet_path_human_readable")
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        }
+    };
+    let object_kiid = opt_str(args, "object_kiid").map(str::to_string);
+    let human_reference = opt_str(args, "human_reference").map(str::to_string);
+    if object_kiid.as_deref().is_some_and(str::is_empty)
+        || human_reference.as_deref().is_some_and(str::is_empty)
+        || object_kiid.is_some() == human_reference.is_some()
+    {
+        return Err(invalid_arg(
+            "object_kiid",
+            "provide exactly one non-empty object_kiid or human_reference",
+        ));
+    }
+    Ok(NavigationTargetRequest {
+        editor,
+        project: IpcProjectIdentity {
+            name: project_name.to_string(),
+            path: project_path.to_string(),
+        },
+        document_path: PathBuf::from(document_path),
+        sheet_instance_path,
+        object_kiid,
+        human_reference,
+    })
+}
+
+fn navigation_target_error_result(
+    error: super::navigation_target::NavigationTargetError,
+) -> CallToolResult {
+    let kind = match error.kind {
+        NavigationTargetErrorKind::WrongProject => ToolErrorKind::WrongProject {
+            requested: error.target.clone(),
+            open_projects: error.candidates.clone(),
+        },
+        NavigationTargetErrorKind::WrongDocument => ToolErrorKind::WrongDocument {
+            requested: error.target.clone(),
+            open_documents: error.candidates.clone(),
+        },
+        NavigationTargetErrorKind::WrongSheetInstance => ToolErrorKind::WrongSheetInstance {
+            requested: error.target.clone(),
+            open_sheet_instances: error.candidates.clone(),
+        },
+        NavigationTargetErrorKind::AmbiguousTarget => ToolErrorKind::AmbiguousTarget {
+            target: error.target.clone(),
+            candidates: error.candidates.clone(),
+        },
+        NavigationTargetErrorKind::StaleTarget => ToolErrorKind::StaleTarget {
+            target: error.target.clone(),
+            reason: error.reason.clone(),
+        },
+    };
+    CallToolResult::error_kind(kind, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,10 +605,57 @@ mod tests {
         url
     }
 
+    fn spawn_open_board_mock(project_path: String) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://navigation-resolver-core-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
+        socket.listen(&url).expect("listen");
+        std::thread::spawn(move || {
+            let message = socket.recv().expect("request");
+            let request =
+                kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
+            assert!(request
+                .message
+                .as_ref()
+                .is_some_and(|message| message.type_url.ends_with("GetOpenDocuments")));
+            let response = kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message: Some(builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    "layout.kicad_pcb".to_string(),
+                                ),
+                            ),
+                            project: Some(kiapi::common::types::ProjectSpecifier {
+                                name: "nav".to_string(),
+                                path: project_path,
+                            }),
+                        }],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )),
+            };
+            socket
+                .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                .expect("response");
+        });
+        url
+    }
+
     #[test]
     fn public_tool_is_read_only_and_takes_no_required_arguments() {
         let definitions = tools();
-        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions.len(), 3);
         let state = definitions
             .iter()
             .find(|tool| tool.name == "get_editor_state")
@@ -452,6 +668,14 @@ mod tests {
         assert_eq!(
             selection.input_schema["required"],
             json!(["editor", "project_name", "project_path"])
+        );
+        let resolver = definitions
+            .iter()
+            .find(|tool| tool.name == "resolve_navigation_target")
+            .expect("resolver tool");
+        assert_eq!(
+            resolver.input_schema["required"],
+            json!(["editor", "project_name", "project_path", "document_path"])
         );
     }
 
@@ -555,6 +779,70 @@ mod tests {
         assert_eq!(
             extract_error_kind(&result).as_deref(),
             Some("wrong_sheet_instance")
+        );
+    }
+
+    #[test]
+    fn resolver_parser_requires_exactly_one_identifier() {
+        let base = json!({
+            "editor": "pcb",
+            "project_name": "navigation",
+            "project_path": r"C:\design",
+            "document_path": r"C:\design\navigation.kicad_pcb"
+        });
+        let missing = parse_navigation_target_request(&base).expect_err("identifier required");
+        assert_eq!(
+            extract_error_kind(&missing).as_deref(),
+            Some("invalid_argument")
+        );
+
+        let mut both = base;
+        both["object_kiid"] = json!("id");
+        both["human_reference"] = json!("C10");
+        let ambiguous = parse_navigation_target_request(&both).expect_err("one identifier only");
+        assert_eq!(
+            extract_error_kind(&ambiguous).as_deref(),
+            Some("invalid_argument")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_resolver_keeps_live_and_structural_evidence_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nav.kicad_pro"), "{}").unwrap();
+        let board = temp.path().join("layout.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (footprint \"Capacitor:C\" (layer \"F.Cu\") (at 1 2) \
+             (uuid \"fp-c10\") (property \"Reference\" \"C10\")))",
+        )
+        .unwrap();
+        let project_path = temp.path().display().to_string();
+        let result = handle_resolve_navigation_target(
+            &json!({
+                "editor": "pcb",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "document_path": board.display().to_string(),
+                "human_reference": "C10"
+            }),
+            &context(spawn_open_board_mock(project_path)),
+        )
+        .await
+        .expect("handler result");
+        assert!(!result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["target"]["object"]["kiid"], "fp-c10");
+        assert_eq!(
+            body["target"]["structural_evidence"]["source"],
+            "saved_kicad_structure"
+        );
+        assert_eq!(
+            body["live_context_evidence"]["source"],
+            "kicad_ipc_get_open_documents"
         );
     }
 }
