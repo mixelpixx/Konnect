@@ -156,10 +156,17 @@ connect_to_net(schematic, reference, pin_number, net)
 - Placing a label by hand with `add_schematic_net_label` instead? Take its
   rotation from `orientation_degrees` in `get_schematic_pin_locations`, or the
   text reads back across the symbol's pin names.
+- These labels are sheet-local. In a sheet placed more than once, each instance
+  gets its own independent copy of the net — right for per-instance signals,
+  wrong for a rail every instance must share. A shared rail takes
+  `add_power_symbol` or `add_schematic_net_label` with
+  `label_type: global_label`; both are one net across all sheets and instances.
 
 ### add_power_symbol
 
 Use for all power connections, in preference to labelling a pin with the rail name.
+The one exception is a rail that must stay separate per instance of a repeated
+sheet — see below.
 
 ```
 add_power_symbol(schematic, power_net, x, y, rotation?)
@@ -175,6 +182,11 @@ add_power_symbol(schematic, power_net, x, y, rotation?)
 - A power pin landing mid-segment on a wire gets its junction dot
   automatically, in either order: symbol onto an existing wire, or a wire
   routed across an already-placed symbol.
+- Power symbols are global: every `+5V` symbol on every sheet, and in every
+  instance of a sheet, joins one `+5V` net. A rail that must stay separate per
+  instance of a repeated sheet (each node's own 5V, say) takes a local net
+  label via `connect_to_net` instead — `power:+5V` there shorts all the
+  instances' rails together.
 
 ---
 
@@ -303,7 +315,7 @@ production-ready claim.
 3. **Always verify after changes** — run validation tools after placing and wiring
 4. **Use the grid** — all placements on 1.27mm grid
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
-6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels
+6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels; the exception is a rail that must stay separate per instance of a repeated sheet, which takes a local label because power symbols are global
 7. **Net labels for named signals** — keeps schematics readable
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting
