@@ -19,6 +19,7 @@ Base branch:
 Depends on:
 Series order, if any:
 Unique commits/acceptance criteria owned by this PR:
+Next PR to promote after this one, if any:
 
 Follow docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md. Do not open a cumulative PR
 against main that repeats unmerged prerequisite commits.
@@ -48,8 +49,19 @@ Write "No public compatibility impact" when applicable.
 - [ ] The branch includes current `upstream/main`, has no merge conflicts, and CI passed on this exact head.
 - [ ] The branch was based on latest `upstream/main`, not a release tag (unless this is an approved backport).
 - [ ] The PR shows only its unique commits and diff; dependencies and series position are explicit.
+- [ ] Every review conversation is resolved; any post-review push or base change has been reviewed again on the new exact head.
 - [ ] New names follow `docs/NAMING_CONVENTIONS.md`; public renames include compatibility handling.
 - [ ] New behavior and failure paths have regression coverage.
 - [ ] File mutations are atomic and preserve unrelated content.
 - [ ] IPC mutations verify the requested board and do not leave partial batches.
 - [ ] If tools were added/removed: counts and docs updated per CONTRIBUTING.md (registry `tool_count`, `tool-directory.md`, DEV.md stats, README count).
+
+## Maintainer merge state
+
+<!-- Maintainers complete this section. Auto-merge is an execution mechanism, not approval. -->
+
+- [ ] The PR has exactly one current `status:*` workflow label.
+- [ ] `status:ready-to-merge` applies to this exact head SHA.
+- [ ] All required checks and review conversations satisfy the `main` ruleset.
+- [ ] Auto-merge uses a merge commit, or an already-green PR will be merged with `gh pr merge N --merge`.
+- [ ] Terminal issue closure and the next PR to promote are identified.
