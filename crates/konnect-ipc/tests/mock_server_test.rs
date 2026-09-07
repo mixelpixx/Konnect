@@ -1908,3 +1908,141 @@ fn verified_trace_delete_refuses_success_when_readback_still_contains_the_segmen
 
     assert!(error.contains("read-back still reports it"), "{error}");
 }
+
+#[test]
+fn generic_helpers_refuse_unbound_ambiguous_or_unidentifiable_documents() {
+    let mut unidentifiable = doc_for("unknown.kicad_pcb");
+    unidentifiable.project = None;
+    for (documents, expected) in [
+        (vec![], "wrong"),
+        (
+            vec![doc_for("a.kicad_pcb"), doc_for("b.kicad_pcb")],
+            "multiple",
+        ),
+        (vec![unidentifiable], "unresolved"),
+    ] {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            assert!(
+                message.type_url.ends_with("GetOpenDocuments"),
+                "must refuse before command"
+            );
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: documents.clone(),
+                },
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let failure =
+            konnect_ipc::IpcFailure::from_error(client.create_items(vec![any_item()]).unwrap_err());
+        match (expected, failure) {
+            (
+                "wrong",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::NoOpenDocuments { .. },
+                    ..
+                },
+            )
+            | (
+                "multiple",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::AmbiguousDocument { .. },
+                    ..
+                },
+            )
+            | (
+                "unresolved",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::UnresolvedDocumentIdentities { .. },
+                    ..
+                },
+            ) => {}
+            (_, other) => panic!("unexpected classification: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn repeating_lookup_cannot_replace_the_bound_typed_document() {
+    let observations = std::sync::atomic::AtomicUsize::new(0);
+    let mock = spawn_mock(move |request| {
+        assert!(request
+            .message
+            .unwrap()
+            .type_url
+            .ends_with("GetOpenDocuments"));
+        let mut doc = doc_for("target.kicad_pcb");
+        if observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            doc.project.as_mut().unwrap().name = "replacement".into();
+        }
+        Some(reply_with(builders::pack_any(
+            &kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![doc],
+            },
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(&mock_board("target.kicad_pcb"))
+        .unwrap();
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .find_open_board(&mock_board("target.kicad_pcb"))
+            .unwrap_err(),
+    );
+    assert!(matches!(
+        failure,
+        konnect_ipc::IpcFailure::Target {
+            error: konnect_ipc::BoardTargetError::StaleDocument { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn generic_reobservation_cannot_replace_the_bound_typed_document() {
+    let observations = std::sync::atomic::AtomicUsize::new(0);
+    let mock = spawn_mock(move |request| {
+        let message = request.message.unwrap();
+        if message.type_url.ends_with("GetItems") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        let mut doc = doc_for("target.kicad_pcb");
+        if observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            doc.project.as_mut().unwrap().name = "replacement".into();
+        }
+        Some(reply_with(builders::pack_any(
+            &kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![doc],
+            },
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(&mock_board("target.kicad_pcb"))
+        .unwrap();
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)
+            .unwrap_err(),
+    );
+    assert!(matches!(
+        failure,
+        konnect_ipc::IpcFailure::Target {
+            error: konnect_ipc::BoardTargetError::StaleDocument { .. },
+            ..
+        }
+    ));
+}
