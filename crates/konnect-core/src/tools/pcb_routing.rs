@@ -23,6 +23,9 @@ macro_rules! ipc {
         let requested_board = get_path($args, "board")?;
         match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
             Ok(v) => v,
+            Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+                return Ok(crate::tools::ipc_target_error_result(&error))
+            }
             Err(error) => {
                 return Ok(CallToolResult::error(format!(
                     "KiCAD must be running with the board loaded (IPC error: {})",

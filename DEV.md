@@ -260,8 +260,9 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `invalid_argument` | Required argument missing/malformed |
 | `file_not_found` | Referenced file or project-discovery directory does not exist or cannot be read |
 | `conflict` | The file changed, a write would replace existing paths, or schematic project ownership cannot be proven uniquely — carries the affected paths; ownership conflicts include the schematic directory and all candidate roots |
-| `ambiguous_target` | More than one observed UUID, reference/unit, field, or instance identity matches the requested target, or component instance records conflict across projects, units, or hierarchy paths — carries `target` and the stable `candidates`; the caller must choose rather than retrying blindly |
-| `stale_target` | Saved symbol instance metadata disagrees with the proven hierarchy, or component readback lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation, or property value — carries `target` and `reason`; preflight refuses before writing, while a readback failure may follow a committed write |
+| `wrong_document` | The requested PCB is not among KiCad's positively identified open documents — carries `requested` and `open_documents`; path-bearing IPC operations never substitute another open board |
+| `ambiguous_target` | More than one observed UUID, reference/unit, field, instance, or requested PCB document identity matches the requested target, or component instance records conflict across projects, units, or hierarchy paths — carries `target` and the stable `candidates`; the caller must choose rather than retrying blindly |
+| `stale_target` | A previously bound PCB document is no longer uniquely open, saved symbol instance metadata disagrees with the proven hierarchy, or component readback lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation, or property value — carries `target` and `reason`; preflight refuses before writing, while a readback failure may follow a committed write |
 | `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
