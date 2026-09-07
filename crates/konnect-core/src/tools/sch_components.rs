@@ -118,25 +118,6 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_schematic_component(args, ctx).await }
         ),
         tool!(
-            "prune_unused_lib_symbols",
-            "Remove cached lib_symbols definitions no placed instance references. \
-             Orphans accumulate whenever a symbol is renamed or swapped — eeschema \
-             never prunes them and kicad-cli preserves them verbatim. Netlist-neutral.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "dry_run": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Report what would be removed without writing."
-                    }
-                },
-                "required": ["schematic"]
-            }),
-            |args, ctx| async move { handle_prune_unused_lib_symbols(args, ctx).await }
-        ),
-        tool!(
             "edit_schematic_component",
             "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component.",
             json!({
@@ -1516,7 +1497,7 @@ async fn handle_delete_schematic_component(
 ///
 /// Edits are surgical byte deletions rather than a parse/serialise round-trip,
 /// so the rest of the file keeps its formatting exactly.
-async fn handle_prune_unused_lib_symbols(
+pub(crate) async fn handle_prune_unused_lib_symbols(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {

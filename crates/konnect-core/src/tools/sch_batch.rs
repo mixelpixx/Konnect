@@ -37,6 +37,25 @@ use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between}
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
+            "prune_unused_lib_symbols",
+            "Remove cached lib_symbols definitions no placed instance references. \
+             Orphans accumulate whenever a symbol is renamed or swapped — eeschema \
+             never prunes them and kicad-cli preserves them verbatim. Netlist-neutral.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Report what would be removed without writing."
+                    }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { super::sch_components::handle_prune_unused_lib_symbols(args, ctx).await }
+        ),
+        tool!(
             "batch_connect_to_net",
             "Connect multiple component pins to a named net by adding net labels at each pin \
              endpoint. Single file read → all labels inserted → single file write.",
