@@ -704,9 +704,13 @@ impl KiCadIpcClient {
                 requested: "<unspecified>".to_string(),
             })),
             [document] => {
-                if let Ok(path) = board_document_identity(document) {
-                    self.bind_board(path, document.clone())?;
-                }
+                let path = board_document_identity(document).map_err(|reason| {
+                    anyhow::Error::new(BoardTargetError::UnresolvedDocumentIdentities {
+                        requested: "<unspecified>".to_string(),
+                        reasons: vec![reason],
+                    })
+                })?;
+                self.bind_board(path, document.clone())?;
                 Ok(document.clone())
             }
             _ => Err(anyhow::Error::new(BoardTargetError::AmbiguousDocument {
@@ -737,14 +741,23 @@ impl KiCadIpcClient {
         requested: PathBuf,
         document: kiapi::common::types::DocumentSpecifier,
     ) -> Result<()> {
-        *self
+        let mut bound = self
             .bound_board
             .lock()
-            .map_err(|_| anyhow::anyhow!("bound board target lock is poisoned"))? =
-            Some(BoundBoardTarget {
-                requested,
-                document,
-            });
+            .map_err(|_| anyhow::anyhow!("bound board target lock is poisoned"))?;
+        if let Some(previous) = bound.as_ref() {
+            if previous.document != document {
+                return Err(anyhow::Error::new(BoardTargetError::StaleDocument {
+                    requested: requested.display().to_string(),
+                    previously_bound: board_document_label(&previous.document),
+                    open_documents: vec![board_document_label(&document)],
+                }));
+            }
+        }
+        *bound = Some(BoundBoardTarget {
+            requested,
+            document,
+        });
         Ok(())
     }
 
