@@ -13,6 +13,7 @@ use crate::types::*;
 use anyhow::{Context, Result};
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -826,6 +827,128 @@ impl KiCadIpcClient {
             sheet_instance_path: requested.sheet_instance_path.clone(),
             selected_objects,
             evidence_source: "kicad_ipc_get_selection_with_document_readback".to_string(),
+        })
+    }
+
+    /// Mutate one exact editor selection and prove the complete resulting set
+    /// through a fresh typed `GetSelection` observation.
+    pub fn mutate_selection(
+        &self,
+        requested: &IpcEditorDocument,
+        operation: IpcSelectionMutation,
+        requested_kiids: &[String],
+    ) -> Result<IpcSelectionMutationResult> {
+        let mut unique = BTreeSet::new();
+        if requested_kiids.iter().any(|kiid| kiid.is_empty()) {
+            return Err(selection_mutation_error(
+                operation,
+                requested_kiids,
+                Vec::new(),
+                Vec::new(),
+                IpcSelectionMutationErrorKind::InvalidRequest,
+                "selection KIIDs must not be empty",
+            ));
+        }
+        if requested_kiids.iter().any(|kiid| !unique.insert(kiid)) {
+            return Err(selection_mutation_error(
+                operation,
+                requested_kiids,
+                Vec::new(),
+                Vec::new(),
+                IpcSelectionMutationErrorKind::InvalidRequest,
+                "selection mutation contains a duplicate KIID",
+            ));
+        }
+        match operation {
+            IpcSelectionMutation::Clear if !requested_kiids.is_empty() => {
+                return Err(selection_mutation_error(
+                    operation,
+                    requested_kiids,
+                    Vec::new(),
+                    Vec::new(),
+                    IpcSelectionMutationErrorKind::InvalidRequest,
+                    "clear selection does not accept object KIIDs",
+                ));
+            }
+            IpcSelectionMutation::Add | IpcSelectionMutation::Remove
+                if requested_kiids.is_empty() =>
+            {
+                return Err(selection_mutation_error(
+                    operation,
+                    requested_kiids,
+                    Vec::new(),
+                    Vec::new(),
+                    IpcSelectionMutationErrorKind::InvalidRequest,
+                    "add and remove selection require at least one object KIID",
+                ));
+            }
+            _ => {}
+        }
+
+        let before = self.observe_selection(requested)?;
+        let document = self.resolve_selection_document(requested)?;
+        let items = requested_kiids
+            .iter()
+            .map(|kiid| kiapi::common::types::Kiid {
+                value: kiid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let response = match operation {
+            IpcSelectionMutation::Clear => self.send_command(
+                &kiapi::common::commands::ClearSelection {
+                    header: Some(header_for(document)),
+                },
+                "kiapi.common.commands.ClearSelection",
+            )?,
+            IpcSelectionMutation::Add => self.send_command(
+                &kiapi::common::commands::AddToSelection {
+                    header: Some(header_for(document)),
+                    items,
+                },
+                "kiapi.common.commands.AddToSelection",
+            )?,
+            IpcSelectionMutation::Remove => self.send_command(
+                &kiapi::common::commands::RemoveFromSelection {
+                    header: Some(header_for(document)),
+                    items,
+                },
+                "kiapi.common.commands.RemoveFromSelection",
+            )?,
+        };
+        let _: kiapi::common::commands::SelectionResponse =
+            unpack_required(response, "selection mutation")?;
+        let after = self.observe_selection(requested)?;
+
+        let before_kiids = selection_kiids(&before);
+        let after_kiids = selection_kiids(&after);
+        let mut expected = before_kiids.iter().cloned().collect::<BTreeSet<_>>();
+        match operation {
+            IpcSelectionMutation::Clear => expected.clear(),
+            IpcSelectionMutation::Add => expected.extend(requested_kiids.iter().cloned()),
+            IpcSelectionMutation::Remove => {
+                for kiid in requested_kiids {
+                    expected.remove(kiid);
+                }
+            }
+        }
+        let expected_kiids = expected.into_iter().collect::<Vec<_>>();
+        if expected_kiids != after_kiids {
+            return Err(selection_mutation_error(
+                operation,
+                requested_kiids,
+                before_kiids,
+                after_kiids,
+                IpcSelectionMutationErrorKind::ReadbackMismatch,
+                "post-operation GetSelection did not match the requested exact set transition",
+            ));
+        }
+
+        Ok(IpcSelectionMutationResult {
+            operation,
+            requested_kiids: requested_kiids.to_vec(),
+            before,
+            after,
+            evidence_source: "kicad_ipc_selection_mutation_with_get_selection_readback".to_string(),
         })
     }
 
@@ -3410,6 +3533,34 @@ fn malformed_selected_object(
         requested: protocol_type.to_string(),
         candidates: Vec::new(),
         reason,
+    })
+}
+
+fn selection_kiids(observation: &IpcSelectionObservation) -> Vec<String> {
+    let mut kiids = observation
+        .selected_objects
+        .iter()
+        .map(|object| object.kiid.clone())
+        .collect::<Vec<_>>();
+    kiids.sort();
+    kiids
+}
+
+fn selection_mutation_error(
+    operation: IpcSelectionMutation,
+    requested_kiids: &[String],
+    before_kiids: Vec<String>,
+    after_kiids: Vec<String>,
+    kind: IpcSelectionMutationErrorKind,
+    reason: &str,
+) -> anyhow::Error {
+    anyhow::Error::new(IpcSelectionMutationError {
+        kind,
+        operation,
+        requested_kiids: requested_kiids.to_vec(),
+        before_kiids,
+        after_kiids,
+        reason: reason.to_string(),
     })
 }
 

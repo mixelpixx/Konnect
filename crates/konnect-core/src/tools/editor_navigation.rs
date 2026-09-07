@@ -9,8 +9,8 @@ use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{invalid_arg, opt_str, require_array, require_str, ToolContext, ToolDef};
 use konnect_ipc::{
-    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionObservationErrorKind,
-    IpcSheetInstancePath,
+    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
+    IpcSelectionMutationErrorKind, IpcSelectionObservationErrorKind, IpcSheetInstancePath,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -70,6 +70,25 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["editor", "project_name", "project_path", "document_path"]
             }),
             |args, ctx| async move { handle_resolve_navigation_target(args, ctx).await }
+        ),
+        tool!(
+            "mutate_editor_selection",
+            "Clear, add to, or remove from one exact KiCad editor selection. Every non-clear KIID is first resolved in the explicit saved project/document/sheet, and success is derived only from a fresh exact GetSelection readback.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["clear", "add", "remove"] },
+                    "editor": { "type": "string", "enum": ["schematic", "pcb"] },
+                    "project_name": { "type": "string" },
+                    "project_path": { "type": "string" },
+                    "document_path": { "type": "string", "description": "Exact saved .kicad_sch or .kicad_pcb document" },
+                    "sheet_instance_path": { "type": "array", "items": { "type": "string" } },
+                    "sheet_path_human_readable": { "type": "string" },
+                    "object_kiids": { "type": "array", "items": { "type": "string" }, "description": "Empty for clear; one or more stable KIIIDs for add/remove" }
+                },
+                "required": ["operation", "editor", "project_name", "project_path", "document_path", "object_kiids"]
+            }),
+            |args, ctx| async move { handle_mutate_editor_selection(args, ctx).await }
         ),
     ]
 }
@@ -452,6 +471,222 @@ fn navigation_target_error_result(
     CallToolResult::error_kind(kind, error.to_string())
 }
 
+#[derive(Debug)]
+struct SelectionMutationRequest {
+    operation: IpcSelectionMutation,
+    live_document: IpcEditorDocument,
+    object_kiids: Vec<String>,
+    structural_targets: Vec<NavigationTargetRequest>,
+}
+
+async fn handle_mutate_editor_selection(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let request = match parse_selection_mutation_request(args) {
+        Ok(request) => request,
+        Err(result) => return Ok(result),
+    };
+    let address = ctx.config.ipc_address.clone();
+    if address.is_empty() {
+        return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
+    }
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let resolved_targets = request
+            .structural_targets
+            .iter()
+            .map(resolve_navigation_target)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mutation = konnect_ipc::KiCadIpcClient::new(address).mutate_selection(
+            &request.live_document,
+            request.operation,
+            &request.object_kiids,
+        )?;
+        Ok((resolved_targets, mutation))
+    })
+    .await?;
+    match result {
+        Ok((resolved_targets, mutation)) => Ok(CallToolResult::json(&json!({
+            "resolved_targets": resolved_targets,
+            "mutation": mutation
+        }))),
+        Err(error) => Ok(selection_mutation_error_result(error)),
+    }
+}
+
+fn parse_selection_mutation_request(
+    args: &serde_json::Value,
+) -> Result<SelectionMutationRequest, CallToolResult> {
+    let operation = match require_str(args, "operation")? {
+        "clear" => IpcSelectionMutation::Clear,
+        "add" => IpcSelectionMutation::Add,
+        "remove" => IpcSelectionMutation::Remove,
+        _ => {
+            return Err(invalid_arg(
+                "operation",
+                "expected 'clear', 'add', or 'remove'",
+            ))
+        }
+    };
+    let editor = match require_str(args, "editor")? {
+        "schematic" => IpcEditorKind::Schematic,
+        "pcb" => IpcEditorKind::Pcb,
+        _ => return Err(invalid_arg("editor", "expected 'schematic' or 'pcb'")),
+    };
+    let project_name = require_str(args, "project_name")?;
+    let project_path = require_str(args, "project_path")?;
+    let document_path = require_str(args, "document_path")?;
+    if project_name.is_empty() || project_path.is_empty() || document_path.is_empty() {
+        return Err(invalid_arg(
+            "project_name",
+            "project and document identity strings must not be empty",
+        ));
+    }
+    let object_kiids = require_array(args, "object_kiids")?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| invalid_arg("object_kiids", "every entry must be a string"))?;
+    if object_kiids.iter().any(String::is_empty) {
+        return Err(invalid_arg("object_kiids", "KIIIDs must not be empty"));
+    }
+    let unique = object_kiids
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != object_kiids.len() {
+        return Err(invalid_arg(
+            "object_kiids",
+            "duplicate KIIIDs are not allowed",
+        ));
+    }
+    match operation {
+        IpcSelectionMutation::Clear if !object_kiids.is_empty() => {
+            return Err(invalid_arg("object_kiids", "clear requires an empty array"));
+        }
+        IpcSelectionMutation::Add | IpcSelectionMutation::Remove if object_kiids.is_empty() => {
+            return Err(invalid_arg(
+                "object_kiids",
+                "add and remove require at least one KIID",
+            ));
+        }
+        _ => {}
+    }
+
+    let project = IpcProjectIdentity {
+        name: project_name.to_string(),
+        path: project_path.to_string(),
+    };
+    let sheet_instance_path = match editor {
+        IpcEditorKind::Pcb => {
+            if !args["sheet_instance_path"].is_null()
+                || !args["sheet_path_human_readable"].is_null()
+            {
+                return Err(invalid_arg(
+                    "sheet_instance_path",
+                    "PCB targets cannot carry schematic sheet identity",
+                ));
+            }
+            None
+        }
+        IpcEditorKind::Schematic => {
+            let ids = require_array(args, "sheet_instance_path")?
+                .iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    invalid_arg("sheet_instance_path", "every entry must be a string")
+                })?;
+            if ids.is_empty() || ids.iter().any(String::is_empty) {
+                return Err(invalid_arg(
+                    "sheet_instance_path",
+                    "must contain non-empty root-to-leaf KIIIDs",
+                ));
+            }
+            Some(IpcSheetInstancePath {
+                kiids: ids,
+                human_readable: opt_str(args, "sheet_path_human_readable")
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        }
+    };
+    let saved_document = PathBuf::from(document_path);
+    let structural_targets = object_kiids
+        .iter()
+        .map(|kiid| NavigationTargetRequest {
+            editor,
+            project: project.clone(),
+            document_path: saved_document.clone(),
+            sheet_instance_path: sheet_instance_path.clone(),
+            object_kiid: Some(kiid.clone()),
+            human_reference: None,
+        })
+        .collect();
+    Ok(SelectionMutationRequest {
+        operation,
+        live_document: IpcEditorDocument {
+            editor,
+            project: Some(project),
+            document_path: (editor == IpcEditorKind::Pcb)
+                .then(|| saved_document.display().to_string()),
+            sheet_instance_path,
+        },
+        object_kiids,
+        structural_targets,
+    })
+}
+
+fn selection_mutation_error_result(error: anyhow::Error) -> CallToolResult {
+    if let Some(target) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<super::navigation_target::NavigationTargetError>())
+    {
+        return navigation_target_error_result(target.clone());
+    }
+    if let Some(mutation) = konnect_ipc::IpcSelectionMutationError::from_error(&error) {
+        let kind = match mutation.kind {
+            IpcSelectionMutationErrorKind::InvalidRequest => ToolErrorKind::InvalidArgument {
+                field: "object_kiids".to_string(),
+                reason: mutation.reason.clone(),
+            },
+            IpcSelectionMutationErrorKind::ReadbackMismatch => ToolErrorKind::ReadbackMismatch {
+                operation: mutation.operation.as_str().to_string(),
+                requested_kiids: mutation.requested_kiids.clone(),
+                before_kiids: mutation.before_kiids.clone(),
+                after_kiids: mutation.after_kiids.clone(),
+            },
+        };
+        return CallToolResult::error_kind(kind, mutation.to_string());
+    }
+    if konnect_ipc::IpcSelectionObservationError::from_error(&error).is_some() {
+        return selection_error_result(error);
+    }
+    if let Some(status) = konnect_ipc::ApiStatusError::from_error(&error) {
+        if status.is_unsupported() {
+            return CallToolResult::error_kind(
+                ToolErrorKind::UnsupportedCapability {
+                    capability: "selection_mutation".to_string(),
+                    kicad_version: None,
+                },
+                "The running KiCad endpoint does not support typed selection mutation.",
+            );
+        }
+    }
+    match konnect_ipc::IpcFailure::from_error(error) {
+        konnect_ipc::IpcFailure::Unreachable(_) => {
+            editor_unavailable("the configured KiCad IPC endpoint is unreachable")
+        }
+        _ => CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: "requested editor selection mutation".to_string(),
+                reason: "KiCad did not return a complete typed mutation/readback sequence"
+                    .to_string(),
+            },
+            "KiCad did not return a complete typed selection mutation/readback sequence.",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,10 +887,87 @@ mod tests {
         url
     }
 
+    fn spawn_add_selection_mock(project_path: String, apply_mutation: bool) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://selection-mutation-core-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
+        socket.listen(&url).expect("listen");
+        std::thread::spawn(move || {
+            let mut selected = false;
+            for _ in 0..8 {
+                let message = socket.recv().expect("request");
+                let request =
+                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
+                let command = request.message.expect("command");
+                let response_any = if command.type_url.ends_with("GetOpenDocuments") {
+                    builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        "layout.kicad_pcb".to_string(),
+                                    ),
+                                ),
+                                project: Some(kiapi::common::types::ProjectSpecifier {
+                                    name: "nav".to_string(),
+                                    path: project_path.clone(),
+                                }),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )
+                } else {
+                    if command.type_url.ends_with("AddToSelection") && apply_mutation {
+                        let add = kiapi::common::commands::AddToSelection::decode(
+                            command.value.as_slice(),
+                        )
+                        .expect("add selection");
+                        assert_eq!(add.items[0].value, "fp-c10");
+                        selected = true;
+                    }
+                    let items = selected
+                        .then(|| {
+                            builders::pack_any(
+                                &kiapi::board::types::FootprintInstance {
+                                    id: Some(kiapi::common::types::Kiid {
+                                        value: "fp-c10".to_string(),
+                                    }),
+                                    ..Default::default()
+                                },
+                                "kiapi.board.types.FootprintInstance",
+                            )
+                        })
+                        .into_iter()
+                        .collect();
+                    builders::pack_any(
+                        &kiapi::common::commands::SelectionResponse { items },
+                        "kiapi.common.commands.SelectionResponse",
+                    )
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: Some(response_any),
+                };
+                socket
+                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                    .expect("response");
+            }
+        });
+        url
+    }
+
     #[test]
     fn public_tool_is_read_only_and_takes_no_required_arguments() {
         let definitions = tools();
-        assert_eq!(definitions.len(), 3);
+        assert_eq!(definitions.len(), 4);
         let state = definitions
             .iter()
             .find(|tool| tool.name == "get_editor_state")
@@ -676,6 +988,21 @@ mod tests {
         assert_eq!(
             resolver.input_schema["required"],
             json!(["editor", "project_name", "project_path", "document_path"])
+        );
+        let mutation = definitions
+            .iter()
+            .find(|tool| tool.name == "mutate_editor_selection")
+            .expect("selection mutation tool");
+        assert_eq!(
+            mutation.input_schema["required"],
+            json!([
+                "operation",
+                "editor",
+                "project_name",
+                "project_path",
+                "document_path",
+                "object_kiids"
+            ])
         );
     }
 
@@ -843,6 +1170,118 @@ mod tests {
         assert_eq!(
             body["live_context_evidence"]["source"],
             "kicad_ipc_get_open_documents"
+        );
+    }
+
+    #[test]
+    fn mutation_parser_requires_operation_appropriate_unique_kiids() {
+        let base = json!({
+            "operation": "clear",
+            "editor": "pcb",
+            "project_name": "navigation",
+            "project_path": r"C:\design",
+            "document_path": r"C:\design\navigation.kicad_pcb",
+            "object_kiids": []
+        });
+        assert!(parse_selection_mutation_request(&base).is_ok());
+
+        for object_kiids in [json!(["a"]), json!(["a", "a"])] {
+            let mut invalid = base.clone();
+            invalid["object_kiids"] = object_kiids;
+            if invalid["object_kiids"].as_array().map(Vec::len) == Some(2) {
+                invalid["operation"] = json!("add");
+            }
+            let result = parse_selection_mutation_request(&invalid).expect_err("invalid KIIIDs");
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_selection_mutation_success_is_derived_from_readback() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nav.kicad_pro"), "{}").unwrap();
+        let board = temp.path().join("layout.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (footprint \"Capacitor:C\" (layer \"F.Cu\") (at 1 2) \
+             (uuid \"fp-c10\") (property \"Reference\" \"C10\")))",
+        )
+        .unwrap();
+        let project_path = temp.path().display().to_string();
+        let result = handle_mutate_editor_selection(
+            &json!({
+                "operation": "add",
+                "editor": "pcb",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "document_path": board.display().to_string(),
+                "object_kiids": ["fp-c10"]
+            }),
+            &context(spawn_add_selection_mock(project_path, true)),
+        )
+        .await
+        .expect("handler result");
+        assert!(!result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["resolved_targets"][0]["object"]["kiid"], "fp-c10");
+        assert_eq!(
+            body["mutation"]["after"]["selected_objects"][0]["kiid"],
+            "fp-c10"
+        );
+        assert_eq!(
+            body["mutation"]["evidence_source"],
+            "kicad_ipc_selection_mutation_with_get_selection_readback"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_selection_mutation_reports_readback_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nav.kicad_pro"), "{}").unwrap();
+        let board = temp.path().join("layout.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (footprint \"Capacitor:C\" (layer \"F.Cu\") (at 1 2) \
+             (uuid \"fp-c10\") (property \"Reference\" \"C10\")))",
+        )
+        .unwrap();
+        let project_path = temp.path().display().to_string();
+        let result = handle_mutate_editor_selection(
+            &json!({
+                "operation": "add",
+                "editor": "pcb",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "document_path": board.display().to_string(),
+                "object_kiids": ["fp-c10"]
+            }),
+            &context(spawn_add_selection_mock(project_path, false)),
+        )
+        .await
+        .expect("handler result");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("readback_mismatch")
+        );
+    }
+
+    #[test]
+    fn unsupported_selection_mutation_maps_to_a_typed_capability_refusal() {
+        let result =
+            selection_mutation_error_result(anyhow::Error::new(konnect_ipc::ApiStatusError {
+                code: kiapi::common::ApiStatusCode::AsUnhandled as i32,
+                code_name: "AS_UNHANDLED".to_string(),
+                message: "unsupported".to_string(),
+            }));
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("unsupported_capability")
         );
     }
 }

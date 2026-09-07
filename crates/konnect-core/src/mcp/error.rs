@@ -87,6 +87,14 @@ pub enum ToolErrorKind {
         capability: String,
         kicad_version: Option<String>,
     },
+    /// KiCad accepted a semantic mutation, but a fresh observation did not
+    /// prove the exact requested post-operation state.
+    ReadbackMismatch {
+        operation: String,
+        requested_kiids: Vec<String>,
+        before_kiids: Vec<String>,
+        after_kiids: Vec<String>,
+    },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
     UnsafeFileFallback { path: String, reason: String },
@@ -117,6 +125,7 @@ impl ToolErrorKind {
             Self::StaleTarget { .. } => "stale_target",
             Self::EditorUnavailable { .. } => "editor_unavailable",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
+            Self::ReadbackMismatch { .. } => "readback_mismatch",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::HandlerError { .. } => "handler_error",
@@ -269,6 +278,12 @@ mod tests {
             ToolErrorKind::UnsupportedCapability {
                 capability: "activate_sheet".into(),
                 kicad_version: Some("10.0.5".into()),
+            },
+            ToolErrorKind::ReadbackMismatch {
+                operation: "add".into(),
+                requested_kiids: vec!["b".into()],
+                before_kiids: vec!["a".into()],
+                after_kiids: vec!["a".into()],
             },
             ToolErrorKind::UnsafeFileFallback {
                 path: "p".into(),

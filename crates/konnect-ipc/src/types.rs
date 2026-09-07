@@ -132,6 +132,73 @@ pub struct IpcSelectionObservation {
     pub evidence_source: String,
 }
 
+/// Semantic selection change requested from one exact editor context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcSelectionMutation {
+    Clear,
+    Add,
+    Remove,
+}
+
+impl IpcSelectionMutation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Add => "add",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// Verified selection mutation. Success means the post-operation observation
+/// exactly matched the requested set transition, not merely that IPC replied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSelectionMutationResult {
+    pub operation: IpcSelectionMutation,
+    pub requested_kiids: Vec<String>,
+    pub before: IpcSelectionObservation,
+    pub after: IpcSelectionObservation,
+    pub evidence_source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcSelectionMutationErrorKind {
+    InvalidRequest,
+    ReadbackMismatch,
+}
+
+/// A semantic selection mutation was invalid or its observed result did not
+/// prove the requested change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcSelectionMutationError {
+    pub kind: IpcSelectionMutationErrorKind,
+    pub operation: IpcSelectionMutation,
+    pub requested_kiids: Vec<String>,
+    pub before_kiids: Vec<String>,
+    pub after_kiids: Vec<String>,
+    pub reason: String,
+}
+
+impl IpcSelectionMutationError {
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+impl std::fmt::Display for IpcSelectionMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cannot verify {} selection mutation: {}",
+            self.operation.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for IpcSelectionMutationError {}
+
 /// Stable classification for a fail-closed selection observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpcSelectionObservationErrorKind {

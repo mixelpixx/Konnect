@@ -8,7 +8,8 @@
 use konnect_ipc::builders;
 use konnect_ipc::gen::kiapi;
 use konnect_ipc::{
-    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionObservationError,
+    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
+    IpcSelectionMutationError, IpcSelectionMutationErrorKind, IpcSelectionObservationError,
     IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient,
 };
 use nng::options::Options;
@@ -2534,4 +2535,157 @@ fn document_disappearing_during_selection_readback_is_stale_editor_state() {
         selection_kind(&error),
         IpcSelectionObservationErrorKind::StaleEditorState
     );
+}
+
+fn selected_footprints(ids: &std::collections::BTreeSet<String>) -> Vec<prost_types::Any> {
+    ids.iter()
+        .map(|id| {
+            builders::pack_any(
+                &kiapi::board::types::FootprintInstance {
+                    id: Some(kiid(id)),
+                    ..Default::default()
+                },
+                "kiapi.board.types.FootprintInstance",
+            )
+        })
+        .collect()
+}
+
+fn spawn_selection_mutation_mock(initial: &[&str], apply_mutation: bool) -> MockKicad {
+    let selection = Arc::new(Mutex::new(
+        initial
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+    ));
+    let selection_in_mock = selection.clone();
+    spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_board_document(),
+            ]));
+        }
+        if message.type_url.ends_with("GetSelection") {
+            return Some(selection_response(selected_footprints(
+                &selection_in_mock.lock().unwrap(),
+            )));
+        }
+
+        let mutation_header = if message.type_url.ends_with("ClearSelection") {
+            let command =
+                kiapi::common::commands::ClearSelection::decode(message.value.as_slice()).unwrap();
+            if apply_mutation {
+                selection_in_mock.lock().unwrap().clear();
+            }
+            command.header
+        } else if message.type_url.ends_with("AddToSelection") {
+            let command =
+                kiapi::common::commands::AddToSelection::decode(message.value.as_slice()).unwrap();
+            if apply_mutation {
+                selection_in_mock
+                    .lock()
+                    .unwrap()
+                    .extend(command.items.iter().map(|id| id.value.clone()));
+            }
+            command.header
+        } else if message.type_url.ends_with("RemoveFromSelection") {
+            let command =
+                kiapi::common::commands::RemoveFromSelection::decode(message.value.as_slice())
+                    .unwrap();
+            if apply_mutation {
+                let mut selection = selection_in_mock.lock().unwrap();
+                for id in &command.items {
+                    selection.remove(&id.value);
+                }
+            }
+            command.header
+        } else {
+            panic!("unexpected request {}", message.type_url);
+        };
+        let document = mutation_header
+            .as_ref()
+            .and_then(|header| header.document.as_ref())
+            .expect("selection mutation document");
+        assert_eq!(board_filename(document), "navigation.kicad_pcb");
+        Some(selection_response(selected_footprints(
+            &selection_in_mock.lock().unwrap(),
+        )))
+    })
+}
+
+#[test]
+fn clear_add_and_remove_selection_are_proven_by_exact_readback() {
+    let cases = [
+        (IpcSelectionMutation::Clear, vec!["a"], Vec::<String>::new()),
+        (
+            IpcSelectionMutation::Add,
+            vec!["a"],
+            vec!["a".to_string(), "b".to_string()],
+        ),
+        (
+            IpcSelectionMutation::Remove,
+            vec!["a", "b"],
+            vec!["a".to_string()],
+        ),
+    ];
+    for (operation, initial, expected) in cases {
+        let mock = spawn_selection_mutation_mock(&initial, true);
+        let requested = match operation {
+            IpcSelectionMutation::Clear => Vec::new(),
+            IpcSelectionMutation::Add | IpcSelectionMutation::Remove => vec!["b".to_string()],
+        };
+        let result = KiCadIpcClient::new(&mock.url)
+            .mutate_selection(&navigation_board_target(), operation, &requested)
+            .expect("verified selection mutation");
+        let mut observed = result
+            .after
+            .selected_objects
+            .iter()
+            .map(|object| object.kiid.clone())
+            .collect::<Vec<_>>();
+        observed.sort();
+        assert_eq!(observed, expected);
+        assert_eq!(result.operation, operation);
+        assert!(result.evidence_source.contains("get_selection_readback"));
+    }
+}
+
+#[test]
+fn transport_success_without_the_requested_selection_change_is_a_mismatch() {
+    let mock = spawn_selection_mutation_mock(&["a"], false);
+    let error = KiCadIpcClient::new(&mock.url)
+        .mutate_selection(
+            &navigation_board_target(),
+            IpcSelectionMutation::Add,
+            &["b".to_string()],
+        )
+        .expect_err("unchanged readback is not success");
+    let typed = IpcSelectionMutationError::from_error(&error).expect("typed mutation error");
+    assert_eq!(typed.kind, IpcSelectionMutationErrorKind::ReadbackMismatch);
+    assert_eq!(typed.before_kiids, ["a"]);
+    assert_eq!(typed.after_kiids, ["a"]);
+}
+
+#[test]
+fn invalid_selection_mutations_are_rejected_before_transport() {
+    let client = KiCadIpcClient::new("inproc://not-contacted");
+    for (operation, requested) in [
+        (IpcSelectionMutation::Clear, vec!["a".to_string()]),
+        (IpcSelectionMutation::Add, Vec::new()),
+        (
+            IpcSelectionMutation::Remove,
+            vec!["a".to_string(), "a".to_string()],
+        ),
+    ] {
+        let error = client
+            .mutate_selection(&navigation_board_target(), operation, &requested)
+            .expect_err("invalid request");
+        assert_eq!(
+            IpcSelectionMutationError::from_error(&error)
+                .expect("typed mutation error")
+                .kind,
+            IpcSelectionMutationErrorKind::InvalidRequest
+        );
+    }
 }
