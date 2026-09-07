@@ -7061,6 +7061,21 @@ mod multi_unit_component_tests {
         assert_eq!(placed[1].rotation, 270.0);
     }
 
+    /// The same real eeschema save as [`eeschema_fixture`], but written under
+    /// the file stem its own instance paths name (`ecc83-pp`). Placement
+    /// preflights the project name against those paths and rightly refuses a
+    /// mismatch, so a placement test needs the two to agree.
+    fn eeschema_placement_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ecc83-pp.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+        (directory, path)
+    }
+
     /// A misspelled axis is a caller asking for a reflection. Placing the
     /// symbol unmirrored and reporting success is exactly the failure this
     /// argument exists to end, so the placement refuses and writes nothing.
@@ -7087,14 +7102,18 @@ mod multi_unit_component_tests {
 
     /// `"none"` is the explicit way to say unmirrored. It must place the
     /// symbol without a `(mirror ...)` token at all — eeschema has no
-    /// `(mirror none)` and would not load one.
+    /// `(mirror none)` and would not load one. Placed into a real eeschema
+    /// save, which already carries mirrored symbols of its own, so the
+    /// assertion has to be scoped to the symbol this test placed.
     #[tokio::test]
     async fn placing_with_mirror_none_writes_no_token() {
-        let (_directory, path) = fixture();
+        let (_directory, path) = eeschema_placement_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mirrors_before = before.matches("(mirror ").count();
         let result = handle_add_schematic_component(
             &json!({
                 "schematic": path,
-                "lib_id": "Device:R",
+                "lib_id": "ecc83-pp:R",
                 "x": 100.0,
                 "y": 40.0,
                 "reference": "R8",
@@ -7105,10 +7124,24 @@ mod multi_unit_component_tests {
         .await
         .unwrap();
         assert!(!result.is_error, "{result:?}");
-        let source = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !source.contains("(mirror"),
-            "no mirror token may be written"
+        let committed = cse::Schematic::load(&path).unwrap();
+        assert_eq!(
+            committed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.reference() == Some("R8"))
+                .expect("placed symbol")
+                .mirror,
+            None,
+            "\"none\" must leave the symbol without a mirror token"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("(mirror ")
+                .count(),
+            mirrors_before,
+            "no mirror token may be added, and none of the file's own may be lost"
         );
     }
 
@@ -7118,11 +7151,11 @@ mod multi_unit_component_tests {
     /// a mirrored symbol's fields sat on its unmirrored side.
     #[tokio::test]
     async fn placing_mirrored_reflects_the_body_and_its_field_anchors() {
-        let (_directory, path) = fixture();
+        let (_directory, path) = eeschema_placement_fixture();
         for (reference, x, mirror) in [("R8", 100.0, None), ("R9", 140.0, Some("y"))] {
             let mut args = json!({
                 "schematic": path,
-                "lib_id": "Device:R",
+                "lib_id": "ecc83-pp:R",
                 "x": x,
                 "y": 40.0,
                 "reference": reference
@@ -7135,9 +7168,18 @@ mod multi_unit_component_tests {
                 .unwrap();
             assert!(!result.is_error, "placement failed for {reference}");
         }
-        let source = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(source.matches("(mirror y)").count(), 1);
         let committed = cse::Schematic::load(&path).unwrap();
+        let mirror_of = |reference: &str| -> Option<String> {
+            committed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.reference() == Some(reference))
+                .expect("placed symbol")
+                .mirror
+                .clone()
+        };
+        assert_eq!(mirror_of("R8"), None);
+        assert_eq!(mirror_of("R9"), Some("y".to_string()));
         let field_x = |reference: &str| -> f64 {
             let symbol = committed
                 .symbols
