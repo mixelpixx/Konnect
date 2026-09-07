@@ -22,13 +22,20 @@ pub enum SexpError {
     #[error("write conflict: {path} changed since it was read")]
     Conflict { path: PathBuf },
 
-    /// KiCad owns, or may still own, the schematic through its sibling lock.
+    /// KiCad owns, or may still own, the design document through its sibling
+    /// lock.
     ///
     /// KiCad lock files identify only a username and hostname, so their
     /// presence cannot be distinguished reliably from a stale lock. Writers
     /// must fail closed and leave both the document and the lock untouched.
     #[error("KiCad editor lock blocks write to {path}: {lock_path}")]
-    KiCadEditorLocked { path: PathBuf, lock_path: PathBuf },
+    KiCadEditorLocked {
+        path: PathBuf,
+        lock_path: PathBuf,
+        /// Inspection failures are retained so callers can distinguish an
+        /// observed lock from a lock whose absence could not be established.
+        inspection_error: Option<String>,
+    },
 
     /// A revision-aware command found that one of its target items no longer
     /// matches the exact item revision on which the command was prepared.

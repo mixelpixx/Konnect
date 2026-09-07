@@ -368,22 +368,40 @@ impl McpHandler {
                     )
                 }
                 Err(e) if kicad_editor_locked_path(&e).is_some() => {
-                    let path = kicad_editor_locked_path(&e)
-                        .expect("guard matched")
-                        .display()
-                        .to_string();
-                    (
-                        CallToolResult::error_kind(
-                            ToolErrorKind::Conflict {
-                                paths: vec![path.clone()],
-                            },
-                            format!(
-                                "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                    let locked = kicad_editor_locked_path(&e).expect("guard matched");
+                    let path = locked.display().to_string();
+                    if locked
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
+                    {
+                        let reason = kicad_board_lock_reason(&e).to_string();
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::UnsafeFileFallback {
+                                    path: path.clone(),
+                                    reason: reason.clone(),
+                                },
+                                format!(
+                                    "Board '{path}' cannot be replaced safely ({reason}): a KiCad editor lock appeared before the committed write, so saved-file authority cannot be proven. Konnect did not modify it. Close or recover Pcbnew, reconcile any unsaved work, and save the authoritative state. Retry only after confirming that no KiCad process owns the board and the lock is gone."
+                                ),
                             ),
-                        ),
-                        CallStatus::Error,
-                        Some("conflict".to_string()),
-                    )
+                            CallStatus::Error,
+                            Some("unsafe_file_fallback".to_string()),
+                        )
+                    } else {
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::Conflict {
+                                    paths: vec![path.clone()],
+                                },
+                                format!(
+                                    "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                                ),
+                            ),
+                            CallStatus::Error,
+                            Some("conflict".to_string()),
+                        )
+                    }
                 }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
@@ -472,6 +490,22 @@ fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
         }
     }
     None
+}
+
+fn kicad_board_lock_reason(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(konnect_sexp::SexpError::KiCadEditorLocked {
+            inspection_error, ..
+        }) = cause.downcast_ref::<konnect_sexp::SexpError>()
+        {
+            return if inspection_error.is_some() {
+                "kicad_lock_unreadable"
+            } else {
+                "kicad_lock_present"
+            };
+        }
+    }
+    "kicad_lock_present"
 }
 
 /// Sum of content bytes in a `CallToolResult` — used for observability size
@@ -765,6 +799,42 @@ mod required_argument_dispatch_tests {
             json!([schematic.display().to_string()])
         );
         assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
+        assert!(lock.exists());
+    }
+
+    #[tokio::test]
+    async fn a_kicad_board_lock_is_a_typed_unsafe_file_fallback() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("locked.kicad_pcb");
+        let lock = directory.path().join("~locked.kicad_pcb.lck");
+        let source = "(kicad_pcb (version 20240108) (generator pcbnew))\n";
+        std::fs::write(&board, source).unwrap();
+        std::fs::write(&lock, "lock ownership cannot be inferred").unwrap();
+
+        let (result, status, kind) = handler
+            .dispatch_tool(
+                "add_mounting_hole",
+                &json!({
+                    "board": board.display().to_string(),
+                    "x": 10.0,
+                    "y": 10.0,
+                    "reference": "H1"
+                }),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(status, CallStatus::Error);
+        assert_eq!(kind.as_deref(), Some("unsafe_file_fallback"));
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "unsafe_file_fallback");
+        assert_eq!(body["error"]["reason"], "kicad_lock_present");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
         assert!(lock.exists());
     }
 }

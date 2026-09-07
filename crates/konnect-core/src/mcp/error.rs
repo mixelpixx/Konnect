@@ -69,7 +69,7 @@ pub enum ToolErrorKind {
     StaleTarget { target: String, reason: String },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
-    UnsafeFileFallback { path: String },
+    UnsafeFileFallback { path: String, reason: String },
     /// KiCad answered, and its open-document list could not be read as a
     /// complete set of comparable board identities — so whether it holds this
     /// board is unknown, and neither a live edit nor a file edit is safe.
@@ -230,7 +230,10 @@ mod tests {
                 target: "p".into(),
                 reason: "r".into(),
             },
-            ToolErrorKind::UnsafeFileFallback { path: "p".into() },
+            ToolErrorKind::UnsafeFileFallback {
+                path: "p".into(),
+                reason: "r".into(),
+            },
             ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];

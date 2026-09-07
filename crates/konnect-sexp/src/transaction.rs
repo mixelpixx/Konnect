@@ -7,7 +7,7 @@
 //! explicit resolution.
 
 use crate::writer::{
-    ensure_kicad_schematic_is_closed, open_document_lock, read_string_unlocked,
+    ensure_kicad_design_document_is_closed, open_document_lock, read_string_unlocked,
     sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
 };
 use crate::SexpError;
@@ -652,7 +652,7 @@ fn lock_entries(root: &Path, entries: &[JournalEntry]) -> Result<Vec<std::fs::Fi
 
 fn ensure_entries_are_closed(root: &Path, entries: &[JournalEntry]) -> Result<(), SexpError> {
     for entry in entries {
-        ensure_kicad_schematic_is_closed(&root.join(&entry.path))?;
+        ensure_kicad_design_document_is_closed(&root.join(&entry.path))?;
     }
     Ok(())
 }
