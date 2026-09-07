@@ -145,6 +145,31 @@ fn load_board(path: &Path) -> SexpNode {
 
 #[test]
 #[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn editor_state_observation_reports_real_version_and_honest_capabilities() {
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let observation = KiCadIpcClient::new(socket)
+        .observe_editor_state()
+        .expect("editor-state observation failed");
+    assert!(
+        observation.kicad_version.major >= 10,
+        "navigation requires KiCad 10 or newer, got {:?}",
+        observation.kicad_version
+    );
+    assert_eq!(observation.evidence_source, "kicad_ipc");
+    assert_eq!(observation.editors.len(), 2);
+    assert!(observation.active_editor.is_none());
+    assert!(observation.active_document.is_none());
+    assert!(observation.active_sheet_instance.is_none());
+    assert!(observation.editors.iter().all(|editor| {
+        editor.addressable
+            || editor.unavailable_reason.as_deref().is_some_and(|reason| {
+                reason.contains("AS_UNHANDLED") || reason.contains("AS_UNIMPLEMENTED")
+            })
+    }));
+}
+
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
 fn moving_and_rotating_footprint_preserves_child_geometry() {
     let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
         .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");

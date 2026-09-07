@@ -320,6 +320,62 @@ pub fn is_transport_unreachable(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<TransportUnreachable>())
 }
 
+/// Typed KiCad response status for a request that completed a round trip.
+///
+/// Keeping the numeric status in the error chain lets capability discovery
+/// distinguish an unsupported/unhandled command from an unreachable editor
+/// without matching human-readable error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiStatusError {
+    pub code: i32,
+    pub code_name: String,
+    pub message: String,
+}
+
+impl ApiStatusError {
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+
+    pub fn is_unsupported(&self) -> bool {
+        self.code == kiapi::common::ApiStatusCode::AsUnhandled as i32
+            || self.code == kiapi::common::ApiStatusCode::AsUnimplemented as i32
+    }
+}
+
+impl std::fmt::Display for ApiStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "KiCad IPC error: {} ({})",
+            self.message, self.code_name
+        )
+    }
+}
+
+impl std::error::Error for ApiStatusError {}
+
+/// A live document reply did not carry the identity required by its requested
+/// editor kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcDocumentObservationError {
+    pub editor: IpcEditorKind,
+    pub reason: String,
+}
+
+impl std::fmt::Display for IpcDocumentObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "KiCad returned a malformed {} document identity: {}",
+            self.editor.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for IpcDocumentObservationError {}
+
 /// A board-bearing operation could not resolve one exact live KiCad document.
 ///
 /// `NoOpenDocuments` and `WrongDocument` positively prove that the requested
@@ -612,7 +668,11 @@ impl KiCadIpcClient {
                 status.error_message.clone()
             };
             debug!("[BETA] IPC ← error: {} ({})", msg, code.as_str_name());
-            anyhow::bail!("KiCad IPC error: {} ({})", msg, code.as_str_name());
+            return Err(anyhow::Error::new(ApiStatusError {
+                code: code as i32,
+                code_name: code.as_str_name().to_string(),
+                message: msg,
+            }));
         }
 
         debug!("[BETA] IPC ← OK");
@@ -644,18 +704,113 @@ impl KiCadIpcClient {
         }
     }
 
+    /// Observe the running KiCad version through the typed IPC command.
+    pub fn get_kicad_version(&self) -> Result<IpcKiCadVersion> {
+        let command = kiapi::common::commands::GetVersion {};
+        let response = unpack_required::<kiapi::common::commands::GetVersionResponse>(
+            self.send_command(&command, "kiapi.common.commands.GetVersion")?,
+            "GetVersion",
+        )?;
+        let version = response
+            .version
+            .context("GetVersion response did not contain a KiCad version")?;
+        Ok(IpcKiCadVersion {
+            major: version.major,
+            minor: version.minor,
+            patch: version.patch,
+            full_version: version.full_version,
+        })
+    }
+
+    /// Query open documents for one explicit editor type.
+    pub fn get_open_documents_for(
+        &self,
+        editor: IpcEditorKind,
+    ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
+        let document_type = match editor {
+            IpcEditorKind::Schematic => kiapi::common::types::DocumentType::DoctypeSchematic,
+            IpcEditorKind::Pcb => kiapi::common::types::DocumentType::DoctypePcb,
+        };
+        let command = kiapi::common::commands::GetOpenDocuments {
+            r#type: document_type as i32,
+        };
+        let response = unpack_required::<kiapi::common::commands::GetOpenDocumentsResponse>(
+            self.send_command(&command, "kiapi.common.commands.GetOpenDocuments")?,
+            "GetOpenDocuments",
+        )?;
+        Ok(response.documents)
+    }
+
+    /// Observe the editor/document surface exposed by the configured endpoint.
+    ///
+    /// KiCad 10 does not expose a stable typed query for the foreground frame,
+    /// active document, or active schematic sheet. Those facts remain null and
+    /// the capability matrix states why; open-document order is never treated
+    /// as active state.
+    pub fn observe_editor_state(&self) -> Result<IpcEditorStateObservation> {
+        let version = self.get_kicad_version()?;
+        let editors = [IpcEditorKind::Schematic, IpcEditorKind::Pcb]
+            .into_iter()
+            .map(|editor| self.observe_editor(editor, &version))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(IpcEditorStateObservation {
+            kicad_version: version,
+            evidence_source: "kicad_ipc".to_string(),
+            editors,
+            active_editor: None,
+            active_document: None,
+            active_sheet_instance: None,
+            limitations: vec![
+                "The configured IPC endpoint cannot enumerate every running KiCad frame or endpoint."
+                    .to_string(),
+                "KiCad 10 exposes no stable typed foreground-frame, active-document, or active-sheet query; open-document order is not active-state evidence."
+                    .to_string(),
+            ],
+        })
+    }
+
+    fn observe_editor(
+        &self,
+        editor: IpcEditorKind,
+        version: &IpcKiCadVersion,
+    ) -> Result<IpcEditorObservation> {
+        let documents = match self.get_open_documents_for(editor) {
+            Ok(documents) => documents,
+            Err(error) => {
+                if let Some(status) = ApiStatusError::from_error(&error) {
+                    if status.is_unsupported() {
+                        return Ok(IpcEditorObservation {
+                            editor,
+                            addressable: false,
+                            documents: Vec::new(),
+                            capabilities: editor_capabilities(editor, version, false),
+                            unavailable_reason: Some(format!(
+                                "GetOpenDocuments is {} on this endpoint",
+                                status.code_name
+                            )),
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        let documents = documents
+            .into_iter()
+            .map(|document| editor_document_from_specifier(editor, document))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(IpcEditorObservation {
+            editor,
+            addressable: true,
+            documents,
+            capabilities: editor_capabilities(editor, version, true),
+            unavailable_reason: None,
+        })
+    }
+
     /// Get the list of open documents (boards).
     pub fn get_open_documents(&self) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
-        let cmd = kiapi::common::commands::GetOpenDocuments {
-            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-        };
-        let response_any = self.send_command(&cmd, "kiapi.common.commands.GetOpenDocuments")?;
-        if let Some(any) = response_any {
-            let resp: kiapi::common::commands::GetOpenDocumentsResponse = unpack_any(&any)?;
-            Ok(resp.documents)
-        } else {
-            Ok(vec![])
-        }
+        self.get_open_documents_for(IpcEditorKind::Pcb)
     }
 
     /// Resolve the filenames of every open PCB document, including relative
@@ -2830,6 +2985,133 @@ fn board_document_path(document: &kiapi::common::types::DocumentSpecifier) -> Op
         .filter(|project| !project.path.is_empty())
         .map(|project| PathBuf::from(&project.path).join(&path))
         .or(Some(path))
+}
+
+fn editor_document_from_specifier(
+    expected: IpcEditorKind,
+    document: kiapi::common::types::DocumentSpecifier,
+) -> Result<IpcEditorDocument> {
+    use kiapi::common::types::document_specifier::Identifier;
+
+    let expected_type = match expected {
+        IpcEditorKind::Schematic => kiapi::common::types::DocumentType::DoctypeSchematic,
+        IpcEditorKind::Pcb => kiapi::common::types::DocumentType::DoctypePcb,
+    };
+    if document.r#type != expected_type as i32 {
+        return Err(anyhow::Error::new(IpcDocumentObservationError {
+            editor: expected,
+            reason: format!(
+                "requested {}, observed {}",
+                expected_type.as_str_name(),
+                kiapi::common::types::DocumentType::try_from(document.r#type)
+                    .map(|kind| kind.as_str_name().to_string())
+                    .unwrap_or_else(|_| document.r#type.to_string())
+            ),
+        }));
+    }
+
+    let project = document.project.as_ref().map(|project| IpcProjectIdentity {
+        name: project.name.clone(),
+        path: project.path.clone(),
+    });
+    let (document_path, sheet_instance_path) = match (expected, document.identifier.as_ref()) {
+        (IpcEditorKind::Pcb, Some(Identifier::BoardFilename(filename))) if !filename.is_empty() => {
+            (
+                board_document_path(&document).map(|path| path.display().to_string()),
+                None,
+            )
+        }
+        (IpcEditorKind::Schematic, Some(Identifier::SheetPath(path)))
+            if !path.path.is_empty() && path.path.iter().all(|id| !id.value.is_empty()) =>
+        {
+            (
+                None,
+                Some(IpcSheetInstancePath {
+                    kiids: path.path.iter().map(|id| id.value.clone()).collect(),
+                    human_readable: path.path_human_readable.clone(),
+                }),
+            )
+        }
+        _ => {
+            return Err(anyhow::Error::new(IpcDocumentObservationError {
+                editor: expected,
+                reason: "missing or empty document identifier".to_string(),
+            }));
+        }
+    };
+
+    Ok(IpcEditorDocument {
+        editor: expected,
+        project,
+        document_path,
+        sheet_instance_path,
+    })
+}
+
+fn editor_capabilities(
+    editor: IpcEditorKind,
+    version: &IpcKiCadVersion,
+    addressable: bool,
+) -> IpcEditorCapabilities {
+    let available = |source: &str| IpcCapability {
+        availability: IpcCapabilityAvailability::Available,
+        evidence_source: source.to_string(),
+        reason: None,
+    };
+    let unsupported = |source: &str, reason: &str| IpcCapability {
+        availability: IpcCapabilityAvailability::Unsupported,
+        evidence_source: source.to_string(),
+        reason: Some(reason.to_string()),
+    };
+
+    let documents = if addressable {
+        available("kicad_ipc_runtime_probe")
+    } else {
+        unsupported(
+            "kicad_ipc_runtime_probe",
+            "the configured endpoint did not handle this editor's document query",
+        )
+    };
+    let selection = if addressable && version.major >= 10 {
+        available("kicad_version_and_typed_protocol")
+    } else {
+        unsupported(
+            "kicad_version_and_typed_protocol",
+            "selection requires an addressable KiCad 10-or-newer editor endpoint",
+        )
+    };
+    let no_active_context = unsupported(
+        "konnect_bundled_kicad_protocol",
+        "no stable typed active-frame, active-document, or active-sheet query is available",
+    );
+    let no_activation = unsupported(
+        "konnect_bundled_kicad_protocol",
+        match editor {
+            IpcEditorKind::Schematic => {
+                "no stable typed exact schematic/sheet activation command is available"
+            }
+            IpcEditorKind::Pcb => "no stable typed exact PCB activation command is available",
+        },
+    );
+    let no_reveal = unsupported(
+        "konnect_bundled_kicad_protocol",
+        "selection is typed, but reveal/center/fit has no stable typed command",
+    );
+    let no_cross_probe = unsupported(
+        "konnect_navigation_mvp",
+        "semantic cross-probe resolution is not implemented in this slice",
+    );
+
+    IpcEditorCapabilities {
+        observe_documents: documents,
+        observe_active_context: no_active_context,
+        read_selection: selection.clone(),
+        mutate_selection: selection,
+        activate_document: no_activation.clone(),
+        activate_sheet: no_activation,
+        reveal_object: no_reveal,
+        cross_probe: no_cross_probe,
+    }
 }
 
 fn board_document_label(document: &kiapi::common::types::DocumentSpecifier) -> String {
