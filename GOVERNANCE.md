@@ -9,6 +9,21 @@ One page, so nobody has to reconstruct this from issue threads.
 - **[@neusse](https://github.com/neusse)** — maintainer. Owns the areas listed
   in [`.github/CODEOWNERS`](.github/CODEOWNERS).
 
+### Current repository access model
+
+Konnect currently lives in a personal GitHub account. [GitHub gives a personal
+repository one owner and write collaborators](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/repository-access-and-collaboration/permission-levels-for-a-personal-account-repository);
+it does not offer the granular Triage, Maintain, and Admin roles available to
+organization repositories.
+Accordingly, `@neusse` can triage, label, assign, review, push, merge, and arm
+auto-merge, but cannot change repository settings or bypass the `main` ruleset.
+Only `@mixelpixx`, as owner, can administer those controls.
+
+Moving Konnect to an organization is accepted in principle but is not part of
+the current workflow. Until that happens, [GitHub's native merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
+is not available here. The ordered queue below, the `status:*` labels, and
+auto-merge provide the deliberately smaller substitute.
+
 Konnect is deliberately built and reviewed through **two different AI
 toolchains** — Claude Code on one side, OpenAI Codex on the other. That is not
 duplication to be tidied away. Every defect found so far in the agent-facing
@@ -18,10 +33,18 @@ independent.
 
 ## Merging
 
-- **A green PR may be merged by its author.** No approval is required. CI is
-  the gate: `main` requires all ten checks to pass, and that requirement is not
-  waived for anyone with write access.
+- **A reviewed green PR may be merged by its author or a maintainer.** No
+  approving-review count is required, but review is still a real decision:
+  every conversation must be resolved and the exact current head must satisfy
+  the issue, evidence, and queue requirements below.
 - **Merge commits only** (`gh pr merge N --merge`), so authorship survives.
+- **The active `main: CI must pass` ruleset is the protection source of truth.**
+  It requires pull requests, all ten CI checks, and resolved review threads;
+  blocks force-pushes and deletion; and permits only merge commits. Repository
+  auto-merge and automatic deletion of merged topic branches are enabled.
+- A write collaborator cannot bypass the ruleset. Any owner-only direct-push
+  exception is reserved for the documented release recipe's bump/stamp commits;
+  it is not an ordinary merge shortcut.
 - **Run the full local gate after each merge** before landing the next one:
 
   ```
@@ -35,6 +58,26 @@ independent.
   that has put a red commit on `main` twice.
 - **CODEOWNERS is a routing hint, not a veto.** It auto-requests the right
   reviewer; it does not block a merge.
+
+### Review-to-merge execution
+
+1. Review the PR's exact head, issue accounting, focused diff, compatibility
+   impact, and available evidence. Resolve every review conversation.
+2. If work remains, apply the one `status:*` label naming the next actor. Do not
+   arm auto-merge.
+3. When the PR is genuinely merge-ready, replace its workflow-state label with
+   `status:ready-to-merge`. If checks are still running, arm GitHub auto-merge
+   with the **merge commit** method. If every requirement is already green,
+   merge with `gh pr merge N --merge` after the same final verification.
+4. Any new commit, force-push, base change, required-check regression, or newly
+   unresolved conversation invalidates the readiness decision. Return the PR to
+   the appropriate state, review the new exact head, and arm it again only after
+   the gate is restored. GitHub may automatically disable auto-merge after a
+   fork contributor pushes; that is expected safety behavior.
+5. After merge, synchronize local `main`, run the complete local gate below,
+   verify terminal issue closure and post the acceptance evidence, then promote
+   only the next PR in the documented dependency order. GitHub deletes the
+   merged topic branch automatically.
 
 ## Claiming work
 

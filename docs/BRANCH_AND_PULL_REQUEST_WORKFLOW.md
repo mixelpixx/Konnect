@@ -14,6 +14,20 @@ do not contain work merged after the release. A PR based on a release can be
 green in isolation while omitting fixes and contracts already present on
 `main`.
 
+## Current repository mechanics
+
+Konnect is currently a personal-account repository. Write collaborators can
+triage, review, merge, and enable auto-merge, but only the owner can administer
+repository settings. Organization-only Maintain/Admin role separation and the
+native GitHub merge queue are not available here yet.
+
+The repository therefore uses one explicit ordered queue rather than pretending
+that GitHub is sequencing PRs for us. One active `main: CI must pass` ruleset
+requires pull requests, all ten hosted checks, resolved review conversations,
+no force-push or deletion, and merge commits only. Auto-merge is enabled for a
+maintainer to arm after exact-head review, and merged topic branches are deleted
+automatically.
+
 ## Default: one independent change
 
 Use an independent branch when a change can be reviewed and merged without
@@ -134,6 +148,38 @@ A PR is merge-ready only when all of the following are true:
 - partial and terminal issue-closing keywords are correct.
 
 A PR is not merge-ready merely because an earlier cumulative head was green.
+
+## Merge execution loop
+
+The next actor is represented by exactly one workflow label:
+
+- `status:waiting-on-author`: the contributor must change or clarify the PR;
+- `status:waiting-on-dependency`: another named change must land first;
+- `status:waiting-on-review`: the focused current head is ready for review; and
+- `status:ready-to-merge`: review of this exact head is complete and only the
+  repository gate or merge execution remains.
+
+For the one next-to-land PR in an overlap set:
+
+1. A maintainer verifies the head SHA, focused diff, dependency position,
+   issue-closing references, evidence, and every resolved review conversation.
+2. If something remains, the maintainer applies the label for the actual next
+   actor and leaves auto-merge off.
+3. If the PR is ready but required checks are still running, the maintainer
+   applies `status:ready-to-merge` and enables auto-merge with the merge-commit
+   method. If all requirements are already satisfied, the maintainer may merge
+   immediately with `gh pr merge N --merge` after the same verification.
+4. A new commit, rewritten head, base change, failed or missing required check,
+   or unresolved conversation returns the PR to review. Recheck the new exact
+   head before arming auto-merge again.
+5. After GitHub merges it, update local `main`, run the complete gate from
+   `GOVERNANCE.md`, verify terminal issue closure, post the acceptance mapping,
+   and only then promote or reconstruct the immediate successor.
+
+Auto-merge removes waiting time; it does not relax admission control, review,
+CI, or the one-next-PR rule. Until Konnect moves to an organization with a
+native merge queue, maintainers must not arm several overlapping PRs and hope
+GitHub chooses a safe order.
 
 ## Responsibilities when `main` moves
 

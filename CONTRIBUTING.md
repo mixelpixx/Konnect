@@ -15,6 +15,9 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
 - Follow the [branch and pull request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md).
   Independent changes branch from current `upstream/main`; dependent work exposes one
   mergeable step at a time instead of opening cumulative PRs against the same old base.
+- Keep the PR's workflow state honest. A maintainer uses one `status:*` label to name
+  the next actor; `status:ready-to-merge` means the exact current head has completed
+  review, not merely that the author considers it finished.
 - Read [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md) before adding public
   tools, schema fields, CLI options, environment variables, or user-facing terms.
 
@@ -72,6 +75,26 @@ The description should state:
 6. tests run, including intentionally skipped environment-dependent checks;
 7. risk and rollback notes for file formats, IPC, packaging, or release changes.
 
+## From review to merge
+
+Konnect currently runs in a personal GitHub repository. Collaborators have Write
+access rather than organization-style Maintain/Admin roles. Maintainers can triage,
+review, merge, and arm auto-merge, but only the owner can change repository settings.
+GitHub's native merge queue is not available in this ownership model, so the documented
+landing order and `status:*` labels are the queue.
+
+The repository requires a pull request, all ten hosted checks, resolved review
+conversations, and the merge-commit method. Once a maintainer has reviewed the exact
+head and marked it `status:ready-to-merge`, they may enable auto-merge while checks are
+finishing. Auto-merge is the last execution step; it is not review and does not make a
+stale, cumulative, or poorly evidenced PR ready.
+
+If you push after that review, assume the readiness decision is invalid. GitHub may
+disable auto-merge automatically for a new commit from a fork. Resolve new feedback,
+bring the branch back to current `upstream/main` when required, rerun the evidence, and
+wait for review of the new head. After merge, GitHub deletes the topic branch
+automatically; retain any later dependent work on its own branch.
+
 You do not need personal access to every supported operating system, KiCad
 version, or hardware configuration. For an environment-dependent check you
 cannot run, name the missing environment, provide the deterministic and hosted
@@ -96,6 +119,8 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
 - `cargo fmt --all -- --check` is clean
 - The branch includes current `upstream/main`, GitHub reports no conflicts, and the
   required checks passed on the exact head being reviewed
+- Every review conversation is resolved; a post-review commit or base change requires
+  review of the new exact head before auto-merge is armed again
 - The commit list and diff contain only this PR's unique work; dependencies and stack
   position are explicit
 - New names follow [the naming conventions](docs/NAMING_CONVENTIONS.md); public name
