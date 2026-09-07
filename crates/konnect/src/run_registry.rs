@@ -63,7 +63,7 @@ struct RunRecord<'a> {
     /// Which binary this is, so a record left by a pre-update install is
     /// recognisable. Absent when the platform will not tell us.
     #[serde(skip_serializing_if = "Option::is_none")]
-    exe: Option<String>,
+    executable_path: Option<String>,
 }
 
 /// Holds the process's own lock open for as long as it lives, and removes the
@@ -285,7 +285,7 @@ fn register(dir: &Path, transport: &str) -> RunGuard {
         version: env!("CARGO_PKG_VERSION"),
         transport,
         started_at_ms: konnect_core::observability::unix_ms(),
-        exe: std::env::current_exe()
+        executable_path: std::env::current_exe()
             .ok()
             .map(|p| p.display().to_string()),
     };
@@ -531,6 +531,55 @@ mod tests {
 
     /// A cache path that cannot become a directory must cost the record and
     /// nothing else — the server still has to serve.
+    /// The body is a persisted format a stranger reads by hand, so its field
+    /// names are part of the contract rather than an implementation detail.
+    /// `docs/NAMING_CONVENTIONS.md` requires a filesystem path to carry the
+    /// `_path` suffix, and a record already on disk cannot be renamed later
+    /// without a migration — which is why this is pinned by a test and not by
+    /// the reviewer who happens to read the struct next.
+    #[test]
+    fn the_record_names_its_fields_by_the_repository_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = register(dir.path(), "stdio");
+        let body_path = dir.path().join(format!("{}.json", std::process::id()));
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&body_path).expect("body must be readable"))
+                .expect("body must parse");
+        let object = body.as_object().expect("the record must be a JSON object");
+
+        for key in object.keys() {
+            assert!(
+                matches!(
+                    key.as_str(),
+                    "pid" | "version" | "transport" | "started_at_ms" | "executable_path"
+                ),
+                "the run record carries an undeclared field `{key}`"
+            );
+        }
+        for required in ["pid", "version", "transport", "started_at_ms"] {
+            assert!(
+                object.contains_key(required),
+                "the run record lost its `{required}` field"
+            );
+        }
+
+        // The binary's path is the one optional field — absent only where the
+        // platform will not name it. Where it is named, it must be named here.
+        if let Ok(current) = std::env::current_exe() {
+            let expected = current.display().to_string();
+            assert_eq!(
+                object
+                    .get("executable_path")
+                    .and_then(|value| value.as_str()),
+                Some(expected.as_str()),
+                "the binary's path is not under `executable_path`"
+            );
+        }
+
+        drop(guard);
+    }
+
     #[test]
     fn registration_survives_a_run_path_that_cannot_be_a_directory() {
         let dir = tempfile::tempdir().unwrap();
