@@ -168,6 +168,122 @@ fn editor_state_observation_reports_real_version_and_honest_capabilities() {
     }));
 }
 
+/// What does KiCad send for a footprint that has no schematic symbol?
+///
+/// `konnect-core`'s board-sync planner treats `symbol_path == None` as
+/// "board-only" — a logo, a fiducial, a mounting hole — and #452 was the
+/// planner reading *absence* as the shared identity `/`. The fix assumes
+/// KiCad's IPC layer sends `symbol_path` **present but empty**
+/// (`Some(SheetPath { path: [] })`) rather than absent (`None`) for such a
+/// footprint. That assumption was read from the source and from the field's
+/// own proto comment ("the associated symbol ... **if one exists**"); until
+/// this test runs it has never been observed against a running editor.
+///
+/// It matters which one it is. If KiCad sends `None`, the empty-vector guard
+/// in `pcb_sync`'s reader is dead code and the `/` identity comes from
+/// somewhere else — so the failure message names the state it actually saw
+/// rather than merely asserting.
+///
+/// The bundled fixture is enough: `live_ipc.kicad_pcb` is KiCad's own EuroCard
+/// template, whose four mounting holes `MH1`–`MH4` carry no `(path ...)` line
+/// at all. Two or more pathless footprints is also exactly the #452 collision,
+/// so this covers the reported case and not a reduced one.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+
+    // The board on disk is the authority for *which* footprints are board-only:
+    // no `(path ...)` child means no schematic symbol behind it. Deriving the
+    // expectation from the file rather than hard-coding references keeps this
+    // honest if the fixture gains a schematic-backed footprint later.
+    //
+    // Deliberately no `save_board()` here, unlike its neighbours: this test
+    // only observes, so it must not rewrite the open board. That keeps it safe
+    // to run against the tracked fixture itself, and whether a footprint has a
+    // `(path ...)` is a property of the design that no format upgrade changes.
+    let tree = load_board(Path::new(&board));
+    let pathless = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter(|node| node.find("path").is_none())
+        .filter_map(|node| {
+            node.find_all("property").into_iter().find_map(|property| {
+                (property.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+                    .then(|| property.get(2).and_then(SexpNode::as_str))
+                    .flatten()
+                    .map(str::to_string)
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        pathless.len() >= 2,
+        "this test needs at least two footprints with no (path ...) on the open \
+         board — the bundled fixture's MH1-MH4 qualify; found {pathless:?}"
+    );
+
+    let document = client
+        .find_open_board(Path::new(&board))
+        .expect("KiCad has not got the requested board open");
+    let items = client
+        .get_items_in(document, ObjectType::KotPcbFootprint)
+        .expect("footprint query failed");
+
+    let mut seen = Vec::new();
+    for item in items {
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("KiCad returned an invalid footprint item");
+        let reference = footprint
+            .reference_field
+            .as_ref()
+            .and_then(|field| field.text.as_ref())
+            .and_then(|text| text.text.as_ref())
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        if !pathless.contains(&reference) {
+            continue;
+        }
+        let state = match footprint.symbol_path.as_ref() {
+            None => "absent (None)".to_string(),
+            Some(path) if path.path.is_empty() => "present and empty".to_string(),
+            Some(path) => format!(
+                "present with {} KIID(s): {:?}",
+                path.path.len(),
+                path.path
+                    .iter()
+                    .map(|k| k.value.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        };
+        seen.push((reference, state));
+    }
+
+    assert_eq!(
+        seen.len(),
+        pathless.len(),
+        "IPC did not return every board-only footprint the file carries: saw {seen:?}, \
+         expected {pathless:?}"
+    );
+    let wrong = seen
+        .iter()
+        .filter(|(_, state)| state != "present and empty")
+        .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "a footprint with no (path ...) must arrive as a present-but-empty SheetPath, \
+         because that is what pcb_sync's board_symbol_path guard normalises to None. \
+         These did not: {wrong:?}. If they are 'absent (None)', the guard is dead code \
+         and the `/` identity in #452 comes from somewhere else."
+    );
+}
+
 #[test]
 #[ignore = "requires a running KiCad GUI with its IPC API enabled"]
 fn moving_and_rotating_footprint_preserves_child_geometry() {
