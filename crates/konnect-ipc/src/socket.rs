@@ -3,26 +3,15 @@
 //! KiCad exports `KICAD_API_SOCKET` only to plugins it launches itself, so a
 //! standalone server started by an MCP client sees nothing and every IPC call
 //! fails as unconfigured. KiCad's own default is predictable —
-//! `<temp dir>/kicad/api.sock` — so probe it before giving up.
+//! `<temp dir>/kicad/api.sock` — so look there before giving up.
+//!
+//! Looking is all this module does. It reads the filesystem's own metadata and
+//! never opens a connection: what sits at that path is KiCad's NNG endpoint,
+//! and dialling it outside the NNG protocol is what wedged the editor in #498.
+//! Whether the endpoint answers is decided later, by the bounded NNG `Ping` in
+//! [`crate::client`].
 
 use std::path::{Path, PathBuf};
-
-/// How long to wait for a candidate socket to accept the probe.
-///
-/// A live local listener accepts immediately, so this bounds only the
-/// pathological case: a KiCad that is still bound but has stopped accepting,
-/// whose backlog is full. A *blocking* `connect()` on an `AF_UNIX` stream
-/// waits for a slot there — it does not fail fast the way TCP does — and
-/// against a queue nothing ever drains it waits forever. This probe runs from
-/// `Config::load_resolved` before tracing is initialized, so that would hang
-/// the server before one line reached stderr.
-///
-/// `connect_timeout` is therefore what does the work: it connects
-/// non-blocking, and Linux answers a full backlog immediately (`POLLHUP`,
-/// measured at ~16 µs). The duration is the remaining bound, for a listener
-/// that neither accepts nor hangs up.
-#[cfg(unix)]
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Socket paths KiCad may have created on this platform, most likely first.
 pub fn candidate_socket_paths() -> Vec<PathBuf> {
@@ -45,23 +34,32 @@ fn candidates_in(temp_dir: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-/// The IPC address to use when `KICAD_API_SOCKET` is unset, or `None` when no
-/// platform default is listening.
+/// The IPC address to use when `KICAD_API_SOCKET` is unset, or `None` when
+/// this platform's default path holds nothing this user could talk to.
 ///
 /// Returning `None` rather than a guess keeps the "socket path not configured"
 /// guidance in place instead of replacing it with a dial failure against an
 /// address nobody chose.
+///
+/// What is returned is a *candidate*, not a proven endpoint. KiCad does not
+/// unlink `api.sock` when it exits, so a socket file left by a finished
+/// session is indistinguishable from a live one by metadata alone, and this
+/// function will return it. The `Ping` that follows then fails within its own
+/// bound and the session falls back to file editing — the same outcome as a
+/// KiCad that was never running, reached without touching the editor. Proving
+/// liveness here instead would mean a second, hand-written handshake against
+/// the socket, which is exactly what #498 is.
 pub fn detect_ipc_address() -> Option<String> {
-    detect_ipc_address_in(&candidate_socket_paths(), is_listening)
+    detect_ipc_address_in(&candidate_socket_paths(), is_adoptable)
 }
 
 fn detect_ipc_address_in(
     candidates: &[PathBuf],
-    is_listening: impl Fn(&Path) -> bool,
+    is_adoptable: impl Fn(&Path) -> bool,
 ) -> Option<String> {
     candidates
         .iter()
-        .find(|path| is_listening(path))
+        .find(|path| is_adoptable(path))
         .map(|path| format_address(path))
 }
 
@@ -81,39 +79,41 @@ fn is_owned_by_us(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.uid() == euid)
 }
 
-/// Whether a unix socket has a live listener.
+/// Whether a candidate path may be adopted as the board endpoint.
 ///
-/// Existence is not enough: KiCad leaves `api.sock` behind when it exits, so a
-/// stale file from a session days ago sits at exactly the path a live one
-/// would. Connecting is what distinguishes them, and it costs one syscall
-/// against a local socket. The connection is dropped immediately; NNG's
-/// listener treats it as a client that came and went.
+/// Metadata only, and deliberately so. Existence alone is not enough — KiCad
+/// leaves `api.sock` behind when it exits, and a directory anyone can write to
+/// is a directory anyone can drop a socket into — so this asks the filesystem
+/// three things it already knows: the path exists, it is a socket rather than
+/// some other file, and it belongs to this user.
+///
+/// What it must not do is connect. KiCad's API server is an NNG `REP` socket,
+/// and a raw `AF_UNIX` stream that connects and disappears without completing
+/// NNG's handshake leaves that server unable to answer *any* client, KiCad's
+/// own `kipy` included, until the editor is restarted (#498). Liveness is the
+/// job of the bounded `Ping` in [`crate::client`], which speaks the protocol
+/// the endpoint expects and is the only handshake this crate performs.
 #[cfg(unix)]
-fn is_listening(path: &Path) -> bool {
-    is_listening_owned_by(path, is_owned_by_us)
+fn is_adoptable(path: &Path) -> bool {
+    is_adoptable_owned_by(path, is_owned_by_us)
 }
 
-/// [`is_listening`] with the ownership rule supplied, so a test can prove the
+/// [`is_adoptable`] with the ownership rule supplied, so a test can prove the
 /// gate refuses a socket that is genuinely live. Faking the *owner* is the
 /// only way to do that without a second account, and the alternative — trusting
 /// that a guard nothing exercises still holds — is how a guard stops holding.
 #[cfg(unix)]
-fn is_listening_owned_by(path: &Path, is_ours: impl Fn(&Path) -> bool) -> bool {
+fn is_adoptable_owned_by(path: &Path, is_ours: impl Fn(&Path) -> bool) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
     if !is_ours(path) {
         return false;
     }
-    let Ok(address) = socket2::SockAddr::unix(path) else {
-        return false;
-    };
-    let Ok(socket) = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-    else {
-        return false;
-    };
-    socket.connect_timeout(&address, PROBE_TIMEOUT).is_ok()
+    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
 }
 
-/// NNG's `ipc://` on Windows is a named pipe, so there is nothing at the path
-/// to connect to and this probe cannot answer.
+/// NNG's `ipc://` on Windows is a named pipe, so there is no filesystem entry
+/// at the path to inspect and this check cannot answer.
 ///
 /// It answers "no" rather than taking the default on trust. Detecting nothing
 /// is what keeps `IpcAddressSource::Unresolved` reachable, and with it the
@@ -123,10 +123,10 @@ fn is_listening_owned_by(path: &Path, is_ours: impl Fn(&Path) -> bool) -> bool {
 /// failure against an address nobody chose — worse than the unconfigured
 /// state it replaced, since Windows had no auto-detection to begin with.
 ///
-/// Probing the pipe (`CreateFileW` against the name NNG derives) is the real
-/// answer and is left for a change that can be tested on Windows.
+/// Inspecting the pipe (`GetFileAttributesW` against the name NNG derives) is
+/// the real answer and is left for a change that can be tested on Windows.
 #[cfg(not(unix))]
-fn is_listening(_path: &Path) -> bool {
+fn is_adoptable(_path: &Path) -> bool {
     false
 }
 
@@ -189,9 +189,9 @@ mod tests {
     /// A genuinely foreign-owned path, with no second account to create one.
     ///
     /// Every Unix ships files this user does not own, and `/etc/passwd` is
-    /// root's on Linux and macOS alike. It is not a socket, which does not
-    /// matter: ownership is decided from the path's metadata, before anything
-    /// is dialled, and refusing it is the whole assertion.
+    /// root's on Linux and macOS alike. It is also not a socket, so this test
+    /// alone would pass on either gate; `an_owned_regular_file_is_not_adopted`
+    /// is what separates them, by owning its file.
     #[test]
     #[cfg(unix)]
     fn a_foreign_owned_path_is_refused() {
@@ -206,103 +206,82 @@ mod tests {
             "/etc/passwd must exist and belong to another account"
         );
         assert!(
-            !is_listening(foreign),
+            !is_adoptable(foreign),
             "a path this user does not own must never be adopted as the board endpoint"
         );
     }
 
-    /// The ownership gate is load-bearing over a socket that *is* live: a
-    /// listening endpoint whose owner fails the check is still not detected.
-    /// This is the shared-`/tmp` squatter, without a second account.
+    /// The ownership gate is load-bearing over a socket that would otherwise
+    /// pass every other check: a real, listening endpoint whose owner fails it
+    /// is still refused. This is the shared-`/tmp` squatter, without a second
+    /// account.
     #[test]
     #[cfg(unix)]
-    fn a_live_socket_that_fails_the_ownership_check_is_not_detected() {
+    fn a_live_socket_that_fails_the_ownership_check_is_not_adopted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert!(is_listening(&path), "sanity: this socket is live and ours");
+        assert!(is_adoptable(&path), "sanity: this socket is ours");
 
         assert!(
-            !is_listening_owned_by(&path, |_| false),
+            !is_adoptable_owned_by(&path, |_| false),
             "a live listener must not be adopted when ownership does not check out"
         );
     }
 
     #[test]
     #[cfg(unix)]
-    fn an_owned_regular_file_is_not_detected() {
+    fn an_owned_regular_file_is_not_adopted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-a-socket");
         std::fs::write(&path, b"regular file").unwrap();
 
         assert!(is_owned_by_us(&path), "sanity: this process owns the file");
         assert!(
-            !is_listening(&path),
+            !is_adoptable(&path),
             "an owned regular file must not be adopted as an IPC socket"
         );
     }
 
-    /// The bound the probe promises, over the case it exists for.
+    /// Discovery must never open a stream connection to a candidate.
     ///
-    /// A blocking `connect()` on an `AF_UNIX` stream whose backlog is full
-    /// does not fail the way TCP does — it waits for a slot, and against a
-    /// queue nothing ever accepts from it waits forever (measured: it never
-    /// returns). This resolution runs before tracing is initialized, so that
-    /// is a server hung at startup with nothing on stderr.
-    ///
-    /// The probe is asserted on a worker thread deliberately. The guard under
-    /// test is the thing that keeps this from waiting forever, so neutralizing
-    /// it has to fail the test rather than hang it — a negative control that
-    /// hangs proves nothing anyone will wait for.
+    /// KiCad's API server is an NNG REP endpoint. A raw `AF_UNIX` connect that
+    /// never completes NNG's handshake leaves that server unable to answer any
+    /// client afterwards, KiCad's own `kipy` included, until the editor is
+    /// restarted (#498). The probe therefore has to answer from metadata
+    /// alone, and the place to prove it is the listener's side: once detection
+    /// has run, nothing may be waiting in its accept queue.
     #[test]
     #[cfg(unix)]
-    fn a_saturated_listener_gives_up_within_the_bound() {
+    fn detection_never_connects_to_a_candidate() {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixListener;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
-        let address = socket2::SockAddr::unix(&path).unwrap();
-        let listener =
-            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
-        listener.bind(&address).unwrap();
-        listener.listen(1).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
 
-        // Nothing ever accepts, so the queue fills and further connects wait.
-        let mut held = Vec::new();
-        let saturated = (0..64).any(|_| {
-            let client =
-                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
-            match client.connect_timeout(&address, std::time::Duration::from_millis(50)) {
-                Ok(()) => {
-                    held.push(client);
-                    false
-                }
-                Err(_) => true,
-            }
-        });
-        assert!(
-            saturated,
-            "the accept queue never filled, so this test proves nothing"
+        let candidates = vec![path.clone()];
+        let detected = detect_ipc_address_in(&candidates, is_adoptable);
+        assert_eq!(
+            detected,
+            Some(format_address(&path)),
+            "sanity: this socket is ours and is the only candidate"
         );
 
-        let (finished, probe) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = finished.send(is_listening(&path));
-        });
-
-        // A literal bound, not `PROBE_TIMEOUT * n`: expressed in terms of the
-        // value under test it would move with it, and pass just as happily if
-        // the timeout were raised to a minute.
-        let detected = probe
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the probe must return; an unbounded connect() waits for a backlog slot");
-
-        assert!(
-            !detected,
-            "a listener that cannot accept is not a usable endpoint"
-        );
+        match listener.accept() {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Ok(_) => panic!(
+                "detection opened a stream connection to the candidate; against KiCad's \
+                 NNG endpoint that is the wedge in #498"
+            ),
+            Err(error) => panic!("unexpected accept error: {error}"),
+        }
     }
 
     #[test]
-    fn probing_picks_the_first_candidate_that_is_listening() {
+    fn discovery_picks_the_first_adoptable_candidate() {
         let candidates = vec![
             PathBuf::from("/first/kicad/api.sock"),
             PathBuf::from("/second/kicad/api.sock"),
@@ -312,36 +291,46 @@ mod tests {
     }
 
     #[test]
-    fn probing_finds_nothing_when_no_candidate_is_listening() {
+    fn discovery_finds_nothing_when_no_candidate_is_adoptable() {
         let candidates = vec![PathBuf::from("/first/kicad/api.sock")];
         assert!(detect_ipc_address_in(&candidates, |_| false).is_none());
     }
 
+    /// The cost of not connecting, asserted rather than left to be discovered.
+    ///
+    /// KiCad does not unlink `api.sock` on exit, and a socket file with no
+    /// listener is byte-for-byte the same metadata as one with a listener, so
+    /// discovery adopts it. That address then fails its `Ping` within the
+    /// bound and the session falls back to file editing — the outcome a
+    /// not-running KiCad produces anyway. Rejecting it here would cost a
+    /// connect, and the connect is the bug.
     #[test]
     #[cfg(unix)]
-    fn a_socket_left_behind_by_a_closed_kicad_is_not_detected() {
-        // KiCad does not unlink api.sock on exit, so the file alone proves
-        // nothing — only a listener does.
+    fn a_socket_left_behind_by_a_closed_kicad_is_still_adopted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
 
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert!(is_listening(&path), "a bound socket is live");
+        assert!(is_adoptable(&path), "sanity: a bound socket is adoptable");
 
         drop(listener);
         assert!(path.exists(), "sanity: the file outlives the listener");
-        assert!(!is_listening(&path), "a stale socket file is not live");
+        assert!(
+            is_adoptable(&path),
+            "metadata cannot tell a stale socket from a live one, and this \
+             check does not connect to find out"
+        );
     }
 
     #[test]
     #[cfg(not(unix))]
-    fn windows_production_probe_detects_nothing() {
-        // Exercise the production non-Unix probe rather than a supplied test
-        // closure. NNG maps ipc:// to a named pipe on Windows, and this PR does
-        // not guess that mapping.
+    fn windows_discovery_adopts_nothing() {
+        // Exercise the production non-Unix check rather than a supplied test
+        // closure. NNG maps ipc:// to a named pipe on Windows, and this crate
+        // does not guess that mapping.
         assert!(candidate_socket_paths()
             .iter()
-            .all(|path| !is_listening(path)));
+            .all(|path| !is_adoptable(path)));
         assert!(detect_ipc_address().is_none());
     }
 

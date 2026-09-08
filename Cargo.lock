@@ -2521,7 +2521,6 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
- "socket2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
