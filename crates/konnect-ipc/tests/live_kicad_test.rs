@@ -205,7 +205,7 @@ fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
     // expectation from the file rather than hard-coding references keeps this
     // honest if the fixture gains a schematic-backed footprint later.
     //
-    // Deliberately no `save_board()` here, unlike its neighbours: this test
+    // Deliberately no `save_board()`, unlike the mutating tests below: this one
     // only observes, so it must not rewrite the open board. That keeps it safe
     // to run against the tracked fixture itself, and whether a footprint has a
     // `(path ...)` is a property of the design that no format upgrade changes.
@@ -686,6 +686,23 @@ fn the_live_fixture_satisfies_what_the_live_tests_assume() {
         }),
         "the fixture is no longer in the legacy net-table shape — it looks like \
          a live run saved over the tracked file instead of a copy"
+    );
+
+    // `kicad_reports_an_empty_sheet_path_for_a_board_only_footprint` needs at
+    // least two footprints with no `(path ...)` — that is the #452 collision,
+    // and one would let the test pass on a case the defect never reached. The
+    // template's four mounting holes supply them; a fixture that gained
+    // schematic-backed footprints, or lost the holes, would leave that test
+    // asserting nothing.
+    let pathless = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter(|node| node.find("path").is_none())
+        .count();
+    assert!(
+        pathless >= 2,
+        "the fixture needs at least two footprints with no (path ...) for the \
+         board-only identity test; found {pathless}"
     );
 
     // The template is not at the origin, and coordinates in the live tests are
