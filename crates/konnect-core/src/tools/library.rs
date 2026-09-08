@@ -42,7 +42,9 @@ fn symbol_graphics_schema() -> serde_json::Value {
          stroke_width_mm), in symbol-local millimetres. `fill` is KiCad's symbol \
          vocabulary: 'none', 'outline' (the shape's own colour) or 'background' (the pale \
          body fill). When given, the automatic body rectangle is not drawn, and pin x/y are \
-         written exactly as supplied rather than slid out to a computed body edge."
+         written exactly as supplied rather than slid out to a computed body edge. At the top \
+         level this draws the single-unit `pins` body; with `units` it belongs on the unit, and \
+         passing it at the top level alongside `units` is refused rather than dropped."
     );
     schema
 }
@@ -3228,6 +3230,7 @@ fn build_symbol_unit(
     // slides pins out to the rectangle it computed — does not want their pin
     // coordinates moved either. Both follow from taking this branch (#501).
     if !graphics.is_empty() {
+        validate_graphics(graphics).map_err(|e| anyhow::anyhow!(e))?;
         let (body_sexp, rect) = emit_symbol_graphics(graphics);
         let mut pins_sexp = String::new();
         let mut resolved = Vec::with_capacity(pins_val.len());
@@ -3250,7 +3253,14 @@ fn build_symbol_unit(
         return Ok(BuiltUnit {
             sexp: format!("{body_sexp}{pins_sexp}"),
             rect,
-            warning: None,
+            // Geometry replaces the body, so an explicitly requested glyph was
+            // not drawn. Say so rather than discarding it silently.
+            warning: glyph.map(|g| {
+                format!(
+                    "glyph '{}' was not drawn: this unit supplies its own graphics",
+                    g.name()
+                )
+            }),
             body: "graphics",
             pins: resolved,
         });
@@ -3288,6 +3298,101 @@ fn build_symbol_unit(
         body: "rectangle",
         pins,
     })
+}
+
+/// Refuse geometry the emitter would otherwise draw wrongly or drop.
+///
+/// The MCP dispatch checks that required *arguments* are present; it does not
+/// validate a `oneOf` inside an array item, so nothing else stops a misspelled
+/// primitive type, a missing end point, or a fill outside the vocabulary. Each
+/// of those has a silent wrong answer as its alternative — a typo'd `type`
+/// emits nothing at all and still reports success — which is the failure this
+/// validation exists to end (#501).
+fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
+    fn point(g: &serde_json::Value, key: &str, at: usize, kind: &str) -> Result<(), String> {
+        let p = &g[key];
+        if p["x"].as_f64().is_some() && p["y"].as_f64().is_some() {
+            Ok(())
+        } else {
+            Err(format!(
+                "graphics[{at}] ({kind}): '{key}' must be an object with numeric x and y"
+            ))
+        }
+    }
+
+    for (at, g) in graphics.iter().enumerate() {
+        let kind = g["type"].as_str().unwrap_or("");
+        match kind {
+            "line" => {
+                point(g, "start", at, kind)?;
+                point(g, "end", at, kind)?;
+            }
+            "arc" => {
+                point(g, "start", at, kind)?;
+                point(g, "mid", at, kind)?;
+                point(g, "end", at, kind)?;
+            }
+            "rect" => {
+                point(g, "start", at, kind)?;
+                point(g, "end", at, kind)?;
+            }
+            "circle" => {
+                point(g, "center", at, kind)?;
+                match g["radius_mm"].as_f64() {
+                    Some(r) if r > 0.0 => {}
+                    Some(_) => return Err(format!("graphics[{at}] (circle): 'radius_mm' must be greater than 0")),
+                    None => return Err(format!("graphics[{at}] (circle): 'radius_mm' is required and must be a number")),
+                }
+            }
+            "poly" => {
+                let points = g["points"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                if points.len() < 3 {
+                    return Err(format!(
+                        "graphics[{at}] (poly): 'points' needs at least 3 entries, got {} — use type 'line' for two",
+                        points.len()
+                    ));
+                }
+                for (i, p) in points.iter().enumerate() {
+                    if p["x"].as_f64().is_none() || p["y"].as_f64().is_none() {
+                        return Err(format!(
+                            "graphics[{at}] (poly): points[{i}] must have numeric x and y"
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "graphics[{at}]: unknown type {other:?} — expected one of line, arc, rect, circle, poly"
+                ))
+            }
+        }
+        match g["stroke_width_mm"].as_f64() {
+            Some(w) if w >= 0.0 => {}
+            Some(_) => {
+                return Err(format!(
+                    "graphics[{at}] ({kind}): 'stroke_width_mm' cannot be negative"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "graphics[{at}] ({kind}): 'stroke_width_mm' is required and must be a number"
+                ))
+            }
+        }
+        // An unrecognised fill would silently become `none`, which is a
+        // different drawing from the one that was asked for.
+        match &g["fill"] {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(f)
+                if matches!(f.as_str(), "none" | "outline" | "background") => {}
+            other => {
+                return Err(format!(
+                    "graphics[{at}] ({kind}): 'fill' must be \"none\", \"outline\" or \"background\", got {other}"
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Emit caller-supplied geometry into a symbol unit body, and report its
@@ -3640,6 +3745,16 @@ async fn handle_create_symbol(
     // top-level `pins` and `glyph` do.
     let sym_graphics: Vec<serde_json::Value> =
         args["graphics"].as_array().cloned().unwrap_or_default();
+    // Top-level `pins` is superseded by `units` and the schema says so, but
+    // losing a redundant pin list is not the same as losing a drawing: geometry
+    // sent here while `units` is in use would never reach the file, and the
+    // symbol would come out with an automatic rectangle and a success.
+    if !sym_graphics.is_empty() && !unit_objs.is_empty() {
+        return Ok(CallToolResult::error(
+            "top-level 'graphics' has no effect when 'units' is given: move it to the \
+             unit that should carry it, as units[].graphics",
+        ));
+    }
 
     let mut units_sexp = String::new();
     let unit_count: usize;
@@ -6458,6 +6573,116 @@ mod tests {
         assert!(
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated symbol doesn't parse"
+        );
+    }
+
+    /// Malformed geometry is refused, not drawn wrongly and not dropped. The
+    /// dispatch validates required *arguments*, not a `oneOf` inside an array
+    /// item, so without this a misspelled `type` emits nothing at all and the
+    /// call still reports success. Found by adversarial review of this feature.
+    #[tokio::test]
+    async fn create_symbol_graphics_refuse_malformed_primitives_without_writing() {
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "unknown type",
+                json!({"type":"polyline","points":[{"x":0,"y":0},{"x":1,"y":1},{"x":2,"y":0}],
+                       "stroke_width_mm":0.2,"fill":"none"}),
+            ),
+            (
+                "line without an end",
+                json!({"type":"line","start":{"x":-1,"y":0},"stroke_width_mm":0.2}),
+            ),
+            (
+                "no stroke width",
+                json!({"type":"rect","start":{"x":-2,"y":2},"end":{"x":2,"y":-2},"fill":"none"}),
+            ),
+            (
+                "poly with one point",
+                json!({"type":"poly","points":[{"x":0,"y":0}],"stroke_width_mm":0.2,"fill":"none"}),
+            ),
+            (
+                "fill outside the vocabulary",
+                json!({"type":"rect","start":{"x":-2,"y":2},"end":{"x":2,"y":-2},
+                       "stroke_width_mm":0.2,"fill":"chartreuse"}),
+            ),
+            (
+                "zero radius",
+                json!({"type":"circle","center":{"x":0,"y":0},"radius_mm":0,
+                       "stroke_width_mm":0.2,"fill":"none"}),
+            ),
+        ];
+        for (label, primitive) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("bad.kicad_sym");
+            let res = handle_create_symbol(
+                &json!({
+                    "library_path": lib.to_string_lossy(),
+                    "name": "BAD",
+                    "reference_prefix": "U",
+                    "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}],
+                    "graphics": [primitive]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(res.is_error, "{label} must be refused");
+            assert!(
+                format!("{res:?}").contains("graphics[0]"),
+                "{label}: the refusal must name the offending entry: {res:?}"
+            );
+            assert!(!lib.exists(), "{label}: nothing may be written");
+        }
+    }
+
+    /// Geometry sent at the top level while `units` is in use would never reach
+    /// the file. Losing a redundant pin list to `units` is one thing; losing a
+    /// drawing and reporting success is another.
+    #[tokio::test]
+    async fn create_symbol_refuses_top_level_graphics_when_units_are_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("u.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "U",
+                "reference_prefix": "U",
+                "units": [{"pins":[{"number":"1","name":"A","type":"passive","x":-2.54,"y":3.81,"angle":270,"length":0.0}]}],
+                "graphics": [{"type":"rect","start":{"x":-5.08,"y":3.81},"end":{"x":5.08,"y":-3.81},
+                              "stroke_width_mm":0.254,"fill":"background"}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_error);
+        assert!(format!("{res:?}").contains("units[].graphics"), "{res:?}");
+        assert!(!lib.exists(), "nothing may be written");
+    }
+
+    /// A glyph that geometry replaced is reported, not discarded in silence.
+    #[tokio::test]
+    async fn create_symbol_warns_when_graphics_replace_a_requested_glyph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("g.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "G",
+                "reference_prefix": "U",
+                "glyph": "opamp",
+                "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}],
+                "graphics": [{"type":"rect","start":{"x":-2,"y":2},"end":{"x":2,"y":-2},
+                              "stroke_width_mm":0.2,"fill":"none"}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        assert!(
+            format!("{res:?}").contains("glyph 'opamp' was not drawn"),
+            "the discarded glyph must be reported: {res:?}"
         );
     }
 
