@@ -2439,45 +2439,53 @@ mod tests {
         );
     }
 
-    /// A footprint placed directly on the board — a logo, a fiducial, a
-    /// mounting hole — as KiCad's IPC layer reports it: `symbol_path` is
-    /// *present*, and empty, because no schematic symbol stands behind it.
+    /// A real `FootprintInstance`, exactly as KiCad 10.0.6's IPC layer sent it
+    /// for a mounting hole with no schematic symbol behind it.
+    ///
+    /// Captured from a running editor rather than hand-built, because a
+    /// hand-built one encodes whatever the author assumed. This one already
+    /// corrected two such assumptions: KiCad reports `symbol_path` as
+    /// **present and empty** (not absent, and `path_human_readable` is `""`,
+    /// not `"/"`), and it leaves `not_in_schematic` **false** on a board-only
+    /// mounting hole — marking it `exclude_from_position_files` and
+    /// `exclude_from_bill_of_materials` instead. The first hand-written
+    /// fixture set that flag true, which made the rename branch below
+    /// unreachable from its own tests.
+    ///
+    /// Regenerate with `KONNECT_CAPTURE_IPC_FIXTURE=1` on the ignored live
+    /// test `kicad_reports_an_empty_sheet_path_for_a_board_only_footprint`;
+    /// provenance is in the fixture's README.
+    const BOARD_ONLY_CAPTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/board_only_footprint.ipc.bin");
+
+    /// The captured footprint, with only its identity fields varied.
+    ///
+    /// A board carries several board-only graphics, and the planner keys on
+    /// reference and KIID, so tests need more than one. Everything else — the
+    /// empty `SheetPath`, the attributes, the pads and graphics — is the real
+    /// message.
     fn board_only_instance(
         kiid: &str,
         reference: &str,
     ) -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
         use konnect_ipc::gen::kiapi;
 
-        let mut instance = kiapi::board::types::FootprintInstance {
-            id: Some(kiapi::common::types::Kiid {
-                value: kiid.to_string(),
-            }),
-            definition: Some(kiapi::board::types::Footprint {
-                id: Some(kiapi::common::types::LibraryIdentifier {
-                    library_nickname: "Symbol".to_string(),
-                    entry_name: "KiCad-Logo_10mm_Copper".to_string(),
-                }),
-                ..Default::default()
-            }),
-            symbol_path: Some(kiapi::common::types::SheetPath {
-                path: Vec::new(),
-                path_human_readable: "/".to_string(),
-            }),
-            attributes: Some(kiapi::board::types::FootprintAttributes {
-                not_in_schematic: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let mut instance = kiapi::board::types::FootprintInstance::decode(BOARD_ONLY_CAPTURE)
+            .expect("the checked-in KiCad IPC capture must decode");
+        instance.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
         set_field_text(&mut instance.reference_field, "Reference", reference);
-        set_field_text(&mut instance.value_field, "Value", "LOGO");
         instance
     }
 
-    /// An unlinked footprint that KiCad has *not* flagged `not_in_schematic`,
-    /// shaped like the resistor `resistor()` exports. Same empty `SheetPath` as
-    /// a logo — the difference is only the flag, and that flag is what decides
-    /// whether the planner will consider it a rename candidate.
+    /// The same real message, re-labelled as the resistor `resistor()` exports.
+    ///
+    /// Only the library id and value change: these tests are about the planner
+    /// branches an absent identity unlocks, and they need a footprint whose
+    /// `footprint_id` and `value` can match a schematic component. The
+    /// `not_in_schematic` flag is left exactly as KiCad set it — false — which
+    /// is what makes the rename branch reachable at all.
     fn unlinked_instance(
         kiid: &str,
         reference: &str,
@@ -2485,14 +2493,12 @@ mod tests {
         use konnect_ipc::gen::kiapi;
 
         let mut instance = board_only_instance(kiid, reference);
-        instance.definition = Some(kiapi::board::types::Footprint {
-            id: Some(kiapi::common::types::LibraryIdentifier {
+        if let Some(definition) = instance.definition.as_mut() {
+            definition.id = Some(kiapi::common::types::LibraryIdentifier {
                 library_nickname: "Resistor_SMD".to_string(),
                 entry_name: "R_0603_1608Metric".to_string(),
-            }),
-            ..Default::default()
-        });
-        instance.attributes = Some(kiapi::board::types::FootprintAttributes::default());
+            });
+        }
         set_field_text(&mut instance.value_field, "Value", "10k");
         instance
     }
@@ -2508,7 +2514,17 @@ mod tests {
         );
         assert_eq!(logo.reference, "LOGO1");
         assert_eq!(logo.kiid, "logo-kiid");
-        assert!(logo.not_in_schematic);
+        // KiCad does *not* set `not_in_schematic` on a board-only footprint —
+        // it marks it excluded from position files and the BOM instead. The
+        // first version of this test asserted the opposite and passed, because
+        // the hand-built fixture it ran against said so. That flag is the
+        // precondition for the rename branch two tests below, so getting it
+        // wrong made that branch unreachable from the tests written to cover
+        // this change.
+        assert!(
+            !logo.not_in_schematic,
+            "real KiCad leaves not_in_schematic false on a board-only footprint"
+        );
     }
 
     #[test]

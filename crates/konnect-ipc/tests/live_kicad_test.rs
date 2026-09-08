@@ -237,6 +237,7 @@ fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
         .expect("footprint query failed");
 
     let mut seen = Vec::new();
+    let mut captures = Vec::new();
     for item in items {
         let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
             .expect("KiCad returned an invalid footprint item");
@@ -262,7 +263,27 @@ fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
                     .collect::<Vec<_>>()
             ),
         };
+        captures.push((reference.clone(), item.value.clone(), footprint.clone()));
         seen.push((reference, state));
+    }
+
+    // Regeneration + provenance inspection for the checked-in capture. Off by
+    // default; the assertions below are what runs normally.
+    if std::env::var("KONNECT_CAPTURE_IPC_FIXTURE").is_ok() {
+        for (reference, raw, decoded) in &captures {
+            eprintln!("--- {reference} ({} bytes) ---\n{decoded:#?}", raw.len());
+        }
+        let (reference, raw, _) = captures
+            .first()
+            .expect("no board-only footprint captured to write");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../konnect-core/tests/fixtures/board_only_footprint.ipc.bin");
+        std::fs::write(&out, raw).expect("failed to write capture");
+        eprintln!(
+            "wrote {} bytes from {reference} to {}",
+            raw.len(),
+            out.display()
+        );
     }
 
     assert_eq!(
