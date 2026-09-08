@@ -23,6 +23,30 @@ use std::path::{Path, PathBuf};
 /// below. `type_desc` parameterizes the one wording difference between call
 /// sites. `require_xy` is false where a `glyph` may auto-place the pins (so x/y
 /// become optional) and true for the always-rectangular `power_pins`.
+/// The drawing primitives a symbol unit may carry.
+///
+/// Deliberately the same vocabulary `set_footprint_graphics` already defines —
+/// `line`, `arc`, `rect`, `circle`, `poly`, points as `{x, y}`,
+/// `stroke_width_mm` — built from the same code so the two cannot drift (#501).
+/// Only `fill` differs: a footprint fills or it does not, while a symbol also
+/// has KiCad's pale `background` body fill.
+fn symbol_graphics_schema() -> serde_json::Value {
+    let mut schema = crate::tools::footprint_graphics::graphics_schema_with_fill(&[
+        "none",
+        "outline",
+        "background",
+    ]);
+    schema["description"] = json!(
+        "Draw this body yourself instead of using a glyph. Same primitive vocabulary as \
+         set_footprint_graphics (line, arc, rect, circle, poly; points as {x, y}; \
+         stroke_width_mm), in symbol-local millimetres. `fill` is KiCad's symbol \
+         vocabulary: 'none', 'outline' (the shape's own colour) or 'background' (the pale \
+         body fill). When given, the automatic body rectangle is not drawn, and pin x/y are \
+         written exactly as supplied rather than slid out to a computed body edge."
+    );
+    schema
+}
+
 fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
     let mut required = vec!["number", "name", "type"];
     if require_xy {
@@ -218,6 +242,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "show_pin_names": { "type": "boolean", "description": "Show pin names on the symbol (default true).", "default": true },
                     "show_pin_numbers": { "type": "boolean", "description": "Show pin numbers on the symbol (default true).", "default": true },
+                    "graphics": symbol_graphics_schema(),
                     "units": {
                         "type": "array",
                         "description": "For MULTI-UNIT parts (dual/quad op-amps, gate banks, multi-bank connectors). Each element is one unit (becomes Unit A, B, C...) with its own pins and body. When given, `units` replaces `pins` (use `pins` for single-unit symbols instead). Each unit may set its own `glyph`, overriding the symbol-level default.",
@@ -233,7 +258,8 @@ pub fn tools() -> Vec<ToolDef> {
                                     "type": "array",
                                     "description": "Pins for this unit. x/y are ignored when the unit has a `glyph`.",
                                     "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').", false)
-                                }
+                                },
+                                "graphics": symbol_graphics_schema()
                             },
                             "required": ["pins"]
                         }
@@ -3193,8 +3219,42 @@ fn build_symbol_unit(
     pins_val: &[serde_json::Value],
     glyph: Option<Glyph>,
     show_names: bool,
+    graphics: &[serde_json::Value],
 ) -> anyhow::Result<BuiltUnit> {
     validate_pin_types(pins_val)?;
+    // Caller-supplied geometry wins over every body. The automatic rectangle
+    // exists to give pins something to sit on; a caller who has drawn the body
+    // does not want a box around their drawing, and — because the auto path
+    // slides pins out to the rectangle it computed — does not want their pin
+    // coordinates moved either. Both follow from taking this branch (#501).
+    if !graphics.is_empty() {
+        let (body_sexp, rect) = emit_symbol_graphics(graphics);
+        let mut pins_sexp = String::new();
+        let mut resolved = Vec::with_capacity(pins_val.len());
+        for pin in pins_val {
+            let x = pin["x"].as_f64().unwrap_or(0.0);
+            let y = pin["y"].as_f64().unwrap_or(0.0);
+            resolved.push(ResolvedPin::new(pin, x, y));
+            pins_sexp.push_str(&emit_pin(
+                pin["type"].as_str().unwrap_or("passive"),
+                pin_style_token(pin["style"].as_str()),
+                x,
+                y,
+                pin["angle"].as_f64().unwrap_or(0.0),
+                pin["length"].as_f64().unwrap_or(2.54),
+                pin["name"].as_str().unwrap_or("~"),
+                pin["number"].as_str().unwrap_or("1"),
+                PIN_TEXT,
+            ));
+        }
+        return Ok(BuiltUnit {
+            sexp: format!("{body_sexp}{pins_sexp}"),
+            rect,
+            warning: None,
+            body: "graphics",
+            pins: resolved,
+        });
+    }
     if let Some(g) = glyph {
         if g != Glyph::Rectangle {
             match build_glyph_unit(pins_val, g) {
@@ -3228,6 +3288,135 @@ fn build_symbol_unit(
         body: "rectangle",
         pins,
     })
+}
+
+/// Emit caller-supplied geometry into a symbol unit body, and report its
+/// bounding box.
+///
+/// The primitive vocabulary is `set_footprint_graphics`'s, shared rather than
+/// reinvented (#501): `line`, `arc`, `rect`, `circle`, `poly`, with points as
+/// `{x, y}` and `stroke_width_mm`. Only the serialisation differs, because a
+/// `.kicad_sym` writes `polyline`/`rectangle`/`circle`/`arc` where a footprint
+/// writes `fp_*`, and only the fill vocabulary differs, because a symbol also
+/// has KiCad's pale `background` body fill.
+///
+/// The bounding box is what the caller drew, so Reference and Value anchor to
+/// the real body rather than to a rectangle that is no longer there.
+fn emit_symbol_graphics(graphics: &[serde_json::Value]) -> (String, SymbolRect) {
+    fn point(v: &serde_json::Value) -> (f64, f64) {
+        (
+            v["x"].as_f64().unwrap_or(0.0),
+            v["y"].as_f64().unwrap_or(0.0),
+        )
+    }
+    fn stroke(g: &serde_json::Value) -> String {
+        format!(
+            "(stroke (width {}) (type default))",
+            fmt_f64(g["stroke_width_mm"].as_f64().unwrap_or(0.254))
+        )
+    }
+    // KiCad symbol fills: `none`, `outline` (the shape's own colour) and
+    // `background` (the pale body fill the automatic rectangle uses).
+    fn fill(g: &serde_json::Value) -> String {
+        let t = match g["fill"].as_str() {
+            Some("outline") => "outline",
+            Some("background") => "background",
+            _ => "none",
+        };
+        format!("(fill (type {t}))")
+    }
+
+    let mut sexp = String::new();
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    let mut grow = |x: f64, y: f64| {
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((min_x, min_y, max_x, max_y)) => {
+                (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+            }
+        });
+    };
+
+    for g in graphics {
+        match g["type"].as_str().unwrap_or("") {
+            kind @ ("line" | "poly") => {
+                let points: Vec<(f64, f64)> = if kind == "line" {
+                    vec![point(&g["start"]), point(&g["end"])]
+                } else {
+                    g["points"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(point)
+                        .collect()
+                };
+                if points.is_empty() {
+                    continue;
+                }
+                let mut pts = String::new();
+                for (x, y) in &points {
+                    grow(*x, *y);
+                    pts.push_str(&format!(" (xy {} {})", fmt_f64(*x), fmt_f64(*y)));
+                }
+                sexp.push_str(&format!(
+                    "\n      (polyline\n        (pts{})\n        {}\n        {}\n      )",
+                    pts,
+                    stroke(g),
+                    fill(g)
+                ));
+            }
+            "rect" => {
+                let (sx, sy) = point(&g["start"]);
+                let (ex, ey) = point(&g["end"]);
+                grow(sx, sy);
+                grow(ex, ey);
+                sexp.push_str(&format!(
+                    "\n      (rectangle (start {} {}) (end {} {})\n        {}\n        {}\n      )",
+                    fmt_f64(sx),
+                    fmt_f64(sy),
+                    fmt_f64(ex),
+                    fmt_f64(ey),
+                    stroke(g),
+                    fill(g)
+                ));
+            }
+            "circle" => {
+                let (cx, cy) = point(&g["center"]);
+                let r = g["radius_mm"].as_f64().unwrap_or(0.0);
+                grow(cx - r, cy - r);
+                grow(cx + r, cy + r);
+                sexp.push_str(&format!(
+                    "\n      (circle (center {} {}) (radius {})\n        {}\n        {}\n      )",
+                    fmt_f64(cx),
+                    fmt_f64(cy),
+                    fmt_f64(r),
+                    stroke(g),
+                    fill(g)
+                ));
+            }
+            "arc" => {
+                let (sx, sy) = point(&g["start"]);
+                let (mx, my) = point(&g["mid"]);
+                let (ex, ey) = point(&g["end"]);
+                for (x, y) in [(sx, sy), (mx, my), (ex, ey)] {
+                    grow(x, y);
+                }
+                sexp.push_str(&format!(
+                    "\n      (arc (start {} {}) (mid {} {}) (end {} {})\n        {}\n        {}\n      )",
+                    fmt_f64(sx),
+                    fmt_f64(sy),
+                    fmt_f64(mx),
+                    fmt_f64(my),
+                    fmt_f64(ex),
+                    fmt_f64(ey),
+                    stroke(g),
+                    fill(g)
+                ));
+            }
+            _ => {}
+        }
+    }
+    (sexp, bounds)
 }
 
 /// The default rectangle body + caller-positioned pins. Pin types are assumed
@@ -3447,6 +3636,11 @@ async fn handle_create_symbol(
     // Multi-unit when `units` is a non-empty array; otherwise the single-unit
     // `pins` path. Sub-symbols are named NAME_<unit>_1; units 1..N are the
     // individual units, and shared `power_pins` become a dedicated final unit.
+    // Top-level geometry belongs to the single-unit `pins` path, the same way
+    // top-level `pins` and `glyph` do.
+    let sym_graphics: Vec<serde_json::Value> =
+        args["graphics"].as_array().cloned().unwrap_or_default();
+
     let mut units_sexp = String::new();
     let unit_count: usize;
     let ref_body: SymbolRect;
@@ -3470,7 +3664,7 @@ async fn handle_create_symbol(
                 .cloned()
                 .collect();
             // Unit 1: the triangle with its signal pins.
-            let unit1 = match build_symbol_unit(&signal, sym_glyph, show_names) {
+            let unit1 = match build_symbol_unit(&signal, sym_glyph, show_names, &sym_graphics) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -3481,7 +3675,7 @@ async fn handle_create_symbol(
             units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
-            let unit2 = match build_symbol_unit(&power_laid, None, show_names) {
+            let unit2 = match build_symbol_unit(&power_laid, None, show_names, &[]) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -3494,7 +3688,7 @@ async fn handle_create_symbol(
             ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
-            let unit = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
+            let unit = match build_symbol_unit(&pins_val, sym_glyph, show_names, &sym_graphics) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -3531,7 +3725,9 @@ async fn handle_create_symbol(
                     }
                 },
             };
-            let unit = match build_symbol_unit(&unit_pins, unit_glyph, show_names) {
+            let unit_graphics: Vec<serde_json::Value> =
+                u["graphics"].as_array().cloned().unwrap_or_default();
+            let unit = match build_symbol_unit(&unit_pins, unit_glyph, show_names, &unit_graphics) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -3554,7 +3750,7 @@ async fn handle_create_symbol(
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
             // The power unit is always a rectangle.
-            let unit = match build_symbol_unit(&power_pins, None, show_names) {
+            let unit = match build_symbol_unit(&power_pins, None, show_names, &[]) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -6142,6 +6338,157 @@ mod tests {
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated symbol doesn't parse"
         );
+    }
+
+    /// A caller who draws the body gets exactly what they drew, and no box
+    /// around it: the automatic rectangle exists to give pins something to sit
+    /// on, and a drawn body already has one (#501).
+    #[tokio::test]
+    async fn create_symbol_graphics_replace_the_automatic_body_rectangle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("g.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "DRAWN",
+                "reference_prefix": "VT",
+                "pins": [
+                    {"number":"1","name":"A","type":"passive","x":-2.54,"y":3.81,"angle":270,"length":0.0}
+                ],
+                "graphics": [
+                    {"type":"rect","start":{"x":-5.08,"y":3.81},"end":{"x":5.08,"y":-3.81},
+                     "stroke_width_mm":0.254,"fill":"background"},
+                    {"type":"poly","points":[{"x":-3.81,"y":1.27},{"x":-1.27,"y":1.27},{"x":-2.54,"y":-1.27}],
+                     "stroke_width_mm":0.254,"fill":"none"}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        let c = std::fs::read_to_string(&lib).unwrap();
+        assert_eq!(
+            c.matches("(rectangle").count(),
+            1,
+            "exactly the one rectangle the caller drew, no automatic body:\n{c}"
+        );
+        assert!(
+            c.contains("(polyline"),
+            "the drawn polygon is missing:\n{c}"
+        );
+        assert!(
+            konnect_sexp::parser::parse_sexp(&c).is_ok(),
+            "generated symbol doesn't parse"
+        );
+    }
+
+    /// The automatic-body path slides every pin out to the rectangle it
+    /// computed, so a caller cannot plan wiring from the coordinates they sent
+    /// (#293). Drawn bodies must not do that — the drawing already fixes where
+    /// the pins belong, and a transcription placing parts against a scan
+    /// depends on the reach it asked for.
+    #[tokio::test]
+    async fn create_symbol_graphics_write_pin_coordinates_exactly_as_supplied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("g.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "DRAWN",
+                "reference_prefix": "VT",
+                "pins": [
+                    {"number":"1","name":"K","type":"passive","x":-2.54,"y":-3.81,"angle":90,"length":0.0},
+                    {"number":"2","name":"A","type":"passive","x":-2.54,"y":3.81,"angle":270,"length":0.0}
+                ],
+                "graphics": [
+                    {"type":"rect","start":{"x":-5.08,"y":3.81},"end":{"x":5.08,"y":-3.81},
+                     "stroke_width_mm":0.254,"fill":"background"}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        let c = std::fs::read_to_string(&lib).unwrap();
+        assert!(c.contains("(at -2.54 3.81 270)"), "pin 2 moved:\n{c}");
+        assert!(c.contains("(at -2.54 -3.81 90)"), "pin 1 moved:\n{c}");
+    }
+
+    /// Every primitive in the shared vocabulary reaches the file in the
+    /// `.kicad_sym` spelling — `line` and `poly` both become `polyline`,
+    /// because a symbol library has no separate line node.
+    #[tokio::test]
+    async fn create_symbol_graphics_emit_every_primitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("g.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "ALL",
+                "reference_prefix": "U",
+                "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}],
+                "graphics": [
+                    {"type":"line","start":{"x":-1.0,"y":0.0},"end":{"x":1.0,"y":0.0},"stroke_width_mm":0.2},
+                    {"type":"poly","points":[{"x":0.0,"y":0.0},{"x":1.0,"y":1.0},{"x":2.0,"y":0.0}],
+                     "stroke_width_mm":0.2,"fill":"none"},
+                    {"type":"rect","start":{"x":-2.0,"y":2.0},"end":{"x":2.0,"y":-2.0},
+                     "stroke_width_mm":0.2,"fill":"background"},
+                    {"type":"circle","center":{"x":0.0,"y":0.0},"radius_mm":0.5,
+                     "stroke_width_mm":0.2,"fill":"outline"},
+                    {"type":"arc","start":{"x":-1.0,"y":0.0},"mid":{"x":0.0,"y":1.0},"end":{"x":1.0,"y":0.0},
+                     "stroke_width_mm":0.2}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        let c = std::fs::read_to_string(&lib).unwrap();
+        assert_eq!(c.matches("(polyline").count(), 2, "line and poly:\n{c}");
+        assert_eq!(c.matches("(rectangle").count(), 1, "{c}");
+        assert_eq!(c.matches("(circle").count(), 1, "{c}");
+        assert_eq!(c.matches("(arc").count(), 1, "{c}");
+        // KiCad's symbol fills, not the footprint side's none/solid.
+        assert!(c.contains("(fill (type background))"), "{c}");
+        assert!(c.contains("(fill (type outline))"), "{c}");
+        assert!(c.contains("(fill (type none))"), "{c}");
+        assert!(
+            konnect_sexp::parser::parse_sexp(&c).is_ok(),
+            "generated symbol doesn't parse"
+        );
+    }
+
+    /// The point of building both schemas from one function: the geometry
+    /// vocabulary cannot drift from `set_footprint_graphics`. If someone adds a
+    /// primitive to one, this fails until they have thought about the other.
+    #[test]
+    fn symbol_graphics_share_the_footprint_primitive_vocabulary() {
+        let names = |schema: &serde_json::Value| -> Vec<String> {
+            schema["items"]["oneOf"]
+                .as_array()
+                .expect("oneOf")
+                .iter()
+                .map(|v| {
+                    v["properties"]["type"]["const"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let symbol = symbol_graphics_schema();
+        let footprint =
+            crate::tools::footprint_graphics::graphics_schema_with_fill(&["none", "solid"]);
+        assert_eq!(names(&symbol), names(&footprint));
+        // Fill is the one deliberate difference.
+        let fill = |s: &serde_json::Value, i: usize| {
+            s["items"]["oneOf"][i]["properties"]["fill"]["enum"].clone()
+        };
+        assert_eq!(fill(&symbol, 2), json!(["none", "outline", "background"]));
+        assert_eq!(fill(&footprint, 2), json!(["none", "solid"]));
     }
 
     #[tokio::test]
