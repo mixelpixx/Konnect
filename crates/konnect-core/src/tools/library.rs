@@ -3300,6 +3300,20 @@ fn build_symbol_unit(
     })
 }
 
+/// Read a `graphics` argument. Present-but-not-an-array must not read as
+/// absent: `as_array().unwrap_or_default()` turns a malformed request into an
+/// empty one, and the symbol comes out with an automatic rectangle and a
+/// success while the caller's drawing is nowhere (#501).
+fn graphics_arg(value: &serde_json::Value, whose: &str) -> Result<Vec<serde_json::Value>, String> {
+    match value {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(items) => Ok(items.clone()),
+        _ => Err(format!(
+            "{whose} 'graphics' must be an array of drawing primitives"
+        )),
+    }
+}
+
 /// Refuse geometry the emitter would otherwise draw wrongly or drop.
 ///
 /// The MCP dispatch checks that required *arguments* are present; it does not
@@ -3321,6 +3335,11 @@ fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
     }
 
     for (at, g) in graphics.iter().enumerate() {
+        if !g.is_object() {
+            return Err(format!(
+                "graphics[{at}]: each entry must be an object describing one primitive"
+            ));
+        }
         let kind = g["type"].as_str().unwrap_or("");
         match kind {
             "line" => {
@@ -3381,6 +3400,14 @@ fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
         }
         // An unrecognised fill would silently become `none`, which is a
         // different drawing from the one that was asked for.
+        // `line` and `arc` take no fill on either side of the shared schema. A
+        // supplied one would be honoured by the emitter for `line`, which is
+        // the schema telling the caller one thing and the writer doing another.
+        if matches!(kind, "line" | "arc") && !g["fill"].is_null() {
+            return Err(format!(
+                "graphics[{at}] ({kind}): '{kind}' takes no 'fill' — use 'poly' for a filled shape"
+            ));
+        }
         match &g["fill"] {
             serde_json::Value::Null => {}
             serde_json::Value::String(f)
@@ -3743,8 +3770,10 @@ async fn handle_create_symbol(
     // individual units, and shared `power_pins` become a dedicated final unit.
     // Top-level geometry belongs to the single-unit `pins` path, the same way
     // top-level `pins` and `glyph` do.
-    let sym_graphics: Vec<serde_json::Value> =
-        args["graphics"].as_array().cloned().unwrap_or_default();
+    let sym_graphics = match graphics_arg(&args["graphics"], "top-level") {
+        Ok(g) => g,
+        Err(e) => return Ok(CallToolResult::error(e)),
+    };
     // Top-level `pins` is superseded by `units` and the schema says so, but
     // losing a redundant pin list is not the same as losing a drawing: geometry
     // sent here while `units` is in use would never reach the file, and the
@@ -3840,8 +3869,10 @@ async fn handle_create_symbol(
                     }
                 },
             };
-            let unit_graphics: Vec<serde_json::Value> =
-                u["graphics"].as_array().cloned().unwrap_or_default();
+            let unit_graphics = match graphics_arg(&u["graphics"], &format!("unit {}:", i + 1)) {
+                Ok(g) => g,
+                Err(e) => return Ok(CallToolResult::error(e)),
+            };
             let unit = match build_symbol_unit(&unit_pins, unit_glyph, show_names, &unit_graphics) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
@@ -6610,6 +6641,7 @@ mod tests {
                 json!({"type":"circle","center":{"x":0,"y":0},"radius_mm":0,
                        "stroke_width_mm":0.2,"fill":"none"}),
             ),
+            ("entry is not an object at all", json!("rect")),
         ];
         for (label, primitive) in cases {
             let tmp = tempfile::tempdir().unwrap();
@@ -6627,12 +6659,119 @@ mod tests {
             .await
             .unwrap();
             assert!(res.is_error, "{label} must be refused");
+            let message = format!("{res:?}");
             assert!(
-                format!("{res:?}").contains("graphics[0]"),
-                "{label}: the refusal must name the offending entry: {res:?}"
+                message.contains("graphics[0]"),
+                "{label}: the refusal must name the offending entry: {message}"
+            );
+            if label == "entry is not an object at all" {
+                // Without the shape check this still refuses, but as
+                // `unknown type ""` — which sends the caller looking for a
+                // typo in a field they never wrote.
+                assert!(
+                    message.contains("must be an object describing one primitive"),
+                    "{label}: the refusal must say what is actually wrong: {message}"
+                );
+            }
+            assert!(!lib.exists(), "{label}: nothing may be written");
+        }
+    }
+
+    /// A present-but-malformed `graphics` must not read as absent. Reading it
+    /// with `as_array().unwrap_or_default()` turned a wrong request into an
+    /// empty one: the symbol came out with an automatic rectangle and a
+    /// success, and the caller's drawing was nowhere. Found on the second
+    /// audit pass, after the primitive validation was already in.
+    #[tokio::test]
+    async fn create_symbol_refuses_a_graphics_argument_that_is_not_an_array() {
+        for (label, args) in [
+            (
+                "top level",
+                json!({
+                    "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}],
+                    "graphics": "rect"
+                }),
+            ),
+            (
+                "per unit",
+                json!({
+                    "units": [{
+                        "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}],
+                        "graphics": { "type": "rect" }
+                    }]
+                }),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("na.kicad_sym");
+            let mut args = args;
+            args["library_path"] = json!(lib.to_string_lossy());
+            args["name"] = json!("NA");
+            args["reference_prefix"] = json!("U");
+            let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+            assert!(res.is_error, "{label} must be refused");
+            assert!(
+                format!("{res:?}").contains("must be an array of drawing primitives"),
+                "{label}: {res:?}"
             );
             assert!(!lib.exists(), "{label}: nothing may be written");
         }
+    }
+
+    /// `line` and `arc` take no fill on either side of the shared schema, but
+    /// the emitter would have honoured one on a `line`. Schema saying one thing
+    /// while the writer does another is the same defect as ignoring the field.
+    #[tokio::test]
+    async fn create_symbol_refuses_a_fill_on_primitives_that_take_none() {
+        for primitive in [
+            json!({"type":"line","start":{"x":-1,"y":0},"end":{"x":1,"y":0},
+                   "stroke_width_mm":0.2,"fill":"outline"}),
+            json!({"type":"arc","start":{"x":-1,"y":0},"mid":{"x":0,"y":1},"end":{"x":1,"y":0},
+                   "stroke_width_mm":0.2,"fill":"none"}),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("f.kicad_sym");
+            let res = handle_create_symbol(
+                &json!({
+                    "library_path": lib.to_string_lossy(),
+                    "name": "F",
+                    "reference_prefix": "U",
+                    "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}],
+                    "graphics": [primitive]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(res.is_error);
+            assert!(format!("{res:?}").contains("takes no 'fill'"), "{res:?}");
+            assert!(!lib.exists());
+        }
+    }
+
+    /// An explicitly empty list is a coherent request — "draw nothing of my
+    /// own" — and gets the automatic body, matching how `require_array` treats
+    /// `[]` elsewhere. It must not be confused with the malformed cases above.
+    #[tokio::test]
+    async fn create_symbol_accepts_an_empty_graphics_list_as_the_automatic_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("e.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "E",
+                "reference_prefix": "U",
+                "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}],
+                "graphics": []
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        assert!(std::fs::read_to_string(&lib)
+            .unwrap()
+            .contains("(rectangle"));
     }
 
     /// Geometry sent at the top level while `units` is in use would never reach
