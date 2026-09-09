@@ -3235,8 +3235,16 @@ fn build_symbol_unit(
         let mut pins_sexp = String::new();
         let mut resolved = Vec::with_capacity(pins_val.len());
         for pin in pins_val {
-            let x = pin["x"].as_f64().unwrap_or(0.0);
-            let y = pin["y"].as_f64().unwrap_or(0.0);
+            // The handler refuses a missing coordinate before this, where it
+            // can name `units[i].pins[j].x`. Restating the contract where the
+            // value is actually used keeps a future drawn call site from
+            // reintroducing the origin the caller never gave.
+            let (Some(x), Some(y)) = (pin["x"].as_f64(), pin["y"].as_f64()) else {
+                anyhow::bail!(
+                    "pin \"{}\" has no numeric x and y, and a drawn body writes pin coordinates exactly as supplied",
+                    pin["number"].as_str().unwrap_or("1")
+                );
+            };
             resolved.push(ResolvedPin::new(pin, x, y));
             pins_sexp.push_str(&emit_pin(
                 pin["type"].as_str().unwrap_or("passive"),
@@ -3314,6 +3322,59 @@ fn graphics_arg(value: &serde_json::Value, whose: &str) -> Result<Vec<serde_json
     }
 }
 
+/// Refuse a drawn-body pin whose coordinates the caller never supplied.
+///
+/// The whole justification for the drawn branch is that it writes pin
+/// coordinates *exactly* as given, rather than sliding them out to a computed
+/// edge the way the automatic rectangle does (#293). `x` and `y` therefore
+/// become semantically required as soon as `graphics` is non-empty, though the
+/// shared pin schema keeps them optional for the automatic path — and
+/// `unwrap_or(0.0)` was answering a missing one with an origin the caller never
+/// gave, which is the single invention this branch exists to prevent.
+///
+/// `split_power` is the one case where a supplied pin is not covered by the
+/// drawn body: a single-unit triangular glyph carrying power pins puts them on
+/// a generated rectangular unit, and `layout_power_unit` replaces their
+/// coordinates outright, so those keep the schema's optional x/y. Indices stay
+/// those of the caller's own array, not of the filtered subset.
+fn validate_drawn_pin_coordinates(
+    pins: &[serde_json::Value],
+    path: &str,
+    split_power: bool,
+) -> Result<(), CallToolResult> {
+    for (index, pin) in pins.iter().enumerate() {
+        if split_power && is_power_pin(pin) {
+            continue;
+        }
+        for field in ["x", "y"] {
+            if pin[field].as_f64().is_none() {
+                return Err(invalid_library_argument(
+                    &format!("{path}[{index}].{field}"),
+                    "missing or not a number; a drawn body writes pin coordinates exactly as supplied",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The keys each primitive accepts, which is also the list it requires: every
+/// nested schema declares `additionalProperties: false` and names every one of
+/// its properties in `required`. Held by hand beside the checks that use it,
+/// like the other validators in this file rather than read back out of the
+/// schema — `symbol_graphics_allow_exactly_the_schema_keys` fails if the two
+/// ever disagree.
+fn graphics_primitive_keys(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "line" => &["type", "start", "end", "stroke_width_mm"],
+        "arc" => &["type", "start", "mid", "end", "stroke_width_mm"],
+        "rect" => &["type", "start", "end", "stroke_width_mm", "fill"],
+        "circle" => &["type", "center", "radius_mm", "stroke_width_mm", "fill"],
+        "poly" => &["type", "points", "stroke_width_mm", "fill"],
+        _ => return None,
+    })
+}
+
 /// Refuse geometry the emitter would otherwise draw wrongly or drop.
 ///
 /// The MCP dispatch checks that required *arguments* are present; it does not
@@ -3335,12 +3396,39 @@ fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
     }
 
     for (at, g) in graphics.iter().enumerate() {
-        if !g.is_object() {
+        let Some(entry) = g.as_object() else {
             return Err(format!(
                 "graphics[{at}]: each entry must be an object describing one primitive"
             ));
-        }
+        };
         let kind = g["type"].as_str().unwrap_or("");
+        let Some(allowed) = graphics_primitive_keys(kind) else {
+            return Err(format!(
+                "graphics[{at}]: unknown type {kind:?} — expected one of line, arc, rect, circle, poly"
+            ));
+        };
+        // `fill` is the one unknown key with a better answer than the generic
+        // one: it is real on the three closed shapes, and the emitter would
+        // have honoured it on a `line` — the schema telling the caller one
+        // thing while the writer does another. Say where a fill belongs
+        // instead of only that it does not belong here.
+        if matches!(kind, "line" | "arc") && !g["fill"].is_null() {
+            return Err(format!(
+                "graphics[{at}] ({kind}): '{kind}' takes no 'fill' — use 'poly' for a filled shape"
+            ));
+        }
+        // The dispatch does not enforce a `oneOf` inside an array item, so any
+        // other extra key reaches the emitter, which has no use for it and
+        // drops it without a word — the caller asked for something the symbol
+        // does not have. Refuse instead, the way the schema already says to.
+        for key in entry.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "graphics[{at}].{key} ({kind}): unknown field — {kind} takes {}",
+                    allowed.join(", ")
+                ));
+            }
+        }
         match kind {
             "line" => {
                 point(g, "start", at, kind)?;
@@ -3359,8 +3447,16 @@ fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
                 point(g, "center", at, kind)?;
                 match g["radius_mm"].as_f64() {
                     Some(r) if r > 0.0 => {}
-                    Some(_) => return Err(format!("graphics[{at}] (circle): 'radius_mm' must be greater than 0")),
-                    None => return Err(format!("graphics[{at}] (circle): 'radius_mm' is required and must be a number")),
+                    Some(_) => {
+                        return Err(format!(
+                            "graphics[{at}] (circle): 'radius_mm' must be greater than 0"
+                        ))
+                    }
+                    None => {
+                        return Err(format!(
+                            "graphics[{at}] (circle): 'radius_mm' is required and must be a number"
+                        ))
+                    }
                 }
             }
             "poly" => {
@@ -3379,11 +3475,8 @@ fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
                     }
                 }
             }
-            other => {
-                return Err(format!(
-                    "graphics[{at}]: unknown type {other:?} — expected one of line, arc, rect, circle, poly"
-                ))
-            }
+            // Every other type was refused by `allowed_keys` above.
+            _ => {}
         }
         match g["stroke_width_mm"].as_f64() {
             Some(w) if w >= 0.0 => {}
@@ -3400,15 +3493,16 @@ fn validate_graphics(graphics: &[serde_json::Value]) -> Result<(), String> {
         }
         // An unrecognised fill would silently become `none`, which is a
         // different drawing from the one that was asked for.
-        // `line` and `arc` take no fill on either side of the shared schema. A
-        // supplied one would be honoured by the emitter for `line`, which is
-        // the schema telling the caller one thing and the writer doing another.
-        if matches!(kind, "line" | "arc") && !g["fill"].is_null() {
-            return Err(format!(
-                "graphics[{at}] ({kind}): '{kind}' takes no 'fill' — use 'poly' for a filled shape"
-            ));
-        }
         match &g["fill"] {
+            // The schema makes `fill` required on the three closed shapes. The
+            // emitter answered a missing one with `(fill (type none))` — an
+            // unfilled body where the stock libraries use KiCad's pale
+            // `background`, chosen by Konnect rather than by the caller.
+            serde_json::Value::Null if matches!(kind, "rect" | "circle" | "poly") => {
+                return Err(format!(
+                    "graphics[{at}] ({kind}): 'fill' is required and must be \"none\", \"outline\" or \"background\""
+                ))
+            }
             serde_json::Value::Null => {}
             serde_json::Value::String(f)
                 if matches!(f.as_str(), "none" | "outline" | "background") => {}
@@ -3796,6 +3890,11 @@ async fn handle_create_symbol(
         // multi-unit op-amps) instead of drawing them on the triangle.
         let split_power =
             matches!(sym_glyph, Some(g) if g.is_triangular()) && pins_val.iter().any(is_power_pin);
+        if !sym_graphics.is_empty() {
+            if let Err(error) = validate_drawn_pin_coordinates(&pins_val, "pins", split_power) {
+                return Ok(error);
+            }
+        }
         if split_power {
             let signal: Vec<serde_json::Value> = pins_val
                 .iter()
@@ -3873,6 +3972,13 @@ async fn handle_create_symbol(
                 Ok(g) => g,
                 Err(e) => return Ok(CallToolResult::error(e)),
             };
+            if !unit_graphics.is_empty() {
+                if let Err(error) =
+                    validate_drawn_pin_coordinates(&unit_pins, &format!("units[{i}].pins"), false)
+                {
+                    return Ok(error);
+                }
+            }
             let unit = match build_symbol_unit(&unit_pins, unit_glyph, show_names, &unit_graphics) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
@@ -6747,6 +6853,246 @@ mod tests {
             assert!(format!("{res:?}").contains("takes no 'fill'"), "{res:?}");
             assert!(!lib.exists());
         }
+    }
+
+    /// A drawn body writes pin coordinates exactly as supplied, so a pin with
+    /// no `x`/`y` has none to write — and `unwrap_or(0.0)` was answering with
+    /// an origin the caller never gave, in the one branch whose whole promise
+    /// is not to invent coordinates. Refuse, naming the indexed field, and
+    /// write nothing. Found in review of #502.
+    #[tokio::test]
+    async fn create_symbol_refuses_a_drawn_pin_without_coordinates() {
+        let rect = json!({"type":"rect","start":{"x":-5.08,"y":3.81},"end":{"x":5.08,"y":-3.81},
+                          "stroke_width_mm":0.254,"fill":"background"});
+        for (label, field, args) in [
+            (
+                "top-level pins, x absent",
+                "pins[1].x",
+                json!({
+                    "pins": [
+                        {"number":"1","name":"A","type":"passive","x":-2.54,"y":3.81},
+                        {"number":"2","name":"K","type":"passive","y":-3.81}
+                    ],
+                    "graphics": [rect.clone()]
+                }),
+            ),
+            (
+                "top-level pins, y is a string",
+                "pins[0].y",
+                json!({
+                    "pins": [
+                        {"number":"1","name":"A","type":"passive","x":-2.54,"y":"3.81"}
+                    ],
+                    "graphics": [rect.clone()]
+                }),
+            ),
+            (
+                "the drawn unit of a multi-unit symbol",
+                "units[1].pins[0].x",
+                json!({
+                    "units": [
+                        {"pins": [{"number":"1","name":"A","type":"passive","x":-2.54,"y":3.81}]},
+                        {"pins": [{"number":"2","name":"K","type":"passive","y":-3.81}],
+                         "graphics": [rect.clone()]}
+                    ]
+                }),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("drawn.kicad_sym");
+            let mut args = args;
+            args["library_path"] = json!(lib.to_string_lossy());
+            args["name"] = json!("DRAWN");
+            args["reference_prefix"] = json!("VT");
+            let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+            assert!(res.is_error, "{label} must be refused");
+            let message = format!("{res:?}");
+            assert!(
+                message.contains(field),
+                "{label}: the refusal must name {field}: {message}"
+            );
+            assert!(!lib.exists(), "{label}: nothing may be written");
+        }
+    }
+
+    /// The guard covers the pins the drawn body carries, and no others. A
+    /// single-unit triangular glyph splits its power pins onto a generated
+    /// rectangular unit, where `layout_power_unit` replaces any supplied
+    /// coordinates outright — so those keep the schema's optional x/y. This
+    /// test proves the guard is not too broad and, by design, still passes
+    /// when the guard is removed entirely.
+    #[tokio::test]
+    async fn create_symbol_drawn_body_leaves_split_power_pins_their_optional_coordinates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("split.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "SPLIT",
+                "reference_prefix": "U",
+                "glyph": "opamp",
+                "pins": [
+                    {"number":"1","name":"OUT","type":"output","x":7.62,"y":0.0,"angle":180},
+                    {"number":"2","name":"IN","type":"input","x":-7.62,"y":2.54,"angle":0},
+                    {"number":"8","name":"V+","type":"power_in"},
+                    {"number":"4","name":"V-","type":"power_in"}
+                ],
+                "graphics": [
+                    {"type":"poly","points":[{"x":-5.08,"y":5.08},{"x":5.08,"y":0.0},{"x":-5.08,"y":-5.08}],
+                     "stroke_width_mm":0.254,"fill":"background"}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        let content = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            content.contains("\"SPLIT_2_1\""),
+            "the power unit is missing:\n{content}"
+        );
+        assert!(
+            content.contains("(at 0 7.62 270)") || content.contains("(at -1.27 7.62 270)"),
+            "the power pins were not laid out by the generated unit:\n{content}"
+        );
+    }
+
+    /// The same contract restated where the coordinate is used, so a future
+    /// drawn call site cannot reintroduce the invented origin without the
+    /// handler's indexed guard in front of it.
+    #[test]
+    fn build_symbol_unit_refuses_to_invent_a_drawn_pin_coordinate() {
+        let pins = vec![json!({"number":"1","name":"A","type":"passive","y":3.81})];
+        let graphics = vec![
+            json!({"type":"rect","start":{"x":-1.0,"y":1.0},"end":{"x":1.0,"y":-1.0},
+                                   "stroke_width_mm":0.2,"fill":"none"}),
+        ];
+        let error = match build_symbol_unit(&pins, None, true, &graphics) {
+            Ok(_) => panic!("a drawn pin with no x must not be built"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exactly as supplied"), "{error}");
+    }
+
+    /// `fill` is schema-required on the three closed shapes, and a missing one
+    /// was emitted as `(fill (type none))` — Konnect choosing an unfilled body
+    /// where the stock libraries use KiCad's pale `background`. Found in review
+    /// of #502.
+    #[tokio::test]
+    async fn create_symbol_requires_a_fill_on_the_closed_primitives() {
+        for primitive in [
+            json!({"type":"rect","start":{"x":-2.0,"y":2.0},"end":{"x":2.0,"y":-2.0},
+                   "stroke_width_mm":0.2}),
+            json!({"type":"circle","center":{"x":0.0,"y":0.0},"radius_mm":1.0,
+                   "stroke_width_mm":0.2}),
+            json!({"type":"poly","points":[{"x":0.0,"y":0.0},{"x":1.0,"y":1.0},{"x":2.0,"y":0.0}],
+                   "stroke_width_mm":0.2}),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("nofill.kicad_sym");
+            let res = handle_create_symbol(
+                &json!({
+                    "library_path": lib.to_string_lossy(),
+                    "name": "NOFILL",
+                    "reference_prefix": "U",
+                    "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270}],
+                    "graphics": [primitive.clone()]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(res.is_error, "{primitive} must be refused");
+            let message = format!("{res:?}");
+            assert!(
+                message.contains("'fill' is required"),
+                "{primitive}: {message}"
+            );
+            assert!(!lib.exists(), "{primitive}: nothing may be written");
+        }
+    }
+
+    /// Every primitive schema declares `additionalProperties: false`, but the
+    /// dispatch does not enforce a `oneOf` inside an array item, so an extra
+    /// key reached the emitter and was dropped without a word — including a key
+    /// that is real on a different primitive. Found in review of #502.
+    #[tokio::test]
+    async fn create_symbol_rejects_unknown_keys_on_a_primitive() {
+        for (key, primitive) in [
+            (
+                "colour",
+                json!({"type":"rect","start":{"x":-2.0,"y":2.0},"end":{"x":2.0,"y":-2.0},
+                       "stroke_width_mm":0.2,"fill":"none","colour":"red"}),
+            ),
+            (
+                // Real on `circle`, not on `rect`: the set is per primitive.
+                "radius_mm",
+                json!({"type":"rect","start":{"x":-2.0,"y":2.0},"end":{"x":2.0,"y":-2.0},
+                       "stroke_width_mm":0.2,"fill":"none","radius_mm":9.0}),
+            ),
+            (
+                "layer",
+                json!({"type":"line","start":{"x":-1.0,"y":0.0},"end":{"x":1.0,"y":0.0},
+                       "stroke_width_mm":0.2,"layer":"F.SilkS"}),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("extra.kicad_sym");
+            let res = handle_create_symbol(
+                &json!({
+                    "library_path": lib.to_string_lossy(),
+                    "name": "EXTRA",
+                    "reference_prefix": "U",
+                    "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270}],
+                    "graphics": [primitive.clone()]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(res.is_error, "{primitive} must be refused");
+            let message = format!("{res:?}");
+            assert!(
+                message.contains(&format!("graphics[0].{key}")),
+                "the refusal must name the offending key: {message}"
+            );
+            assert!(!lib.exists(), "{primitive}: nothing may be written");
+        }
+    }
+
+    /// `graphics_primitive_keys` copies the schema's property list by hand,
+    /// because the dispatch cannot enforce the nested `oneOf`. This is what
+    /// keeps the copy honest — and it also pins the property that makes one
+    /// list serve for both checks: on these primitives every declared property
+    /// is also required.
+    #[test]
+    fn symbol_graphics_allow_exactly_the_schema_keys() {
+        let schema = symbol_graphics_schema();
+        let branches = schema["items"]["oneOf"].as_array().expect("oneOf");
+        assert_eq!(branches.len(), 5);
+        for branch in branches {
+            let kind = branch["properties"]["type"]["const"].as_str().unwrap();
+            let mut declared: Vec<&str> = branch["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            declared.sort_unstable();
+            let mut required: Vec<&str> = branch["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            required.sort_unstable();
+            assert_eq!(declared, required, "{kind}: every property is required");
+            let mut accepted = graphics_primitive_keys(kind).expect(kind).to_vec();
+            accepted.sort_unstable();
+            assert_eq!(accepted, declared, "{kind}: validator against schema");
+        }
+        assert!(graphics_primitive_keys("polyline").is_none());
     }
 
     /// An explicitly empty list is a coherent request — "draw nothing of my
