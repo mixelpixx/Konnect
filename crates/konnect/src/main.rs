@@ -1,6 +1,7 @@
 mod config;
 mod install;
 mod manifest;
+mod run_registry;
 mod transaction_cli;
 mod transport;
 
@@ -162,6 +163,14 @@ async fn main() -> Result<()> {
             config_resolution.source().as_str(),
         ),
     }
+
+    // Record this server, and reap the records of servers that are gone
+    // (#103). This is the only spot that sees all three spawn paths — the
+    // Python ActionPlugin, KiCad 10's `exec` entrypoint, and an external MCP
+    // client — so it is the only spot where the bookkeeping cannot be skipped
+    // by launching a different way. The guard has to outlive every transport
+    // below: it holds the lock that proves this process is still alive.
+    let _run_record = run_registry::sweep_and_register(&config.transport);
 
     let server_config = konnect_core::tools::ServerConfig {
         kicad_cli: config.kicad_cli.clone(),
