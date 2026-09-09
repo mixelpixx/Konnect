@@ -1280,78 +1280,11 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
     let mut footprints = Vec::new();
     let mut items = BTreeMap::new();
     for item in footprint_items {
-        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+        let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
             .context("KiCad returned an invalid footprint item")?;
-        let kiid = footprint
-            .id
-            .as_ref()
-            .map(|id| id.value.clone())
-            .filter(|id| !id.is_empty())
-            .context("KiCad returned a footprint without a KIID")?;
-        let definition = footprint
-            .definition
-            .as_ref()
-            .context("KiCad returned a footprint without a definition")?;
-        let mut pad_nets = BTreeMap::new();
-        for child in &definition.items {
-            // Same discriminator as `apply_footprint_fields`, for the same
-            // reason: a graphic decodes happily as an empty pad.
-            //
-            // No test covers this one, and deliberately so — it has no
-            // observable effect today. A graphic decoded as a pad has
-            // `net: None`, so the filter below drops it anyway, and this
-            // function never writes. It is here because the next person to add
-            // a field to this loop should not have to rediscover why reading
-            // `definition.items` untyped is unsafe. Neutering it changes
-            // nothing, which is the honest result.
-            if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
-                continue;
-            }
-            let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) else {
-                continue;
-            };
-            if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
-                pad_nets.insert(pad.number, net.name);
-            }
-        }
-        let position = footprint.position.as_ref();
-        footprints.push(BoardFootprint {
-            kiid: kiid.clone(),
-            reference: field_text(&footprint.reference_field),
-            value: field_text(&footprint.value_field),
-            footprint_id: definition
-                .id
-                .as_ref()
-                .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
-                .unwrap_or_default(),
-            symbol_path: footprint.symbol_path.as_ref().map(sheet_path_string),
-            pad_nets,
-            position: Point {
-                x: position
-                    .map(|point| konnect_ipc::builders::nm_to_mm(point.x_nm))
-                    .unwrap_or(0.0),
-                y: position
-                    .map(|point| konnect_ipc::builders::nm_to_mm(point.y_nm))
-                    .unwrap_or(0.0),
-            },
-            rotation: footprint
-                .orientation
-                .as_ref()
-                .map(|angle| angle.value_degrees)
-                .unwrap_or(0.0),
-            layer: board_layer_name(footprint.layer),
-            locked: footprint.locked == kiapi::common::types::LockedState::LsLocked as i32,
-            dnp: footprint
-                .attributes
-                .as_ref()
-                .map(|attributes| attributes.do_not_populate)
-                .unwrap_or(false),
-            not_in_schematic: footprint
-                .attributes
-                .as_ref()
-                .map(|attributes| attributes.not_in_schematic)
-                .unwrap_or(false),
-        });
+        let footprint = board_footprint_from_instance(&instance)?;
+        let kiid = footprint.kiid.clone();
+        footprints.push(footprint);
         items.insert(kiid, item);
     }
 
@@ -1409,6 +1342,88 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
     })
 }
 
+/// Convert one live KiCad footprint into the planner's board-side view.
+///
+/// Split out of [`snapshot_board`] so the IPC-to-planner mapping is reachable
+/// without a live editor: the planner's own tests build `BoardFootprint`
+/// directly and therefore cannot see a defect that lives in this conversion.
+fn board_footprint_from_instance(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+) -> Result<BoardFootprint> {
+    use konnect_ipc::gen::kiapi;
+
+    let kiid = footprint
+        .id
+        .as_ref()
+        .map(|id| id.value.clone())
+        .filter(|id| !id.is_empty())
+        .context("KiCad returned a footprint without a KIID")?;
+    let definition = footprint
+        .definition
+        .as_ref()
+        .context("KiCad returned a footprint without a definition")?;
+    let mut pad_nets = BTreeMap::new();
+    for child in &definition.items {
+        // Same discriminator as `apply_footprint_fields`, for the same
+        // reason: a graphic decodes happily as an empty pad.
+        //
+        // No test covers this one, and deliberately so — it has no
+        // observable effect today. A graphic decoded as a pad has
+        // `net: None`, so the filter below drops it anyway, and this
+        // function never writes. It is here because the next person to add
+        // a field to this loop should not have to rediscover why reading
+        // `definition.items` untyped is unsafe. Neutering it changes
+        // nothing, which is the honest result.
+        if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+            continue;
+        }
+        let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) else {
+            continue;
+        };
+        if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
+            pad_nets.insert(pad.number, net.name);
+        }
+    }
+    let position = footprint.position.as_ref();
+    Ok(BoardFootprint {
+        kiid,
+        reference: field_text(&footprint.reference_field),
+        value: field_text(&footprint.value_field),
+        footprint_id: definition
+            .id
+            .as_ref()
+            .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+            .unwrap_or_default(),
+        symbol_path: board_symbol_path(footprint.symbol_path.as_ref()),
+        pad_nets,
+        position: Point {
+            x: position
+                .map(|point| konnect_ipc::builders::nm_to_mm(point.x_nm))
+                .unwrap_or(0.0),
+            y: position
+                .map(|point| konnect_ipc::builders::nm_to_mm(point.y_nm))
+                .unwrap_or(0.0),
+        },
+        rotation: footprint
+            .orientation
+            .as_ref()
+            .map(|angle| angle.value_degrees)
+            .unwrap_or(0.0),
+        layer: board_layer_name(footprint.layer),
+        locked: footprint.locked == kiapi::common::types::LockedState::LsLocked as i32,
+        dnp: footprint
+            .attributes
+            .as_ref()
+            .map(|attributes| attributes.do_not_populate)
+            .unwrap_or(false),
+        not_in_schematic: footprint
+            .attributes
+            .as_ref()
+            .map(|attributes| attributes.not_in_schematic)
+            .unwrap_or(false),
+    })
+}
+
 fn field_text(field: &Option<konnect_ipc::gen::kiapi::board::types::Field>) -> String {
     field
         .as_ref()
@@ -1416,6 +1431,32 @@ fn field_text(field: &Option<konnect_ipc::gen::kiapi::board::types::Field>) -> S
         .and_then(|text| text.text.as_ref())
         .map(|text| text.text.clone())
         .unwrap_or_default()
+}
+
+/// The board-side schematic identity of a footprint, or `None` when it has no
+/// schematic symbol behind it at all.
+///
+/// KiCad's IPC layer sends a *present but empty* `SheetPath` for a footprint
+/// placed directly on the board — a logo, a fiducial, a mounting hole. Passing
+/// that through [`sheet_path_string`] renders `/`, so every such footprint
+/// arrives carrying the same synthetic identity and the planner reads them as
+/// duplicates of one another, blocking the sync (#452). Absence of an identity
+/// must arrive as absence, which is what the rest of this module already
+/// assumes `None` to mean.
+fn board_symbol_path(
+    path: Option<&konnect_ipc::gen::kiapi::common::types::SheetPath>,
+) -> Option<String> {
+    let path = path?;
+    // A path made only of empty KIIDs names no symbol either, so it is absence
+    // too. Only this all-empty case is normalised: an empty segment *inside* an
+    // otherwise real path is left to render as it always has, because that is a
+    // shape KiCad does not emit and inventing a meaning for it here would be
+    // guessing. `apply_footprint_fields` drops empty segments on the way out, so
+    // the round trip is exact for every path either side can actually produce.
+    if path.path.iter().all(|part| part.value.is_empty()) {
+        return None;
+    }
+    Some(sheet_path_string(path))
 }
 
 fn sheet_path_string(path: &konnect_ipc::gen::kiapi::common::types::SheetPath) -> String {
@@ -2396,5 +2437,221 @@ mod tests {
             plan_revision(&netlist("2025-01-01", "literal (tool beta)"), &board),
             "tool-like text inside a quoted value is design content"
         );
+    }
+
+    /// A real `FootprintInstance`, exactly as KiCad 10.0.6's IPC layer sent it
+    /// for a mounting hole with no schematic symbol behind it.
+    ///
+    /// Captured from a running editor rather than hand-built, because a
+    /// hand-built one encodes whatever the author assumed. This one already
+    /// corrected two such assumptions: KiCad reports `symbol_path` as
+    /// **present and empty** (not absent, and `path_human_readable` is `""`,
+    /// not `"/"`), and it leaves `not_in_schematic` **false** on a board-only
+    /// mounting hole — marking it `exclude_from_position_files` and
+    /// `exclude_from_bill_of_materials` instead. The first hand-written
+    /// fixture set that flag true, which made the rename branch below
+    /// unreachable from its own tests.
+    ///
+    /// Regenerate with `KONNECT_CAPTURE_IPC_FIXTURE=1` on the ignored live
+    /// test `kicad_reports_an_empty_sheet_path_for_a_board_only_footprint`;
+    /// provenance is in the fixture's README.
+    const BOARD_ONLY_CAPTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/board_only_footprint.ipc.bin");
+
+    /// The captured footprint, with only its identity fields varied.
+    ///
+    /// A board carries several board-only graphics, and the planner keys on
+    /// reference and KIID, so tests need more than one. Everything else — the
+    /// empty `SheetPath`, the attributes, the pads and graphics — is the real
+    /// message.
+    fn board_only_instance(
+        kiid: &str,
+        reference: &str,
+    ) -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
+        use konnect_ipc::gen::kiapi;
+
+        let mut instance = kiapi::board::types::FootprintInstance::decode(BOARD_ONLY_CAPTURE)
+            .expect("the checked-in KiCad IPC capture must decode");
+        instance.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        set_field_text(&mut instance.reference_field, "Reference", reference);
+        instance
+    }
+
+    /// The same real message, re-labelled as the resistor `resistor()` exports.
+    ///
+    /// Only the library id and value change: these tests are about the planner
+    /// branches an absent identity unlocks, and they need a footprint whose
+    /// `footprint_id` and `value` can match a schematic component. The
+    /// `not_in_schematic` flag is left exactly as KiCad set it — false — which
+    /// is what makes the rename branch reachable at all.
+    fn unlinked_instance(
+        kiid: &str,
+        reference: &str,
+    ) -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
+        use konnect_ipc::gen::kiapi;
+
+        let mut instance = board_only_instance(kiid, reference);
+        if let Some(definition) = instance.definition.as_mut() {
+            definition.id = Some(kiapi::common::types::LibraryIdentifier {
+                library_nickname: "Resistor_SMD".to_string(),
+                entry_name: "R_0603_1608Metric".to_string(),
+            });
+        }
+        set_field_text(&mut instance.value_field, "Value", "10k");
+        instance
+    }
+
+    #[test]
+    fn issue_452_board_only_footprint_reads_as_no_identity_not_a_shared_one() {
+        let logo = board_footprint_from_instance(&board_only_instance("logo-kiid", "LOGO1"))
+            .expect("a board-only footprint is a valid footprint");
+
+        assert_eq!(
+            logo.symbol_path, None,
+            "an empty SheetPath means no schematic symbol, not the identity `/`"
+        );
+        assert_eq!(logo.reference, "LOGO1");
+        assert_eq!(logo.kiid, "logo-kiid");
+        // KiCad does *not* set `not_in_schematic` on a board-only footprint —
+        // it marks it excluded from position files and the BOM instead. The
+        // first version of this test asserted the opposite and passed, because
+        // the hand-built fixture it ran against said so. That flag is the
+        // precondition for the rename branch two tests below, so getting it
+        // wrong made that branch unreachable from the tests written to cover
+        // this change.
+        assert!(
+            !logo.not_in_schematic,
+            "real KiCad leaves not_in_schematic false on a board-only footprint"
+        );
+    }
+
+    #[test]
+    fn issue_452_two_board_only_footprints_do_not_collide_on_identity() {
+        // The whole board as KiCad reports it: one schematic-backed resistor
+        // and two pathless graphics. Before the fix both graphics arrived
+        // carrying `/`, and the planner refused to sync the resistor.
+        let board = board_with(vec![
+            board_resistor("R1", Some("/sheet/existing")),
+            board_footprint_from_instance(&board_only_instance("logo-kiid", "LOGO1")).unwrap(),
+            board_footprint_from_instance(&board_only_instance("fiducial-kiid", "FID1")).unwrap(),
+        ]);
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+        };
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(
+            plan.diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "duplicate_board_identity")
+                .count(),
+            0,
+            "footprints with no schematic identity are not duplicates of each other"
+        );
+        assert_eq!(plan.status, PlanStatus::Noop);
+        assert_eq!(plan.counts.conflicts.planned, 0);
+        assert_eq!(plan.counts.board_only_preserved.planned, 2);
+    }
+
+    #[test]
+    fn a_schematic_backed_footprint_still_reads_its_identity() {
+        use konnect_ipc::gen::kiapi;
+
+        let mut instance = board_only_instance("r1-kiid", "R1");
+        instance.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: vec![
+                kiapi::common::types::Kiid {
+                    value: "sheet-uuid".to_string(),
+                },
+                kiapi::common::types::Kiid {
+                    value: "symbol-uuid".to_string(),
+                },
+            ],
+            path_human_readable: "/Power/".to_string(),
+        });
+
+        let footprint = board_footprint_from_instance(&instance).unwrap();
+
+        assert_eq!(
+            footprint.symbol_path.as_deref(),
+            Some("/sheet-uuid/symbol-uuid"),
+            "the guard must not swallow a real schematic identity"
+        );
+    }
+    // The two branches below test `symbol_path.is_none()`, so before #452 they
+    // were unreachable for a board-only footprint: every one of them wore the
+    // synthetic identity `/`. Reading absence correctly wakes both, which
+    // changes plans on boards that never hit the duplicate-identity bug at all.
+    // They are pinned here so the consequence is a decision rather than a
+    // discovery. Note `board_resistor` leaves `not_in_schematic` false — a
+    // footprint KiCad has not flagged — which is what makes them reachable.
+
+    #[test]
+    fn issue_452_an_unlinked_footprint_the_schematic_names_is_adopted_not_refused() {
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+        };
+
+        let mut footprint =
+            board_footprint_from_instance(&unlinked_instance("R1-kiid", "R1")).unwrap();
+        footprint.pad_nets = BTreeMap::from([
+            ("1".to_string(), "VCC".to_string()),
+            ("2".to_string(), "GND".to_string()),
+        ]);
+        let plan = plan_sync("netlist", &design, &board_with(vec![footprint]));
+
+        // Was `reference_identity_conflict`: the board footprint appeared to
+        // hold the identity `/`, so the schematic's R1 looked like a different
+        // symbol wearing the same reference.
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert_eq!(plan.counts.board_only_preserved.planned, 0);
+        let PlannedChange::Update {
+            kiid, symbol_path, ..
+        } = &plan.changes[0]
+        else {
+            panic!("adoption is an update, not an add: {:?}", plan.changes[0]);
+        };
+        assert_eq!(kiid, "R1-kiid");
+        assert_eq!(
+            symbol_path, "/sheet/existing",
+            "adoption writes the schematic identity onto a footprint the \
+             planner previously refused to touch"
+        );
+    }
+
+    #[test]
+    fn issue_452_an_unlinked_lookalike_blocks_a_new_component_instead_of_duplicating_it() {
+        // The board carries a footprint with no schematic identity whose
+        // library id and value match a component the schematic has just gained.
+        let design = ExportedDesign {
+            components: vec![resistor("R5", "/sheet/new")],
+            skipped: Vec::new(),
+        };
+
+        let plan = plan_sync(
+            "netlist",
+            &design,
+            &board_with(vec![board_footprint_from_instance(&unlinked_instance(
+                "R1-kiid", "R1",
+            ))
+            .unwrap()]),
+        );
+
+        // This plan was `Ready` before #452, and it added a second identical
+        // footprint beside the unlinked one. It is now the conflict the
+        // `possible_renames` scan was written to raise. Better, but it is a
+        // fix that can newly block a sync, and that belongs in the notes.
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert_eq!(plan.counts.added.planned, 0);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "reference_only_rename_ambiguous"));
     }
 }
