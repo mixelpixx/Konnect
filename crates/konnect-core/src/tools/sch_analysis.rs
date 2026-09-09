@@ -146,7 +146,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "find_shorted_nets",
-            "Detect accidentally merged nets — pairs of distinct net names sharing a wire path.",
+            "Detect accidentally merged nets — distinct net names that KiCad nets together, \
+             through a wire path they share or through a name that joins their segments.",
             json!({ "type": "object",
                 "properties": { "schematic": { "type": "string" } },
                 "required": ["schematic"] }),
@@ -696,7 +697,7 @@ async fn handle_find_single_pin_nets(
         for (pin, transform) in pins {
             let (x, y) = konnect_sexp::schematic::pin_endpoint(pin, *transform);
             pins_by_root
-                .entry(graph.find(pt_key(x, y)))
+                .entry(graph.root_at(x, y))
                 .or_default()
                 .push(Connection::ComponentPin {
                     reference: &instance.reference,
@@ -708,7 +709,7 @@ async fn handle_find_single_pin_nets(
     }
     for (x, y) in extract_sheet_pins(&tree) {
         pins_by_root
-            .entry(graph.find(pt_key(x, y)))
+            .entry(graph.root_at(x, y))
             .or_default()
             .push(Connection::SheetPin { x, y });
     }
@@ -806,27 +807,29 @@ async fn handle_get_connected_items(
     let placed_pins = placed_pins_by_reference(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
 
-    // Get nets for each pin
-    let mut connected_nets: HashSet<String> = HashSet::new();
+    // The nets this component's pins are on, held by identity: a net can carry
+    // more than one name, and one can carry none at all. Keying this by name
+    // dropped the labels spelling a net its other way, and dropped an unnamed
+    // net's items entirely.
+    let mut connected_roots: HashSet<(i64, i64)> = HashSet::new();
+    let mut connected_nets: BTreeSet<String> = BTreeSet::new();
     for (_, pins) in placed_pins
         .iter()
         .filter(|(instance, _)| instance.reference == reference)
     {
         for (pin, transform) in pins {
             let (px, py) = konnect_sexp::schematic::pin_endpoint(pin, *transform);
-            if let Some(net) = g.net_at(px, py) {
+            let root = g.root_at(px, py);
+            connected_roots.insert(root);
+            if let Some(net) = g.name_of_root(root) {
                 connected_nets.insert(net);
             }
         }
     }
 
     // Find all wires, labels, and components on those nets
-    let mut all_net_pts: HashSet<(i64, i64)> = HashSet::new();
-    for net in &connected_nets {
-        for pt in g.points_on_net(net) {
-            all_net_pts.insert(pt);
-        }
-    }
+    let all_net_pts: HashSet<(i64, i64)> =
+        g.points_on_roots(&connected_roots).into_iter().collect();
 
     let connected_wires: Vec<serde_json::Value> = wires
         .iter()
@@ -836,10 +839,10 @@ async fn handle_get_connected_items(
         .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
         .collect();
 
-    let connected_labels: Vec<serde_json::Value> = labels
-        .iter()
-        .filter(|l| connected_nets.contains(&l.net))
-        .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+    let connected_labels: Vec<serde_json::Value> = label_roots(&mut g, &labels)
+        .into_iter()
+        .filter(|(root, _)| connected_roots.contains(root))
+        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
         .collect();
 
     // Find other components on the same nets (excluding the queried one)
@@ -868,7 +871,7 @@ async fn handle_get_connected_items(
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
-        "nets": connected_nets.iter().collect::<Vec<_>>(),
+        "nets": connected_nets,
         "connected_wires": connected_wires.len(),
         "wires": connected_wires,
         "labels": connected_labels,
@@ -1765,5 +1768,111 @@ mod multi_unit_tool_tests {
                 .any(|net| net == "HEATER_TEST"),
             "heater unit net missing: {result}"
         );
+    }
+}
+
+/// The read-only side of net identity, on the real KiCad fixture.
+///
+/// Provenance, KiCad's own netlist and the ERC precedence statements are in
+/// `two_name_nets.README.md`; every expectation below is that table.
+#[cfg(test)]
+mod two_name_net_tests {
+    use super::tool_call_support::call;
+    use super::*;
+
+    const SCH: &str = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
+
+    /// Every multi-name net on this sheet answers with the name KiCad prints,
+    /// so the five `multiple_net_names` outcomes in the ERC report are all
+    /// asserted here. Twenty runs: the old scan returned the first `point_nets`
+    /// entry on the net's root, so the answer moved between runs of the same
+    /// binary rather than within one.
+    #[tokio::test]
+    async fn a_multi_name_net_answers_with_kicads_name() {
+        // pin, and the name KiCad's netlist gives the net it is on.
+        for (reference, pin, expected) in [
+            // The five nets carrying more than one name, one per precedence rule.
+            ("U1", "8", "+3V3"),   // power symbol over the VCC and ALT labels
+            ("U1", "4", "RETURN"), // global label over the GND symbols
+            ("R1", "1", "SYS"),    // global over both the +5V symbol and PULLUP
+            ("TP2", "1", "AAA"),   // two locals, the lexically first one
+            ("TP4", "1", "MIX"),   // local label over the hierarchical one
+            // And a single-name net whose two segments are joined by that name.
+            ("R1", "2", "SDA"),
+        ] {
+            for attempt in 0..20 {
+                let body = call(
+                    SCH,
+                    "get_pin_connections",
+                    json!({ "reference": reference, "pin_number": pin }),
+                )
+                .await;
+                assert_eq!(
+                    body["net"], expected,
+                    "{reference}.{pin} on attempt {attempt}: {body}"
+                );
+            }
+        }
+    }
+
+    /// `get_connected_items` answers about the component's *nets*: everything
+    /// on them, including the parts reachable only by name and the aliases the
+    /// net is not called by.
+    #[tokio::test]
+    async fn connected_items_span_every_segment_and_alias_of_the_net() {
+        let items = call(SCH, "get_connected_items", json!({ "reference": "U1" })).await;
+
+        let mut nets: Vec<&str> = items["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|net| net.as_str().unwrap())
+            .collect();
+        nets.sort_unstable();
+        assert_eq!(nets, ["+3V3", "RETURN", "SCL", "SDA"], "{items}");
+
+        let components: Vec<&str> = items["connected_components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|component| component["reference"].as_str().unwrap())
+            .collect();
+        for reachable_by_name_only in ["C1", "C2", "TP1", "TP7", "R1", "R2", "C3"] {
+            assert!(
+                components.contains(&reachable_by_name_only),
+                "{reachable_by_name_only} is on one of U1's nets: {items}"
+            );
+        }
+
+        let labels: Vec<&str> = items["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|label| label["net"].as_str().unwrap())
+            .collect();
+        // The names these nets are *not* called by are still on them: `VCC` and
+        // `ALT` on the rail KiCad calls `+3V3`, `GND` on the one it calls
+        // `RETURN`. (`PULLUP` names the pull-up rail, which U1 is not on — its
+        // SDA/SCL pins reach the resistors, not the rail behind them.)
+        for alias in ["VCC", "ALT", "GND"] {
+            assert!(labels.contains(&alias), "alias {alias} dropped: {items}");
+        }
+    }
+
+    /// A net with no label at all is still a net. Collecting by name left it
+    /// out of the point set entirely, so the wire and the part at its other end
+    /// went unreported.
+    #[tokio::test]
+    async fn an_unnamed_net_reports_its_wire_and_the_part_at_the_far_end() {
+        let items = call(SCH, "get_connected_items", json!({ "reference": "TP8" })).await;
+
+        assert_eq!(items["connected_wires"], 1, "{items}");
+        let components: Vec<&str> = items["connected_components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|component| component["reference"].as_str().unwrap())
+            .collect();
+        assert_eq!(components, ["TP9"], "{items}");
     }
 }
