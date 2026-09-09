@@ -329,7 +329,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
-             Name the pin with reference + pin_number, or give its coordinates directly.",
+             Name the pin with reference + pin_number, or give its coordinates directly. \
+             The label is sheet-local: a sheet instanced N times gets N independent nets. \
+             A rail shared by every instance needs add_power_symbol or a global_label, \
+             which are one net across all sheets and instances.",
             json!({
                 "type": "object",
                 "properties": {

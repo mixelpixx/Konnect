@@ -39,7 +39,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_to_net",
             "Connect multiple component pins to a named net by adding net labels at each pin \
-             endpoint. Single file read → all labels inserted → single file write.",
+             endpoint. Single file read → all labels inserted → single file write. \
+             Labels are sheet-local: a sheet instanced N times gets N independent nets. \
+             Use add_power_symbol or a global_label for a rail shared by every instance, and \
+             only a local label for one that must stay per-instance — power symbols and \
+             global labels are one net across all sheets and instances.",
             json!({
                 "type": "object",
                 "properties": {

@@ -86,6 +86,12 @@
 | Hierarchical label (`hierarchical_label`) | Sheet boundary | Interface pins on hierarchical sheet symbols |
 | Power symbol | Global | Power rails (+3V3, GND, VCC) |
 
+In a sheet placed more than once, a net label is a separate net in each
+instance, while a global label or power symbol is one net across every sheet
+and instance. A rail shared by all instances therefore needs a power symbol or
+global label; a rail private to each instance needs a net label — `power:+5V`
+inside a repeated sheet ties every instance's 5V together.
+
 ## Spacing Guidelines
 
 - Components: minimum 5.08mm (4 grid units) between component bodies
