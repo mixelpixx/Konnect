@@ -404,11 +404,34 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     let mut board_by_path = HashMap::new();
     let mut board_by_reference = HashMap::new();
 
+    // Every reference the schematic export names, on either side of the
+    // `on_board` flag. A duplicate board reference only matters when this set
+    // contains it: `board_by_reference` is consulted at four sites below, and
+    // each one looks up a reference that came from the export —
+    // `skipped.reference` once and `component.reference` three times. A
+    // reference the export never names is therefore never looked up, so which
+    // of the duplicates `insert` happened to keep is unobservable.
+    //
+    // The map is still built from every footprint, duplicates included. Only
+    // the diagnostic is scoped; suppressing the insert would change which
+    // footprint an unrelated adoption resolves to.
+    let exported_references = design
+        .components
+        .iter()
+        .map(|component| component.reference.as_str())
+        .chain(
+            design
+                .skipped
+                .iter()
+                .map(|skipped| skipped.reference.as_str()),
+        )
+        .collect::<HashSet<_>>();
+
     for (index, footprint) in board.footprints.iter().enumerate() {
-        if board_by_reference
+        let duplicate_reference = board_by_reference
             .insert(footprint.reference.as_str(), index)
-            .is_some()
-        {
+            .is_some();
+        if duplicate_reference && exported_references.contains(footprint.reference.as_str()) {
             diagnostics.push(conflict(
                 "duplicate_board_reference",
                 format!("board contains duplicate reference {}", footprint.reference),
@@ -2479,6 +2502,41 @@ mod tests {
         instance
     }
 
+    /// A real `FootprintInstance` for a board-only footprint KiCad left
+    /// carrying the library's own default reference, `REF**`.
+    ///
+    /// The capture above is a mounting hole someone had annotated `MH1`, so it
+    /// cannot witness the case #452 actually reported: unannotated graphics,
+    /// every one of them called `REF**`, colliding with each other. This one
+    /// comes from `konnect-ipc/tests/fixtures/board_only_shared_reference.kicad_pcb`,
+    /// a board KiCad wrote holding two such footprints — and `REF**` is the
+    /// library's own string, not one an editing session left behind.
+    ///
+    /// Regenerate with `KONNECT_CAPTURE_IPC_FIXTURE=1` on the ignored live
+    /// test `kicad_reports_the_same_reference_for_two_board_only_footprints`;
+    /// provenance is in the fixture's README.
+    const SHARED_REFERENCE_CAPTURE: &[u8] =
+        include_bytes!("../../tests/fixtures/board_only_shared_reference.ipc.bin");
+
+    /// One of that board's two `REF**` footprints, with only its KIID varied.
+    ///
+    /// The reference is deliberately *not* varied — it is the shared value the
+    /// tests are about, and it is what KiCad really sent. That the board
+    /// carries two of them is checked without KiCad by
+    /// `the_shared_reference_fixture_still_carries_a_duplicate_board_only_reference`,
+    /// so the second instance is a KIID away from the first rather than an
+    /// assumption.
+    fn ref_star_instance(kiid: &str) -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
+        use konnect_ipc::gen::kiapi;
+
+        let mut instance = kiapi::board::types::FootprintInstance::decode(SHARED_REFERENCE_CAPTURE)
+            .expect("the checked-in KiCad IPC capture must decode");
+        instance.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        instance
+    }
+
     /// The same real message, re-labelled as the resistor `resistor()` exports.
     ///
     /// Only the library id and value change: these tests are about the planner
@@ -2653,5 +2711,190 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "reference_only_rename_ambiguous"));
+    }
+    #[test]
+    fn issue_452_repeated_ref_star_graphics_are_not_a_duplicate_the_schematic_can_see() {
+        // The reported board: a synchronized resistor plus two unannotated
+        // graphics, both called `REF**` because that is what the library calls
+        // them. Nothing in the schematic is named `REF**`, so no adoption ever
+        // looks that reference up and there is nothing to disambiguate.
+        let board = board_with(vec![
+            board_resistor("R1", Some("/sheet/existing")),
+            board_footprint_from_instance(&ref_star_instance("first-kiid")).unwrap(),
+            board_footprint_from_instance(&ref_star_instance("second-kiid")).unwrap(),
+        ]);
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+        };
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(
+            plan.diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "duplicate_board_reference")
+                .count(),
+            0,
+            "a reference the schematic never names has no adoption to make ambiguous"
+        );
+        assert_eq!(plan.status, PlanStatus::Noop);
+        assert_eq!(plan.counts.conflicts.planned, 0);
+        assert_eq!(
+            plan.counts.board_only_preserved.planned, 2,
+            "both graphics are preserved, not merely un-diagnosed"
+        );
+        assert!(plan.changes.is_empty());
+    }
+
+    #[test]
+    fn issue_452_repeated_ref_star_graphics_no_longer_block_an_unrelated_update() {
+        // The same board, with the resistor out of date. Before this change the
+        // duplicate `REF**` diagnostic conflicted the whole plan, so the update
+        // the user asked for could not be applied while those graphics existed
+        // — which is the symptom #452 was filed about.
+        let mut stale = board_resistor("R1", Some("/sheet/existing"));
+        stale.value = "4k7".to_string();
+        let board = board_with(vec![
+            stale,
+            board_footprint_from_instance(&ref_star_instance("first-kiid")).unwrap(),
+            board_footprint_from_instance(&ref_star_instance("second-kiid")).unwrap(),
+        ]);
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+        };
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert_eq!(plan.counts.board_only_preserved.planned, 2);
+        let Some(PlannedChange::Update { kiid, value, .. }) = plan.changes.first() else {
+            panic!("expected one update, got {:?}", plan.changes);
+        };
+        assert_eq!(kiid, "R1-kiid");
+        assert_eq!(value, "10k");
+    }
+
+    /// A **scope test**: it passes with the narrowing removed, and that is the
+    /// point of it.
+    ///
+    /// The guard tests above fail when the `exported_references` clause is
+    /// deleted. This one cannot — it asserts the diagnostic that the
+    /// unconditional version also raises. It exists to prove the narrowing did
+    /// not go too far, so its silence under neutering is the finding, and
+    /// counting it as coverage of the change would be a lie.
+    #[test]
+    fn issue_452_a_duplicate_reference_the_schematic_does_use_is_still_a_conflict() {
+        // Two pathless footprints called `R1`, and a schematic component called
+        // `R1` with no board identity to match on. The reference-only adoption
+        // path keys on exactly that name, so with two candidates it would pick
+        // whichever one `board_by_reference` happened to keep and write the
+        // schematic identity onto it. That is the ambiguity the diagnostic
+        // exists for, and scoping the rule to the schematic's own reference set
+        // — rather than exempting board-only footprints as a kind — is what
+        // keeps it.
+        let board = board_with(vec![
+            board_footprint_from_instance(&unlinked_instance("first-kiid", "R1")).unwrap(),
+            board_footprint_from_instance(&unlinked_instance("second-kiid", "R1")).unwrap(),
+        ]);
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+        };
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "duplicate_board_reference"));
+        assert!(
+            plan.changes.is_empty(),
+            "an ambiguous adoption target must not be written to: {:?}",
+            plan.changes
+        );
+        assert_eq!(plan.counts.updated.planned, 0);
+        assert_eq!(plan.counts.added.planned, 0);
+    }
+
+    /// The `on_board=no` side of the export, which is a consult site too.
+    ///
+    /// One of the four `board_by_reference` lookups reads `skipped.reference`,
+    /// so the set has to span both halves of the export or an excluded
+    /// instance loses its ambiguity check. This test guards the `.chain(...)`
+    /// specifically: it survives deleting the whole narrowing — the
+    /// unconditional diagnostic raises it too — and fails only when the
+    /// skipped half is dropped from the set. Do not read it as coverage of the
+    /// narrowing itself; the two `ref_star` tests above are that.
+    #[test]
+    fn issue_452_a_duplicate_reference_only_an_on_board_no_instance_uses_still_conflicts() {
+        let board = board_with(vec![
+            board_footprint_from_instance(&unlinked_instance("first-kiid", "R9")).unwrap(),
+            board_footprint_from_instance(&unlinked_instance("second-kiid", "R9")).unwrap(),
+        ]);
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: vec![SkippedComponent {
+                reference: "R9".to_string(),
+                symbol_path: "/sheet/excluded".to_string(),
+            }],
+        };
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "duplicate_board_reference"));
+    }
+    /// One of a duplicate pair *can* still be written to — when the schematic
+    /// matched it by path, which the duplicate reference plays no part in.
+    ///
+    /// A footprint can carry a schematic identity and still wear `REF**` if it
+    /// was never back-annotated, and then it collides with the board's loose
+    /// graphics. The old diagnostic blocked the whole sync, so the identity
+    /// match could not be applied while such a graphic existed; now the
+    /// path-matched footprint is renamed and the other is preserved.
+    ///
+    /// This is the honest limit of "un-diagnosed footprints are left alone":
+    /// they are never *selected by reference*, because the reference is not in
+    /// the export. Selection by path is a different and unambiguous route.
+    #[test]
+    fn issue_452_a_path_matched_footprint_is_still_adopted_despite_a_duplicate_reference() {
+        let mut pathed = board_footprint_from_instance(&ref_star_instance("pathed-kiid")).unwrap();
+        pathed.symbol_path = Some("/sheet/existing".to_string());
+        pathed.footprint_id = "Resistor_SMD:R_0603_1608Metric".to_string();
+        pathed.value = "10k".to_string();
+        let board = board_with(vec![
+            pathed,
+            board_footprint_from_instance(&ref_star_instance("loose-kiid")).unwrap(),
+        ]);
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+        };
+
+        let plan = plan_sync("netlist", &design, &board);
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        let Some(PlannedChange::Update {
+            kiid, reference, ..
+        }) = plan.changes.first()
+        else {
+            panic!("expected one update, got {:?}", plan.changes);
+        };
+        assert_eq!(
+            kiid, "pathed-kiid",
+            "the path match selected it, not the reference"
+        );
+        assert_eq!(reference, "R1");
+        assert_eq!(
+            plan.counts.board_only_preserved.planned, 1,
+            "the footprint the schematic never named is preserved untouched"
+        );
     }
 }
