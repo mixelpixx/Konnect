@@ -246,7 +246,7 @@ and Windows servers do not.
 | `set_active_layer` | Set the active layer recorded in the board file's setup section. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
-| `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
+| `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |

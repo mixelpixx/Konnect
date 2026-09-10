@@ -867,6 +867,80 @@ fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()>
     Ok(())
 }
 
+/// One prepared footprint placement shared by the IPC and guarded file paths.
+///
+/// Callers choose whether the definition came from a KiCad library or from
+/// deliberately supplied inline geometry, but they do not orchestrate the
+/// parser, IPC extraction, board serialization, and duplicate-safe insertion
+/// helpers independently.
+#[derive(Clone)]
+pub(crate) struct PreparedFootprintPlacement {
+    pub(crate) value: String,
+    pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
+    pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
+    pub(crate) fields: konnect_ipc::IpcFieldPlacement,
+    board_sexp: String,
+}
+
+impl PreparedFootprintPlacement {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_library(
+        source: &str,
+        lib_id: &str,
+        reference: &str,
+        value: Option<&str>,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+        project_dir: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let prepared =
+            prepare_footprint_source(source, lib_id, reference, value, x, y, rotation, layer)?;
+        let pads = extract_pad_definitions(&prepared)?;
+        let graphics = extract_graphic_definitions(&prepared)?;
+        let fields = extract_field_placement(&prepared);
+        let board_sexp =
+            board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
+                .map_err(anyhow::Error::msg)?;
+        let value = value.map(str::to_string).unwrap_or_else(|| {
+            lib_id
+                .split_once(':')
+                .map_or(lib_id, |(_, entry)| entry)
+                .to_string()
+        });
+        Ok(Self {
+            value,
+            pads,
+            graphics,
+            fields,
+            board_sexp,
+        })
+    }
+
+    pub(crate) fn from_inline(
+        value: String,
+        pads: Vec<konnect_ipc::IpcPadDefinition>,
+        graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
+        fields: konnect_ipc::IpcFieldPlacement,
+        board_sexp: String,
+    ) -> Self {
+        Self {
+            value,
+            pads,
+            graphics,
+            fields,
+            board_sexp,
+        }
+    }
+
+    /// Insert exactly this footprint through the same atomic, duplicate-safe
+    /// path used by ordinary library placement.
+    pub(crate) fn insert_into_board(&self, board_path: &Path) -> anyhow::Result<()> {
+        insert_into_board(board_path, std::slice::from_ref(&self.board_sexp))
+    }
+}
+
 fn footprint_references(content: &str) -> anyhow::Result<HashSet<String>> {
     let root = konnect_sexp::parse_sexp(content)?;
     let footprints: Vec<&konnect_sexp::SexpNode> = if root.head() == Some("footprint") {
@@ -2115,27 +2189,20 @@ async fn handle_place_component(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let prepared = match prepare_footprint_source(
-        &source, &footprint, &reference, None, x, y, rotation, &layer,
+    let prepared = match PreparedFootprintPlacement::from_library(
+        &source,
+        &footprint,
+        &reference,
+        None,
+        x,
+        y,
+        rotation,
+        &layer,
+        board.parent(),
     ) {
         Ok(prepared) => prepared,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let pads = match extract_pad_definitions(&prepared) {
-        Ok(pads) => pads,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let graphics = match extract_graphic_definitions(&prepared) {
-        Ok(graphics) => graphics,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let fields = extract_field_placement(&prepared);
-
-    let value = footprint
-        .split_once(':')
-        .map(|(_, entry)| entry)
-        .unwrap_or(&footprint)
-        .to_string();
 
     // Try IPC first. The fallback gate is the typed transport classification:
     // only when the transport is unreachable and this server has never
@@ -2145,15 +2212,16 @@ async fn handle_place_component(
     let reference_ipc = reference.clone();
     let layer_ipc = layer.clone();
     let requested_board = board.clone();
+    let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
         c.place_footprint(
             &requested_board,
             &footprint_ipc,
             &reference_ipc,
-            &value,
-            &pads,
-            &graphics,
-            &fields,
+            &prepared_ipc.value,
+            &prepared_ipc.pads,
+            &prepared_ipc.graphics,
+            &prepared_ipc.fields,
             x,
             y,
             rotation,
@@ -2185,19 +2253,7 @@ async fn handle_place_component(
                     format!("Footprint reference '{reference}' already exists on the board"),
                 ));
             }
-            let sexp = match board_footprint_sexp(
-                &footprint,
-                x,
-                y,
-                rotation,
-                &layer,
-                Some(&reference),
-                board.parent(),
-            ) {
-                Ok(sexp) => sexp,
-                Err(message) => return Ok(CallToolResult::error(message)),
-            };
-            insert_into_board(&board, std::slice::from_ref(&sexp))?;
+            prepared.insert_into_board(&board)?;
             Ok(CallToolResult::json(&json!({
                 "placed": reference,
                 "footprint": footprint,
