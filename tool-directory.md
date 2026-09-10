@@ -20,8 +20,9 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Meta-tools (always visible)
 
 Seven cross-platform tools, grouped into *discovery/routing*, *observability*,
-and *runtime diagnostics*. A Unix server running exclusively over stdio also
-advertises `reload_server`; HTTP, mixed-transport, and Windows servers do not.
+and *runtime diagnostics*. The standalone Unix executable running exclusively
+over stdio also advertises `reload_server`; embedded, HTTP, mixed-transport,
+and Windows servers do not.
 
 ### Discovery / routing
 
@@ -49,7 +50,7 @@ advertises `reload_server`; HTTP, mixed-transport, and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `reload_server` | After explicit confirmation, validate the on-disk Konnect binary, preserve the original argv (including `--config`), flush the reply, stop accepting requests, and replace the current Unix stdio process image. Same-version development rebuilds require `allow_same_version=true`; downgrades are refused. |
+| `reload_server` | After explicit confirmation, open and validate the on-disk Konnect binary, preserve the original argv (including `--config`), flush the reply, stop accepting requests, release process bookkeeping, recheck the candidate identity at the final handoff, and replace the current standalone Unix stdio process image. Linux executes the open file directly. Same-version development rebuilds require `allow_same_version=true`; downgrades are refused. |
 
 ---
 

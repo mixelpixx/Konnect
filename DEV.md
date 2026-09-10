@@ -396,7 +396,9 @@ convention for other `kicad-cli`-calling code.
 ## Current Stats
 
 - **21 toolsets, 226 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
-- Unix stdio adds one conditional maintenance meta-tool, `reload_server`; it is not registered for HTTP, mixed transport, or Windows.
+- The standalone Unix executable adds one conditional stdio maintenance meta-tool,
+  `reload_server`; it is not registered for an embedded server, HTTP, mixed
+  transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
 - Full-catalog `tools/list` (all loaded): 233 tools (226 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)

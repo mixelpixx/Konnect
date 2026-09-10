@@ -102,9 +102,10 @@ impl McpHandler {
         &self.observer
     }
 
-    /// Enable the Unix-only in-place reload tool for a server whose sole
-    /// transport is stdio. HTTP and mixed transports intentionally never call
-    /// this, so they neither advertise nor dispatch the operation.
+    /// Enable the Unix-only in-place reload tool for the standalone executable
+    /// when its sole transport is stdio. Embedded, HTTP, and mixed transports
+    /// intentionally never call this, so they neither advertise nor dispatch
+    /// the operation.
     pub fn enable_stdio_reload(&self) {
         #[cfg(unix)]
         self.reload.enable();

@@ -75,8 +75,11 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
         match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {
-                    handler.enable_stdio_reload();
-                    let _ = crate::transport::stdio::run_stdio(handler).await;
+                    // This server is embedded in the host process. Even on
+                    // Unix stdio, current_exe() names that host (for example
+                    // KiCad), not the Konnect cdylib, so in-place reload is a
+                    // standalone-binary capability and is not enabled here.
+                    run_embedded_stdio(handler).await;
                 }
                 TransportMode::Http => {
                     let _ = crate::transport::http::run_http(handler, &config.http_address).await;
@@ -86,7 +89,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
                     let http_addr = config.http_address.clone();
                     tokio::select! {
                         _ = crate::transport::http::run_http(handler_http, &http_addr) => {},
-                        _ = crate::transport::stdio::run_stdio(handler) => {},
+                        _ = run_embedded_stdio(handler) => {},
                     }
                 }
             },
@@ -97,6 +100,23 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
     });
 
     RUNTIME.set(rt).is_ok() as c_int
+}
+
+async fn run_embedded_stdio(handler: konnect_core::mcp::handler::McpHandler) {
+    match crate::transport::stdio::run_stdio(handler).await {
+        Ok(crate::transport::stdio::StdioExit::Eof) => {}
+        #[cfg(unix)]
+        Ok(crate::transport::stdio::StdioExit::Reload(plan)) => {
+            // Defense in depth: embedded handlers never enable this request.
+            // If that invariant regresses, consume and refuse the handoff
+            // instead of replacing the KiCad host process.
+            eprintln!(
+                "kicad_plugin_init: refused an embedded reload request for {}",
+                plan.binary_path.display()
+            );
+        }
+        Err(error) => eprintln!("kicad_plugin_init: stdio transport failed: {error}"),
+    }
 }
 
 /// Return the plugin version string.

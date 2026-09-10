@@ -23,14 +23,133 @@ use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
 use serde_json::{json, Value};
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::AsRawFd;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReloadPlan {
-    pub executable: PathBuf,
+    /// User-facing path of the installed binary. The open handle below is the
+    /// executable identity used for both validation and the eventual exec.
+    pub binary_path: PathBuf,
+    #[cfg(unix)]
+    executable: File,
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    identity: ExecutableIdentity,
     pub arguments: Vec<OsString>,
+}
+
+impl ReloadPlan {
+    /// Resolve the platform's safest handoff for the candidate that passed the
+    /// version probe.
+    #[cfg(unix)]
+    pub fn validated_exec_path(&self) -> Result<PathBuf, String> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Linux can execute the open file itself, so a concurrent rename
+            // of the installation path cannot change the selected image.
+            Ok(executable_handle_path(&self.executable))
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // macOS and the remaining Unix targets expose no portable fexecve.
+            // Recheck the open file and its pathname at the final handoff so a
+            // normal atomic build/install replacement is refused.
+            self.identity.verify(&self.executable, &self.binary_path)?;
+            Ok(self.binary_path.clone())
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn executable_handle_path(executable: &File) -> PathBuf {
+    PathBuf::from("/proc/self/fd").join(executable.as_raw_fd().to_string())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecutableIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+impl ExecutableIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+
+    fn capture(executable: &File, path: &std::path::Path) -> Result<Self, String> {
+        let open = Self::from_metadata(
+            &executable
+                .metadata()
+                .map_err(|error| format!("cannot inspect open candidate: {error}"))?,
+        );
+        let named = Self::from_metadata(
+            &std::fs::metadata(path)
+                .map_err(|error| format!("cannot inspect candidate path: {error}"))?,
+        );
+        if open != named {
+            return Err("candidate path changed during validation".to_string());
+        }
+        Ok(open)
+    }
+
+    fn verify(&self, executable: &File, path: &std::path::Path) -> Result<(), String> {
+        let current = Self::capture(executable, path)?;
+        if current != *self {
+            return Err("candidate executable changed after its version probe".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(unix, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ReloadVersionRefusal {
+    Downgrade,
+    SameVersionNeedsOptIn,
+    Uncomparable,
+}
+
+#[cfg(any(unix, test))]
+fn validate_reload_version(
+    candidate: &str,
+    running: &str,
+    allow_same_version: bool,
+) -> Result<(), ReloadVersionRefusal> {
+    match crate::runtime_info::compare_konnect_versions(candidate, running) {
+        Some(std::cmp::Ordering::Less) => Err(ReloadVersionRefusal::Downgrade),
+        Some(std::cmp::Ordering::Equal) if !allow_same_version => {
+            Err(ReloadVersionRefusal::SameVersionNeedsOptIn)
+        }
+        None => Err(ReloadVersionRefusal::Uncomparable),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(any(unix, test))]
+fn reload_arguments<I>(arguments: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    arguments.into_iter().skip(1).collect()
 }
 
 /// One-shot handoff between the core handler and the stdio transport. The
@@ -67,7 +186,7 @@ impl ReloadControl {
 }
 
 /// Return the always-visible meta-tool descriptions. `reload_server` is added
-/// only for a Unix server running stdio exclusively.
+/// only by the standalone Unix server when it runs stdio exclusively.
 pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
     meta_tool_descriptions_for(false)
 }
@@ -194,7 +313,7 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
         if reload_enabled {
             descriptions.push(McpToolDescription {
             name: "reload_server".to_string(),
-            description: "Replace this Unix stdio server with the verified Konnect binary now on disk while preserving the client-owned pipes and original command-line arguments. The transport stops accepting requests, flushes this response, and then performs the one-way exec. Loaded toolsets reset to startup state. Same-version development builds require allow_same_version=true."
+            description: "Replace this standalone Unix stdio server with the verified Konnect binary now on disk while preserving the client-owned pipes and original command-line arguments. The transport stops accepting requests and flushes this response, process bookkeeping is released, and then the validated executable identity is rechecked at the one-way exec handoff. Linux executes the open file directly. Loaded toolsets reset to startup state. Same-version development builds require allow_same_version=true."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -278,7 +397,26 @@ async fn handle_reload_server(args: &Value, reload: &ReloadControl) -> CallToolR
         }
     };
 
-    let disk_version = match crate::runtime_info::probe_konnect_version(&executable).await {
+    let candidate = match File::open(&executable) {
+        Ok(file) => file,
+        Err(error) => {
+            return CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: format!("cannot open candidate executable: {error}"),
+                },
+                format!(
+                    "reload_server could not open the Konnect binary at {}: {error}",
+                    executable.display()
+                ),
+            )
+        }
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let candidate_probe_path = executable_handle_path(&candidate);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let candidate_probe_path = executable.clone();
+    let disk_version = match crate::runtime_info::probe_konnect_version(&candidate_probe_path).await
+    {
         Ok(version) => version,
         Err(status) => {
             return CallToolResult::error_kind(
@@ -292,22 +430,32 @@ async fn handle_reload_server(args: &Value, reload: &ReloadControl) -> CallToolR
             )
         }
     };
-    let running_version = env!("CARGO_PKG_VERSION");
-    match crate::runtime_info::compare_konnect_versions(&disk_version, running_version) {
-        Some(std::cmp::Ordering::Less) => {
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let identity = match ExecutableIdentity::capture(&candidate, &executable) {
+        Ok(identity) => identity,
+        Err(reason) => {
             return CallToolResult::error_kind(
-                ToolErrorKind::InvalidArgument {
-                    field: "binary".to_string(),
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("reload_server refused the candidate: {reason}"),
+            )
+        }
+    };
+    let running_version = env!("CARGO_PKG_VERSION");
+    let allow_same_version = args.get("allow_same_version").and_then(Value::as_bool) == Some(true);
+    match validate_reload_version(&disk_version, running_version, allow_same_version) {
+        Err(ReloadVersionRefusal::Downgrade) => {
+            return CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
                     reason: format!(
-                        "on-disk version {disk_version} is older than running version {running_version}"
+                        "candidate version {disk_version} is older than running version {running_version}"
                     ),
                 },
                 "reload_server refuses to downgrade the serving process.",
             )
         }
-        Some(std::cmp::Ordering::Equal)
-            if args.get("allow_same_version").and_then(Value::as_bool) != Some(true) =>
-        {
+        Err(ReloadVersionRefusal::SameVersionNeedsOptIn) => {
             return CallToolResult::error_kind(
                 ToolErrorKind::InvalidArgument {
                     field: "allow_same_version".to_string(),
@@ -318,7 +466,7 @@ async fn handle_reload_server(args: &Value, reload: &ReloadControl) -> CallToolR
                 "Set allow_same_version=true only when intentionally loading a development rebuild.",
             )
         }
-        None => {
+        Err(ReloadVersionRefusal::Uncomparable) => {
             return CallToolResult::error_kind(
                 ToolErrorKind::HandlerError {
                     reason: format!(
@@ -328,12 +476,15 @@ async fn handle_reload_server(args: &Value, reload: &ReloadControl) -> CallToolR
                 "reload_server could not prove that the candidate is not a downgrade.",
             )
         }
-        _ => {}
+        Ok(()) => {}
     }
 
     let plan = ReloadPlan {
-        executable: executable.clone(),
-        arguments: std::env::args_os().skip(1).collect(),
+        binary_path: executable.clone(),
+        executable: candidate,
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        identity,
+        arguments: reload_arguments(std::env::args_os()),
     };
     if let Err(reason) = reload.request(plan) {
         return CallToolResult::error_kind(
@@ -346,7 +497,7 @@ async fn handle_reload_server(args: &Value, reload: &ReloadControl) -> CallToolR
 
     CallToolResult::json(&json!({
         "reloading": true,
-        "binary": executable.display().to_string(),
+        "binary_path": executable.display().to_string(),
         "running_version": running_version,
         "candidate_version": disk_version,
         "arguments_preserved": true,
@@ -571,19 +722,109 @@ mod reload_tests {
         assert!(control.is_enabled());
 
         let plan = ReloadPlan {
-            executable: PathBuf::from("konnect"),
+            binary_path: std::env::current_exe().unwrap(),
+            #[cfg(unix)]
+            executable: File::open(std::env::current_exe().unwrap()).unwrap(),
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+            identity: {
+                let path = std::env::current_exe().unwrap();
+                let file = File::open(&path).unwrap();
+                ExecutableIdentity::capture(&file, &path).unwrap()
+            },
             arguments: vec![OsString::from("--config"), OsString::from("custom.toml")],
         };
         control.request(plan).expect("first request queues");
         assert!(control
             .request(ReloadPlan {
-                executable: PathBuf::from("other"),
+                binary_path: std::env::current_exe().unwrap(),
+                #[cfg(unix)]
+                executable: File::open(std::env::current_exe().unwrap()).unwrap(),
+                #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+                identity: {
+                    let path = std::env::current_exe().unwrap();
+                    let file = File::open(&path).unwrap();
+                    ExecutableIdentity::capture(&file, &path).unwrap()
+                },
                 arguments: Vec::new(),
             })
             .is_err());
         let queued = control.take().expect("queued request");
         assert_eq!(queued.arguments[0], "--config");
         assert!(control.take().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_open_executable_handle_can_be_invoked_after_its_path_is_irrelevant() {
+        let directory = tempfile::tempdir().unwrap();
+        let copied_path = directory.path().join("reload-candidate");
+        std::fs::copy(std::env::current_exe().unwrap(), &copied_path).unwrap();
+        let executable = File::open(&copied_path).unwrap();
+        std::fs::remove_file(&copied_path).unwrap();
+        let output = std::process::Command::new(executable_handle_path(&executable))
+            .arg("--list")
+            .output()
+            .expect("the open test executable must be invokable through its descriptor");
+
+        assert!(output.status.success());
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn a_non_linux_unix_handoff_refuses_a_replaced_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let copied_path = directory.path().join("reload-candidate");
+        let current = std::env::current_exe().unwrap();
+        std::fs::copy(&current, &copied_path).unwrap();
+        let executable = File::open(&copied_path).unwrap();
+        let identity = ExecutableIdentity::capture(&executable, &copied_path).unwrap();
+        let plan = ReloadPlan {
+            binary_path: copied_path.clone(),
+            executable,
+            identity,
+            arguments: Vec::new(),
+        };
+
+        assert_eq!(plan.validated_exec_path().unwrap(), copied_path);
+        std::fs::remove_file(&copied_path).unwrap();
+        std::fs::copy(current, &copied_path).unwrap();
+        assert!(plan.validated_exec_path().is_err());
+    }
+
+    #[test]
+    fn reload_version_policy_covers_upgrade_equal_downgrade_and_unknown() {
+        assert_eq!(validate_reload_version("0.12.0", "0.11.1", false), Ok(()));
+        assert_eq!(
+            validate_reload_version("0.11.0", "0.11.1", true),
+            Err(ReloadVersionRefusal::Downgrade)
+        );
+        assert_eq!(
+            validate_reload_version("0.11.1", "0.11.1", false),
+            Err(ReloadVersionRefusal::SameVersionNeedsOptIn)
+        );
+        assert_eq!(validate_reload_version("0.11.1", "0.11.1", true), Ok(()));
+        assert_eq!(
+            validate_reload_version("development", "0.11.1", true),
+            Err(ReloadVersionRefusal::Uncomparable)
+        );
+    }
+
+    #[test]
+    fn reload_preserves_every_original_argument_except_argv_zero() {
+        let arguments = reload_arguments([
+            OsString::from("konnect"),
+            OsString::from("--config"),
+            OsString::from("custom.toml"),
+            OsString::from("--stdio"),
+        ]);
+
+        assert_eq!(
+            arguments,
+            ["--config", "custom.toml", "--stdio"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

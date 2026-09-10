@@ -237,7 +237,7 @@ pub(crate) async fn probe_konnect_version(path: &Path) -> Result<String, &'stati
     probe.version.ok_or(probe.status)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 pub(crate) fn compare_konnect_versions(candidate: &str, running: &str) -> Option<Ordering> {
     stable_version_cmp(candidate, running)
 }
