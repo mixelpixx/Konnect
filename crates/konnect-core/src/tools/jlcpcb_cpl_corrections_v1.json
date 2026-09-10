@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "policy_id": "konnect-jlcpcb-cpl-v1",
+  "provenance": "Konnect issue #518: independently observed KiCad 10 export and JLCPCB Component Placements evidence, 2026-09-10",
+  "footprint_rules": [
+    {
+      "id": "kicad-soic-8-3.9x4.9-p1.27",
+      "footprint_prefix": "SOIC-8_3.9x4.9mm_P1.27mm",
+      "rotation_degrees": 270
+    },
+    {
+      "id": "kicad-hro-type-c-31-m-12",
+      "footprint_prefix": "USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+      "rotation_degrees": 180
+    }
+  ],
+  "component_overrides": []
+}
