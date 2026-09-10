@@ -3,6 +3,40 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `side` on the sheet-pin tools (minor release)
+
+`add_sheet_pin`, `edit_sheet_pin`, and `import_sheet_pins` take one optional
+`side`: `right`, `left`, `top`, or `bottom`, written as the KiCad rotations
+`0`, `180`, `90`, and `270`. KiCad reads a sheet pin's edge from that rotation,
+so `top` and `bottom` were unreachable: `add_sheet_pin` and `edit_sheet_pin`
+had no rotation input at all and always wrote `0`, and `import_sheet_pins.side`
+accepted only `right` and `left`.
+
+Omitting `side` keeps the existing behavior exactly — the pin is written at
+rotation `0`, on the right edge, and its position is not checked. **No existing
+call changes meaning**, and nothing a caller could do before is refused now.
+
+Supplying `side` also selects validation. The position is checked against the
+named edge on both axes — the coordinate the edge pins the pin to, and the span
+it runs along, corners inclusive — and a point that is not on it is refused with
+`invalid_argument` naming the offending axis, before anything is written. Such a
+point was previously written and then relocated by KiCad on load, so a caller
+that starts passing `side` can see a refusal where it used to see a success
+whose file did not describe the pin the editor showed. Surfacing that is what
+the argument is for; omit `side` to keep the old behavior.
+
+`import_sheet_pins` stacks a `top` or `bottom` import along the edge in x, as a
+`right` or `left` import stacks down it in y. It validates nothing, because it
+derives every position itself.
+
+Response `x`, `y`, and `side` are derived from the sheet pin read back out of
+the committed file rather than echoed from the request; `import_sheet_pins`
+reads `side` off a pin it actually saved and reports `null` when it saved none.
+Existing response fields keep their names and their meanings.
+
+No tool, argument, or existing response field was renamed or removed. This
+additive schema and response change is planned for the next minor release.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and
