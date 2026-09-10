@@ -3221,7 +3221,7 @@ fn build_symbol_unit(
     pins_val: &[serde_json::Value],
     glyph: Option<Glyph>,
     show_names: bool,
-    graphics: &[serde_json::Value],
+    graphics: Option<&[serde_json::Value]>,
 ) -> anyhow::Result<BuiltUnit> {
     validate_pin_types(pins_val)?;
     // Caller-supplied geometry wins over every body. The automatic rectangle
@@ -3229,7 +3229,7 @@ fn build_symbol_unit(
     // does not want a box around their drawing, and — because the auto path
     // slides pins out to the rectangle it computed — does not want their pin
     // coordinates moved either. Both follow from taking this branch (#501).
-    if !graphics.is_empty() {
+    if let Some(graphics) = graphics {
         validate_graphics(graphics).map_err(|e| anyhow::anyhow!(e))?;
         let (body_sexp, rect) = emit_symbol_graphics(graphics);
         let mut pins_sexp = String::new();
@@ -3308,14 +3308,23 @@ fn build_symbol_unit(
     })
 }
 
-/// Read a `graphics` argument. Present-but-not-an-array must not read as
-/// absent: `as_array().unwrap_or_default()` turns a malformed request into an
-/// empty one, and the symbol comes out with an automatic rectangle and a
-/// success while the caller's drawing is nowhere (#501).
-fn graphics_arg(value: &serde_json::Value, whose: &str) -> Result<Vec<serde_json::Value>, String> {
+/// Read a `graphics` argument, keeping **present** and **absent** apart.
+///
+/// Two distinct mistakes live here. `as_array().unwrap_or_default()` turned a
+/// present-but-malformed argument into an empty one, so the caller's drawing
+/// went nowhere and the call still succeeded. Collapsing `[]` into "absent"
+/// then lost the other half: #501 suppresses the automatic body "whenever
+/// `graphics` is given for that unit", and `[]` **is** given — it asks for a
+/// symbol with no body at all, which is a thing a caller can legitimately want
+/// and cannot otherwise express. `None` here means the key was omitted; `Some`
+/// means it was supplied, empty or not.
+fn graphics_arg(
+    value: &serde_json::Value,
+    whose: &str,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
     match value {
-        serde_json::Value::Null => Ok(Vec::new()),
-        serde_json::Value::Array(items) => Ok(items.clone()),
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(items) => Ok(Some(items.clone())),
         _ => Err(format!(
             "{whose} 'graphics' must be an array of drawing primitives"
         )),
@@ -3332,20 +3341,19 @@ fn graphics_arg(value: &serde_json::Value, whose: &str) -> Result<Vec<serde_json
 /// `unwrap_or(0.0)` was answering a missing one with an origin the caller never
 /// gave, which is the single invention this branch exists to prevent.
 ///
-/// `split_power` is the one case where a supplied pin is not covered by the
-/// drawn body: a single-unit triangular glyph carrying power pins puts them on
-/// a generated rectangular unit, and `layout_power_unit` replaces their
-/// coordinates outright, so those keep the schema's optional x/y. Indices stay
-/// those of the caller's own array, not of the filtered subset.
+/// Every pin in a drawn scope is covered, power pins included. An earlier
+/// version exempted the power pins of a triangular glyph, because those were
+/// being moved to a generated unit whose coordinates `layout_power_unit`
+/// overwrites. That exemption was precisely scoped and still wrong: the right
+/// fix was to stop splitting when geometry supersedes the glyph at all, which
+/// leaves nothing to exempt. **An exemption that makes a wrong behaviour
+/// consistent is not a fix, and being able to prove it cannot drift is exactly
+/// what makes it look finished.**
 fn validate_drawn_pin_coordinates(
     pins: &[serde_json::Value],
     path: &str,
-    split_power: bool,
 ) -> Result<(), CallToolResult> {
     for (index, pin) in pins.iter().enumerate() {
-        if split_power && is_power_pin(pin) {
-            continue;
-        }
         for field in ["x", "y"] {
             if pin[field].as_f64().is_none() {
                 return Err(invalid_library_argument(
@@ -3872,7 +3880,7 @@ async fn handle_create_symbol(
     // losing a redundant pin list is not the same as losing a drawing: geometry
     // sent here while `units` is in use would never reach the file, and the
     // symbol would come out with an automatic rectangle and a success.
-    if !sym_graphics.is_empty() && !unit_objs.is_empty() {
+    if sym_graphics.is_some() && !unit_objs.is_empty() {
         return Ok(CallToolResult::error(
             "top-level 'graphics' has no effect when 'units' is given: move it to the \
              unit that should carry it, as units[].graphics",
@@ -3888,10 +3896,18 @@ async fn handle_create_symbol(
         // room for power-pin names on its narrow apex, so if it carries power
         // pins, split them onto a dedicated rectangular power unit (like KiCAD's
         // multi-unit op-amps) instead of drawing them on the triangle.
-        let split_power =
-            matches!(sym_glyph, Some(g) if g.is_triangular()) && pins_val.iter().any(is_power_pin);
-        if !sym_graphics.is_empty() {
-            if let Err(error) = validate_drawn_pin_coordinates(&pins_val, "pins", split_power) {
+        // Only when the glyph is the thing actually drawn. Supplied geometry
+        // supersedes the glyph, and the split exists solely because a
+        // triangle's apex has no room for power-pin names — a body the caller
+        // drew has whatever room they gave it. Splitting anyway moved their
+        // power pins to a generated unit and let `layout_power_unit` overwrite
+        // the coordinates, breaking both advertised contracts at once: that
+        // geometry wins, and that pin coordinates are written as supplied.
+        let split_power = sym_graphics.is_none()
+            && matches!(sym_glyph, Some(g) if g.is_triangular())
+            && pins_val.iter().any(is_power_pin);
+        if sym_graphics.is_some() {
+            if let Err(error) = validate_drawn_pin_coordinates(&pins_val, "pins") {
                 return Ok(error);
             }
         }
@@ -3907,10 +3923,11 @@ async fn handle_create_symbol(
                 .cloned()
                 .collect();
             // Unit 1: the triangle with its signal pins.
-            let unit1 = match build_symbol_unit(&signal, sym_glyph, show_names, &sym_graphics) {
-                Ok(v) => v,
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
-            };
+            let unit1 =
+                match build_symbol_unit(&signal, sym_glyph, show_names, sym_graphics.as_deref()) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                };
             warnings.extend(unit1.warning.clone());
             warnings.extend(unit1.displacement_warning("unit 1"));
             units_report.push(unit1.to_json(1));
@@ -3918,7 +3935,7 @@ async fn handle_create_symbol(
             units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
-            let unit2 = match build_symbol_unit(&power_laid, None, show_names, &[]) {
+            let unit2 = match build_symbol_unit(&power_laid, None, show_names, None) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -3931,7 +3948,12 @@ async fn handle_create_symbol(
             ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
-            let unit = match build_symbol_unit(&pins_val, sym_glyph, show_names, &sym_graphics) {
+            let unit = match build_symbol_unit(
+                &pins_val,
+                sym_glyph,
+                show_names,
+                sym_graphics.as_deref(),
+            ) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -3972,14 +3994,19 @@ async fn handle_create_symbol(
                 Ok(g) => g,
                 Err(e) => return Ok(CallToolResult::error(e)),
             };
-            if !unit_graphics.is_empty() {
+            if unit_graphics.is_some() {
                 if let Err(error) =
-                    validate_drawn_pin_coordinates(&unit_pins, &format!("units[{i}].pins"), false)
+                    validate_drawn_pin_coordinates(&unit_pins, &format!("units[{i}].pins"))
                 {
                     return Ok(error);
                 }
             }
-            let unit = match build_symbol_unit(&unit_pins, unit_glyph, show_names, &unit_graphics) {
+            let unit = match build_symbol_unit(
+                &unit_pins,
+                unit_glyph,
+                show_names,
+                unit_graphics.as_deref(),
+            ) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -4002,7 +4029,7 @@ async fn handle_create_symbol(
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
             // The power unit is always a rectangle.
-            let unit = match build_symbol_unit(&power_pins, None, show_names, &[]) {
+            let unit = match build_symbol_unit(&power_pins, None, show_names, None) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -6915,14 +6942,18 @@ mod tests {
         }
     }
 
-    /// The guard covers the pins the drawn body carries, and no others. A
-    /// single-unit triangular glyph splits its power pins onto a generated
-    /// rectangular unit, where `layout_power_unit` replaces any supplied
-    /// coordinates outright — so those keep the schema's optional x/y. This
-    /// test proves the guard is not too broad and, by design, still passes
-    /// when the guard is removed entirely.
+    /// Supplied geometry supersedes the glyph, so a triangular glyph must not
+    /// still drive the power split. It did: the power pins were moved to a
+    /// generated unit and `layout_power_unit` overwrote the coordinates the
+    /// caller gave, breaking both advertised contracts at once — that geometry
+    /// wins, and that pin coordinates are written as supplied.
+    ///
+    /// This test asserted the old behaviour and was declared a scope test, on
+    /// the reasoning that it only pinned how far the coordinate guard reached.
+    /// **Declaring a test as scope does not exempt its assertion from being
+    /// wrong**; it pinned a contract, and the contract was the wrong one.
     #[tokio::test]
-    async fn create_symbol_drawn_body_leaves_split_power_pins_their_optional_coordinates() {
+    async fn create_symbol_graphics_suppress_the_glyph_power_split() {
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("split.kicad_sym");
         let res = handle_create_symbol(
@@ -6934,8 +6965,8 @@ mod tests {
                 "pins": [
                     {"number":"1","name":"OUT","type":"output","x":7.62,"y":0.0,"angle":180},
                     {"number":"2","name":"IN","type":"input","x":-7.62,"y":2.54,"angle":0},
-                    {"number":"8","name":"V+","type":"power_in"},
-                    {"number":"4","name":"V-","type":"power_in"}
+                    {"number":"8","name":"V+","type":"power_in","x":0.0,"y":7.62,"angle":270},
+                    {"number":"4","name":"V-","type":"power_in","x":0.0,"y":-7.62,"angle":90}
                 ],
                 "graphics": [
                     {"type":"poly","points":[{"x":-5.08,"y":5.08},{"x":5.08,"y":0.0},{"x":-5.08,"y":-5.08}],
@@ -6949,13 +6980,99 @@ mod tests {
         assert!(!res.is_error, "{res:?}");
         let content = std::fs::read_to_string(&lib).unwrap();
         assert!(
-            content.contains("\"SPLIT_2_1\""),
-            "the power unit is missing:\n{content}"
+            !content.contains("\"SPLIT_2_1\""),
+            "geometry supersedes the glyph, so there must be no generated power unit:\n{content}"
         );
         assert!(
-            content.contains("(at 0 7.62 270)") || content.contains("(at -1.27 7.62 270)"),
-            "the power pins were not laid out by the generated unit:\n{content}"
+            content.contains("\"SPLIT_0_1\""),
+            "one drawn single unit was expected:\n{content}"
         );
+        // The whole point: the caller's own power-pin coordinates survive.
+        assert!(
+            content.contains("(at 0 7.62 270)") && content.contains("(at 0 -7.62 90)"),
+            "the supplied power-pin coordinates were not written as given:\n{content}"
+        );
+        assert!(
+            !content.contains("(rectangle"),
+            "no automatic body may be drawn beside the supplied geometry:\n{content}"
+        );
+    }
+
+    /// The other half: with the glyph actually rendering — no `graphics` — the
+    /// split still happens, because a triangle's apex genuinely has no room for
+    /// power-pin names. Confining the split must not delete it.
+    #[tokio::test]
+    async fn create_symbol_triangular_glyph_without_graphics_still_splits_power() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("glyph.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "GLYPH",
+                "reference_prefix": "U",
+                "glyph": "opamp",
+                "pins": [
+                    {"number":"1","name":"OUT","type":"output","x":7.62,"y":0.0,"angle":180},
+                    {"number":"2","name":"IN","type":"input","x":-7.62,"y":2.54,"angle":0},
+                    {"number":"8","name":"V+","type":"power_in"},
+                    {"number":"4","name":"V-","type":"power_in"}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        let content = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            content.contains("\"GLYPH_2_1\""),
+            "the generated power unit is missing:\n{content}"
+        );
+        // Making `graphics` presence meaningful turned `&[]` into a different
+        // request at every call site, and the two that build generated power
+        // units must pass `None`, not `Some(&[])` — otherwise the power unit
+        // comes out bodyless and the assertion above would not notice, because
+        // it checks that the unit exists rather than that it has a body.
+        let power_unit = &content[content.find("\"GLYPH_2_1\"").unwrap()..];
+        assert!(
+            power_unit.contains("(rectangle"),
+            "the generated power unit lost its automatic body:\n{content}"
+        );
+    }
+
+    /// And with geometry supplied, a power pin is a drawn pin like any other,
+    /// so it needs coordinates. Before the split was confined, this request
+    /// succeeded and the pin was placed wherever `layout_power_unit` put it.
+    #[tokio::test]
+    async fn create_symbol_drawn_power_pin_without_coordinates_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("nopc.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "NOPC",
+                "reference_prefix": "U",
+                "glyph": "opamp",
+                "pins": [
+                    {"number":"1","name":"OUT","type":"output","x":7.62,"y":0.0,"angle":180},
+                    {"number":"8","name":"V+","type":"power_in"}
+                ],
+                "graphics": [
+                    {"type":"poly","points":[{"x":-5.08,"y":5.08},{"x":5.08,"y":0.0},{"x":-5.08,"y":-5.08}],
+                     "stroke_width_mm":0.254,"fill":"background"}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_error, "{res:?}");
+        let message = format!("{res:?}");
+        assert!(
+            message.contains("pins[1].x"),
+            "the refusal must name the power pin: {message}"
+        );
+        assert!(!lib.exists(), "nothing may be written");
     }
 
     /// The same contract restated where the coordinate is used, so a future
@@ -6968,7 +7085,7 @@ mod tests {
             json!({"type":"rect","start":{"x":-1.0,"y":1.0},"end":{"x":1.0,"y":-1.0},
                                    "stroke_width_mm":0.2,"fill":"none"}),
         ];
-        let error = match build_symbol_unit(&pins, None, true, &graphics) {
+        let error = match build_symbol_unit(&pins, None, true, Some(&graphics)) {
             Ok(_) => panic!("a drawn pin with no x must not be built"),
             Err(error) => error,
         };
@@ -7095,11 +7212,16 @@ mod tests {
         assert!(graphics_primitive_keys("polyline").is_none());
     }
 
-    /// An explicitly empty list is a coherent request — "draw nothing of my
-    /// own" — and gets the automatic body, matching how `require_array` treats
-    /// `[]` elsewhere. It must not be confused with the malformed cases above.
+    /// An explicitly empty list is a coherent request — "give me no body at
+    /// all" — and #501 suppresses the automatic body "whenever `graphics` is
+    /// given for that unit". `[]` is given. This asserted the opposite until
+    /// review caught it: `graphics_arg` collapsed `[]` into absent, so the one
+    /// request that cannot be expressed any other way drew a rectangle.
+    ///
+    /// It must still not be confused with the malformed cases above, which
+    /// refuse.
     #[tokio::test]
-    async fn create_symbol_accepts_an_empty_graphics_list_as_the_automatic_body() {
+    async fn create_symbol_accepts_an_empty_graphics_list_as_no_body_at_all() {
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("e.kicad_sym");
         let res = handle_create_symbol(
@@ -7115,9 +7237,46 @@ mod tests {
         .await
         .unwrap();
         assert!(!res.is_error, "{res:?}");
-        assert!(std::fs::read_to_string(&lib)
-            .unwrap()
-            .contains("(rectangle"));
+        let content = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            !content.contains("(rectangle"),
+            "`graphics: []` is given, so no automatic body may be drawn:\n{content}"
+        );
+        assert!(
+            content.contains("(pin passive"),
+            "the pins must still be written:\n{content}"
+        );
+        assert!(
+            konnect_sexp::parser::parse_sexp(&content).is_ok(),
+            "a bodyless symbol must still parse:\n{content}"
+        );
+    }
+
+    /// Omitting `graphics` entirely is the other half of that contract, and is
+    /// what keeps the correction above from being a silent behaviour change for
+    /// every existing caller: no key means the automatic body, as before.
+    #[tokio::test]
+    async fn create_symbol_without_a_graphics_key_still_draws_the_automatic_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("auto.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "AUTO",
+                "reference_prefix": "U",
+                "pins": [{"number":"1","name":"P","type":"passive","x":0.0,"y":5.08,"angle":270,"length":0.0}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        assert!(
+            std::fs::read_to_string(&lib)
+                .unwrap()
+                .contains("(rectangle"),
+            "an omitted `graphics` must still get the automatic body"
+        );
     }
 
     /// Geometry sent at the top level while `units` is in use would never reach
