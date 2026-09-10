@@ -5,9 +5,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+pub enum StdioExit {
+    Eof,
+    #[cfg(unix)]
+    Reload(konnect_core::router::meta_tools::ReloadPlan),
+}
+
 /// Run the MCP server over STDIO (stdin/stdout).
 /// All logging must go to stderr — stdout is reserved for the MCP protocol.
-pub async fn run_stdio(handler: McpHandler) -> Result<()> {
+pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
     info!("Starting STDIO transport");
 
     let stdin = tokio::io::stdin();
@@ -76,7 +82,16 @@ pub async fn run_stdio(handler: McpHandler) -> Result<()> {
             stdout.write_all(json.as_bytes()).await?;
             stdout.flush().await?;
         }
+
+        // The handler only queues a reload. Reaching this point proves the
+        // response and all synchronous notifications were flushed. Return the
+        // sealed handoff before reading another request so the standalone
+        // process can release its run record and perform the exec.
+        #[cfg(unix)]
+        if let Some(plan) = handler.take_reload_request() {
+            return Ok(StdioExit::Reload(plan));
+        }
     }
 
-    Ok(())
+    Ok(StdioExit::Eof)
 }

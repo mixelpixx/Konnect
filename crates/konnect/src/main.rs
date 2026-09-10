@@ -185,7 +185,18 @@ async fn main() -> Result<()> {
 
     match config.transport {
         TransportMode::Stdio => {
-            transport::stdio::run_stdio(handler).await?;
+            handler.enable_stdio_reload();
+            match transport::stdio::run_stdio(handler).await? {
+                transport::stdio::StdioExit::Eof => {}
+                #[cfg(unix)]
+                transport::stdio::StdioExit::Reload(plan) => {
+                    // exec does not run destructors. Release the old process's
+                    // run-registry pair explicitly so the replacement can
+                    // register the same PID without leaving stale state.
+                    drop(_run_record);
+                    exec_reload(plan)?;
+                }
+            }
         }
         TransportMode::Http => {
             transport::http::run_http(handler, &config.http_address).await?;
@@ -211,6 +222,25 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Replace the standalone process through the platform-specific validated
+/// handoff selected by the handler. Keeping this in the binary entry point
+/// makes the embedded library structurally incapable of invoking it.
+#[cfg(unix)]
+fn exec_reload(plan: konnect_core::router::meta_tools::ReloadPlan) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = plan
+        .validated_exec_path()
+        .map_err(|reason| anyhow::anyhow!("reload_server refused final handoff: {reason}"))?;
+    let error = std::process::Command::new(executable)
+        .args(&plan.arguments)
+        .exec();
+    Err(anyhow::anyhow!(
+        "reload_server failed to exec {}: {error}",
+        plan.binary_path.display()
+    ))
 }
 
 /// Help for one subcommand, or the whole program.

@@ -19,7 +19,10 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Meta-tools (always visible)
 
-Seven tools, grouped into *discovery/routing*, *observability*, and *runtime diagnostics*.
+Seven cross-platform tools, grouped into *discovery/routing*, *observability*,
+and *runtime diagnostics*. The standalone Unix executable running exclusively
+over stdio also advertises `reload_server`; embedded, HTTP, mixed-transport,
+and Windows servers do not.
 
 ### Discovery / routing
 
@@ -42,6 +45,12 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | Tool | Purpose |
 |------|---------|
 | `get_installation_info` | Report the serving build version and commit, executable path, verified install source, on-disk binary version, KiCad CLI version, redacted IPC endpoint, proven stale-process evidence, and platform-specific restart guidance. |
+
+### Unix stdio maintenance
+
+| Tool | Purpose |
+|------|---------|
+| `reload_server` | After explicit confirmation, open and validate the on-disk Konnect binary, preserve the original argv (including `--config`), flush the reply, stop accepting requests, release process bookkeeping, recheck the candidate identity at the final handoff, and replace the current standalone Unix stdio process image. Linux executes the open file directly. Same-version development rebuilds require `allow_same_version=true`; downgrades are refused. |
 
 ---
 

@@ -34,6 +34,8 @@ fn read(rel: &str) -> String {
 fn counts() -> (usize, usize, usize) {
     let toolsets = registry::ALL_TOOLSETS.len();
     let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
+    // Documentation quotes the cross-platform baseline. Unix stdio adds the
+    // optional reload_server tool at runtime without changing that baseline.
     let meta = konnect_core::router::meta_tools::meta_tool_descriptions().len();
     (toolsets, registered, meta)
 }

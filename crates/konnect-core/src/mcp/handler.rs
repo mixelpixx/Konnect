@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 #[derive(Clone)]
 pub struct McpHandler {
     ctx: Arc<crate::tools::ToolContext>,
+    reload: meta_tools::ReloadControl,
     sse_senders: Arc<RwLock<Vec<mpsc::Sender<Event>>>>,
     /// Raw-JSON-line notification sinks for non-SSE transports (stdio). A
     /// server-initiated notification (e.g. tools/list_changed) must reach the
@@ -88,6 +89,7 @@ impl McpHandler {
 
         Ok(McpHandler {
             ctx,
+            reload: meta_tools::ReloadControl::default(),
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
             observer,
@@ -98,6 +100,19 @@ impl McpHandler {
     /// and `server_stats` that live on `ToolContext`.
     pub fn observer(&self) -> &CallObserver {
         &self.observer
+    }
+
+    /// Enable the Unix-only in-place reload tool for the standalone executable
+    /// when its sole transport is stdio. Embedded, HTTP, and mixed transports
+    /// intentionally never call this, so they neither advertise nor dispatch
+    /// the operation.
+    pub fn enable_stdio_reload(&self) {
+        #[cfg(unix)]
+        self.reload.enable();
+    }
+
+    pub fn take_reload_request(&self) -> Option<meta_tools::ReloadPlan> {
+        self.reload.take()
     }
 
     pub async fn register_sse_sender(&self, tx: mpsc::Sender<Event>) {
@@ -191,7 +206,7 @@ impl McpHandler {
             // ── Tool listing ───────────────────────────────────────────────
             "tools/list" => {
                 // Meta-tools (always visible) + all domain tools (pre-loaded at startup)
-                let mut tools = meta_tools::meta_tool_descriptions();
+                let mut tools = meta_tools::meta_tool_descriptions_for(self.reload.is_enabled());
                 for def in self.ctx.router.active_tools().await {
                     tools.push(def.to_mcp_description());
                 }
@@ -282,7 +297,9 @@ impl McpHandler {
         args: &Value,
     ) -> (CallToolResult, CallStatus, Option<String>) {
         // Meta-tools always win.
-        if let Some(result) = meta_tools::handle_meta_tool(name, args, &self.ctx).await {
+        if let Some(result) =
+            meta_tools::handle_meta_tool_with_reload(name, args, &self.ctx, &self.reload).await
+        {
             if name == "load_toolset" || name == "unload_toolset" {
                 self.notify_tools_list_changed().await;
             }
