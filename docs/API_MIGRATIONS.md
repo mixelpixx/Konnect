@@ -3,6 +3,54 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `create_symbol` draws a symbol body (minor release)
+
+`create_symbol` accepts `graphics`, an array of drawing primitives, at the top
+level beside `pins` and per unit inside `units[]`. The vocabulary is
+`set_footprint_graphics`'s — `line`, `arc`, `rect`, `circle`, `poly`, with points
+as `{x, y}` and `stroke_width_mm` — generated for both tools by one function, so
+the two domains cannot drift. Only `fill` differs: a symbol adds KiCad's pale
+`background`, which is what the stock libraries use for a body box.
+`set_footprint_graphics`'s own schema is unchanged.
+
+**Whether the key is present is itself the contract, and `[]` is present.**
+Omitting `graphics` keeps the existing behaviour exactly: the automatic body
+rectangle is sized to the pin names, and pins are slid out to the edge it
+computes. Supplying `graphics` suppresses that body for that unit — including
+`graphics: []`, which asks for a symbol with no body at all and cannot be
+expressed any other way. Supplying it also means pin `x`/`y` are written exactly
+as given rather than moved, which is the reason the feature exists.
+
+Two consequences follow for callers who combine `graphics` with older arguments:
+
+- A `glyph` on a unit that also supplies `graphics` is not drawn; the response
+  carries a warning saying so, rather than discarding the request silently.
+- A triangular `glyph` (op-amp, buffer, inverter, schmitt) carrying power pins
+  normally moves them to a generated rectangular power unit, because the
+  triangle's apex has no room for their names. **With `graphics` supplied that
+  split no longer happens**, since a body the caller drew has whatever room they
+  gave it, and moving the pins would overwrite the coordinates they supplied. A
+  caller relying on the split must omit `graphics` for that unit.
+
+`units[].body` reports `"graphics"` when geometry was supplied, alongside the
+existing `"rectangle"` and glyph names. No tool, argument, or existing response
+field was renamed or removed.
+
+**Four request shapes that previously returned success now fail**, because each
+wrote something other than what was asked for:
+
+| request | before | now |
+|---|---|---|
+| `rect`, `circle` or `poly` with no `fill` (schema-required) | `(fill (type none))` written | `invalid_argument` naming `graphics[i]` |
+| any primitive carrying a key outside its schema | key ignored, the rest drawn | `invalid_argument` naming `graphics[i].<key>` |
+| a pin with no numeric `x`/`y` in a unit supplying `graphics` | pin written at `(0 0)` | `invalid_argument` naming `units[i].pins[j].x` |
+| `graphics` present but not an array | read as absent; automatic body and success | `invalid_argument` |
+
+Nothing is written to the library file in any of those cases. Callers that
+depended on the defaults must now send `fill`, drop the extra key, or supply the
+pin coordinates. This additive argument and these refusals are planned for the
+next minor release.
+
 ## Unreleased: `estimate_cost` and `validate_for_manufacturing` count copper structurally (minor release)
 
 Both tools counted copper layers by finding the substring `signal)` in the

@@ -10,7 +10,7 @@ use konnect_sexp::writer::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-fn point_schema() -> serde_json::Value {
+pub(super) fn point_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
@@ -22,7 +22,12 @@ fn point_schema() -> serde_json::Value {
     })
 }
 
-fn common_shape_properties() -> serde_json::Map<String, serde_json::Value> {
+/// Shared shape properties, with the fill vocabulary of the calling domain.
+/// Footprints fill or they do not; a symbol also has KiCad's pale `background`
+/// body fill, so the geometry is shared and only this list differs.
+pub(super) fn common_shape_properties_with_fill(
+    fill_values: &[&str],
+) -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([
         (
             "stroke_width_mm".to_string(),
@@ -36,13 +41,13 @@ fn common_shape_properties() -> serde_json::Map<String, serde_json::Value> {
             "fill".to_string(),
             json!({
                 "type": "string",
-                "enum": ["none", "solid"]
+                "enum": fill_values
             }),
         ),
     ])
 }
 
-fn primitive_schema(
+pub(super) fn primitive_schema(
     primitive_type: &str,
     mut properties: serde_json::Map<String, serde_json::Value>,
     required: &[&str],
@@ -57,22 +62,28 @@ fn primitive_schema(
 }
 
 fn graphics_schema() -> serde_json::Value {
+    graphics_schema_with_fill(&["none", "solid"])
+}
+
+/// The primitive vocabulary, shared with `create_symbol` so the two domains
+/// cannot drift apart. Only the fill values differ.
+pub(super) fn graphics_schema_with_fill(fill_values: &[&str]) -> serde_json::Value {
     let mut line = serde_json::Map::new();
     line.insert("start".to_string(), point_schema());
     line.insert("end".to_string(), point_schema());
     line.insert(
         "stroke_width_mm".to_string(),
-        common_shape_properties()["stroke_width_mm"].clone(),
+        common_shape_properties_with_fill(fill_values)["stroke_width_mm"].clone(),
     );
 
     let mut arc = line.clone();
     arc.insert("mid".to_string(), point_schema());
 
-    let mut rect = common_shape_properties();
+    let mut rect = common_shape_properties_with_fill(fill_values);
     rect.insert("start".to_string(), point_schema());
     rect.insert("end".to_string(), point_schema());
 
-    let mut circle = common_shape_properties();
+    let mut circle = common_shape_properties_with_fill(fill_values);
     circle.insert("center".to_string(), point_schema());
     circle.insert(
         "radius_mm".to_string(),
@@ -83,7 +94,7 @@ fn graphics_schema() -> serde_json::Value {
         }),
     );
 
-    let mut poly = common_shape_properties();
+    let mut poly = common_shape_properties_with_fill(fill_values);
     poly.insert(
         "points".to_string(),
         json!({
