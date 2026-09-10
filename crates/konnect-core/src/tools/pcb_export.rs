@@ -914,7 +914,7 @@ async fn handle_export_position_file(
     }
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_position_file(cli, &board, &output, format, units, side).await?;
+    cli::export_position_file(cli, &board, &output, format, units, side, false).await?;
 
     let mut result = json!({
         "success": true,

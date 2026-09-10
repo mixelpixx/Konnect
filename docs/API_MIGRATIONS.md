@@ -224,10 +224,11 @@ headers. The existing `files_generated.type="pick_and_place"` discriminator is
 unchanged.
 
 JLCPCB assembly exports require `position_units="mm"`. Grouped BOM references
-are individually enumerated, and a malformed CPL, compressed BOM range, or
-BOM/CPL designator mismatch returns an incomplete/error result instead of an
-upload instruction. Generic and other-fabricator exports retain the existing
-`bom.csv`/`positions.csv` names and KiCad-native position schema.
+are individually enumerated and DNP parts are excluded from both the BOM and
+CPL. A malformed CPL, compressed BOM range, or BOM/CPL designator mismatch
+returns an incomplete/error result instead of an upload instruction. Generic
+and other-fabricator exports retain the existing `bom.csv`/`positions.csv`
+names, inclusion policy, and KiCad-native position schema.
 
 ## Unreleased: remove inputs that never affected an operation
 

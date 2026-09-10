@@ -1099,6 +1099,7 @@ fn position_args<'a>(
     format: &'a str,
     units: &'a str,
     side: &'a str,
+    exclude_dnp: bool,
 ) -> Vec<&'a str> {
     let mut args = vec![
         "pcb", "export", "pos", "--output", output, "--format", format, "--side", side,
@@ -1109,12 +1110,15 @@ fn position_args<'a>(
         args.push("--units");
         args.push(units);
     }
+    if exclude_dnp {
+        args.push("--exclude-dnp");
+    }
     args.push(pcb);
     args
 }
 
 /// KiCad 10: `pcb export pos --output <path> --format <fmt> --side <side>
-/// [--units <units>] <input>`
+/// [--units <units>] [--exclude-dnp] <input>`
 ///
 /// KiCad itself omits footprints carrying `exclude_from_pos_files`; Konnect
 /// deliberately leaves that source-of-truth filtering to the exporter rather
@@ -1126,6 +1130,7 @@ pub async fn export_position_file(
     format: &str,
     units: &str,
     side: &str,
+    exclude_dnp: bool,
 ) -> Result<()> {
     let staging = export_staging_dir(output)?;
     let staged = staging.path().join(
@@ -1139,6 +1144,7 @@ pub async fn export_position_file(
         format,
         units,
         side,
+        exclude_dnp,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     publish_verified_file(&staged, output, "position file").await?;
@@ -1801,6 +1807,7 @@ mod position_export_tests {
             "csv",
             "mm",
             "back",
+            false,
         );
         assert_eq!(flag(&args, "--format"), Some("csv"));
         assert_eq!(flag(&args, "--units"), Some("mm"));
@@ -1816,10 +1823,33 @@ mod position_export_tests {
             "gerber",
             "mm",
             "front",
+            false,
         );
         assert_eq!(flag(&args, "--format"), Some("gerber"));
         assert_eq!(flag(&args, "--side"), Some("front"));
         assert_eq!(flag(&args, "--units"), None);
+    }
+
+    #[test]
+    fn dnp_exclusion_reaches_kicad_cli_only_when_requested() {
+        let excluded = position_args(
+            "/out/positions.csv",
+            "/board.kicad_pcb",
+            "csv",
+            "mm",
+            "both",
+            true,
+        );
+        let included = position_args(
+            "/out/positions.csv",
+            "/board.kicad_pcb",
+            "csv",
+            "mm",
+            "both",
+            false,
+        );
+        assert!(excluded.contains(&"--exclude-dnp"));
+        assert!(!included.contains(&"--exclude-dnp"));
     }
 }
 

@@ -100,10 +100,11 @@ For `fab_house="jlcpcb"`, use millimetres (the default) and provide the BOM
 fields, labels, and grouping required by the current order contract. The tool
 emits `BOM-<project>.csv` plus `CPL-<project>.csv`; the CPL uses JLCPCB's
 `Designator,Mid X,Mid Y,Layer,Rotation` schema, and KiCad is instructed to
-enumerate grouped BOM references instead of compressing them into ranges. A
-BOM/CPL designator mismatch makes the package incomplete. This conversion does
-not apply package-specific rotation corrections, so the order preview remains
-an assembly release gate.
+enumerate grouped BOM references instead of compressing them into ranges. DNP
+parts are excluded from both native exports; any remaining population mismatch
+caused by board/schematic exclusion flags makes the package incomplete. This
+conversion does not apply package-specific rotation corrections, so the order
+preview remains an assembly release gate.
 
 ### Artifact acceptance gate
 
