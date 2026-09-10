@@ -17,6 +17,7 @@ prost-types.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+csv.workspace = true
 tokio.workspace = true
 axum.workspace = true
 anyhow.workspace = true

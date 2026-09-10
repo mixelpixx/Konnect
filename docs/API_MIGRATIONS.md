@@ -214,6 +214,22 @@ pass `prefer` (use the native export when available, otherwise Rust) or
 `require` (refuse when the native bridge is unavailable). No tool or argument
 was removed.
 
+## Unreleased: JLCPCB manufacturing files use vendor-ready names and schema
+
+`export_manufacturing_package(fab_house="jlcpcb", include_assembly=true)` now
+publishes `BOM-<project>.csv` and `CPL-<project>.csv` instead of `bom.csv` and
+`positions.csv`. The CPL contains JLCPCB's documented `Designator`, `Mid X`,
+`Mid Y`, `Layer`, and `Rotation` columns rather than KiCad's native position
+headers. The existing `files_generated.type="pick_and_place"` discriminator is
+unchanged.
+
+JLCPCB assembly exports require `position_units="mm"`. Grouped BOM references
+are individually enumerated and DNP parts are excluded from both the BOM and
+CPL. A malformed CPL, compressed BOM range, or BOM/CPL designator mismatch
+returns an incomplete/error result instead of an upload instruction. Generic
+and other-fabricator exports retain the existing `bom.csv`/`positions.csv`
+names, inclusion policy, and KiCad-native position schema.
+
 ## Unreleased: remove inputs that never affected an operation
 
 The following optional inputs were advertised but never read by their handlers.

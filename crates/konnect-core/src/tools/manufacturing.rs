@@ -6,7 +6,9 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, ToolContext, ToolDef};
+use anyhow::{bail, Context};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use tracing::{debug, error, info};
 
@@ -63,7 +65,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "position_units": {
                         "type": "string",
                         "enum": ["mm", "in"],
-                        "description": "Coordinate units in the assembly position file.",
+                        "description": "Coordinate units in the assembly position file. JLCPCB assembly requires 'mm'.",
                         "default": "mm"
                     }
                 },
@@ -133,6 +135,7 @@ async fn handle_export_manufacturing_package(
     let output_dir = get_path(args, "output_dir")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
     let include_assembly = args["include_assembly"].as_bool().unwrap_or(true);
+    let is_jlcpcb = fab_house == "jlcpcb";
     let schematic = args["schematic"].as_str().map(PathBuf::from);
     let requested_gerber_layers = match pcb_export::optional_string_array(args, "gerber_layers") {
         Ok(layers) => layers,
@@ -156,6 +159,12 @@ async fn handle_export_manufacturing_package(
         };
         return Ok(invalid_manufacturing_argument(public_field, reason));
     }
+    if is_jlcpcb && include_assembly && position_units != "mm" {
+        return Ok(invalid_manufacturing_argument(
+            "position_units",
+            "JLCPCB CPL coordinates must use millimetres",
+        ));
+    }
 
     info!(
         board = %board.display(),
@@ -171,6 +180,8 @@ async fn handle_export_manufacturing_package(
     let mut files_generated = Vec::new();
     let mut verified_paths = Vec::new();
     let mut warnings = Vec::new();
+    let mut cpl_designators = None;
+    let mut bom_designators = None;
 
     // 1. Export Gerbers
     let gerber_dir = output_dir.join("gerbers");
@@ -218,42 +229,60 @@ async fn handle_export_manufacturing_package(
 
     // 3. Assembly files (BOM + pick-and-place)
     if include_assembly {
-        // Pick-and-place (position file)
-        let pos_format = match fab_house {
-            "jlcpcb" => "csv",
-            _ => "csv",
+        // Pick-and-place (position file). KiCad's native CSV is retained for
+        // generic callers. JLCPCB receives a structurally parsed CPL with the
+        // exact vendor column contract instead of a header text replacement.
+        let project_name = board
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("board");
+        let pos_path = if is_jlcpcb {
+            output_dir.join(format!("CPL-{project_name}.csv"))
+        } else {
+            output_dir.join("positions.csv")
         };
-        let pos_path = output_dir.join(format!("positions.{}", pos_format));
-        match cli::export_position_file(
-            cli_path,
-            &board,
-            &pos_path,
-            pos_format,
-            position_units,
-            position_side,
-        )
-        .await
-        {
-            Ok(()) => {
+        let position_result = if is_jlcpcb {
+            export_jlcpcb_cpl(cli_path, &board, &pos_path, position_side)
+                .await
+                .map(Some)
+        } else {
+            cli::export_position_file(
+                cli_path,
+                &board,
+                &pos_path,
+                "csv",
+                position_units,
+                position_side,
+            )
+            .await
+            .map(|()| None)
+        };
+        match position_result {
+            Ok(designators) => {
                 info!("[BETA] Position file export succeeded");
+                cpl_designators = designators;
                 verified_paths.push(pos_path.clone());
                 files_generated.push(json!({
                     "type": "pick_and_place",
                     "path": pos_path.to_str().unwrap_or(""),
-                    "format": pos_format,
+                    "format": "csv",
                     "units": position_units,
                     "side": position_side
                 }));
             }
             Err(e) => {
                 error!(error = %e, "[BETA] Position file export failed");
-                warnings.push(format!("Position file export failed: {}", e));
+                warnings.push(format!("Position file export failed: {e:#}"));
             }
         }
 
         // BOM
         if let Some(ref sch) = schematic {
-            let bom_path = output_dir.join("bom.csv");
+            let bom_path = if is_jlcpcb {
+                output_dir.join(format!("BOM-{project_name}.csv"))
+            } else {
+                output_dir.join("bom.csv")
+            };
             // Without bom_fields the package gets kicad-cli's fixed
             // Reference,Value,Footprint,QUANTITY,DNP set — no MPN, no supplier
             // part number, nothing a fab can source a part from.
@@ -261,18 +290,39 @@ async fn handle_export_manufacturing_package(
                 fields: args["bom_fields"].as_str(),
                 labels: args["bom_labels"].as_str(),
                 group_by: args["bom_group_by"].as_str(),
-                ..Default::default()
+                exclude_dnp: is_jlcpcb,
             };
-            match cli::export_bom(cli_path, sch, &bom_path, &bom_options).await {
+            let bom_result = if is_jlcpcb {
+                cli::export_bom_with_ref_range_delimiter(cli_path, sch, &bom_path, &bom_options, "")
+                    .await
+            } else {
+                cli::export_bom(cli_path, sch, &bom_path, &bom_options).await
+            };
+            match bom_result {
                 Ok(()) => {
-                    info!("[BETA] BOM export succeeded");
-                    verified_paths.push(bom_path.clone());
-                    files_generated.push(json!({
-                        "type": "bom",
-                        "path": bom_path.to_str().unwrap_or(""),
-                        "format": "csv",
-                        "fields": bom_options.fields
-                    }));
+                    let parsed = if is_jlcpcb {
+                        let source = tokio::fs::read_to_string(&bom_path).await?;
+                        jlcpcb_bom_designators(&source).map(Some)
+                    } else {
+                        Ok(None)
+                    };
+                    match parsed {
+                        Ok(designators) => {
+                            info!("[BETA] BOM export succeeded");
+                            bom_designators = designators;
+                            verified_paths.push(bom_path.clone());
+                            files_generated.push(json!({
+                                "type": "bom",
+                                "path": bom_path.to_str().unwrap_or(""),
+                                "format": "csv",
+                                "fields": bom_options.fields
+                            }));
+                        }
+                        Err(e) => {
+                            error!(error = %e, "[BETA] JLCPCB BOM validation failed");
+                            warnings.push(format!("JLCPCB BOM validation failed: {e:#}"));
+                        }
+                    }
                 }
                 Err(e) => {
                     error!(error = %e, "[BETA] BOM export failed");
@@ -281,6 +331,14 @@ async fn handle_export_manufacturing_package(
             }
         } else {
             warnings.push("No schematic provided — BOM not generated. Pass 'schematic' for full assembly package.".to_string());
+        }
+
+        if is_jlcpcb {
+            if let (Some(cpl), Some(bom)) = (&cpl_designators, &bom_designators) {
+                if let Some(mismatch) = jlcpcb_designator_mismatch(cpl, bom) {
+                    warnings.push(mismatch);
+                }
+            }
         }
     }
 
@@ -326,7 +384,7 @@ async fn handle_export_manufacturing_package(
 
     let next_steps = if complete {
         format!(
-                "Upload only the verified paths listed in `files` from {} to {}'s order page. Gerbers go in the PCB order, BOM + positions go in the assembly order.",
+                "Upload only the verified paths listed in `files` from {} to {}'s order page. Gerbers go in the PCB order; BOM and CPL/positions go in the assembly order.",
                 output_dir.display(),
                 fab_house.to_uppercase()
             )
@@ -352,6 +410,133 @@ async fn handle_export_manufacturing_package(
     } else {
         CallToolResult::error(body)
     })
+}
+
+async fn export_jlcpcb_cpl(
+    cli_path: &str,
+    board: &std::path::Path,
+    output: &std::path::Path,
+    side: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    let staging = tempfile::tempdir_in(
+        output
+            .parent()
+            .context("JLCPCB CPL output has no parent directory")?,
+    )?;
+    let native = staging.path().join("kicad-positions.csv");
+    cli::export_position_file_excluding_dnp(cli_path, board, &native, "csv", "mm", side).await?;
+    let source = tokio::fs::read_to_string(&native).await?;
+    let (cpl, designators) = jlcpcb_cpl_from_kicad_csv(&source)?;
+    cli::publish_verified_bytes(output, &cpl, "JLCPCB CPL").await?;
+    Ok(designators)
+}
+
+/// Translate KiCad 10's native position CSV into JLCPCB's documented CPL
+/// contract: Designator, Mid X, Mid Y, Layer, Rotation. Parsing and writing as
+/// CSV preserves quoted commas and non-ASCII values even though Val/Package do
+/// not belong in the vendor file.
+fn jlcpcb_cpl_from_kicad_csv(source: &str) -> anyhow::Result<(Vec<u8>, BTreeSet<String>)> {
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(source.as_bytes());
+    let headers = reader.headers()?.clone();
+    let column = |name: &str| {
+        headers
+            .iter()
+            .position(|header| header == name)
+            .with_context(|| format!("KiCad position CSV is missing '{name}'"))
+    };
+    let reference = column("Ref")?;
+    let pos_x = column("PosX")?;
+    let pos_y = column("PosY")?;
+    let rotation = column("Rot")?;
+    let side = column("Side")?;
+
+    let mut writer = csv::WriterBuilder::new().from_writer(Vec::new());
+    writer.write_record(["Designator", "Mid X", "Mid Y", "Layer", "Rotation"])?;
+    let mut designators = BTreeSet::new();
+    for row in reader.records() {
+        let row = row?;
+        let field = |index: usize, name: &str| {
+            row.get(index)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("KiCad position row is missing '{name}'"))
+        };
+        let designator = field(reference, "Ref")?;
+        let x = field(pos_x, "PosX")?;
+        let y = field(pos_y, "PosY")?;
+        let angle = field(rotation, "Rot")?;
+        x.parse::<f64>()
+            .with_context(|| format!("invalid PosX for {designator}: {x}"))?;
+        y.parse::<f64>()
+            .with_context(|| format!("invalid PosY for {designator}: {y}"))?;
+        angle
+            .parse::<f64>()
+            .with_context(|| format!("invalid Rot for {designator}: {angle}"))?;
+        let layer = match field(side, "Side")?.to_ascii_lowercase().as_str() {
+            "top" | "front" => "top",
+            "bottom" | "back" => "bottom",
+            other => bail!("invalid Side for {designator}: {other}"),
+        };
+        if !designators.insert(designator.to_string()) {
+            bail!("duplicate CPL designator '{designator}'");
+        }
+        writer.write_record([designator, x, y, layer, angle])?;
+    }
+    if designators.is_empty() {
+        bail!("KiCad position CSV contains no components");
+    }
+    writer.flush()?;
+    Ok((writer.into_inner()?, designators))
+}
+
+fn jlcpcb_bom_designators(source: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(source.as_bytes());
+    let headers = reader.headers()?.clone();
+    let reference = headers
+        .iter()
+        .position(|header| matches!(header, "Designator" | "Reference" | "Refs"))
+        .context("JLCPCB BOM has no Designator/Reference/Refs column")?;
+    let mut designators = BTreeSet::new();
+    for row in reader.records() {
+        let row = row?;
+        let group = row
+            .get(reference)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("JLCPCB BOM contains an empty designator group")?;
+        for designator in group.split(',').map(str::trim) {
+            if designator.contains('-') {
+                bail!(
+                    "JLCPCB BOM contains compressed designator range '{designator}'; pass an empty KiCad reference-range delimiter"
+                );
+            }
+            if designator.is_empty() || !designators.insert(designator.to_string()) {
+                bail!("JLCPCB BOM contains an empty or duplicate designator '{designator}'");
+            }
+        }
+    }
+    if designators.is_empty() {
+        bail!("JLCPCB BOM contains no designators");
+    }
+    Ok(designators)
+}
+
+fn jlcpcb_designator_mismatch(cpl: &BTreeSet<String>, bom: &BTreeSet<String>) -> Option<String> {
+    let missing_from_bom = cpl.difference(bom).cloned().collect::<Vec<_>>();
+    let missing_from_cpl = bom.difference(cpl).cloned().collect::<Vec<_>>();
+    if missing_from_bom.is_empty() && missing_from_cpl.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "JLCPCB BOM/CPL designators do not match: missing from BOM [{}]; missing from CPL [{}]",
+            missing_from_bom.join(", "),
+            missing_from_cpl.join(", ")
+        ))
+    }
 }
 
 fn invalid_manufacturing_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
@@ -713,6 +898,212 @@ mod package_export_option_tests {
             .as_str()
             .unwrap()
             .starts_with("Do not upload"));
+    }
+
+    #[tokio::test]
+    async fn jlcpcb_assembly_rejects_non_metric_positions_before_writing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/specctra_two_resistors_locked.kicad_pcb");
+        let output = dir.path().join("package");
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let result = handle_export_manufacturing_package(
+            &json!({
+                "board": board,
+                "output_dir": output,
+                "fab_house": "jlcpcb",
+                "include_assembly": true,
+                "position_units": "in"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(!output.exists(), "invalid request must not create output");
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        assert!(text.contains("must use millimetres"));
+    }
+}
+
+#[cfg(test)]
+mod jlcpcb_assembly_tests {
+    use super::*;
+
+    /// Captured verbatim from KiCad 10.0.6 using:
+    /// `kicad-cli pcb export pos --format csv --units mm --side both`
+    /// against the repository's real `pic_programmer.kicad_pcb` fixture.
+    const KICAD_POSITIONS: &str =
+        include_str!("../../tests/fixtures/positions_pic_programmer_kicad10.csv");
+
+    fn csv_rows(bytes: &[u8]) -> Vec<Vec<String>> {
+        csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(bytes)
+            .records()
+            .map(|record| record.unwrap().iter().map(str::to_string).collect())
+            .collect()
+    }
+
+    #[test]
+    fn real_kicad_positions_become_the_documented_jlcpcb_cpl_schema() {
+        let (cpl, designators) = jlcpcb_cpl_from_kicad_csv(KICAD_POSITIONS).unwrap();
+        let rows = csv_rows(&cpl);
+        assert_eq!(
+            rows[0],
+            ["Designator", "Mid X", "Mid Y", "Layer", "Rotation"]
+        );
+        assert_eq!(
+            rows[1],
+            ["JP1", "148.082000", "-97.790000", "bottom", "0.000000"]
+        );
+        assert!(rows.iter().any(|row| {
+            row.as_slice() == ["R10", "114.300000", "-48.260000", "top", "0.000000"]
+        }));
+        assert_eq!(designators.len(), rows.len() - 1);
+        assert!(designators.contains("JP1"));
+        assert!(designators.contains("R10"));
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_position_rows_fail_instead_of_becoming_cpl() {
+        let missing_column = "Ref,PosX,PosY,Rot\nR1,1,2,0\n";
+        assert!(jlcpcb_cpl_from_kicad_csv(missing_column)
+            .unwrap_err()
+            .to_string()
+            .contains("Side"));
+
+        let duplicate = "Ref,PosX,PosY,Rot,Side\nR1,1,2,0,top\nR1,3,4,0,bottom\n";
+        assert!(jlcpcb_cpl_from_kicad_csv(duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate CPL designator"));
+
+        let invalid_number = "Ref,PosX,PosY,Rot,Side\nR1,left,2,0,top\n";
+        assert!(jlcpcb_cpl_from_kicad_csv(invalid_number)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid PosX"));
+    }
+
+    #[test]
+    fn fully_enumerated_bom_groups_match_individual_cpl_rows() {
+        let bom = "\"Designator\",\"Comment\",\"Footprint\",\"LCSC Part #\"\n\"C1,C2,C3\",\"100nF\",\"C_0402\",\"C1525\"\n\"R1\",\"10k\",\"R_0402\",\"C25744\"\n";
+        let bom_refs = jlcpcb_bom_designators(bom).unwrap();
+        let cpl_refs = ["C1", "C2", "C3", "R1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs), None);
+    }
+
+    #[test]
+    fn compressed_ranges_and_cross_file_mismatches_fail_closed() {
+        let ranged = "Designator,Comment\nC1-C3,100nF\n";
+        assert!(jlcpcb_bom_designators(ranged)
+            .unwrap_err()
+            .to_string()
+            .contains("compressed designator range"));
+
+        let cpl = ["C1", "C2", "U1"].into_iter().map(str::to_string).collect();
+        let bom = ["C1", "C2", "R1"].into_iter().map(str::to_string).collect();
+        let mismatch = jlcpcb_designator_mismatch(&cpl, &bom).unwrap();
+        assert!(mismatch.contains("missing from BOM [U1]"));
+        assert!(mismatch.contains("missing from CPL [R1]"));
+    }
+
+    /// This is an output-level test of KiCad's range switch, not merely an
+    /// assertion about the argument vector. The checked-in schematic is a
+    /// KiCad demo saved by KiCad and contains groups of one, two, and more than
+    /// three identical parts across a hierarchy.
+    #[tokio::test]
+    #[ignore = "requires an installed KiCad 10 kicad-cli"]
+    async fn real_kicad_grouped_bom_enumerates_every_reference() {
+        let cli_path = std::env::var("KICAD_CLI_PATH").unwrap_or_else(|_| "kicad-cli".into());
+        let schematic = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/project_ownership/complex_hierarchy.kicad_sch");
+        let dir = tempfile::tempdir().unwrap();
+        let enumerated = dir.path().join("enumerated.csv");
+        let ranged = dir.path().join("ranged.csv");
+
+        let options = cli::BomOptions {
+            fields: Some("Reference,Value,Footprint"),
+            labels: Some("Designator,Comment,Footprint"),
+            group_by: Some("Value,Footprint"),
+            exclude_dnp: true,
+        };
+        cli::export_bom_with_ref_range_delimiter(&cli_path, &schematic, &enumerated, &options, "")
+            .await
+            .unwrap();
+        let source = tokio::fs::read_to_string(&enumerated).await.unwrap();
+        let mut reader = csv::Reader::from_reader(source.as_bytes());
+        let mut group_sizes = Vec::new();
+        for row in reader.records() {
+            let row = row.unwrap();
+            let group = row.get(0).unwrap();
+            assert!(!group.contains('-'), "compressed group escaped: {group}");
+            group_sizes.push(group.split(',').count());
+        }
+        assert!(group_sizes.contains(&1));
+        assert!(group_sizes.contains(&2));
+        assert!(group_sizes.iter().any(|size| *size >= 3));
+
+        cli::export_bom(&cli_path, &schematic, &ranged, &options)
+            .await
+            .unwrap();
+        let ranged_source = tokio::fs::read_to_string(&ranged).await.unwrap();
+        let ranged_refs = jlcpcb_bom_designators(&ranged_source).unwrap_err();
+        assert!(ranged_refs
+            .to_string()
+            .contains("compressed designator range"));
+    }
+
+    /// The KiCad ECC83 demo contains board footprints excluded from both the
+    /// BOM and position files. Running the real exporters proves their output
+    /// populations remain identical after the JLCPCB transformations.
+    #[tokio::test]
+    #[ignore = "requires an installed KiCad 10 kicad-cli"]
+    async fn real_kicad_exclusions_leave_a_matched_bom_and_cpl() {
+        let cli_path = std::env::var("KICAD_CLI_PATH").unwrap_or_else(|_| "kicad-cli".into());
+        let fixture_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-sexp/tests/fixtures");
+        let schematic = fixture_root.join("variants/ecc83-pp.kicad_sch");
+        let board = fixture_root.join("ecc83-pp.kicad_pcb");
+        let dir = tempfile::tempdir().unwrap();
+        let bom = dir.path().join("BOM-ecc83.csv");
+        let cpl = dir.path().join("CPL-ecc83.csv");
+
+        let cpl_refs = export_jlcpcb_cpl(&cli_path, &board, &cpl, "both")
+            .await
+            .unwrap();
+        let options = cli::BomOptions {
+            fields: Some("Reference,Value,Footprint"),
+            labels: Some("Designator,Comment,Footprint"),
+            group_by: Some("Value,Footprint"),
+            exclude_dnp: true,
+        };
+        cli::export_bom_with_ref_range_delimiter(&cli_path, &schematic, &bom, &options, "")
+            .await
+            .unwrap();
+        let bom_source = tokio::fs::read_to_string(&bom).await.unwrap();
+        let bom_refs = jlcpcb_bom_designators(&bom_source).unwrap();
+        assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs), None);
     }
 }
 
