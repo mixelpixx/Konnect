@@ -320,6 +320,80 @@ fn place_component_loads_real_library_geometry() {
     }
 }
 
+/// Issue #462 through the public MCP boundary and a real KiCad PCB Editor.
+///
+/// This proves more than a successful tool response: the tool must select IPC,
+/// KiCad must expose the new footprint through live readback, and a KiCad save
+/// must persist the exact shipped library id and NPTH drill geometry.
+#[test]
+#[ignore = "requires a running KiCad GUI, API socket, disposable open board, and standard footprint libraries"]
+fn add_mounting_hole_round_trips_through_live_kicad() {
+    let board = std::path::PathBuf::from(
+        std::env::var("KONNECT_LIVE_KICAD_BOARD")
+            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let reference =
+        std::env::var("KONNECT_LIVE_KICAD_HOLE_REFERENCE").unwrap_or_else(|_| "H900".to_string());
+    let expected_lib_id = "MountingHole:MountingHole_3.2mm_M3";
+
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool("load_toolset", json!({"name": "pcb_board"}));
+    let result = mcp.tool(
+        "add_mounting_hole",
+        json!({
+            "board": board,
+            "x": 42.0,
+            "y": 37.0,
+            "drill_diameter": 3.2,
+            "reference": reference
+        }),
+    );
+    let body: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+        .expect("add_mounting_hole did not return JSON");
+    assert_eq!(body["source"], "ipc", "{body}");
+    assert_eq!(body["reference"], reference, "{body}");
+    assert_eq!(body["footprint"], expected_lib_id, "{body}");
+
+    let live = live_footprint(&ipc, &board, &reference);
+    assert_eq!(
+        live.definition
+            .as_ref()
+            .and_then(|definition| definition.id.as_ref())
+            .map(|id| format!("{}:{}", id.library_nickname, id.entry_name)),
+        Some(expected_lib_id.to_string()),
+        "live KiCad readback did not preserve the shipped library identity"
+    );
+
+    ipc.save_board().expect("failed to save live board");
+    let tree = parse_sexp(&std::fs::read_to_string(&board).unwrap()).unwrap();
+    let saved = footprint(&tree, &reference);
+    assert_eq!(
+        saved.get(1).and_then(SexpNode::as_str),
+        Some(expected_lib_id)
+    );
+    let pad = saved
+        .find_all("pad")
+        .into_iter()
+        .next()
+        .expect("saved mounting hole has no pad");
+    assert_eq!(pad.get(2).and_then(SexpNode::as_str), Some("np_thru_hole"));
+    assert!((pad.find("drill").unwrap().get_f64(1).unwrap() - 3.2).abs() < 1e-6);
+}
+
 #[test]
 #[ignore = "requires a running KiCad GUI, API socket, saved schematic, and matching open board"]
 fn schematic_sync_apply_then_dry_run_is_noop() {
