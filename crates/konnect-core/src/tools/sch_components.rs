@@ -2112,11 +2112,11 @@ fn set_property_value(
 /// Every part is optional: an absent one leaves the file's value alone rather
 /// than defaulting, so moving a field cannot silently unhide it.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct FieldPlacement {
-    pub(crate) x: Option<f64>,
-    pub(crate) y: Option<f64>,
-    pub(crate) rotation: Option<f64>,
-    pub(crate) hide: Option<bool>,
+struct FieldPlacement {
+    x: Option<f64>,
+    y: Option<f64>,
+    rotation: Option<f64>,
+    hide: Option<bool>,
 }
 
 impl FieldPlacement {
@@ -2225,13 +2225,42 @@ fn set_property_placement(
                 .find(')')
                 .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?
             + 1;
-        let existing: Vec<f64> = content[at_start + "(at ".len()..at_end - 1]
-            .split_whitespace()
-            .filter_map(|token| token.parse().ok())
-            .collect();
-        let current_x = existing.first().copied().unwrap_or(0.0);
-        let current_y = existing.get(1).copied().unwrap_or(0.0);
-        let current_rot = existing.get(2).copied().unwrap_or(0.0);
+        // Parse the existing placement *positionally* and strictly. Dropping
+        // unparseable tokens and defaulting the gaps to zero silently shifts
+        // the remaining ones left: `(at bad 20 90)` reads as x=20, y=90, and a
+        // rotation-only request then commits `(at 20 90 NEW)` — a position the
+        // caller never asked for and the file never held. A malformed
+        // placement is refused here, before anything is committed, because a
+        // wrong coordinate written into a schematic is silent.
+        let raw = &content[at_start + "(at ".len()..at_end - 1];
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let coordinate = |index: usize, axis: &str| -> Result<f64, String> {
+            let token = tokens.get(index).ok_or_else(|| {
+                format!("'{field}' placement on '{reference}' has no {axis} in `(at {raw})`")
+            })?;
+            match token.parse::<f64>() {
+                Ok(value) if value.is_finite() => Ok(value),
+                _ => Err(format!(
+                    "'{field}' placement on '{reference}' has a non-numeric {axis} \
+                     '{token}' in `(at {raw})`"
+                )),
+            }
+        };
+        let current_x = coordinate(0, "x")?;
+        let current_y = coordinate(1, "y")?;
+        // KiCad writes `(at x y)` or `(at x y rotation)`; anything longer is
+        // not a placement it produces, and rewriting it as three tokens would
+        // drop whatever the extra ones carried.
+        let current_rot = match tokens.len() {
+            2 => 0.0,
+            3 => coordinate(2, "rotation")?,
+            count => {
+                return Err(format!(
+                    "'{field}' placement on '{reference}' has {count} values in \
+                     `(at {raw})`; expected x, y and an optional rotation"
+                ))
+            }
+        };
         if placement.x.is_some() || placement.y.is_some() || placement.rotation.is_some() {
             edits.push(SexpEdit::replace(
                 at_start,
@@ -6710,6 +6739,54 @@ mod multi_unit_component_tests {
                 .count(),
             1,
             "only the named unit's field moves"
+        );
+    }
+
+    /// The *file's* existing placement can be malformed, which is a different
+    /// door from a malformed request. Dropping the unparseable token and
+    /// defaulting the gap to zero shifts the rest left: `(at bad 85.09 90)`
+    /// reads as x=85.09, y=90, so a rotation-only edit would commit
+    /// `(at 85.09 90 0)` — moving the text to a position the caller never
+    /// asked for and the file never held. Refused before anything is written.
+    #[tokio::test]
+    async fn field_placement_refuses_a_malformed_existing_placement_without_writing() {
+        let (_directory, path) = eeschema_fixture();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let corrupted = original.replacen(
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at 157.48 85.09 90)",
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at bad 85.09 90)",
+            1,
+        );
+        assert_ne!(
+            corrupted, original,
+            "the fixture must still carry R1's Value placement"
+        );
+        std::fs::write(&path, &corrupted).unwrap();
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "field_placements": { "Value": { "rotation": 0.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        // Assert the reason, not merely that something failed: this handler
+        // has several ways to error, and a test that accepts any of them
+        // passes with the strict parse gone.
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("non-numeric x") && message.contains("bad"),
+            "the refusal must name the malformed coordinate: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupted,
+            "a refusal must leave the file byte-identical"
         );
     }
 
