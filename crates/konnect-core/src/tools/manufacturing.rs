@@ -253,7 +253,6 @@ async fn handle_export_manufacturing_package(
                 "csv",
                 position_units,
                 position_side,
-                false,
             )
             .await
             .map(|()| None)
@@ -292,9 +291,14 @@ async fn handle_export_manufacturing_package(
                 labels: args["bom_labels"].as_str(),
                 group_by: args["bom_group_by"].as_str(),
                 exclude_dnp: is_jlcpcb,
-                ref_range_delimiter: is_jlcpcb.then_some(""),
             };
-            match cli::export_bom(cli_path, sch, &bom_path, &bom_options).await {
+            let bom_result = if is_jlcpcb {
+                cli::export_bom_with_ref_range_delimiter(cli_path, sch, &bom_path, &bom_options, "")
+                    .await
+            } else {
+                cli::export_bom(cli_path, sch, &bom_path, &bom_options).await
+            };
+            match bom_result {
                 Ok(()) => {
                     let parsed = if is_jlcpcb {
                         let source = tokio::fs::read_to_string(&bom_path).await?;
@@ -420,7 +424,7 @@ async fn export_jlcpcb_cpl(
             .context("JLCPCB CPL output has no parent directory")?,
     )?;
     let native = staging.path().join("kicad-positions.csv");
-    cli::export_position_file(cli_path, board, &native, "csv", "mm", side, true).await?;
+    cli::export_position_file_excluding_dnp(cli_path, board, &native, "csv", "mm", side).await?;
     let source = tokio::fs::read_to_string(&native).await?;
     let (cpl, designators) = jlcpcb_cpl_from_kicad_csv(&source)?;
     cli::publish_verified_bytes(output, &cpl, "JLCPCB CPL").await?;
@@ -1043,9 +1047,8 @@ mod jlcpcb_assembly_tests {
             labels: Some("Designator,Comment,Footprint"),
             group_by: Some("Value,Footprint"),
             exclude_dnp: true,
-            ref_range_delimiter: Some(""),
         };
-        cli::export_bom(&cli_path, &schematic, &enumerated, &options)
+        cli::export_bom_with_ref_range_delimiter(&cli_path, &schematic, &enumerated, &options, "")
             .await
             .unwrap();
         let source = tokio::fs::read_to_string(&enumerated).await.unwrap();
@@ -1061,11 +1064,7 @@ mod jlcpcb_assembly_tests {
         assert!(group_sizes.contains(&2));
         assert!(group_sizes.iter().any(|size| *size >= 3));
 
-        let ranged_options = cli::BomOptions {
-            ref_range_delimiter: None,
-            ..options
-        };
-        cli::export_bom(&cli_path, &schematic, &ranged, &ranged_options)
+        cli::export_bom(&cli_path, &schematic, &ranged, &options)
             .await
             .unwrap();
         let ranged_source = tokio::fs::read_to_string(&ranged).await.unwrap();
@@ -1098,9 +1097,8 @@ mod jlcpcb_assembly_tests {
             labels: Some("Designator,Comment,Footprint"),
             group_by: Some("Value,Footprint"),
             exclude_dnp: true,
-            ref_range_delimiter: Some(""),
         };
-        cli::export_bom(&cli_path, &schematic, &bom, &options)
+        cli::export_bom_with_ref_range_delimiter(&cli_path, &schematic, &bom, &options, "")
             .await
             .unwrap();
         let bom_source = tokio::fs::read_to_string(&bom).await.unwrap();

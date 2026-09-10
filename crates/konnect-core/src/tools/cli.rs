@@ -737,14 +737,21 @@ pub struct BomOptions<'a> {
     pub group_by: Option<&'a str>,
     /// Drop Do-Not-Populate symbols.
     pub exclude_dnp: bool,
-    /// Character placed between the ends of a compressed reference range.
-    /// `Some("")` asks KiCad to enumerate every reference instead.
-    pub ref_range_delimiter: Option<&'a str>,
 }
 
 /// Argument vector for the BOM export, factored out so the flags can be
 /// asserted without a kicad-cli on the machine.
+#[cfg(test)]
 fn bom_args<'a>(output: &'a str, schematic: &'a str, options: &BomOptions<'a>) -> Vec<&'a str> {
+    bom_args_with_ref_range_delimiter(output, schematic, options, None)
+}
+
+fn bom_args_with_ref_range_delimiter<'a>(
+    output: &'a str,
+    schematic: &'a str,
+    options: &BomOptions<'a>,
+    ref_range_delimiter: Option<&'a str>,
+) -> Vec<&'a str> {
     let mut args = vec!["sch", "export", "bom", "--output", output];
     if let Some(fields) = options.fields {
         args.push("--fields");
@@ -761,7 +768,7 @@ fn bom_args<'a>(output: &'a str, schematic: &'a str, options: &BomOptions<'a>) -
     if options.exclude_dnp {
         args.push("--exclude-dnp");
     }
-    if let Some(delimiter) = options.ref_range_delimiter {
+    if let Some(delimiter) = ref_range_delimiter {
         args.push("--ref-range-delimiter");
         args.push(delimiter);
     }
@@ -781,14 +788,38 @@ pub async fn export_bom(
     output: &Path,
     options: &BomOptions<'_>,
 ) -> Result<()> {
+    export_bom_with_options(cli, schematic, output, options, None).await
+}
+
+/// Export a BOM while overriding KiCad's reference-range delimiter. This is
+/// intentionally crate-private so vendor policy does not expand the public
+/// Rust API used by generic callers.
+pub(crate) async fn export_bom_with_ref_range_delimiter(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &BomOptions<'_>,
+    delimiter: &str,
+) -> Result<()> {
+    export_bom_with_options(cli, schematic, output, options, Some(delimiter)).await
+}
+
+async fn export_bom_with_options(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &BomOptions<'_>,
+    ref_range_delimiter: Option<&str>,
+) -> Result<()> {
     let staging = export_staging_dir(output)?;
     let staged = staging
         .path()
         .join(output.file_name().context("BOM output has no file name")?);
-    let args = bom_args(
+    let args = bom_args_with_ref_range_delimiter(
         staged.to_str().unwrap_or(""),
         schematic.to_str().unwrap_or(""),
         options,
+        ref_range_delimiter,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     publish_verified_file(&staged, output, "BOM").await?;
@@ -1124,6 +1155,31 @@ fn position_args<'a>(
 /// deliberately leaves that source-of-truth filtering to the exporter rather
 /// than trying to post-process CSV and Gerber output differently.
 pub async fn export_position_file(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    format: &str,
+    units: &str,
+    side: &str,
+) -> Result<()> {
+    export_position_file_with_options(cli, pcb, output, format, units, side, false).await
+}
+
+/// Export a position file while asking KiCad to omit DNP footprints. Kept
+/// crate-private because this policy is currently specific to matched vendor
+/// assembly packages.
+pub(crate) async fn export_position_file_excluding_dnp(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    format: &str,
+    units: &str,
+    side: &str,
+) -> Result<()> {
+    export_position_file_with_options(cli, pcb, output, format, units, side, true).await
+}
+
+async fn export_position_file_with_options(
     cli: &str,
     pcb: &Path,
     output: &Path,
@@ -1933,7 +1989,6 @@ mod bom_export_tests {
             labels: Some("Refs,Value,Footprint,MPN,Qty"),
             group_by: Some("Value,Footprint"),
             exclude_dnp: false,
-            ref_range_delimiter: None,
         };
         let args = bom_args("/out/bom.csv", "/tmp/board.kicad_sch", &options);
         let flag = |name: &str| {
@@ -1988,11 +2043,9 @@ mod bom_export_tests {
     /// KiCad range such as C3-C18 is one opaque, unmatched designator there.
     #[test]
     fn an_empty_reference_range_delimiter_reaches_kicad_cli() {
-        let options = BomOptions {
-            ref_range_delimiter: Some(""),
-            ..Default::default()
-        };
-        let args = bom_args("/out/bom.csv", "/s.kicad_sch", &options);
+        let options = BomOptions::default();
+        let args =
+            bom_args_with_ref_range_delimiter("/out/bom.csv", "/s.kicad_sch", &options, Some(""));
         let index = args
             .iter()
             .position(|arg| *arg == "--ref-range-delimiter")
