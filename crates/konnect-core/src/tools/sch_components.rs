@@ -2163,16 +2163,41 @@ fn placement_landed(seen: &serde_json::Value, placement: &FieldPlacement) -> boo
 /// `(at …)` and its other fields' `(at …)` sit in the same instance block, and
 /// a search that is not bounded by the property would move the body instead of
 /// the text.
+/// Why a field placement was refused, and how far the refusal reaches.
+///
+/// A malformed *file* makes the whole call unsafe: this handler edits text and
+/// commits once at the end, so letting a sibling edit proceed would commit a
+/// file we have already found to be broken. A target that simply was not there
+/// is local to the field the caller named.
+#[derive(Debug)]
+enum PlacementRefusal {
+    /// The existing property or its placement is malformed. Aborts the call
+    /// before anything is committed.
+    MalformedFile(String),
+    /// The named symbol, field or unit was not found. Refuses this field only.
+    TargetMissing(String),
+}
+
+impl PlacementRefusal {
+    fn reason(&self) -> &str {
+        match self {
+            Self::MalformedFile(reason) | Self::TargetMissing(reason) => reason,
+        }
+    }
+}
+
 fn set_property_placement(
     content: &str,
     reference: &str,
     field: &str,
     placement: &FieldPlacement,
     only_unit: Option<u32>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize), PlacementRefusal> {
     let blocks = find_all_symbol_instance_blocks(content, reference);
     if blocks.is_empty() {
-        return Err(format!("symbol '{reference}' not found in this schematic"));
+        return Err(PlacementRefusal::TargetMissing(format!(
+            "symbol '{reference}' not found in this schematic"
+        )));
     }
     let escaped_field = escape_property_text(field);
     let field_search = format!(r#"(property "{escaped_field}" ""#);
@@ -2196,13 +2221,17 @@ fn set_property_placement(
             }
         }
         let Some(relative) = block.find(&field_search) else {
-            return Err(format!(
+            return Err(PlacementRefusal::TargetMissing(format!(
                 "'{reference}' has no '{field}' property on one of its placed units"
-            ));
+            )));
         };
         let (_prop_start, prop_end) =
             konnect_sexp::writer::find_enclosing_block(content, "property", start + relative)
-                .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
+                .ok_or_else(|| {
+                    PlacementRefusal::MalformedFile(format!(
+                        "'{field}' property on '{reference}' is malformed"
+                    ))
+                })?;
 
         // Everything below searches for tokens *after* the property's value
         // string. A field value is arbitrary text and may contain "(at " or
@@ -2210,20 +2239,27 @@ fn set_property_placement(
         // instead of the placement, and the result is still valid
         // S-expression, so nothing downstream notices.
         let value_start = start + relative + field_search.len();
-        let value_end = closing_quote(content, value_start)
-            .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
+        let value_end = closing_quote(content, value_start).ok_or_else(|| {
+            PlacementRefusal::MalformedFile(format!(
+                "'{field}' property on '{reference}' is malformed"
+            ))
+        })?;
         let body_start = value_end + 1;
         let property = &content[body_start..prop_end];
 
         // The field's own (at x y [rot]); a property carries exactly one.
-        let at_rel = property
-            .find("(at ")
-            .ok_or_else(|| format!("'{field}' property on '{reference}' carries no (at …)"))?;
+        let at_rel = property.find("(at ").ok_or_else(|| {
+            PlacementRefusal::MalformedFile(format!(
+                "'{field}' property on '{reference}' carries no (at …)"
+            ))
+        })?;
         let at_start = body_start + at_rel;
         let at_end = at_start
-            + content[at_start..prop_end]
-                .find(')')
-                .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?
+            + content[at_start..prop_end].find(')').ok_or_else(|| {
+                PlacementRefusal::MalformedFile(format!(
+                    "'{field}' property on '{reference}' is malformed"
+                ))
+            })?
             + 1;
         // Parse the existing placement *positionally* and strictly. Dropping
         // unparseable tokens and defaulting the gaps to zero silently shifts
@@ -2234,16 +2270,18 @@ fn set_property_placement(
         // wrong coordinate written into a schematic is silent.
         let raw = &content[at_start + "(at ".len()..at_end - 1];
         let tokens: Vec<&str> = raw.split_whitespace().collect();
-        let coordinate = |index: usize, axis: &str| -> Result<f64, String> {
+        let coordinate = |index: usize, axis: &str| -> Result<f64, PlacementRefusal> {
             let token = tokens.get(index).ok_or_else(|| {
-                format!("'{field}' placement on '{reference}' has no {axis} in `(at {raw})`")
+                PlacementRefusal::MalformedFile(format!(
+                    "'{field}' placement on '{reference}' has no {axis} in `(at {raw})`"
+                ))
             })?;
             match token.parse::<f64>() {
                 Ok(value) if value.is_finite() => Ok(value),
-                _ => Err(format!(
+                _ => Err(PlacementRefusal::MalformedFile(format!(
                     "'{field}' placement on '{reference}' has a non-numeric {axis} \
                      '{token}' in `(at {raw})`"
-                )),
+                ))),
             }
         };
         let current_x = coordinate(0, "x")?;
@@ -2255,10 +2293,10 @@ fn set_property_placement(
             2 => 0.0,
             3 => coordinate(2, "rotation")?,
             count => {
-                return Err(format!(
+                return Err(PlacementRefusal::MalformedFile(format!(
                     "'{field}' placement on '{reference}' has {count} values in \
                      `(at {raw})`; expected x, y and an optional rotation"
-                ))
+                )))
             }
         };
         if placement.x.is_some() || placement.y.is_some() || placement.rotation.is_some() {
@@ -2293,7 +2331,9 @@ fn set_property_placement(
                 (false, Some(at)) => {
                     let token_end =
                         at + content[at..prop_end].find(')').ok_or_else(|| {
-                            format!("'{field}' hide flag on '{reference}' is malformed")
+                            PlacementRefusal::MalformedFile(format!(
+                                "'{field}' hide flag on '{reference}' is malformed"
+                            ))
                         })? + 1;
                     // Take the indentation before the token, and the newline
                     // too *only* if the token had the line to itself. Deleting
@@ -2320,10 +2360,10 @@ fn set_property_placement(
     }
 
     if touched == 0 {
-        return Err(format!(
+        return Err(PlacementRefusal::TargetMissing(format!(
             "'{reference}' has no placed unit {}",
             only_unit.map(|u| u.to_string()).unwrap_or_default()
-        ));
+        )));
     }
     Ok((apply_edits(content.to_string(), edits), touched))
 }
@@ -2486,15 +2526,34 @@ async fn handle_edit_schematic_component(
     if let Some(placements) = placements {
         let only_unit = match &args["unit"] {
             serde_json::Value::Null => None,
-            value => match value.as_u64() {
-                Some(unit) if unit >= 1 => Some(unit as u32),
-                _ => {
+            value => {
+                let Some(unit) = value.as_u64() else {
                     return Ok(crate::tools::invalid_arg(
                         "unit",
                         "expected a positive integer unit number",
-                    ))
+                    ));
+                };
+                // `as u32` truncates rather than refusing: 4294967297 becomes
+                // 1 and would silently edit a real unit's field text.
+                match u32::try_from(unit) {
+                    Ok(unit) if unit >= 1 => Some(unit),
+                    Ok(_) => {
+                        return Ok(crate::tools::invalid_arg(
+                            "unit",
+                            "expected a positive integer unit number",
+                        ))
+                    }
+                    Err(_) => {
+                        return Ok(crate::tools::invalid_arg(
+                            "unit",
+                            &format!(
+                                "unit {unit} is out of range; a placed unit number \
+                                 fits in 32 bits"
+                            ),
+                        ))
+                    }
                 }
-            },
+            }
         };
         for (name, spec) in placements {
             let Some(spec) = spec.as_object() else {
@@ -2557,7 +2616,18 @@ async fn handle_edit_schematic_component(
                     placement_unit = only_unit;
                     changed.push(format!("{name} placement ({touched} unit(s))"));
                 }
-                Err(why) => errors.push(format!("{name}: {why}")),
+                // A malformed file aborts the whole call. This handler edits
+                // text and commits once, at the end, so a sibling edit that
+                // succeeded would otherwise be written into a file already
+                // found to be broken: the refusal would be reported while the
+                // write went ahead anyway.
+                Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
+                    return Ok(CallToolResult::error(format!(
+                        "No fields were updated on '{reference}': {name}: {}",
+                        refusal.reason()
+                    )))
+                }
+                Err(refusal) => errors.push(format!("{name}: {}", refusal.reason())),
             }
         }
     }
@@ -6787,6 +6857,97 @@ mod multi_unit_component_tests {
             std::fs::read_to_string(&path).unwrap(),
             corrupted,
             "a refusal must leave the file byte-identical"
+        );
+    }
+
+    /// A malformed placement must abort the *whole* call, not just its own
+    /// field. This handler edits text and commits once at the end, so a valid
+    /// sibling edit in the same request would otherwise be committed while the
+    /// call reported a refusal. The placement-only test cannot see this: with
+    /// nothing else in the request there is no sibling to commit, so it passes
+    /// either way.
+    #[tokio::test]
+    async fn malformed_placement_aborts_a_combined_edit_without_writing() {
+        let (_directory, path) = eeschema_fixture();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let corrupted = original.replacen(
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at 157.48 85.09 90)",
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at bad 85.09 90)",
+            1,
+        );
+        assert_ne!(
+            corrupted, original,
+            "the fixture must still carry R1's Value placement"
+        );
+        std::fs::write(&path, &corrupted).unwrap();
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                // A perfectly good sibling edit, which must not be committed.
+                "fields": { "Description": "sibling edit that must not land" },
+                "reference": "R1",
+                "field_placements": { "Value": { "rotation": 0.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("non-numeric x") && message.contains("bad"),
+            "the refusal must name the malformed coordinate: {message}"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, corrupted,
+            "a refusal must leave the file byte-identical"
+        );
+        assert!(
+            !after.contains("sibling edit that must not land"),
+            "the sibling field edit must not have been committed"
+        );
+    }
+
+    /// `unit` is a u64 from JSON narrowed to u32. `as` truncates rather than
+    /// refusing, so 4294967297 becomes 1 and would silently move unit 1's
+    /// field text — a real unit the caller never named.
+    #[tokio::test]
+    async fn an_oversized_unit_is_refused_rather_than_wrapping_to_a_real_unit() {
+        let (_directory, path) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "U1",
+                "unit": 4_294_967_297u64,
+                "field_placements": { "Value": { "x": 10.0, "y": 10.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        // Assert the reason: wrapping would produce a *successful* edit of
+        // unit 1, so a test that accepted any error would pass with the
+        // checked conversion removed only if it also checked the file.
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument"),
+            "{result:?}"
+        );
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("out of range"),
+            "the refusal must say why: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "no unit's field text may move"
         );
     }
 
