@@ -3,6 +3,31 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: DRC item ownership (minor release)
+
+`run_drc` and `get_drc_violations` now say what owns each item of each
+violation. Every item in `violations`, `unconnected_items`, and
+`schematic_parity` gains up to four additive fields:
+
+- `ownership_status`: `resolved`, `uuid_missing`, `not_found`, `ambiguous`, or
+  `unavailable`.
+- `owner`: `{"kind":"board"}` or a footprint owner with its reference and UUID
+  when resolved; `null` for every unresolved state.
+- `item_kind`: the board node head when uniquely resolved.
+- `layer`: the item's single layer when uniquely resolved.
+
+Ownership is derived only from exact UUIDs in the saved `.kicad_pcb`; it is
+never inferred from KiCad's prose. Duplicate UUIDs are `ambiguous` rather than
+resolved according to file order. If the saved board cannot be reread or
+parsed, every item is marked `unavailable` and the report adds
+`ownership_diagnostic` with the reason, while retaining all original DRC
+findings.
+
+Footprint ownership does not make a finding false. Footprint-owned `Edge.Cuts`
+is fabrication geometry; ownership identifies whether the board or footprint
+definition is the likely repair location. KiCad's existing `description`,
+`pos`, `uuid`, `severity`, and `rule` fields remain unchanged.
+
 ## Unreleased: `create_symbol` draws a symbol body (minor release)
 
 `create_symbol` accepts `graphics`, an array of drawing primitives, at the top

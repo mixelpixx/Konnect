@@ -716,6 +716,13 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "sheet_instance_path",
         // Structured placement-score response field, not a callable tool.
         "interface_filter_caps",
+        // Structured DRC ownership response field and its unresolved values,
+        // not callable tools (#413).
+        "ownership_status",
+        "uuid_missing",
+        "not_found",
+        "unavailable",
+        "ambiguous",
     ];
 
     let mut phantom = Vec::new();
