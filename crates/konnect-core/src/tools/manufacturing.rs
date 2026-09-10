@@ -113,7 +113,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "layers": {
                         "type": "integer",
-                        "description": "Layer count (2, 4, 6). Auto-detected from board if omitted."
+                        "description": "Copper layer count to quote at (2, 4, 6). Defaults to the count the board file declares; when given and different, the response reports both under board.copper_layers / board.board_copper_layers and warns."
                     }
                 },
                 "required": ["board"]
@@ -403,12 +403,10 @@ async fn handle_validate_for_manufacturing(
         }));
     }
 
-    // Check layer count
-    let _layers = tree
-        .find("layers")
-        .map(|l| l.find_all("*"))
-        .unwrap_or_default();
-    let copper_layers = content.matches("signal)").count() + content.matches("signal \"").count();
+    // Check layer count — structurally, from the `(layers …)` table, through
+    // the same function `get_board_info` uses (#461). Counting the substring
+    // `signal)` missed every `power`/`mixed`/`jumper` copper layer.
+    let copper_layers = konnect_sexp::layers::copper_layer_count(&tree);
     debug!(
         copper_layers = copper_layers,
         "[BETA] Detected copper layers"
@@ -545,11 +543,28 @@ async fn handle_estimate_cost(
     let fps = tree.find_all("footprint");
     let component_count = fps.len();
 
-    // Detect layers
-    let copper_layers = args["layers"].as_u64().unwrap_or_else(|| {
-        let count = content.matches("signal)").count() + content.matches("signal \"").count();
-        (count as u64).max(2)
-    }) as usize;
+    // The board's own copper count comes from its `(layers …)` table, through
+    // the same function `get_board_info` uses (#461). A caller may still quote
+    // at a different count, but the quote then says so instead of presenting
+    // the requested number as the board's.
+    let board_copper_layers = konnect_sexp::layers::copper_layer_count(&tree);
+    let requested_layers = args["layers"].as_u64().map(|n| n as usize);
+    let copper_layers = requested_layers.unwrap_or(board_copper_layers);
+    let mut warnings: Vec<String> = Vec::new();
+    match requested_layers {
+        Some(requested) if requested != board_copper_layers => warnings.push(format!(
+            "quoted at {requested} copper layers, but the board file declares \
+             {board_copper_layers}; this estimate does not describe the board as saved"
+        )),
+        _ => {}
+    }
+    if board_copper_layers == 0 {
+        warnings.push(
+            "the board file declares no copper layers (no `(layers …)` table was read); \
+             the layer count could not be taken from the board"
+                .to_string(),
+        );
+    }
 
     // Estimate board dimensions from Edge.Cuts
     let (width_mm, height_mm) = estimate_board_dimensions(&content);
@@ -558,7 +573,8 @@ async fn handle_estimate_cost(
     let (pcb_cost, assembly_cost, component_est) = match fab_house {
         "jlcpcb" => {
             let pcb = match copper_layers {
-                2 => 2.0 + (quantity as f64 - 5.0).max(0.0) * 0.40,
+                // JLCPCB prices single-sided boards on the two-layer scale.
+                1 | 2 => 2.0 + (quantity as f64 - 5.0).max(0.0) * 0.40,
                 4 => 7.0 + (quantity as f64 - 5.0).max(0.0) * 1.40,
                 6 => 15.0 + (quantity as f64 - 5.0).max(0.0) * 3.00,
                 _ => 30.0 + (quantity as f64 - 5.0).max(0.0) * 5.00,
@@ -570,7 +586,7 @@ async fn handle_estimate_cost(
         }
         "pcbway" => {
             let pcb = match copper_layers {
-                2 => 5.0 + (quantity as f64 - 5.0).max(0.0) * 0.50,
+                1 | 2 => 5.0 + (quantity as f64 - 5.0).max(0.0) * 0.50,
                 4 => 12.0 + (quantity as f64 - 5.0).max(0.0) * 2.00,
                 _ => 25.0 + (quantity as f64 - 5.0).max(0.0) * 4.00,
             };
@@ -601,9 +617,13 @@ async fn handle_estimate_cost(
             "board": {
                 "width_mm": width_mm,
                 "height_mm": height_mm,
+                // What this estimate was priced at, and what the board itself
+                // declares. They differ only when the caller passed `layers`.
                 "copper_layers": copper_layers,
+                "board_copper_layers": board_copper_layers,
                 "component_count": component_count
             },
+            "warnings": warnings,
             "cost_estimate": {
                 "pcb_fabrication": format!("${:.2}", pcb_cost),
                 "smt_assembly": format!("${:.2}", assembly_cost),
@@ -1040,5 +1060,164 @@ mod readiness_evidence_tests {
                 .contains("DRC could not run")),
             "the missing evidence must be named: {issues:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod copper_layer_count_tests {
+    //! Issue #461: `estimate_cost` and `validate_for_manufacturing` counted
+    //! copper layers by finding the substring `signal)` in the file text, so a
+    //! board whose inner layers are `power`/`mixed`/`jumper` planes was quoted
+    //! as a two-layer board while `get_board_info` on the same file said six.
+    //!
+    //! The fixture is pcbnew's own serialization of a six-layer board with two
+    //! `power` planes and one `mixed` layer — provenance in
+    //! `tests/fixtures/six_layer_power_planes_kicad10.README.md`. The old
+    //! substring count reads it as 3.
+
+    use super::*;
+    use serde_json::json;
+
+    const SIX_LAYER: &str =
+        include_str!("../../tests/fixtures/six_layer_power_planes_kicad10.kicad_pcb");
+
+    /// Two copper layers, both `signal` — the control the old scan got right.
+    const TWO_LAYER: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(generator \"pcbnew\")\n\
+        \t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t)\n\
+        \t(gr_line (start 0 0) (end 50 0) (layer \"Edge.Cuts\") (width 0.1))\n\
+        )\n";
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn text_of(result: CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    async fn estimate(board_text: &str, extra: serde_json::Value) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        let mut args =
+            json!({ "board": board.to_str().unwrap(), "fab_house": "jlcpcb", "quantity": 5 });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        text_of(handle_estimate_cost(&args, &ctx()).await.unwrap())
+    }
+
+    async fn validate(board_text: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        text_of(
+            handle_validate_for_manufacturing(&json!({ "board": board.to_str().unwrap() }), &ctx())
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// The fixture really does defeat the substring scan; if a future KiCad
+    /// resave changed that, this test would be proving nothing.
+    #[test]
+    fn the_fixture_defeats_a_substring_count() {
+        let substring =
+            SIX_LAYER.matches("signal)").count() + SIX_LAYER.matches("signal \"").count();
+        assert_eq!(substring, 3, "fixture must carry non-signal copper");
+        let tree = konnect_sexp::parser::parse_sexp(SIX_LAYER).unwrap();
+        assert_eq!(konnect_sexp::layers::copper_layer_count(&tree), 6);
+    }
+
+    /// The reported case: a six-layer board priced as a six-layer board, with
+    /// the quote's count and the board's count agreeing and no warning.
+    #[tokio::test]
+    async fn estimate_cost_prices_the_boards_declared_copper_count() {
+        let report = estimate(SIX_LAYER, json!({})).await;
+        assert_eq!(report["board"]["copper_layers"], 6, "{report}");
+        assert_eq!(report["board"]["board_copper_layers"], 6);
+        assert_eq!(
+            report["cost_estimate"]["pcb_fabrication"], "$15.00",
+            "JLCPCB six-layer price at quantity 5, not the two-layer $2.00: {report}"
+        );
+        assert_eq!(report["warnings"], json!([]));
+
+        let control = estimate(TWO_LAYER, json!({})).await;
+        assert_eq!(control["board"]["copper_layers"], 2);
+        assert_eq!(control["cost_estimate"]["pcb_fabrication"], "$2.00");
+    }
+
+    /// A caller may quote at a different count, but the response must say the
+    /// board disagrees rather than present the request as the board's fact.
+    #[tokio::test]
+    async fn estimate_cost_reports_a_layer_override_against_the_board() {
+        let report = estimate(SIX_LAYER, json!({ "layers": 2 })).await;
+        assert_eq!(report["board"]["copper_layers"], 2, "priced as asked");
+        assert_eq!(
+            report["board"]["board_copper_layers"], 6,
+            "but the board says six"
+        );
+        assert_eq!(report["cost_estimate"]["pcb_fabrication"], "$2.00");
+        let warnings = report["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{report}");
+        let text = warnings[0].as_str().unwrap();
+        assert!(
+            text.contains("quoted at 2") && text.contains("declares 6"),
+            "{text}"
+        );
+
+        // Asking for the count the board already has is not a discrepancy.
+        let agree = estimate(SIX_LAYER, json!({ "layers": 6 })).await;
+        assert_eq!(agree["warnings"], json!([]));
+    }
+
+    /// No `(layers …)` table: zero and a warning, never an invented two.
+    #[tokio::test]
+    async fn estimate_cost_does_not_invent_two_layers_for_a_board_without_a_table() {
+        let report = estimate(
+            "(kicad_pcb (version 20260206) (generator \"pcbnew\"))",
+            json!({}),
+        )
+        .await;
+        assert_eq!(report["board"]["copper_layers"], 0);
+        assert_eq!(report["board"]["board_copper_layers"], 0);
+        assert!(
+            report["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("no copper layers"),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_for_manufacturing_counts_copper_structurally() {
+        let report = validate(SIX_LAYER).await;
+        assert_eq!(report["board_info"]["copper_layers"], 6, "{report}");
+        assert!(report["summary"]
+            .as_str()
+            .unwrap()
+            .contains("6 copper layers"));
+
+        let control = validate(TWO_LAYER).await;
+        assert_eq!(control["board_info"]["copper_layers"], 2);
     }
 }
