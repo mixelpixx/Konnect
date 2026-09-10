@@ -3,6 +3,29 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `add_mounting_hole` uses KiCad's shipped footprint names (minor release)
+
+`add_mounting_hole` wrote `MountingHole:MountingHole_{drill:.1}mm`. KiCad 10
+ships no plain `MountingHole_3.2mm` — 3.2 mm exists only as the M3 family — and
+spells round sizes without a decimal (`MountingHole_3mm`), so the default call
+and every integer size produced a name no stock KiCad resolves (#462).
+
+The lib_id now comes from a table of the footprints KiCad 10 ships (`3.2` →
+`MountingHole_3.2mm_M3`, `3` → `MountingHole_3mm`, `4.3` →
+`MountingHole_4.3mm_M4`, …), and a drill with no shipped footprint is refused
+with `invalid_argument` on `drill_diameter` listing the shipped sizes, before
+anything is written. When `MountingHole.pretty` resolves from the machine
+(project or global `fp-lib-table`, or a discovered install), the hole placed is
+KiCad's own library footprint, as `place_component` would place it; otherwise
+Konnect's unplated-hole geometry is written under the shipped name. That
+geometry's pad now equals the drill (no `+0.5` annulus), matching KiCad's plain
+`MountingHole_*` footprints.
+
+Results add `geometry` (`"library"` or `"inline"`) and, for inline geometry,
+`geometry_note`. The `footprint` field is now read back from the saved board
+rather than repeated from the request. No tool or argument was renamed or
+removed; `drill_diameter` keeps its default of 3.2.
+
 ## Unreleased: DRC item ownership (minor release)
 
 `run_drc` and `get_drc_violations` now say what owns each item of each
@@ -94,7 +117,6 @@ count rather than a substring count clamped to a minimum of two; a board with
 no `(layers …)` table reports `0` and a warning rather than an invented `2`.
 `validate_for_manufacturing`'s `board_info.copper_layers` changes value on any
 board with non-`signal` copper; its shape is unchanged.
-
 ## Unreleased: `find_single_pin_nets` counts pins, not labels (minor release)
 
 `find_single_pin_nets` counted label instances per net name, so an ordinary net

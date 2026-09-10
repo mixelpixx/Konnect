@@ -697,15 +697,100 @@ fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) 
     )
 }
 
-/// Library identifier a mounting hole is placed under. Shared by the IPC and
-/// file paths so the two cannot drift.
-fn mounting_hole_lib_id(drill_d: f64) -> String {
-    format!("MountingHole:MountingHole_{drill_d:.1}mm")
+/// Every unplated mounting-hole footprint KiCad 10 ships in `MountingHole.pretty`
+/// without a pad, keyed by drill diameter, spelled exactly as the library
+/// spells it (#462).
+///
+/// Two conventions coexist in that library and neither is derivable from the
+/// number: round sizes are `MountingHole_3mm` (no `.0`), metric-clearance
+/// sizes carry the screw (`MountingHole_3.2mm_M3`), and a plain
+/// `MountingHole_3.2mm` does not exist at all. Formatting the drill as
+/// `{:.1}mm` wrote a name for the default call and for every integer size
+/// that no stock KiCad resolves. Where a drill has both a plain and a screw
+/// variant (2.7 mm), the plain one is used: the caller named a hole, not a
+/// screw.
+///
+/// `every_shipped_name_exists_in_the_installed_library` checks this table
+/// against the installed KiCad when one is present.
+const MOUNTING_HOLE_NAMES: &[(f64, &str)] = &[
+    (2.0, "MountingHole_2mm"),
+    (2.1, "MountingHole_2.1mm"),
+    (2.2, "MountingHole_2.2mm_M2"),
+    (2.5, "MountingHole_2.5mm"),
+    (2.7, "MountingHole_2.7mm"),
+    (3.0, "MountingHole_3mm"),
+    (3.2, "MountingHole_3.2mm_M3"),
+    (3.5, "MountingHole_3.5mm"),
+    (3.7, "MountingHole_3.7mm"),
+    (4.0, "MountingHole_4mm"),
+    (4.3, "MountingHole_4.3mm_M4"),
+    (4.5, "MountingHole_4.5mm"),
+    (5.0, "MountingHole_5mm"),
+    (5.3, "MountingHole_5.3mm_M5"),
+    (5.5, "MountingHole_5.5mm"),
+    (6.0, "MountingHole_6mm"),
+    (6.4, "MountingHole_6.4mm_M6"),
+    (6.5, "MountingHole_6.5mm"),
+    (8.4, "MountingHole_8.4mm_M8"),
+];
+
+/// Library identifier a mounting hole is placed under, or `None` when KiCad 10
+/// ships no footprint for that drill. Shared by the IPC and file paths so the
+/// two cannot drift.
+fn mounting_hole_lib_id(drill_d: f64) -> Option<String> {
+    MOUNTING_HOLE_NAMES
+        .iter()
+        .find(|(drill, _)| (drill - drill_d).abs() < 1e-6)
+        .map(|(_, name)| format!("MountingHole:{name}"))
 }
 
-/// Copper/mask annulus diameter around a `drill_d` mounting hole.
+/// Structured refusal for a drill KiCad ships no mounting hole for. Writing a
+/// name that does not resolve was the defect; the alternative is to say so
+/// before touching the board.
+fn mounting_hole_refusal(drill_d: f64) -> CallToolResult {
+    let shipped = MOUNTING_HOLE_NAMES
+        .iter()
+        .map(|(drill, _)| format!("{drill}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: "drill_diameter".to_string(),
+            reason: format!(
+                "KiCad 10 ships no MountingHole footprint for a {drill_d} mm drill; shipped \
+                 drills are {shipped} mm"
+            ),
+        },
+        format!(
+            "No stock KiCad mounting hole has a {drill_d} mm drill, so a footprint under that \
+             name would not resolve. Shipped drill sizes: {shipped} mm. Nothing was written."
+        ),
+    )
+}
+
+/// Pad diameter of a `drill_d` mounting hole: equal to the drill, as KiCad's
+/// own plain `MountingHole_*` footprints are — an unplated hole with no
+/// annulus. The old `drill + 0.5` annulus matched no library footprint, so a
+/// hole placed under a library name disagreed with that library's pad.
 fn mounting_hole_pad_size(drill_d: f64) -> f64 {
-    drill_d + 0.5
+    drill_d
+}
+
+/// The `Library:Footprint` id the board file carries for `reference`, read
+/// back from the saved text rather than echoed from the request.
+fn written_footprint_lib_id(content: &str, reference: &str) -> Option<String> {
+    let tree = konnect_sexp::parse_sexp(content).ok()?;
+    tree.find_all("footprint").into_iter().find_map(|fp| {
+        let named = fp.find_all("property").into_iter().any(|property| {
+            property.get(1).and_then(|n| n.as_str()) == Some("Reference")
+                && property.get(2).and_then(|n| n.as_str()) == Some(reference)
+        });
+        if named {
+            fp.get(1).and_then(|n| n.as_str()).map(str::to_string)
+        } else {
+            None
+        }
+    })
 }
 
 /// Footprint-local Y offset of the Reference/Value text of a mounting hole.
@@ -735,13 +820,12 @@ fn mounting_hole_pad(drill_d: f64) -> konnect_ipc::IpcPadDefinition {
     }
 }
 
-fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> String {
+fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str, lib_id: &str) -> String {
     let fp_uuid = new_uuid();
     let ref_uuid = new_uuid();
     let val_uuid = new_uuid();
     let pad_uuid = new_uuid();
     let pad_size = mounting_hole_pad_size(drill_d);
-    let lib_id = mounting_hole_lib_id(drill_d);
     format!(
         "\n  (footprint \"{lib_id}\"\n    \
          (layer \"F.Cu\")\n    (at {x} {y})\n    \
@@ -1024,14 +1108,18 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_mounting_hole",
-            "Add an NPTH mounting hole footprint at the specified position.",
+            "Add an NPTH mounting hole footprint at the specified position, under the \
+             MountingHole library name stock KiCad 10 ships for that drill (3.2 → \
+             MountingHole_3.2mm_M3, 3 → MountingHole_3mm). A drill KiCad ships no \
+             footprint for is refused. Places KiCad's own library footprint when the \
+             library resolves; otherwise an equivalent unplated hole under the same name.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":          { "type": "string" },
                     "x":              { "type": "number", "description": "X position in mm" },
                     "y":              { "type": "number", "description": "Y position in mm" },
-                    "drill_diameter": { "type": "number", "description": "Drill diameter in mm", "default": 3.2 },
+                    "drill_diameter": { "type": "number", "description": "Drill diameter in mm. Must be one KiCad 10 ships a MountingHole footprint for: 2, 2.1, 2.2, 2.5, 2.7, 3, 3.2, 3.5, 3.7, 4, 4.3, 4.5, 5, 5.3, 5.5, 6, 6.4, 6.5 or 8.4.", "default": 3.2 },
                     "reference":      { "type": "string", "description": "Designator for the hole (e.g. 'H1')", "default": "H1" }
                 },
                 "required": ["board", "x", "y"]
@@ -1900,27 +1988,85 @@ async fn handle_add_mounting_hole(
     let drill_d = args["drill_diameter"].as_f64().unwrap_or(3.2);
     let reference = args["reference"].as_str().unwrap_or("H1").to_string();
 
+    // The name must be one stock KiCad resolves (#462). A drill with no
+    // shipped footprint is refused here, before any transport is dialled or
+    // any byte written.
+    let Some(lib_id) = mounting_hole_lib_id(drill_d) else {
+        return Ok(mounting_hole_refusal(drill_d));
+    };
+
+    // Prefer KiCad's own footprint. When `MountingHole.pretty` resolves from
+    // this machine (project or global fp-lib-table, or a discovered install),
+    // the hole placed is that library footprint — pads, courtyard, comments
+    // layer circle and all — exactly as `place_component` would place it, so
+    // the name and the geometry are KiCad's and `lib_footprint_mismatch` has
+    // nothing to say. Without a resolvable library, Konnect's own NPTH
+    // geometry is written under the same shipped name and the response says
+    // so.
+    let library_source = super::pcb_components::resolve_footprint_source(&lib_id, &board_path).ok();
+    let geometry = if library_source.is_some() {
+        "library"
+    } else {
+        "inline"
+    };
+    let text_offset = mounting_hole_text_offset(drill_d);
+    let (pads, graphics, fields, value) = match &library_source {
+        Some(source) => {
+            let prepared = match super::pcb_components::prepare_footprint_source(
+                source, &lib_id, &reference, None, x, y, 0.0, "F.Cu",
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+            };
+            let pads = match super::pcb_components::extract_pad_definitions(&prepared) {
+                Ok(pads) => pads,
+                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+            };
+            let graphics = match super::pcb_components::extract_graphic_definitions(&prepared) {
+                Ok(graphics) => graphics,
+                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+            };
+            let fields = super::pcb_components::extract_field_placement(&prepared);
+            let value = lib_id
+                .split_once(':')
+                .map(|(_, entry)| entry.to_string())
+                .unwrap_or_else(|| lib_id.clone());
+            (pads, graphics, fields, value)
+        }
+        None => (
+            vec![mounting_hole_pad(drill_d)],
+            Vec::new(),
+            konnect_ipc::IpcFieldPlacement {
+                reference_at: Some((0.0, text_offset, 0.0)),
+                value_at: Some((0.0, -text_offset, 0.0)),
+            },
+            "MountingHole".to_string(),
+        ),
+    };
+    let geometry_note = (geometry == "inline").then(|| {
+        format!(
+            "KiCad's MountingHole library was not resolvable from this machine, so Konnect's \
+             own unplated-hole geometry was placed under the shipped name {lib_id}; KiCad may \
+             report lib_footprint_mismatch until the footprint is updated from the library"
+        )
+    });
+
     // A mounting hole is a footprint, so the same rule as every other
     // board-mutating tool applies (see `attempt_ipc_write`): the request must
     // name the board KiCAD has open, and only an IPC transport that was never
     // reached may fall back to editing the file.
     let requested_board = board_path.clone();
-    let lib_id = mounting_hole_lib_id(drill_d);
     let lib_id_ipc = lib_id.clone();
     let reference_ipc = reference.clone();
-    let text_offset = mounting_hole_text_offset(drill_d);
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
         c.place_footprint(
             &requested_board,
             &lib_id_ipc,
             &reference_ipc,
-            "MountingHole",
-            std::slice::from_ref(&mounting_hole_pad(drill_d)),
-            &[],
-            &konnect_ipc::IpcFieldPlacement {
-                reference_at: Some((0.0, text_offset, 0.0)),
-                value_at: Some((0.0, -text_offset, 0.0)),
-            },
+            &value,
+            &pads,
+            &graphics,
+            &fields,
             x,
             y,
             0.0,
@@ -1933,21 +2079,58 @@ async fn handle_add_mounting_hole(
         BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
             "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
             "drill_diameter": drill_d, "footprint": fp.footprint,
+            "geometry": geometry,
+            "geometry_note": geometry_note,
             "source": "ipc"
         }))),
         BoardWrite::Refused(err) => Ok(err),
         BoardWrite::File(reason) => {
             // No live KiCad now, and this board was not observed live during
             // the current server session: use the guarded file path.
-            let fp_sexp = format_npth_footprint(x, y, drill_d, &reference);
-            let content = std::fs::read_to_string(&board_path)?;
-            let close_pos = content.rfind(')').unwrap_or(content.len());
-            let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, fp_sexp)]);
-            write_atomic(&board_path, &new_content)?;
+            match &library_source {
+                Some(_) => {
+                    let sexp = match super::pcb_components::board_footprint_sexp(
+                        &lib_id,
+                        x,
+                        y,
+                        0.0,
+                        "F.Cu",
+                        Some(&reference),
+                        board_path.parent(),
+                    ) {
+                        Ok(sexp) => sexp,
+                        Err(message) => return Ok(CallToolResult::error(message)),
+                    };
+                    super::pcb_components::insert_into_board(
+                        &board_path,
+                        std::slice::from_ref(&sexp),
+                    )?;
+                }
+                None => {
+                    let fp_sexp = format_npth_footprint(x, y, drill_d, &reference, &lib_id);
+                    let content = std::fs::read_to_string(&board_path)?;
+                    let close_pos = content.rfind(')').unwrap_or(content.len());
+                    let new_content =
+                        apply_edits(content, vec![SexpEdit::insert(close_pos, fp_sexp)]);
+                    write_atomic(&board_path, &new_content)?;
+                }
+            }
+
+            // The footprint name is read back from what was saved, not
+            // repeated from the request.
+            let written = std::fs::read_to_string(&board_path)?;
+            let footprint = written_footprint_lib_id(&written, &reference).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mounting hole {reference} was written but cannot be read back from {}",
+                    board_path.display()
+                )
+            })?;
 
             Ok(CallToolResult::json(&json!({
                 "reference": reference, "x": x, "y": y, "drill_diameter": drill_d,
-                "footprint": lib_id,
+                "footprint": footprint,
+                "geometry": geometry,
+                "geometry_note": geometry_note,
                 "source": "file",
                 "fallback_reason": reason.evidence(),
                 "warning": reason.warning()
@@ -3683,17 +3866,18 @@ mod mounting_hole_tests {
     }
 
     #[test]
-    fn mounting_hole_pad_is_an_unplated_hole_with_drill_and_annulus() {
-        let pad = mounting_hole_pad(3.45);
+    fn mounting_hole_pad_is_an_unplated_hole_with_no_annulus() {
+        let pad = mounting_hole_pad(3.2);
         assert_eq!(pad.pad_type, "np_thru_hole");
         assert_eq!(pad.shape, "circle");
-        assert_eq!(pad.drill_x, Some(3.45));
-        assert_eq!(pad.drill_y, Some(3.45));
+        assert_eq!(pad.drill_x, Some(3.2));
+        assert_eq!(pad.drill_y, Some(3.2));
         assert!(!pad.drill_oval);
-        // Annulus matches the (size …) the file path writes, so a hole placed
-        // over IPC and one written to the file are the same hole.
-        assert_eq!(pad.size_x, 3.95);
-        assert_eq!(pad.size_y, 3.95);
+        // Pad equals drill, as KiCad's own plain MountingHole_* footprints are
+        // (#462); and it matches the (size …) the file path writes, so a hole
+        // placed over IPC and one written to the file are the same hole.
+        assert_eq!(pad.size_x, 3.2);
+        assert_eq!(pad.size_y, 3.2);
         assert_eq!(pad.layers, ["*.Cu", "*.Mask"]);
         assert_eq!(pad.x, 0.0);
         assert_eq!(pad.y, 0.0);
@@ -3712,7 +3896,7 @@ mod mounting_hole_tests {
         let ctx = ctx_with_ipc(spawn_rejecting_kicad());
         let args = json!({
             "board": board.to_str().unwrap(),
-            "x": 5.0, "y": 6.0, "drill_diameter": 3.45, "reference": "H1"
+            "x": 5.0, "y": 6.0, "drill_diameter": 3.2, "reference": "H1"
         });
         let res = handle_add_mounting_hole(&args, &ctx).await.unwrap();
 
@@ -3739,7 +3923,7 @@ mod mounting_hole_tests {
         let ctx = ctx_with_ipc(String::new());
         let args = json!({
             "board": board.to_str().unwrap(),
-            "x": 5.0, "y": 6.0, "drill_diameter": 3.45, "reference": "H1"
+            "x": 5.0, "y": 6.0, "drill_diameter": 3.2, "reference": "H1"
         });
         let res = handle_add_mounting_hole(&args, &ctx).await.unwrap();
         assert!(!res.is_error, "handler errored: {:?}", res.content);
@@ -3753,8 +3937,171 @@ mod mounting_hole_tests {
             updated.contains("(pad \"\" np_thru_hole circle"),
             "{updated}"
         );
-        assert!(updated.contains("(drill 3.45)"), "{updated}");
+        assert!(updated.contains("(drill 3.2)"), "{updated}");
         assert!(updated.contains("\"H1\""), "{updated}");
+    }
+}
+
+#[cfg(test)]
+mod mounting_hole_name_tests {
+    //! Issue #462: `add_mounting_hole` wrote `MountingHole:MountingHole_{drill:.1}mm`.
+    //! KiCad 10 ships no plain `MountingHole_3.2mm` (3.2 mm exists only as the
+    //! M3 family) and spells round sizes without a decimal (`MountingHole_3mm`,
+    //! never `3.0mm`), so the default call and every integer size wrote a name
+    //! no stock KiCad resolves.
+
+    use super::mounting_hole_tests::{blank_board, ctx_with_ipc, result_text};
+    use super::*;
+
+    #[test]
+    fn shipped_drills_get_the_library_spelling() {
+        for (drill, expected) in [
+            (3.2, "MountingHole:MountingHole_3.2mm_M3"),
+            (3.0, "MountingHole:MountingHole_3mm"),
+            (4.0, "MountingHole:MountingHole_4mm"),
+            (2.7, "MountingHole:MountingHole_2.7mm"),
+            (4.3, "MountingHole:MountingHole_4.3mm_M4"),
+            (8.4, "MountingHole:MountingHole_8.4mm_M8"),
+        ] {
+            assert_eq!(
+                mounting_hole_lib_id(drill).as_deref(),
+                Some(expected),
+                "{drill}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unshipped_drill_has_no_name() {
+        for drill in [3.3, 3.45, 0.0, -1.0, 10.0, f64::NAN] {
+            assert_eq!(mounting_hole_lib_id(drill), None, "{drill}");
+        }
+    }
+
+    /// The table is a copy of what KiCad ships; the installed library is the
+    /// truth. Skips silently on a machine without KiCad, like the other
+    /// installed-library conformance checks.
+    #[test]
+    fn every_shipped_name_exists_in_the_installed_library() {
+        let Some(pretty) = crate::kicad_install::share_roots()
+            .into_iter()
+            .map(|root| root.join("footprints").join("MountingHole.pretty"))
+            .find(|dir| dir.is_dir())
+        else {
+            eprintln!("no installed KiCad footprint library found; skipping");
+            return;
+        };
+        let mut missing = Vec::new();
+        for (_, name) in MOUNTING_HOLE_NAMES {
+            if !pretty.join(format!("{name}.kicad_mod")).is_file() {
+                missing.push(*name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "names not shipped by the installed KiCad at {}: {missing:?}",
+            pretty.display()
+        );
+        // And the names the old formatter produced must NOT exist — otherwise
+        // this fixture no longer proves the defect.
+        for absent in [
+            "MountingHole_3.2mm",
+            "MountingHole_3.0mm",
+            "MountingHole_4.0mm",
+        ] {
+            assert!(
+                !pretty.join(format!("{absent}.kicad_mod")).is_file(),
+                "{absent} exists in the installed library; the premise of #462 changed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unshipped_drill_refuses_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let ctx = ctx_with_ipc(String::new());
+        let res = handle_add_mounting_hole(
+            &json!({
+                "board": board.to_str().unwrap(),
+                "x": 5.0, "y": 6.0, "drill_diameter": 3.3, "reference": "H1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            res.is_error,
+            "3.3 mm is not a shipped hole: {:?}",
+            res.content
+        );
+        let text = result_text(&res);
+        assert!(text.contains("3.3") && text.contains("3.2"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            before,
+            "nothing written"
+        );
+    }
+
+    /// The default call — the one Chris's E2E made — writes the name KiCad
+    /// ships, and the response reports the name read back from the file.
+    #[tokio::test]
+    async fn the_default_drill_writes_a_name_stock_kicad_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+
+        let ctx = ctx_with_ipc(String::new());
+        let res = handle_add_mounting_hole(
+            &json!({ "board": board.to_str().unwrap(), "x": 5.0, "y": 6.0, "reference": "H1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let parsed: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            updated.contains("(footprint \"MountingHole:MountingHole_3.2mm_M3\""),
+            "{updated}"
+        );
+        assert!(
+            !updated.contains("MountingHole_3.2mm\""),
+            "the old name must be gone"
+        );
+        assert_eq!(
+            parsed["footprint"],
+            json!("MountingHole:MountingHole_3.2mm_M3")
+        );
+        assert_eq!(parsed["drill_diameter"], json!(3.2));
+
+        // Which geometry landed depends on whether this machine resolves
+        // KiCad's library; either way the response must say which, and the
+        // file must agree with it.
+        match parsed["geometry"].as_str() {
+            Some("library") => {
+                assert!(
+                    updated.contains("fp_circle"),
+                    "library footprint carries its circles: {updated}"
+                );
+                assert!(parsed["geometry_note"].is_null());
+            }
+            Some("inline") => {
+                assert!(
+                    updated.contains("(size 3.2 3.2)"),
+                    "no annulus, like KiCad's: {updated}"
+                );
+                assert!(parsed["geometry_note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not resolvable"));
+            }
+            other => panic!("geometry must be library or inline, got {other:?}"),
+        }
     }
 }
 

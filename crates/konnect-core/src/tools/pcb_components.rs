@@ -165,7 +165,7 @@ fn replace_reference(source: &mut String, reference: &str) -> anyhow::Result<()>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_footprint_source(
+pub(crate) fn prepare_footprint_source(
     source: &str,
     lib_id: &str,
     reference: &str,
@@ -557,7 +557,7 @@ fn extract_graphic_definitions_with_properties(
 ///
 /// KiCAD's own parser then handles the pads and graphics, which is why the
 /// whole definition is forwarded rather than reconstructed.
-fn board_footprint_sexp(
+pub(crate) fn board_footprint_sexp(
     lib_id: &str,
     x: f64,
     y: f64,
@@ -824,7 +824,7 @@ fn replace_footprint_layer(content: &str, layer: &str) -> String {
 /// `#`-commented paren would be miscounted. KiCad does not write comments into
 /// `.kicad_pcb`, and no reader in this workspace understands them either, so
 /// the assumption is at least consistent.
-fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()> {
+pub(crate) fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()> {
     let content = read_consistent(board_path)?;
     let existing_references = footprint_references(&content)?;
     let mut inserted_references = HashSet::new();
