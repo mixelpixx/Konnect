@@ -7,9 +7,10 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use anyhow::{bail, Context};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
 
 use super::{cli, pcb_export};
@@ -67,6 +68,10 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["mm", "in"],
                         "description": "Coordinate units in the assembly position file. JLCPCB assembly requires 'mm'.",
                         "default": "mm"
+                    },
+                    "jlcpcb_cpl_corrections_path": {
+                        "type": "string",
+                        "description": "Optional path to a versioned JLCPCB CPL correction-policy JSON file. Project footprint rules override built-in rules, and exact designator overrides take highest precedence. Used only when fab_house is 'jlcpcb'."
                     }
                 },
                 "required": ["board", "output_dir"]
@@ -149,6 +154,11 @@ async fn handle_export_manufacturing_package(
     };
     let position_side = args["position_side"].as_str().unwrap_or("both");
     let position_units = args["position_units"].as_str().unwrap_or("mm");
+    let jlcpcb_cpl_corrections_path = if args.get("jlcpcb_cpl_corrections_path").is_some() {
+        Some(get_path(args, "jlcpcb_cpl_corrections_path")?)
+    } else {
+        None
+    };
     if let Err((field, reason)) =
         pcb_export::validate_position_values("csv", position_side, position_units)
     {
@@ -163,6 +173,12 @@ async fn handle_export_manufacturing_package(
         return Ok(invalid_manufacturing_argument(
             "position_units",
             "JLCPCB CPL coordinates must use millimetres",
+        ));
+    }
+    if jlcpcb_cpl_corrections_path.is_some() && (!is_jlcpcb || !include_assembly) {
+        return Ok(invalid_manufacturing_argument(
+            "jlcpcb_cpl_corrections_path",
+            "requires fab_house='jlcpcb' and include_assembly=true",
         ));
     }
 
@@ -182,6 +198,7 @@ async fn handle_export_manufacturing_package(
     let mut warnings = Vec::new();
     let mut cpl_designators = None;
     let mut bom_designators = None;
+    let mut cpl_orientation_evidence = None;
 
     // 1. Export Gerbers
     let gerber_dir = output_dir.join("gerbers");
@@ -242,9 +259,15 @@ async fn handle_export_manufacturing_package(
             output_dir.join("positions.csv")
         };
         let position_result = if is_jlcpcb {
-            export_jlcpcb_cpl(cli_path, &board, &pos_path, position_side)
-                .await
-                .map(Some)
+            export_jlcpcb_cpl(
+                cli_path,
+                &board,
+                &pos_path,
+                position_side,
+                jlcpcb_cpl_corrections_path.as_deref(),
+            )
+            .await
+            .map(Some)
         } else {
             cli::export_position_file(
                 cli_path,
@@ -258,17 +281,24 @@ async fn handle_export_manufacturing_package(
             .map(|()| None)
         };
         match position_result {
-            Ok(designators) => {
+            Ok(export) => {
                 info!("[BETA] Position file export succeeded");
-                cpl_designators = designators;
+                if let Some(export) = export {
+                    cpl_designators = Some(export.designators);
+                    cpl_orientation_evidence = Some(export.orientation_evidence.clone());
+                }
                 verified_paths.push(pos_path.clone());
-                files_generated.push(json!({
+                let mut generated = json!({
                     "type": "pick_and_place",
                     "path": pos_path.to_str().unwrap_or(""),
                     "format": "csv",
                     "units": position_units,
                     "side": position_side
-                }));
+                });
+                if let Some(evidence) = &cpl_orientation_evidence {
+                    generated["placement_orientation"] = json!(evidence);
+                }
+                files_generated.push(generated);
             }
             Err(e) => {
                 error!(error = %e, "[BETA] Position file export failed");
@@ -383,11 +413,18 @@ async fn handle_export_manufacturing_package(
     );
 
     let next_steps = if complete {
-        format!(
+        let upload = format!(
                 "Upload only the verified paths listed in `files` from {} to {}'s order page. Gerbers go in the PCB order; BOM and CPL/positions go in the assembly order.",
                 output_dir.display(),
                 fab_house.to_uppercase()
+            );
+        if is_jlcpcb && include_assembly {
+            format!(
+                "{upload} Then inspect every component in JLCPCB Component Placements. Correction rules reduce known orientation mismatches; they do not replace the mandatory visual placement preview."
             )
+        } else {
+            upload
+        }
     } else {
         "Do not upload this package. Resolve every warning and export again.".to_string()
     };
@@ -400,6 +437,7 @@ async fn handle_export_manufacturing_package(
         "gerber_layers": gerber_layers,
         "position_units": if include_assembly { Some(position_units) } else { None },
         "position_side": if include_assembly { Some(position_side) } else { None },
+        "placement_orientation": cpl_orientation_evidence,
         "warnings": warnings,
         "summary": summary,
         "next_steps": next_steps
@@ -414,10 +452,11 @@ async fn handle_export_manufacturing_package(
 
 async fn export_jlcpcb_cpl(
     cli_path: &str,
-    board: &std::path::Path,
-    output: &std::path::Path,
+    board: &Path,
+    output: &Path,
     side: &str,
-) -> anyhow::Result<BTreeSet<String>> {
+    project_policy_path: Option<&Path>,
+) -> anyhow::Result<JlcpcbCplExport> {
     let staging = tempfile::tempdir_in(
         output
             .parent()
@@ -426,16 +465,279 @@ async fn export_jlcpcb_cpl(
     let native = staging.path().join("kicad-positions.csv");
     cli::export_position_file_excluding_dnp(cli_path, board, &native, "csv", "mm", side).await?;
     let source = tokio::fs::read_to_string(&native).await?;
-    let (cpl, designators) = jlcpcb_cpl_from_kicad_csv(&source)?;
-    cli::publish_verified_bytes(output, &cpl, "JLCPCB CPL").await?;
-    Ok(designators)
+    let policies = JlcpcbCorrectionPolicies::load(project_policy_path).await?;
+    let export = jlcpcb_cpl_from_kicad_csv(&source, &policies)?;
+    cli::publish_verified_bytes(output, &export.bytes, "JLCPCB CPL").await?;
+    Ok(export)
+}
+
+const BUILT_IN_JLCPCB_CORRECTIONS: &str = include_str!("jlcpcb_cpl_corrections_v1.json");
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JlcpcbCorrectionPolicy {
+    schema_version: u64,
+    policy_id: String,
+    provenance: String,
+    #[serde(default)]
+    footprint_rules: Vec<JlcpcbCorrectionRule>,
+    #[serde(default)]
+    component_overrides: Vec<JlcpcbComponentOverride>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JlcpcbCorrectionRule {
+    id: String,
+    footprint_prefix: String,
+    #[serde(default)]
+    rotation_degrees: f64,
+    #[serde(default)]
+    offset_x_mm: f64,
+    #[serde(default)]
+    offset_y_mm: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JlcpcbComponentOverride {
+    id: String,
+    designator: String,
+    #[serde(default)]
+    rotation_degrees: f64,
+    #[serde(default)]
+    offset_x_mm: f64,
+    #[serde(default)]
+    offset_y_mm: f64,
+}
+
+#[derive(Debug)]
+struct JlcpcbCorrectionPolicies {
+    built_in: JlcpcbCorrectionPolicy,
+    project: Option<JlcpcbCorrectionPolicy>,
+}
+
+impl JlcpcbCorrectionPolicies {
+    async fn load(project_path: Option<&Path>) -> anyhow::Result<Self> {
+        let built_in = parse_jlcpcb_correction_policy(BUILT_IN_JLCPCB_CORRECTIONS, "built-in")?;
+        let project = if let Some(path) = project_path {
+            let source = tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("read JLCPCB correction policy {}", path.display()))?;
+            Some(parse_jlcpcb_correction_policy(
+                &source,
+                &path.display().to_string(),
+            )?)
+        } else {
+            None
+        };
+        Ok(Self { built_in, project })
+    }
+
+    fn matching_rule<'a>(&'a self, designator: &str, footprint: &str) -> Option<MatchedRule<'a>> {
+        if let Some(project) = &self.project {
+            if let Some(rule) = project
+                .component_overrides
+                .iter()
+                .find(|rule| rule.designator == designator)
+            {
+                return Some(MatchedRule::Component {
+                    policy: project,
+                    rule,
+                });
+            }
+            if let Some(rule) = project
+                .footprint_rules
+                .iter()
+                .find(|rule| footprint.starts_with(&rule.footprint_prefix))
+            {
+                return Some(MatchedRule::Footprint {
+                    policy: project,
+                    rule,
+                });
+            }
+        }
+        self.built_in
+            .footprint_rules
+            .iter()
+            .find(|rule| footprint.starts_with(&rule.footprint_prefix))
+            .map(|rule| MatchedRule::Footprint {
+                policy: &self.built_in,
+                rule,
+            })
+    }
+}
+
+enum MatchedRule<'a> {
+    Component {
+        policy: &'a JlcpcbCorrectionPolicy,
+        rule: &'a JlcpcbComponentOverride,
+    },
+    Footprint {
+        policy: &'a JlcpcbCorrectionPolicy,
+        rule: &'a JlcpcbCorrectionRule,
+    },
+}
+
+impl MatchedRule<'_> {
+    fn values(&self) -> (&str, &str, &str, f64, f64, f64) {
+        match self {
+            Self::Component { policy, rule } => (
+                &policy.policy_id,
+                &rule.id,
+                "component_override",
+                rule.rotation_degrees,
+                rule.offset_x_mm,
+                rule.offset_y_mm,
+            ),
+            Self::Footprint { policy, rule } => (
+                &policy.policy_id,
+                &rule.id,
+                "footprint_rule",
+                rule.rotation_degrees,
+                rule.offset_x_mm,
+                rule.offset_y_mm,
+            ),
+        }
+    }
+}
+
+fn parse_jlcpcb_correction_policy(
+    source: &str,
+    description: &str,
+) -> anyhow::Result<JlcpcbCorrectionPolicy> {
+    let policy: JlcpcbCorrectionPolicy = serde_json::from_str(source)
+        .with_context(|| format!("parse JLCPCB correction policy {description}"))?;
+    if policy.schema_version != 1 {
+        bail!(
+            "JLCPCB correction policy {description} uses unsupported schema_version {}",
+            policy.schema_version
+        );
+    }
+    if policy.policy_id.trim().is_empty() || policy.provenance.trim().is_empty() {
+        bail!("JLCPCB correction policy {description} requires policy_id and provenance");
+    }
+    let mut ids = BTreeSet::new();
+    for rule in &policy.footprint_rules {
+        if rule.id.trim().is_empty() || rule.footprint_prefix.trim().is_empty() {
+            bail!(
+                "JLCPCB correction policy {description} has an empty rule id or footprint_prefix"
+            );
+        }
+        if !ids.insert(rule.id.as_str()) {
+            bail!(
+                "JLCPCB correction policy {description} has duplicate rule id '{}'",
+                rule.id
+            );
+        }
+        validate_finite_correction(
+            description,
+            &rule.id,
+            rule.rotation_degrees,
+            rule.offset_x_mm,
+            rule.offset_y_mm,
+        )?;
+    }
+    let mut designators = BTreeSet::new();
+    for rule in &policy.component_overrides {
+        if rule.id.trim().is_empty() || rule.designator.trim().is_empty() {
+            bail!("JLCPCB correction policy {description} has an empty override id or designator");
+        }
+        if !ids.insert(rule.id.as_str()) {
+            bail!(
+                "JLCPCB correction policy {description} has duplicate rule id '{}'",
+                rule.id
+            );
+        }
+        if !designators.insert(rule.designator.as_str()) {
+            bail!(
+                "JLCPCB correction policy {description} has duplicate override for '{}'",
+                rule.designator
+            );
+        }
+        validate_finite_correction(
+            description,
+            &rule.id,
+            rule.rotation_degrees,
+            rule.offset_x_mm,
+            rule.offset_y_mm,
+        )?;
+    }
+    Ok(policy)
+}
+
+fn validate_finite_correction(
+    description: &str,
+    id: &str,
+    rotation: f64,
+    offset_x: f64,
+    offset_y: f64,
+) -> anyhow::Result<()> {
+    if [rotation, offset_x, offset_y]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        bail!("JLCPCB correction rule '{id}' in {description} contains a non-finite value");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct JlcpcbOrientationEvidence {
+    status: &'static str,
+    physical_validation: bool,
+    policies: Vec<JlcpcbPolicyEvidence>,
+    applied_corrections: Vec<JlcpcbAppliedCorrection>,
+    unmatched_footprints: Vec<JlcpcbUnmatchedFootprint>,
+    note: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct JlcpcbPolicyEvidence {
+    policy_id: String,
+    schema_version: u64,
+    provenance: String,
+    precedence: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct JlcpcbAppliedCorrection {
+    designator: String,
+    footprint: String,
+    side: String,
+    policy_id: String,
+    rule_id: String,
+    match_kind: String,
+    rotation_before_degrees: f64,
+    rotation_after_degrees: f64,
+    x_before_mm: f64,
+    x_after_mm: f64,
+    y_before_mm: f64,
+    y_after_mm: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct JlcpcbUnmatchedFootprint {
+    designator: String,
+    footprint: String,
+    side: String,
+}
+
+#[derive(Debug)]
+struct JlcpcbCplExport {
+    bytes: Vec<u8>,
+    designators: BTreeSet<String>,
+    orientation_evidence: JlcpcbOrientationEvidence,
 }
 
 /// Translate KiCad 10's native position CSV into JLCPCB's documented CPL
 /// contract: Designator, Mid X, Mid Y, Layer, Rotation. Parsing and writing as
 /// CSV preserves quoted commas and non-ASCII values even though Val/Package do
 /// not belong in the vendor file.
-fn jlcpcb_cpl_from_kicad_csv(source: &str) -> anyhow::Result<(Vec<u8>, BTreeSet<String>)> {
+fn jlcpcb_cpl_from_kicad_csv(
+    source: &str,
+    policies: &JlcpcbCorrectionPolicies,
+) -> anyhow::Result<JlcpcbCplExport> {
     let mut reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .from_reader(source.as_bytes());
@@ -451,10 +753,13 @@ fn jlcpcb_cpl_from_kicad_csv(source: &str) -> anyhow::Result<(Vec<u8>, BTreeSet<
     let pos_y = column("PosY")?;
     let rotation = column("Rot")?;
     let side = column("Side")?;
+    let package = column("Package")?;
 
     let mut writer = csv::WriterBuilder::new().from_writer(Vec::new());
     writer.write_record(["Designator", "Mid X", "Mid Y", "Layer", "Rotation"])?;
     let mut designators = BTreeSet::new();
+    let mut applied_corrections = Vec::new();
+    let mut unmatched_footprints = Vec::new();
     for row in reader.records() {
         let row = row?;
         let field = |index: usize, name: &str| {
@@ -464,16 +769,22 @@ fn jlcpcb_cpl_from_kicad_csv(source: &str) -> anyhow::Result<(Vec<u8>, BTreeSet<
                 .with_context(|| format!("KiCad position row is missing '{name}'"))
         };
         let designator = field(reference, "Ref")?;
-        let x = field(pos_x, "PosX")?;
-        let y = field(pos_y, "PosY")?;
-        let angle = field(rotation, "Rot")?;
-        x.parse::<f64>()
-            .with_context(|| format!("invalid PosX for {designator}: {x}"))?;
-        y.parse::<f64>()
-            .with_context(|| format!("invalid PosY for {designator}: {y}"))?;
-        angle
+        let footprint = field(package, "Package")?
+            .rsplit(':')
+            .next()
+            .context("footprint basename is missing")?;
+        let x_source = field(pos_x, "PosX")?;
+        let y_source = field(pos_y, "PosY")?;
+        let angle_source = field(rotation, "Rot")?;
+        let mut x = x_source
             .parse::<f64>()
-            .with_context(|| format!("invalid Rot for {designator}: {angle}"))?;
+            .with_context(|| format!("invalid PosX for {designator}: {x_source}"))?;
+        let mut y = y_source
+            .parse::<f64>()
+            .with_context(|| format!("invalid PosY for {designator}: {y_source}"))?;
+        let angle = angle_source
+            .parse::<f64>()
+            .with_context(|| format!("invalid Rot for {designator}: {angle_source}"))?;
         let layer = match field(side, "Side")?.to_ascii_lowercase().as_str() {
             "top" | "front" => "top",
             "bottom" | "back" => "bottom",
@@ -482,13 +793,85 @@ fn jlcpcb_cpl_from_kicad_csv(source: &str) -> anyhow::Result<(Vec<u8>, BTreeSet<
         if !designators.insert(designator.to_string()) {
             bail!("duplicate CPL designator '{designator}'");
         }
-        writer.write_record([designator, x, y, layer, angle])?;
+        let before_x = x;
+        let before_y = y;
+        let matched = policies.matching_rule(designator, footprint);
+        let corrected_angle = if let Some(rule) = matched {
+            let (policy_id, rule_id, match_kind, rotation_delta, offset_x, offset_y) =
+                rule.values();
+            x += offset_x;
+            y += offset_y;
+            let corrected = if layer == "bottom" {
+                (180.0 - (angle - rotation_delta)).rem_euclid(360.0)
+            } else {
+                (angle + rotation_delta).rem_euclid(360.0)
+            };
+            applied_corrections.push(JlcpcbAppliedCorrection {
+                designator: designator.to_string(),
+                footprint: footprint.to_string(),
+                side: layer.to_string(),
+                policy_id: policy_id.to_string(),
+                rule_id: rule_id.to_string(),
+                match_kind: match_kind.to_string(),
+                rotation_before_degrees: angle,
+                rotation_after_degrees: corrected,
+                x_before_mm: before_x,
+                x_after_mm: x,
+                y_before_mm: before_y,
+                y_after_mm: y,
+            });
+            corrected
+        } else {
+            unmatched_footprints.push(JlcpcbUnmatchedFootprint {
+                designator: designator.to_string(),
+                footprint: footprint.to_string(),
+                side: layer.to_string(),
+            });
+            if layer == "bottom" {
+                (180.0 - angle).rem_euclid(360.0)
+            } else {
+                angle.rem_euclid(360.0)
+            }
+        };
+        writer.write_record([
+            designator.to_string(),
+            format!("{x:.6}"),
+            format!("{y:.6}"),
+            layer.to_string(),
+            format!("{corrected_angle:.6}"),
+        ])?;
     }
     if designators.is_empty() {
         bail!("KiCad position CSV contains no components");
     }
     writer.flush()?;
-    Ok((writer.into_inner()?, designators))
+    let mut policy_evidence = Vec::new();
+    if let Some(project) = &policies.project {
+        policy_evidence.push(JlcpcbPolicyEvidence {
+            policy_id: project.policy_id.clone(),
+            schema_version: project.schema_version,
+            provenance: project.provenance.clone(),
+            precedence: "project component override, then project footprint first-match",
+        });
+    }
+    policy_evidence.push(JlcpcbPolicyEvidence {
+        policy_id: policies.built_in.policy_id.clone(),
+        schema_version: policies.built_in.schema_version,
+        provenance: policies.built_in.provenance.clone(),
+        precedence: "built-in footprint first-match after project policy",
+    });
+    Ok(JlcpcbCplExport {
+        bytes: writer.into_inner()?,
+        designators,
+        orientation_evidence: JlcpcbOrientationEvidence {
+            status: "PREVIEW_REQUIRED",
+            physical_validation: false,
+            policies: policy_evidence,
+            applied_corrections,
+            unmatched_footprints,
+            note: "Structural export does not prove physical placement orientation. Inspect every component in JLCPCB Component Placements before ordering.",
+        },
+    })
 }
 
 fn jlcpcb_bom_designators(source: &str) -> anyhow::Result<BTreeSet<String>> {
@@ -853,6 +1236,7 @@ mod package_export_option_tests {
             properties["position_side"]["enum"],
             json!(["front", "back", "both"])
         );
+        assert_eq!(properties["jlcpcb_cpl_corrections_path"]["type"], "string");
     }
 
     #[tokio::test]
@@ -940,6 +1324,49 @@ mod package_export_option_tests {
         };
         assert!(text.contains("must use millimetres"));
     }
+
+    #[tokio::test]
+    async fn jlcpcb_policy_is_rejected_when_the_export_cannot_apply_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/specctra_two_resistors_locked.kicad_pcb");
+        let output = dir.path().join("package");
+        let policy = dir.path().join("policy.json");
+        std::fs::write(&policy, "{}").unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let result = handle_export_manufacturing_package(
+            &json!({
+                "board": board,
+                "output_dir": output,
+                "fab_house": "generic",
+                "include_assembly": true,
+                "jlcpcb_cpl_corrections_path": policy
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(!output.exists(), "invalid request must not create output");
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        assert!(text.contains("requires fab_house='jlcpcb'"));
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +1378,15 @@ mod jlcpcb_assembly_tests {
     /// against the repository's real `pic_programmer.kicad_pcb` fixture.
     const KICAD_POSITIONS: &str =
         include_str!("../../tests/fixtures/positions_pic_programmer_kicad10.csv");
+    const ISSUE_518_POSITIONS: &str =
+        include_str!("../../tests/fixtures/positions_jlcpcb_issue518_kicad10.csv");
+
+    fn built_in_policies() -> JlcpcbCorrectionPolicies {
+        JlcpcbCorrectionPolicies {
+            built_in: parse_jlcpcb_correction_policy(BUILT_IN_JLCPCB_CORRECTIONS, "test").unwrap(),
+            project: None,
+        }
+    }
 
     fn csv_rows(bytes: &[u8]) -> Vec<Vec<String>> {
         csv::ReaderBuilder::new()
@@ -963,43 +1399,158 @@ mod jlcpcb_assembly_tests {
 
     #[test]
     fn real_kicad_positions_become_the_documented_jlcpcb_cpl_schema() {
-        let (cpl, designators) = jlcpcb_cpl_from_kicad_csv(KICAD_POSITIONS).unwrap();
-        let rows = csv_rows(&cpl);
+        let export = jlcpcb_cpl_from_kicad_csv(KICAD_POSITIONS, &built_in_policies()).unwrap();
+        let rows = csv_rows(&export.bytes);
         assert_eq!(
             rows[0],
             ["Designator", "Mid X", "Mid Y", "Layer", "Rotation"]
         );
         assert_eq!(
             rows[1],
-            ["JP1", "148.082000", "-97.790000", "bottom", "0.000000"]
+            ["JP1", "148.082000", "-97.790000", "bottom", "180.000000"]
         );
         assert!(rows.iter().any(|row| {
             row.as_slice() == ["R10", "114.300000", "-48.260000", "top", "0.000000"]
         }));
-        assert_eq!(designators.len(), rows.len() - 1);
-        assert!(designators.contains("JP1"));
-        assert!(designators.contains("R10"));
+        assert_eq!(export.designators.len(), rows.len() - 1);
+        assert!(export.designators.contains("JP1"));
+        assert!(export.designators.contains("R10"));
+        assert_eq!(export.orientation_evidence.status, "PREVIEW_REQUIRED");
+        assert!(!export.orientation_evidence.physical_validation);
     }
 
     #[test]
     fn malformed_or_ambiguous_position_rows_fail_instead_of_becoming_cpl() {
-        let missing_column = "Ref,PosX,PosY,Rot\nR1,1,2,0\n";
-        assert!(jlcpcb_cpl_from_kicad_csv(missing_column)
+        let missing_column = "Ref,Package,PosX,PosY,Rot\nR1,R_0402,1,2,0\n";
+        let policies = built_in_policies();
+        assert!(jlcpcb_cpl_from_kicad_csv(missing_column, &policies)
             .unwrap_err()
             .to_string()
             .contains("Side"));
 
-        let duplicate = "Ref,PosX,PosY,Rot,Side\nR1,1,2,0,top\nR1,3,4,0,bottom\n";
-        assert!(jlcpcb_cpl_from_kicad_csv(duplicate)
+        let duplicate =
+            "Ref,Package,PosX,PosY,Rot,Side\nR1,R_0402,1,2,0,top\nR1,R_0402,3,4,0,bottom\n";
+        assert!(jlcpcb_cpl_from_kicad_csv(duplicate, &policies)
             .unwrap_err()
             .to_string()
             .contains("duplicate CPL designator"));
 
-        let invalid_number = "Ref,PosX,PosY,Rot,Side\nR1,left,2,0,top\n";
-        assert!(jlcpcb_cpl_from_kicad_csv(invalid_number)
+        let invalid_number = "Ref,Package,PosX,PosY,Rot,Side\nR1,R_0402,left,2,0,top\n";
+        assert!(jlcpcb_cpl_from_kicad_csv(invalid_number, &policies)
             .unwrap_err()
             .to_string()
             .contains("invalid PosX"));
+    }
+
+    #[test]
+    fn built_in_rules_correct_soic_usb_c_bottom_and_normalize_angles() {
+        let source = concat!(
+            "Ref,Val,Package,PosX,PosY,Rot,Side\n",
+            "U1,timer,Package_SO:SOIC-8_3.9x4.9mm_P1.27mm,47,-35,90,top\n",
+            "J1,usb,Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12,30,-26.5,0,top\n",
+            "R1,10k,Resistor_SMD:R_0402_1005Metric,1,2,450,top\n",
+            "U2,timer,Package_SO:SOIC-8_3.9x4.9mm_P1.27mm,5,6,90,bottom\n",
+        );
+        let export = jlcpcb_cpl_from_kicad_csv(source, &built_in_policies()).unwrap();
+        let rows = csv_rows(&export.bytes);
+        assert_eq!(rows[1][4], "0.000000");
+        assert_eq!(rows[2][4], "180.000000");
+        assert_eq!(rows[3][4], "90.000000");
+        assert_eq!(rows[4][4], "0.000000");
+        assert_eq!(export.orientation_evidence.applied_corrections.len(), 3);
+        assert_eq!(export.orientation_evidence.unmatched_footprints.len(), 1);
+        assert_eq!(
+            export.orientation_evidence.unmatched_footprints[0].designator,
+            "R1"
+        );
+    }
+
+    #[test]
+    fn project_component_override_precedes_project_and_built_in_footprint_rules() {
+        let project = parse_jlcpcb_correction_policy(
+            r#"{
+              "schema_version": 1,
+              "policy_id": "project-clock-v1",
+              "provenance": "Project owner verified in JLCPCB placement preview",
+              "footprint_rules": [{
+                "id": "project-soic",
+                "footprint_prefix": "SOIC-8_",
+                "rotation_degrees": 90,
+                "offset_x_mm": 1,
+                "offset_y_mm": -2
+              }],
+              "component_overrides": [{
+                "id": "u1-exact",
+                "designator": "U1",
+                "rotation_degrees": 45,
+                "offset_x_mm": 3,
+                "offset_y_mm": 4
+              }]
+            }"#,
+            "project test",
+        )
+        .unwrap();
+        let policies = JlcpcbCorrectionPolicies {
+            built_in: built_in_policies().built_in,
+            project: Some(project),
+        };
+        let source = concat!(
+            "Ref,Val,Package,PosX,PosY,Rot,Side\n",
+            "U1,timer,Package_SO:SOIC-8_3.9x4.9mm_P1.27mm,1,2,10,top\n",
+            "U2,timer,Package_SO:SOIC-8_3.9x4.9mm_P1.27mm,1,2,10,top\n",
+        );
+        let export = jlcpcb_cpl_from_kicad_csv(source, &policies).unwrap();
+        let rows = csv_rows(&export.bytes);
+        assert_eq!(&rows[1][1..], ["4.000000", "6.000000", "top", "55.000000"]);
+        assert_eq!(&rows[2][1..], ["2.000000", "0.000000", "top", "100.000000"]);
+        assert_eq!(
+            export.orientation_evidence.applied_corrections[0].match_kind,
+            "component_override"
+        );
+        assert_eq!(
+            export.orientation_evidence.applied_corrections[1].rule_id,
+            "project-soic"
+        );
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_correction_policies_fail_closed() {
+        let unsupported = r#"{
+          "schema_version": 2,
+          "policy_id": "future",
+          "provenance": "test"
+        }"#;
+        assert!(parse_jlcpcb_correction_policy(unsupported, "test")
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported schema_version"));
+
+        let duplicate = r#"{
+          "schema_version": 1,
+          "policy_id": "duplicate",
+          "provenance": "test",
+          "component_overrides": [
+            {"id":"first", "designator":"U1", "rotation_degrees":90},
+            {"id":"second", "designator":"U1", "rotation_degrees":180}
+          ]
+        }"#;
+        assert!(parse_jlcpcb_correction_policy(duplicate, "test")
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate override"));
+    }
+
+    #[test]
+    fn real_issue_518_kicad_fixture_changes_only_known_package_values() {
+        let export = jlcpcb_cpl_from_kicad_csv(ISSUE_518_POSITIONS, &built_in_policies()).unwrap();
+        let rows = csv_rows(&export.bytes);
+        let u1 = rows.iter().find(|row| row[0] == "U1").unwrap();
+        let j1 = rows.iter().find(|row| row[0] == "J1").unwrap();
+        let r1 = rows.iter().find(|row| row[0] == "R1").unwrap();
+        assert_eq!(u1, &["U1", "47.000000", "-35.000000", "top", "0.000000"]);
+        assert_eq!(j1, &["J1", "30.000000", "-26.500000", "top", "180.000000"]);
+        assert_eq!(r1, &["R1", "38.000000", "-24.000000", "top", "90.000000"]);
+        assert_eq!(export.designators.len(), 12);
     }
 
     #[test]
@@ -1089,7 +1640,7 @@ mod jlcpcb_assembly_tests {
         let bom = dir.path().join("BOM-ecc83.csv");
         let cpl = dir.path().join("CPL-ecc83.csv");
 
-        let cpl_refs = export_jlcpcb_cpl(&cli_path, &board, &cpl, "both")
+        let cpl_export = export_jlcpcb_cpl(&cli_path, &board, &cpl, "both", None)
             .await
             .unwrap();
         let options = cli::BomOptions {
@@ -1103,7 +1654,10 @@ mod jlcpcb_assembly_tests {
             .unwrap();
         let bom_source = tokio::fs::read_to_string(&bom).await.unwrap();
         let bom_refs = jlcpcb_bom_designators(&bom_source).unwrap();
-        assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs), None);
+        assert_eq!(
+            jlcpcb_designator_mismatch(&cpl_export.designators, &bom_refs),
+            None
+        );
     }
 }
 

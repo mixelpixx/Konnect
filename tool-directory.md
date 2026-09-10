@@ -471,7 +471,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, pick-and-place. Targets JLCPCB, PCBWay, etc. |
+| `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB output applies versioned footprint/component CPL corrections, reports every match and unmatched footprint, and requires a Component Placements preview. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 

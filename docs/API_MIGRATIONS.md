@@ -325,6 +325,20 @@ returns an incomplete/error result instead of an upload instruction. Generic
 and other-fabricator exports retain the existing `bom.csv`/`positions.csv`
 names, inclusion policy, and KiCad-native position schema.
 
+JLCPCB CPL rotation and position corrections are now applied after KiCad's
+native geometry export. The optional `jlcpcb_cpl_corrections_path` input points
+to a versioned project JSON policy; exact designator overrides take precedence
+over the first matching project footprint prefix, which takes precedence over
+Konnect's independently verified built-in rules. See
+[JLCPCB CPL corrections](JLCPCB_CPL_CORRECTIONS.md) for the policy schema.
+
+The response adds `placement_orientation` at the top level and on the
+`pick_and_place` artifact. It records policy provenance, each applied rule with
+before/after values, and every unmatched footprint. Its status is always
+`PREVIEW_REQUIRED` and `physical_validation` is always `false`: a structurally
+complete package is not evidence that JLCPCB's selected component models are
+physically aligned. Inspect every part in Component Placements before ordering.
+
 ## Unreleased: remove inputs that never affected an operation
 
 The following optional inputs were advertised but never read by their handlers.

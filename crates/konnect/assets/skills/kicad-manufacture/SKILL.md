@@ -89,7 +89,7 @@ structurally unable to impersonate output from the current invocation.
 For a package attempt:
 
 ```
-export_manufacturing_package(board, output_dir, fab_house?, schematic?)
+export_manufacturing_package(board, output_dir, fab_house?, schematic?, jlcpcb_cpl_corrections_path?)
 ```
 
 Pass `schematic` when assembly output requires a BOM. The tool attempts Gerber,
@@ -103,8 +103,19 @@ emits `BOM-<project>.csv` plus `CPL-<project>.csv`; the CPL uses JLCPCB's
 enumerate grouped BOM references instead of compressing them into ranges. DNP
 parts are excluded from both native exports; any remaining population mismatch
 caused by board/schematic exclusion flags makes the package incomplete. This
-conversion does not apply package-specific rotation corrections, so the order
-preview remains an assembly release gate.
+conversion applies Konnect's independently verified built-in CPL correction
+policy. Pass a checked-in project policy through
+`jlcpcb_cpl_corrections_path` when an unmatched footprint or one exact
+designator needs a correction. The precedence and JSON format are documented in
+`docs/JLCPCB_CPL_CORRECTIONS.md`.
+
+Inspect **placement_orientation.applied_corrections** and
+**placement_orientation.unmatched_footprints**. **complete: true** proves the
+package is structurally complete; it does **not** prove physical placement
+orientation. Require **placement_orientation.status == "PREVIEW_REQUIRED"** to
+be discharged by inspecting every component in JLCPCB Component Placements
+before an order is approved. Never describe the CPL as physically validated
+from the automated result alone.
 
 ### Artifact acceptance gate
 
