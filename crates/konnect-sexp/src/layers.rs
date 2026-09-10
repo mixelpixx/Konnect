@@ -63,6 +63,19 @@ pub fn copper(stack: &[Layer]) -> Vec<&Layer> {
     stack.iter().filter(|l| l.is_copper()).collect()
 }
 
+/// How many copper layers a parsed board declares — the number a fab house
+/// quotes on.
+///
+/// This is the one place that answer is computed, so `get_board_info`,
+/// `validate_for_manufacturing` and `estimate_cost` cannot disagree (#461:
+/// the manufacturing tools counted the substring `signal)` in the file text,
+/// which misses every `power`, `mixed` and `jumper` copper layer and quoted a
+/// six-layer board as two-layer). A board with no `(layers …)` table has zero
+/// copper layers; callers decide what that means, never this function.
+pub fn copper_layer_count(board: &SexpNode) -> usize {
+    copper(&layers(board)).len()
+}
+
 /// The fixed layer names, i.e. every `BoardLayer` variant that is neither
 /// `In<n>.Cu` nor `User.<n>` nor a sentinel.
 const FIXED_NAMES: &[&str] = &[
@@ -203,6 +216,25 @@ mod tests {
     #[test]
     fn a_board_without_a_layers_block_is_empty_not_a_panic() {
         assert!(layers(&parse_sexp("(kicad_pcb)").unwrap()).is_empty());
+    }
+
+    /// #461: the count a fab quotes on. Every copper kind counts, the user
+    /// layers never do, and a board with no table is zero, not two.
+    #[test]
+    fn copper_layer_count_counts_every_copper_kind() {
+        assert_eq!(
+            copper_layer_count(&board(
+                r#"(0 "F.Cu" signal) (4 "In1.Cu" power) (6 "In2.Cu" signal) (8 "In3.Cu" mixed) (10 "In4.Cu" jumper) (2 "B.Cu" signal) (9 "F.Adhes" user) (25 "Edge.Cuts" user)"#,
+            )),
+            6
+        );
+        assert_eq!(
+            copper_layer_count(&board(
+                r#"(0 "F.Cu" signal "Top Layer") (2 "B.Cu" signal "Bottom")"#
+            )),
+            2
+        );
+        assert_eq!(copper_layer_count(&parse_sexp("(kicad_pcb)").unwrap()), 0);
     }
 
     #[test]

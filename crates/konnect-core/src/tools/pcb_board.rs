@@ -1394,9 +1394,9 @@ async fn handle_get_board_info(
     // A layer is `(0 "F.Cu" signal)`, keyed by its ordinal rather than by a
     // tag, so find_all("") — which matches on the head — never matched one and
     // this was always 0. See konnect_sexp::layers.
-    let stack = konnect_sexp::layers::layers(&tree);
-    let layer_count = stack.len();
-    let copper_layer_count = konnect_sexp::layers::copper(&stack).len();
+    let layer_count = konnect_sexp::layers::layers(&tree).len();
+    // Shared with validate_for_manufacturing and estimate_cost (#461).
+    let copper_layer_count = konnect_sexp::layers::copper_layer_count(&tree);
     let paper = paper_name(&tree);
 
     // Not find_all("net"): that counts only direct children of (kicad_pcb …),

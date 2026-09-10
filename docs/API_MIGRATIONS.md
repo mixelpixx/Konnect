@@ -3,6 +3,25 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `estimate_cost` and `validate_for_manufacturing` count copper structurally (minor release)
+
+Both tools counted copper layers by finding the substring `signal)` in the
+board text, which misses every `power`, `mixed` and `jumper` copper layer and
+quoted a six-layer board as two-layer (#461). Both now read the `(layers …)`
+table through the same function `get_board_info` uses, so the three tools
+report one number for one file.
+
+`estimate_cost` keeps its optional `layers` argument as the count to quote at.
+Two additive response fields make an override visible instead of silent:
+`board.board_copper_layers` (what the file declares) beside the existing
+`board.copper_layers` (what was priced), and a top-level `warnings` array that
+names the discrepancy when they differ, or states that the file declares no
+copper layers at all. Omitting `layers` now prices at the board's declared
+count rather than a substring count clamped to a minimum of two; a board with
+no `(layers …)` table reports `0` and a warning rather than an invented `2`.
+`validate_for_manufacturing`'s `board_info.copper_layers` changes value on any
+board with non-`signal` copper; its shape is unchanged.
+
 ## Unreleased: `find_single_pin_nets` counts pins, not labels (minor release)
 
 `find_single_pin_nets` counted label instances per net name, so an ordinary net
