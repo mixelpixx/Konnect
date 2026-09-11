@@ -82,8 +82,11 @@ claim.
 content while setting `is_error`.
 
 Common error kinds include `toolset_not_loaded`, `unknown_tool`,
-`invalid_argument`, `file_not_found`, `conflict`, and `handler_error`. Add a new
-kind in `mcp/error.rs` only when callers need a stable new classification; use
+`invalid_argument`, `file_not_found`, `conflict`, `stale_target`,
+`mutation_outcome_uncertain`, and `handler_error`. The uncertain-mutation kind
+means a commit occurred but readback did not prove its result, so the caller
+must reload and inspect the named file before retrying. Add a new kind in
+`mcp/error.rs` only when callers need a stable new classification; use
 `CallToolResult::error_kind` to return it.
 
 ## Documentation Coupling

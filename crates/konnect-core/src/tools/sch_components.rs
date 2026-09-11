@@ -4,7 +4,10 @@
 //! round-trip parsing.  Pin coordinate math still delegates to
 //! `konnect_sexp::geometry::transform_pin`.
 
-use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
+use crate::mcp::{
+    error::ToolErrorKind,
+    protocol::{CallToolResult, ToolContent},
+};
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, reembed_lib_symbols,
@@ -944,7 +947,7 @@ fn verify_component_expectations(
                 return Err(ComponentDeleteTargetError::stale(
                     path,
                     format!(
-                        "post-write {field} differs from bound intent for UUID {}",
+                        "observed {field} differs from bound intent for UUID {}",
                         target.uuid
                     ),
                 )
@@ -956,7 +959,7 @@ fn verify_component_expectations(
                 return Err(ComponentDeleteTargetError::stale(
                     path,
                     format!(
-                        "post-write property {field} differs from bound intent for UUID {}",
+                        "observed property {field} differs from bound intent for UUID {}",
                         target.uuid
                     ),
                 )
@@ -1180,7 +1183,7 @@ fn component_mutation_readback_from_schematic(
         if matches.is_empty() {
             return Err(ComponentDeleteTargetError::stale(
                 path,
-                format!("component UUID {uuid} is absent from post-write readback"),
+                format!("component UUID {uuid} is absent from the observed schematic"),
             )
             .into_result());
         }
@@ -1301,8 +1304,8 @@ fn component_mutation_readback_from_schematic(
             )
             .into_result());
         }
-        // Where each field's text actually sits, read back from the committed
-        // file so a move can be checked rather than taken on trust.
+        // Where each field's text actually sits in the observed schematic, so
+        // a move can be checked rather than taken on trust.
         let mut field_placements = serde_json::Map::new();
         for property in &symbol.properties {
             // KiCad writes a *placement's* hidden flag inside the property's
@@ -1384,6 +1387,166 @@ fn load_component_mutation_readback(
     Ok(verified_component_readback(path, &committed, expected))
 }
 
+#[derive(Debug, Clone)]
+struct ComponentMutationIntent {
+    target: ComponentTarget,
+    field_placements: Vec<(String, FieldPlacement)>,
+    placement_unit: Option<u32>,
+}
+
+impl ComponentMutationIntent {
+    fn new(target: ComponentTarget) -> Self {
+        Self {
+            target,
+            field_placements: Vec::new(),
+            placement_unit: None,
+        }
+    }
+
+    fn with_field_placements(
+        mut self,
+        field_placements: Vec<(String, FieldPlacement)>,
+        placement_unit: Option<u32>,
+    ) -> Self {
+        self.field_placements = field_placements;
+        self.placement_unit = placement_unit;
+        self
+    }
+}
+
+fn verify_requested_field_placements(
+    path: &std::path::Path,
+    observed: &serde_json::Value,
+    intent: &ComponentMutationIntent,
+    phase: &str,
+) -> Result<(), CallToolResult> {
+    for (name, placement) in &intent.field_placements {
+        for unit in observed["units"].as_array().into_iter().flatten() {
+            if intent
+                .placement_unit
+                .is_some_and(|wanted| unit["unit"].as_u64() != Some(u64::from(wanted)))
+            {
+                continue;
+            }
+            if !placement_landed(&unit["field_placements"][name], placement) {
+                return Err(ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "{phase} placement of '{name}' on unit {} differs from what was requested",
+                        unit["unit"]
+                    ),
+                )
+                .into_result());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_component_mutation_intents(
+    path: &std::path::Path,
+    schematic: &cse::Schematic,
+    intents: &[ComponentMutationIntent],
+    phase: &str,
+) -> Result<Vec<serde_json::Value>, CallToolResult> {
+    let mut observations = Vec::with_capacity(intents.len());
+    for intent in intents {
+        let observed = verified_component_readback(path, schematic, &intent.target)?;
+        verify_requested_field_placements(path, &observed, intent, phase)?;
+        observations.push(observed);
+    }
+    Ok(observations)
+}
+
+fn tool_error_summary(error: &CallToolResult) -> String {
+    error
+        .content
+        .iter()
+        .find_map(|content| match content {
+            ToolContent::Text { text } => Some(
+                serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .and_then(|body| body["message"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| text.clone()),
+            ),
+            ToolContent::Image { .. } => None,
+        })
+        .unwrap_or_else(|| "readback returned no diagnostic text".to_owned())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot corruption of a prospective command result. This lets tests
+    /// drive the public handlers through the exact writer-mismatch failure
+    /// that #499 is about without altering the file on disk first.
+    static COMPONENT_PROSPECTIVE_FAULT: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn apply_component_prospective_fault(source: String) -> String {
+    COMPONENT_PROSPECTIVE_FAULT.with(|fault| {
+        let Some((from, to)) = fault.borrow_mut().take() else {
+            return source;
+        };
+        assert!(
+            source.contains(&from),
+            "prospective fault anchor was not present: {from}"
+        );
+        source.replacen(&from, &to, 1)
+    })
+}
+
+/// Validate the exact prospective command result before committing it, then
+/// independently verify the saved file. A prospective mismatch is a true
+/// no-op; a post-commit mismatch is reported as an uncertain mutation outcome.
+fn commit_verified_component_mutation(
+    path: &std::path::Path,
+    before: &str,
+    command: &SchematicCommand,
+    intents: &[ComponentMutationIntent],
+    operation: &str,
+) -> anyhow::Result<Result<Vec<serde_json::Value>, CallToolResult>> {
+    let (prospective_source, _) = prepare_command(path, before, command)?;
+    #[cfg(test)]
+    let prospective_source = apply_component_prospective_fault(prospective_source);
+    let prospective = match cse::Schematic::from_source(path, prospective_source) {
+        Ok(schematic) => schematic,
+        Err(error) => {
+            return Ok(Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("prospective schematic is not readable: {error}"),
+            )
+            .into_result()))
+        }
+    };
+    if let Err(error) =
+        verify_component_mutation_intents(path, &prospective, intents, "prospective")
+    {
+        return Ok(Err(error));
+    }
+    commit_command(path, command)?;
+
+    let committed = match cse::Schematic::load(path) {
+        Ok(schematic) => schematic,
+        Err(error) => {
+            return Ok(Err(super::mutation_outcome_uncertain(
+                path,
+                operation,
+                format!("The committed schematic could not be loaded: {error}"),
+            )))
+        }
+    };
+    match verify_component_mutation_intents(path, &committed, intents, "post-commit") {
+        Ok(observations) => Ok(Ok(observations)),
+        Err(error) => Ok(Err(super::mutation_outcome_uncertain(
+            path,
+            operation,
+            tool_error_summary(&error),
+        ))),
+    }
+}
+
 fn verified_component_readback(
     path: &std::path::Path,
     committed: &cse::Schematic,
@@ -1418,33 +1581,6 @@ fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_j
         "fields",
     ] {
         result[key] = observed[key].clone();
-    }
-}
-
-fn verify_observed_field(
-    path: &std::path::Path,
-    observed: &serde_json::Value,
-    field: &str,
-    expected: &str,
-) -> Result<(), CallToolResult> {
-    let mismatches = observed["units"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|unit| unit["fields"][field].as_str() != Some(expected))
-        .map(|unit| unit["uuid"].as_str().unwrap_or("unknown").to_owned())
-        .collect::<Vec<_>>();
-    if mismatches.is_empty() {
-        Ok(())
-    } else {
-        Err(ComponentDeleteTargetError::stale(
-            path,
-            format!(
-                "post-write readback did not observe {field}={expected:?} on UUIDs {}",
-                mismatches.join(", ")
-            ),
-        )
-        .into_result())
     }
 }
 
@@ -2723,7 +2859,9 @@ async fn handle_edit_schematic_component(
         )));
     }
 
-    if !changed.is_empty() {
+    let intent = ComponentMutationIntent::new(target.with_fields(&expected_fields))
+        .with_field_placements(applied_placements, placement_unit);
+    let observed = if !changed.is_empty() {
         let item_ids = match target.item_ids() {
             Ok(item_ids) => item_ids,
             Err(error) => return Ok(error.into_result()),
@@ -2734,35 +2872,22 @@ async fn handle_edit_schematic_component(
             item_ids,
             format!("Edit {reference}"),
         )?;
-        commit_command(&sch_path, &command)?;
-    }
-
-    let observed =
-        match load_component_mutation_readback(&sch_path, &target.with_fields(&expected_fields))? {
+        match commit_verified_component_mutation(
+            &sch_path,
+            &expected,
+            &command,
+            std::slice::from_ref(&intent),
+            "edit_schematic_component",
+        )? {
+            Ok(mut observed) => observed.remove(0),
+            Err(error) => return Ok(error),
+        }
+    } else {
+        match load_component_mutation_readback(&sch_path, &intent.target)? {
             Ok(observed) => observed,
             Err(error) => return Ok(error),
-        };
-    // Every placement is checked against the committed file. A move that did
-    // not land must not be reported as a change; this handler edits source
-    // text, and a search that matched nothing would otherwise pass silently.
-    for (name, placement) in &applied_placements {
-        for unit in observed["units"].as_array().into_iter().flatten() {
-            if placement_unit.is_some_and(|wanted| unit["unit"].as_u64() != Some(u64::from(wanted)))
-            {
-                continue;
-            }
-            if !placement_landed(&unit["field_placements"][name], placement) {
-                return Ok(ComponentDeleteTargetError::stale(
-                    &sch_path,
-                    format!(
-                        "post-write placement of '{name}' on unit {} differs from what was requested",
-                        unit["unit"]
-                    ),
-                )
-                .into_result());
-            }
         }
-    }
+    };
 
     let mut result = json!({
         "reference": observed["reference"],
@@ -3379,18 +3504,19 @@ async fn handle_add_component_annotation(
         item_ids,
         format!("Add {key} property to {reference}"),
     )?;
-    commit_command(&sch_path, &command)?;
-
-    let observed = match load_component_mutation_readback(
+    let intent = ComponentMutationIntent::new(
+        target.with_fields(&BTreeMap::from([(key.clone(), value.clone())])),
+    );
+    let observed = match commit_verified_component_mutation(
         &sch_path,
-        &target.with_fields(&BTreeMap::from([(key.clone(), value.clone())])),
+        &expected,
+        &command,
+        std::slice::from_ref(&intent),
+        "add_component_annotation",
     )? {
-        Ok(observed) => observed,
+        Ok(mut observed) => observed.remove(0),
         Err(error) => return Ok(error),
     };
-    if let Err(error) = verify_observed_field(&sch_path, &observed, &key, &value) {
-        return Ok(error);
-    }
     let updated_units = target
         .units
         .iter()
@@ -3484,23 +3610,28 @@ async fn handle_group_components(
         item_ids,
         format!("Group components as {group_name}"),
     )?;
-    commit_command(&sch_path, &command)?;
+    let intents = targets
+        .iter()
+        .map(|target| {
+            ComponentMutationIntent::new(
+                target.with_fields(&BTreeMap::from([("Group".to_owned(), group_name.clone())])),
+            )
+        })
+        .collect::<Vec<_>>();
+    let observations = match commit_verified_component_mutation(
+        &sch_path,
+        &expected,
+        &command,
+        &intents,
+        "group_components",
+    )? {
+        Ok(observations) => observations,
+        Err(error) => return Ok(error),
+    };
 
-    let committed = cse::Schematic::load(&sch_path)?;
     let mut grouped = Vec::new();
     let mut components = Vec::new();
-    for target in &targets {
-        let observed = match verified_component_readback(
-            &sch_path,
-            &committed,
-            &target.with_fields(&BTreeMap::from([("Group".to_owned(), group_name.clone())])),
-        ) {
-            Ok(observed) => observed,
-            Err(error) => return Ok(error),
-        };
-        if let Err(error) = verify_observed_field(&sch_path, &observed, "Group", &group_name) {
-            return Ok(error);
-        }
+    for observed in observations {
         grouped.push(
             observed["reference"]
                 .as_str()
@@ -7580,15 +7711,15 @@ mod multi_unit_component_tests {
             Some("stale_target")
         );
 
-        let observed = component_mutation_readback_from_schematic(
+        let mismatched_field = verified_component_readback(
             &path,
             &committed,
-            &target.uuids(),
-            Some("U1"),
+            &target.with_fields(&BTreeMap::from([(
+                "Value".to_owned(),
+                "NOT-COMMITTED".to_owned(),
+            )])),
         )
-        .unwrap();
-        let mismatched_field =
-            verify_observed_field(&path, &observed, "Value", "NOT-COMMITTED").unwrap_err();
+        .unwrap_err();
         assert_eq!(
             extract_error_kind(&mismatched_field).as_deref(),
             Some("stale_target")
@@ -7746,5 +7877,148 @@ mod multi_unit_component_tests {
             SexpError::Conflict { .. } | SexpError::ItemConflict { .. }
         ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_mutation_handlers_refuse_bad_prospective_results_without_writing() {
+        for (operation, written, intended) in [
+            (
+                "edit_schematic_component",
+                "WRITER-VALUE",
+                "REQUESTED-VALUE",
+            ),
+            ("add_component_annotation", "WRITER-NOTE", "REQUESTED-NOTE"),
+            ("group_components", "WRITER-GROUP", "REQUESTED-GROUP"),
+        ] {
+            let (_directory, path) = eeschema_fixture();
+            let before = std::fs::read_to_string(&path).unwrap();
+            COMPONENT_PROSPECTIVE_FAULT.with(|fault| {
+                *fault.borrow_mut() = Some((intended.to_owned(), written.to_owned()));
+            });
+            let refusal = match operation {
+                "edit_schematic_component" => {
+                    handle_edit_schematic_component(
+                        &json!({
+                            "schematic": path.display().to_string(),
+                            "reference": "U1",
+                            "value": intended,
+                        }),
+                        &context(),
+                    )
+                    .await
+                }
+                "add_component_annotation" => {
+                    handle_add_component_annotation(
+                        &json!({
+                            "schematic": path.display().to_string(),
+                            "reference": "U1",
+                            "key": "Note",
+                            "value": intended,
+                        }),
+                        &context(),
+                    )
+                    .await
+                }
+                "group_components" => {
+                    handle_group_components(
+                        &json!({
+                            "schematic": path.display().to_string(),
+                            "references": ["U1"],
+                            "group_name": intended,
+                        }),
+                        &context(),
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            }
+            .unwrap();
+
+            assert_eq!(
+                extract_error_kind(&refusal).as_deref(),
+                Some("stale_target"),
+                "{operation} must refuse the prospective mismatch"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{operation} must not commit before its intent is proven"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn component_mutation_handlers_do_not_create_an_absent_schematic() {
+        for operation in [
+            "edit_schematic_component",
+            "add_component_annotation",
+            "group_components",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("absent.kicad_sch");
+            let outcome = match operation {
+                "edit_schematic_component" => {
+                    handle_edit_schematic_component(
+                        &json!({
+                            "schematic": path.display().to_string(),
+                            "reference": "U1",
+                            "value": "X",
+                        }),
+                        &context(),
+                    )
+                    .await
+                }
+                "add_component_annotation" => {
+                    handle_add_component_annotation(
+                        &json!({
+                            "schematic": path.display().to_string(),
+                            "reference": "U1",
+                            "key": "Note",
+                            "value": "X",
+                        }),
+                        &context(),
+                    )
+                    .await
+                }
+                "group_components" => {
+                    handle_group_components(
+                        &json!({
+                            "schematic": path.display().to_string(),
+                            "references": ["U1"],
+                            "group_name": "X",
+                        }),
+                        &context(),
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            };
+            assert!(outcome.is_err(), "{operation} must refuse an absent target");
+            assert!(!path.exists(), "{operation} must not create its target");
+        }
+    }
+
+    #[test]
+    fn a_post_commit_verification_failure_says_the_file_may_have_changed() {
+        let (_directory, path) = fixture();
+        let error = crate::tools::mutation_outcome_uncertain(
+            &path,
+            "edit_schematic_component",
+            "observed Value differs from bound intent",
+        );
+        assert_eq!(
+            extract_error_kind(&error).as_deref(),
+            Some("mutation_outcome_uncertain")
+        );
+        let ToolContent::Text { text } = &error.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["path"], path.display().to_string());
+        assert_eq!(body["error"]["operation"], "edit_schematic_component");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("may have changed"));
     }
 }

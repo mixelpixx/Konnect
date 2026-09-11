@@ -7,7 +7,7 @@
 //! schematic-editing commands upstream (`schematic_commands.proto` is empty),
 //! so there's no dual IPC/file path to maintain, unlike the PCB toolsets.
 
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{
     get_path, opt_f64, opt_str, project_name_for, require_f64, require_str, ToolContext, ToolDef,
@@ -448,25 +448,172 @@ fn replace_source_root_uuid(source: &str, uuid: &str) -> anyhow::Result<String> 
         .or_else(|_| anyhow::bail!("could not replace newly inserted schematic UUID {generated}"))
 }
 
-/// Commit one edited sheet item and report whether the document changed.
-///
-/// A command that restates the block already on disk is valid and commits as a
-/// no-op, so callers that set a value unconditionally get `false` here rather
-/// than an error.
+#[derive(Debug)]
+enum SheetMutationIntent {
+    Present {
+        uuid: String,
+        expected: cse::sexp::SexpNode,
+    },
+    Absent {
+        uuid: String,
+    },
+}
+
+fn verify_sheet_mutation(
+    schematic: &cse::Schematic,
+    intent: &SheetMutationIntent,
+    phase: &str,
+) -> Result<(), String> {
+    let uuid = match intent {
+        SheetMutationIntent::Present { uuid, .. } | SheetMutationIntent::Absent { uuid } => uuid,
+    };
+    let matching: Vec<_> = schematic
+        .sheets
+        .iter()
+        .filter(|sheet| sheet.uuid == *uuid)
+        .collect();
+    match intent {
+        SheetMutationIntent::Present { expected, .. } => {
+            if matching.len() != 1 {
+                return Err(format!(
+                    "{phase} result contains {} sheet items with UUID {uuid}; expected exactly one",
+                    matching.len()
+                ));
+            }
+            if &matching[0].to_sexp() != expected {
+                return Err(format!(
+                    "{phase} sheet UUID {uuid} differs from the edited intent"
+                ));
+            }
+        }
+        SheetMutationIntent::Absent { .. } if !matching.is_empty() => {
+            return Err(format!(
+                "{phase} result still contains {} sheet items with deleted UUID {uuid}",
+                matching.len()
+            ));
+        }
+        SheetMutationIntent::Absent { .. } => {}
+    }
+    Ok(())
+}
+
+fn sheet_precommit_refusal(path: &Path, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target: path.display().to_string(),
+            reason: reason.clone(),
+        },
+        format!("Prospective hierarchy validation failed; nothing was written. {reason}"),
+    )
+}
+
+#[cfg(test)]
+enum HierarchyProspectiveFault {
+    Replace { from: String, to: String },
+    RestoreDeletedSheet(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot corruption of a prospective hierarchy result. Tests use it to
+    /// reproduce the wrong-bytes writer failure through a real handler.
+    static HIERARCHY_PROSPECTIVE_FAULT: std::cell::RefCell<Option<HierarchyProspectiveFault>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn apply_hierarchy_prospective_fault(source: String) -> String {
+    HIERARCHY_PROSPECTIVE_FAULT.with(|fault| {
+        let Some(fault) = fault.borrow_mut().take() else {
+            return source;
+        };
+        match fault {
+            HierarchyProspectiveFault::Replace { from, to } => {
+                assert!(
+                    source.contains(&from),
+                    "prospective hierarchy fault anchor was not present: {from}"
+                );
+                source.replacen(&from, &to, 1)
+            }
+            HierarchyProspectiveFault::RestoreDeletedSheet(sheet) => {
+                let closing = source
+                    .rfind("\n)")
+                    .expect("prospective schematic has a root closing line");
+                let mut corrupted = source;
+                corrupted.insert_str(closing, &format!("\n{sheet}"));
+                corrupted
+            }
+        }
+    })
+}
+
+fn commit_verified_sheet_mutation(
+    path: &Path,
+    before: &str,
+    command: &SchematicCommand,
+    intent: &SheetMutationIntent,
+    operation: &str,
+) -> anyhow::Result<Option<CallToolResult>> {
+    let (prospective_source, _) = prepare_command(path, before, command)?;
+    #[cfg(test)]
+    let prospective_source = apply_hierarchy_prospective_fault(prospective_source);
+    let prospective = match cse::Schematic::from_source(path, prospective_source) {
+        Ok(schematic) => schematic,
+        Err(error) => {
+            return Ok(Some(sheet_precommit_refusal(
+                path,
+                format!("prospective schematic is not readable: {error}"),
+            )))
+        }
+    };
+    if let Err(reason) = verify_sheet_mutation(&prospective, intent, "prospective") {
+        return Ok(Some(sheet_precommit_refusal(path, reason)));
+    }
+
+    commit_command(path, command)?;
+    let committed = match cse::Schematic::load(path) {
+        Ok(schematic) => schematic,
+        Err(error) => {
+            return Ok(Some(super::mutation_outcome_uncertain(
+                path,
+                operation,
+                format!("The committed schematic could not be loaded: {error}"),
+            )))
+        }
+    };
+    if let Err(reason) = verify_sheet_mutation(&committed, intent, "post-commit") {
+        return Ok(Some(super::mutation_outcome_uncertain(
+            path, operation, reason,
+        )));
+    }
+    Ok(None)
+}
+
+/// Commit one edited sheet item after validating the exact prospective text,
+/// then independently verify the saved document.
 fn commit_edited_sheet_item(
     path: &Path,
     before: &str,
     edited: &cse::Schematic,
     uuid: &str,
     label: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<CallToolResult>> {
     let command = SchematicCommand::replace_item_from_document(
         before,
         &edited.to_source(),
         ItemId::new(uuid)?,
         label,
     )?;
-    Ok(commit_command(path, &command)?.changed)
+    let intended = edited
+        .sheets
+        .by_uuid(uuid)
+        .ok_or_else(|| anyhow::anyhow!("edited {label} result has no sheet UUID {uuid}"))?;
+    let intent = SheetMutationIntent::Present {
+        uuid: uuid.to_owned(),
+        expected: intended.to_sexp(),
+    };
+    commit_verified_sheet_mutation(path, before, &command, &intent, label)
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -677,7 +824,11 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     // the whole sheet (#210) and produce a diff for a request that asked for
     // the state already on disk.
     if !changed.is_empty() {
-        let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet")?;
+        if let Some(error) =
+            commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "edit_sheet")?
+        {
+            return Ok(error);
+        }
     }
     Ok(CallToolResult::json(&json!({
         "edited": sheet_name,
@@ -711,8 +862,11 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             let changed = sheet.at.x != x || sheet.at.y != y;
             if changed {
                 sheet.move_to(x, y);
-                let _ =
-                    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Move sheet")?;
+                if let Some(error) =
+                    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "move_sheet")?
+                {
+                    return Ok(error);
+                }
             }
             Ok(CallToolResult::json(
                 &json!({ "moved": sheet_name, "x": x, "y": y, "changed": changed }),
@@ -737,12 +891,19 @@ async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result
     match sch.sheets.by_name(&sheet_name) {
         Some(removed) => {
             let child_file = removed.file().to_owned();
-            let command = SchematicCommand::delete_item(
+            let uuid = removed.uuid.clone();
+            let command =
+                SchematicCommand::delete_item(&before, ItemId::new(uuid.clone())?, "Delete sheet")?;
+            let intent = SheetMutationIntent::Absent { uuid };
+            if let Some(error) = commit_verified_sheet_mutation(
+                &sch_path,
                 &before,
-                ItemId::new(removed.uuid.clone())?,
-                "Delete sheet",
-            )?;
-            commit_command(&sch_path, &command)?;
+                &command,
+                &intent,
+                "delete_sheet",
+            )? {
+                return Ok(error);
+            }
             Ok(CallToolResult::json(&json!({
                 "deleted": sheet_name,
                 "child_file_preserved": child_file,
@@ -1200,13 +1361,15 @@ async fn handle_import_sheet_pins(
     }
 
     if !imported.is_empty() {
-        let _ = commit_edited_sheet_item(
+        if let Some(error) = commit_edited_sheet_item(
             &sch_path,
             &before,
             &parent,
             &sheet_uuid,
-            "Import sheet pins",
-        )?;
+            "import_sheet_pins",
+        )? {
+            return Ok(error);
+        }
     }
 
     Ok(CallToolResult::json(&json!({
@@ -1268,7 +1431,11 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         x,
         y,
     ));
-    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Add sheet pin")?;
+    if let Some(error) =
+        commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "add_sheet_pin")?
+    {
+        return Ok(error);
+    }
 
     Ok(CallToolResult::json(&json!({
         "added_pin": pin_name,
@@ -1341,7 +1508,11 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let summary = json!({
         "name": pin.name, "pin_type": pin.pin_type, "x": pin.at.x, "y": pin.at.y
     });
-    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet pin")?;
+    if let Some(error) =
+        commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "edit_sheet_pin")?
+    {
+        return Ok(error);
+    }
 
     Ok(CallToolResult::json(&json!({
         "edited_pin": pin_name,
@@ -1384,7 +1555,11 @@ async fn handle_delete_sheet_pin(
             pin_name, sheet_name
         )));
     }
-    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Delete sheet pin")?;
+    if let Some(error) =
+        commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "delete_sheet_pin")?
+    {
+        return Ok(error);
+    }
 
     Ok(CallToolResult::json(&json!({
         "deleted_pin": pin_name,
@@ -1474,6 +1649,7 @@ fn collect_pin_mismatches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::error::extract_error_kind;
     use crate::tools::{ServerConfig, ToolContext};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2541,5 +2717,79 @@ mod tests {
         };
         let report: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(report["issue_count"], 0);
+    }
+
+    fn real_hierarchy_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("probe.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/junction_sheet_pin.kicad_sch"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hierarchy_handlers_refuse_bad_prospective_results_without_writing() {
+        let tmp = TempDir::new().unwrap();
+        let root = real_hierarchy_fixture(tmp.path());
+        let ctx = test_ctx();
+        let before = std::fs::read_to_string(&root).unwrap();
+        HIERARCHY_PROSPECTIVE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(HierarchyProspectiveFault::Replace {
+                from: "(at 75 80)".to_owned(),
+                to: "(at 76 80)".to_owned(),
+            });
+        });
+        let refusal = handle_move_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "test",
+                "x": 75.0,
+                "y": 80.0,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            extract_error_kind(&refusal).as_deref(),
+            Some("stale_target")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&root).unwrap(),
+            before,
+            "move_sheet must leave the real KiCad file byte-identical"
+        );
+
+        let deleted_sheet = cse::Schematic::load(&root)
+            .unwrap()
+            .sheets
+            .by_name("test")
+            .unwrap()
+            .to_sexp();
+        HIERARCHY_PROSPECTIVE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(HierarchyProspectiveFault::RestoreDeletedSheet(
+                cse::sexp::writer::write(&deleted_sheet),
+            ));
+        });
+        let refusal = handle_delete_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "test",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            extract_error_kind(&refusal).as_deref(),
+            Some("stale_target")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&root).unwrap(),
+            before,
+            "delete_sheet must leave the real KiCad file byte-identical"
+        );
     }
 }
