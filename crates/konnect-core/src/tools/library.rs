@@ -2770,35 +2770,54 @@ fn is_power_pin(p: &serde_json::Value) -> bool {
 /// caller x/y is replaced. Same spread (bulbs at y = ±7.62) as the multi-unit
 /// `power_pins` path so a single op-amp's power unit matches a dual's.
 fn layout_power_unit(power: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    let n_top = power.len().div_ceil(2);
-    let n_bot = power.len() / 2;
-    let mut top_i = 0usize;
-    let mut bot_i = 0usize;
+    // A repeated number is a legal stacked representation of one physical pin
+    // and therefore owns one layout slot. Preserve the first-seen number order
+    // while distributing distinct physical pins between the two sides.
+    let mut numbers = Vec::<&str>::new();
+    for pin in power {
+        let number = pin["number"].as_str().unwrap_or("1");
+        if !numbers.contains(&number) {
+            numbers.push(number);
+        }
+    }
+    let n_top = numbers.len().div_ceil(2);
+    let n_bot = numbers.len() / 2;
     power
         .iter()
-        .enumerate()
-        .map(|(i, p)| {
+        .map(|p| {
             let mut q = p.clone();
             if let Some(obj) = q.as_object_mut() {
-                if i % 2 == 0 {
+                let number = p["number"].as_str().unwrap_or("1");
+                let slot = numbers
+                    .iter()
+                    .position(|candidate| *candidate == number)
+                    .expect("the number was collected above");
+                if slot % 2 == 0 {
+                    let top_i = slot / 2;
                     let x = (top_i as f64 - (n_top as f64 - 1.0) / 2.0) * 2.54;
                     obj.insert("x".into(), json!(x));
                     obj.insert("y".into(), json!(7.62));
                     obj.insert("angle".into(), json!(270));
                     obj.insert("length".into(), json!(2.54));
-                    top_i += 1;
                 } else {
+                    let bot_i = slot / 2;
                     let x = (bot_i as f64 - (n_bot as f64 - 1.0) / 2.0) * 2.54;
                     obj.insert("x".into(), json!(x));
                     obj.insert("y".into(), json!(-7.62));
                     obj.insert("angle".into(), json!(90));
                     obj.insert("length".into(), json!(2.54));
-                    bot_i += 1;
                 }
             }
             q
         })
         .collect()
+}
+
+/// With no angles supplied, the dedicated power unit owns the conventional
+/// top/bottom arrangement. Any explicit angle makes the caller's arrangement
+/// authoritative; a collision in that arrangement is refused after layout.
+fn power_pins_need_layout(power: &[serde_json::Value]) -> bool {
+    !power.is_empty() && power.iter().all(|pin| pin["angle"].is_null())
 }
 
 /// Normalize a caller-supplied pin graphic style to a valid KiCAD token,
@@ -3889,6 +3908,7 @@ async fn handle_create_symbol(
 
     let mut units_sexp = String::new();
     let unit_count: usize;
+    let power_pin_count: usize;
     let ref_body: SymbolRect;
     if unit_objs.is_empty() {
         let pins_val = pins;
@@ -3945,6 +3965,7 @@ async fn handle_create_symbol(
             let inner2 = unit2.sexp;
             units_sexp.push_str(&format!("\n    (symbol \"{}_2_1\"{}\n    )", name, inner2));
             unit_count = 2;
+            power_pin_count = power_laid.len();
             ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
@@ -3963,6 +3984,7 @@ async fn handle_create_symbol(
             let (inner, body) = (unit.sexp, unit.rect);
             units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
             unit_count = 1;
+            power_pin_count = pins_val.iter().filter(|pin| is_power_pin(pin)).count();
             ref_body = body;
         }
     } else {
@@ -4029,10 +4051,33 @@ async fn handle_create_symbol(
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
             // The power unit is always a rectangle.
-            let unit = match build_symbol_unit(&power_pins, None, show_names, None) {
+            let power_laid = if power_pins_need_layout(&power_pins) {
+                layout_power_unit(&power_pins)
+            } else {
+                power_pins.clone()
+            };
+            let unit = match build_symbol_unit(&power_laid, None, show_names, None) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
+            if let Some((first, second)) = unit.pins.iter().enumerate().find_map(|(i, first)| {
+                unit.pins[i + 1..]
+                    .iter()
+                    .find(|second| {
+                        first.number != second.number
+                            && (first.x - second.x).abs() < POSITION_EPSILON
+                            && (first.y - second.y).abs() < POSITION_EPSILON
+                    })
+                    .map(|second| (first, second))
+            }) {
+                return Ok(invalid_library_argument(
+                    "power_pins",
+                    format!(
+                        "pins {} ({}) and {} ({}) resolve to the same connection point ({:.4}, {:.4}); provide distinct angles or positions",
+                        first.number, first.name, second.number, second.name, first.x, first.y
+                    ),
+                ));
+            }
             total += 1;
             warnings.extend(unit.displacement_warning(&format!("unit {total}")));
             units_report.push(unit.to_json(total));
@@ -4043,6 +4088,7 @@ async fn handle_create_symbol(
             ));
         }
         unit_count = total;
+        power_pin_count = power_pins.len();
         ref_body = first_body;
     }
 
@@ -4129,7 +4175,7 @@ async fn handle_create_symbol(
         "symbol": name,
         "library": lib_path.to_str().unwrap_or(""),
         "unit_count": unit_count,
-        "power_pin_count": power_pins.len()
+        "power_pin_count": power_pin_count
     });
     result["units"] = json!(units_report);
     if !warnings.is_empty() {
@@ -6978,6 +7024,8 @@ mod tests {
         .await
         .unwrap();
         assert!(!res.is_error, "{res:?}");
+        let response: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(response["power_pin_count"], 2);
         let content = std::fs::read_to_string(&lib).unwrap();
         assert!(
             !content.contains("\"SPLIT_2_1\""),
@@ -7023,6 +7071,8 @@ mod tests {
         .await
         .unwrap();
         assert!(!res.is_error, "{res:?}");
+        let response: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(response["power_pin_count"], 2);
         let content = std::fs::read_to_string(&lib).unwrap();
         assert!(
             content.contains("\"GLYPH_2_1\""),
@@ -8176,6 +8226,216 @@ mod tests {
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "multi-unit symbol doesn't parse"
         );
+    }
+
+    /// Shared power pins with their default angle used to reach the automatic
+    /// rectangular builder unchanged. Both pins were consequently placed at
+    /// one coordinate, silently shorting the generated symbol's supply rails.
+    #[tokio::test]
+    async fn multi_unit_power_pins_are_distributed_within_the_power_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("power-layout.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "POWER_LAYOUT",
+            "reference_prefix": "U",
+            "units": [{ "pins": [
+                {"number":"1","name":"A","type":"input","x":-5.08,"y":0.0}
+            ]}],
+            "power_pins": [
+                {"number":"14","name":"VCC","type":"power_in","x":0.0,"y":0.0},
+                {"number":"7","name":"GND","type":"power_in","x":0.0,"y":0.0}
+            ]
+        });
+
+        let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let content = std::fs::read_to_string(&lib).unwrap();
+        let marker = "(symbol \"POWER_LAYOUT_2_1\"";
+        let start = content.find(marker).expect("dedicated power unit");
+        let (_, end) = find_balanced_block(&content, start).expect("balanced power unit");
+        let power_unit = &content[start..end];
+        let positions: Vec<(f64, f64, f64)> = find_block_starts(power_unit, "pin")
+            .into_iter()
+            .filter_map(|pin_start| find_balanced_block(power_unit, pin_start))
+            .map(|(pin_start, pin_end)| {
+                let pin = parse_sexp(&power_unit[pin_start..pin_end]).unwrap();
+                konnect_sexp::schematic::parse_at(&pin).unwrap()
+            })
+            .collect();
+
+        assert_eq!(positions.len(), 2, "expected two pins in {power_unit}");
+        assert_ne!(
+            (positions[0].0, positions[0].1),
+            (positions[1].0, positions[1].1),
+            "VCC and GND must not share a connection point: {power_unit}"
+        );
+        assert!(positions[0].1 > 0.0 && positions[1].1 < 0.0);
+        assert_eq!((positions[0].2, positions[1].2), (270.0, 90.0));
+    }
+
+    /// Distinct explicit angles already select opposite sides correctly. Their
+    /// order must not be reinterpreted as VCC-first/GND-second by auto-layout.
+    #[tokio::test]
+    async fn multi_unit_power_pins_preserve_distinct_explicit_angles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("explicit-power-layout.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "EXPLICIT_POWER",
+                "reference_prefix": "U",
+                "units": [{ "pins": [
+                    {"number":"1","name":"A","type":"input","x":-5.08,"y":0.0}
+                ]}],
+                // Reversed semantic order and the two-pin top group are
+                // intentional: explicit angles and positions remain authoritative.
+                "power_pins": [
+                    {"number":"7","name":"GND","type":"power_in","x":0.0,"y":-7.62,"angle":90},
+                    {"number":"6","name":"VREF","type":"power_in","x":-2.54,"y":7.62,"angle":270},
+                    {"number":"14","name":"VCC","type":"power_in","x":2.54,"y":7.62,"angle":270}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let content = std::fs::read_to_string(&lib).unwrap();
+        let marker = "(symbol \"EXPLICIT_POWER_2_1\"";
+        let start = content.find(marker).expect("dedicated power unit");
+        let (_, end) = find_balanced_block(&content, start).expect("balanced power unit");
+        let power_unit = &content[start..end];
+        let mut gnd = None;
+        let mut vref = None;
+        let mut vcc = None;
+        for (pin_start, pin_end) in find_block_starts(power_unit, "pin")
+            .into_iter()
+            .filter_map(|pin_start| find_balanced_block(power_unit, pin_start))
+        {
+            let block = &power_unit[pin_start..pin_end];
+            let pin = parse_sexp(block).unwrap();
+            let at = konnect_sexp::schematic::parse_at(&pin).unwrap();
+            if block.contains("(name \"GND\"") {
+                gnd = Some(at);
+            } else if block.contains("(name \"VREF\"") {
+                vref = Some(at);
+            } else if block.contains("(name \"VCC\"") {
+                vcc = Some(at);
+            }
+        }
+
+        let (_, gnd_y, gnd_angle) = gnd.expect("GND pin");
+        let (vref_x, vref_y, vref_angle) = vref.expect("VREF pin");
+        let (vcc_x, vcc_y, vcc_angle) = vcc.expect("VCC pin");
+        assert!(gnd_y < 0.0 && vcc_y > 0.0, "{power_unit}");
+        assert!(vref_y > 0.0 && vref_x < vcc_x, "{power_unit}");
+        assert_eq!((gnd_angle, vref_angle, vcc_angle), (90.0, 270.0, 270.0));
+    }
+
+    /// KiCad treats 0 and 360 degrees as the same direction. If their resolved
+    /// connection points coincide, refusing the request is safer than writing
+    /// a power unit that shorts itself while reporting success.
+    #[tokio::test]
+    async fn equivalent_explicit_power_pin_angles_cannot_share_a_connection_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("equivalent-angles.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "EQUIVALENT_ANGLES",
+                "reference_prefix": "U",
+                "units": [{ "pins": [
+                    {"number":"1","name":"A","type":"input","x":-5.08,"y":0.0}
+                ]}],
+                "power_pins": [
+                    {"number":"14","name":"VCC","type":"power_in","x":0.0,"y":0.0,"angle":0},
+                    {"number":"7","name":"GND","type":"power_in","x":0.0,"y":0.0,"angle":360}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let message = result_text(&result);
+        assert!(message.contains("same connection point"), "{message}");
+        assert!(message.contains("14 (VCC)") && message.contains("7 (GND)"));
+        assert!(!lib.exists(), "a colliding symbol must not be written");
+    }
+
+    /// Multiple hidden power-pin gates may intentionally represent one
+    /// physical pin number at one anchor. That is a legal KiCad stack, not a
+    /// short between distinct supply rails.
+    #[tokio::test]
+    async fn identical_power_pin_numbers_may_share_a_connection_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("stacked-power.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "STACKED_POWER",
+                "reference_prefix": "U",
+                "units": [{ "pins": [
+                    {"number":"1","name":"A","type":"input","x":-5.08,"y":0.0}
+                ]}],
+                "power_pins": [
+                    {"number":"14","name":"VCC","type":"power_in","x":0.0,"y":0.0},
+                    {"number":"14","name":"VCC","type":"power_in","x":0.0,"y":0.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let content = std::fs::read_to_string(&lib).expect("a legal stacked pin must be written");
+        let marker = "(symbol \"STACKED_POWER_2_1\"";
+        let start = content.find(marker).expect("dedicated power unit");
+        let (_, end) = find_balanced_block(&content, start).expect("balanced power unit");
+        let power_unit = &content[start..end];
+        let positions: Vec<_> = find_block_starts(power_unit, "pin")
+            .into_iter()
+            .filter_map(|pin_start| find_balanced_block(power_unit, pin_start))
+            .map(|(pin_start, pin_end)| {
+                let pin = parse_sexp(&power_unit[pin_start..pin_end]).unwrap();
+                konnect_sexp::schematic::parse_at(&pin).unwrap()
+            })
+            .collect();
+        assert_eq!(positions.len(), 2, "expected a two-pin stack");
+        assert_eq!(
+            positions[0], positions[1],
+            "the shared pin number must stay stacked"
+        );
+    }
+
+    /// `power_pin_count` describes generated output, not ignored request data.
+    #[tokio::test]
+    async fn power_pins_without_units_report_zero_written_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("ignored-power.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "IGNORED_POWER",
+                "reference_prefix": "U",
+                "pins": [{"number":"1","name":"A","type":"input","x":-5.08,"y":0.0}],
+                "power_pins": [
+                    {"number":"2","name":"VCC","type":"power_in","x":0.0,"y":5.08},
+                    {"number":"3","name":"GND","type":"power_in","x":0.0,"y":-5.08}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let response: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(response["power_pin_count"], 0);
     }
 
     async fn make_symbol(glyph: &str, pins: serde_json::Value) -> String {
