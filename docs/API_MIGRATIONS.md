@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `get_netclasses` names the patterns that fit no net (minor release)
+
+`get_netclasses` reported `orphan_patterns` — patterns naming a class that
+does not exist — but a pattern whose class exists and which fits no net on
+the board was invisible: the class simply governed nothing, and the caller
+had to subtract `matched_nets` from `patterns` by hand, which on a class with
+several patterns does not even say which one is idle. That is the usual trace
+of a renamed net, a pattern carried over from another board, or a glob that
+never fitted the net's real name.
+
+One additive response field, `unmatched_patterns`, lists those patterns in
+the shape of the project file (`{ "pattern", "netclass" }`), the same shape
+as `orphan_patterns`. A pattern is listed in one of the two, never both. When
+the board cannot be read or parsed the field is `null` rather than `[]`,
+because an empty list would claim every pattern matched; `nets_source`
+carries the reason, as before. Nothing is renamed or removed.
+
 ## Unreleased: mirrored schematic placement (minor release)
 
 `add_schematic_component` and every entry of `batch_place_components` accept a

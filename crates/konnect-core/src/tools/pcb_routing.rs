@@ -255,7 +255,11 @@ pub fn tools() -> Vec<ToolDef> {
              priority) and falls back to Default. Settings are reported \
              resolved, with 'inherits' naming the ones a class takes from the \
              Default rather than setting itself; 'missing_fields' on the \
-             Default names settings nothing can resolve.",
+             Default names settings nothing can resolve. 'orphan_patterns' \
+             lists patterns naming a class that does not exist; \
+             'unmatched_patterns' lists patterns whose class exists but which \
+             fit no net on the board as saved (null when the board could not \
+             be read).",
             json!({
                 "type": "object",
                 "properties": {
@@ -1538,29 +1542,33 @@ async fn handle_get_netclasses(
     // net table at all, so a direct-children scan finds zero nets on every
     // current board and every pattern would match nothing. A board held open
     // with unsaved edits reads as last saved, which the payload says out loud.
-    let (net_names, nets_note): (Vec<String>, String) = match std::fs::read_to_string(&board_path) {
-        Ok(text) => match konnect_sexp::parse_sexp(&text) {
-            Ok(tree) => {
-                let mut names: Vec<String> = konnect_sexp::net::collect_net_keys(&tree)
-                    .into_iter()
-                    .collect();
-                names.sort();
-                (
-                    names,
-                    "board file as last saved; unsaved edits in a running KiCad are not visible"
-                        .to_string(),
-                )
-            }
+    let (net_names, nets_note, nets_readable): (Vec<String>, String, bool) =
+        match std::fs::read_to_string(&board_path) {
+            Ok(text) => match konnect_sexp::parse_sexp(&text) {
+                Ok(tree) => {
+                    let mut names: Vec<String> = konnect_sexp::net::collect_net_keys(&tree)
+                        .into_iter()
+                        .collect();
+                    names.sort();
+                    (
+                        names,
+                        "board file as last saved; unsaved edits in a running KiCad are not visible"
+                            .to_string(),
+                        true,
+                    )
+                }
+                Err(e) => (
+                    Vec::new(),
+                    format!("board could not be parsed ({e}); nets unavailable"),
+                    false,
+                ),
+            },
             Err(e) => (
                 Vec::new(),
-                format!("board could not be parsed ({e}); nets unavailable"),
+                format!("board could not be read ({e}); nets unavailable"),
+                false,
             ),
-        },
-        Err(e) => (
-            Vec::new(),
-            format!("board could not be read ({e}); nets unavailable"),
-        ),
-    };
+        };
 
     // What an omitted key resolves to. A Default in the file is the whole
     // fallback, holes included; KiCad's seeded one applies only when the file
@@ -1654,6 +1662,34 @@ async fn handle_get_netclasses(
         .cloned()
         .collect();
 
+    // A pattern whose class exists but fits no net on the board is just as
+    // silent in KiCad: the class governs nothing, and the dialog shows the
+    // pattern beside the others. It is the usual trace of a renamed net, a
+    // pattern written for another board, or a glob that never fitted the
+    // net's real name. Until now the caller had to subtract `matched_nets`
+    // from `patterns` by hand, and a class with three patterns and five nets
+    // does not even say which pattern is the idle one. Reported in the shape
+    // of the file, like `orphan_patterns`; a pattern with no class is an
+    // orphan, not unmatched, so each is listed once. Without a readable board
+    // the answer is unknown, and the field says so with null rather than an
+    // empty list that would claim every pattern matched.
+    let unmatched_patterns: serde_json::Value = if nets_readable {
+        json!(patterns
+            .iter()
+            .filter(|p| {
+                let target = p["netclass"].as_str().unwrap_or_default();
+                let class_exists = classes.iter().any(|c| c["name"] == json!(target));
+                class_exists
+                    && p["pattern"]
+                        .as_str()
+                        .is_some_and(|pat| !net_names.iter().any(|net| wildcard_matches(pat, net)))
+            })
+            .cloned()
+            .collect::<Vec<_>>())
+    } else {
+        serde_json::Value::Null
+    };
+
     // Netclass membership is many-to-many: KiCad forms an aggregate class per
     // net, taking each property from the highest-priority class that sets it,
     // with Default filling what is left. Naming one winning class per net
@@ -1665,6 +1701,7 @@ async fn handle_get_netclasses(
         "nets_on_board": net_names.len(),
         "nets_source": nets_note,
         "orphan_patterns": orphan_patterns,
+        "unmatched_patterns": unmatched_patterns,
         "note": "A net can match several classes; KiCad then takes each property from the \
                  highest-priority class that sets it and falls back to Default. Lower \
                  priority numbers rank higher.",
@@ -2740,6 +2777,56 @@ mod netclass_tests {
         let body = get_classes(&board).await;
         assert_eq!(body["orphan_patterns"][0]["netclass"], json!("Vanished"));
         assert_eq!(body["netclasses"][0]["matched_nets"], json!([]));
+    }
+
+    /// A pattern whose class exists but fits no net governs nothing, and
+    /// KiCad's dialog shows it beside the ones that work. Subtracting
+    /// `matched_nets` from `patterns` by hand does not even say which pattern
+    /// is idle, so the tool names it — once, and never the orphan too.
+    #[tokio::test]
+    async fn a_pattern_fitting_no_net_is_reported_as_unmatched() {
+        let (_dir, board) = fixture_with_nets(&["GND", "HV_IN"]);
+        create(&board, json!({ "name": "HV" })).await;
+        let pro = board.with_extension("kicad_pro");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pro).unwrap()).unwrap();
+        settings["net_settings"]["netclass_patterns"] = json!([
+            { "pattern": "HV_*", "netclass": "HV" },
+            { "pattern": "LV_*", "netclass": "HV" },
+            { "pattern": "GND",  "netclass": "Vanished" },
+        ]);
+        std::fs::write(&pro, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let body = get_classes(&board).await;
+        assert_eq!(
+            body["unmatched_patterns"],
+            json!([{ "pattern": "LV_*", "netclass": "HV" }]),
+            "{body}"
+        );
+        assert_eq!(body["orphan_patterns"][0]["netclass"], json!("Vanished"));
+        assert_eq!(body["netclasses"][0]["matched_nets"], json!(["HV_IN"]));
+    }
+
+    /// With no readable board there is no net to fit, and an empty list would
+    /// claim every pattern matched. The field is null, and `nets_source` says
+    /// why.
+    #[tokio::test]
+    async fn unmatched_patterns_is_unknown_without_a_readable_board() {
+        let (_dir, board) = fixture_with_nets(&["GND"]);
+        create(&board, json!({ "name": "HV" })).await;
+        assign(&board, "GND", "HV").await;
+        std::fs::write(&board, "(kicad_pcb (version 20260206").unwrap();
+
+        let body = get_classes(&board).await;
+        assert!(body["unmatched_patterns"].is_null(), "{body}");
+        assert_eq!(body["nets_on_board"], json!(0));
+        assert!(
+            body["nets_source"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nets unavailable"),
+            "{body}"
+        );
     }
 
     /// Default is KiCad's fallback and its clearance explains DRC results no
