@@ -78,6 +78,41 @@ No tool mirrors an already-placed symbol: changing a placement's reflection
 still means deleting it and placing it again. This additive change is planned
 for the next minor release; no tool or argument was renamed or removed.
 
+## Unreleased: DRC checks schematic parity on every run (minor release)
+
+`run_drc`, `get_drc_violations`, `run_design_review`, `validate_for_manufacturing`
+and `export_manufacturing_package` all run `kicad-cli pcb drc` through one
+path, and that path never passed `--schematic-parity`. KiCad gates the parity
+test behind that flag; without it, KiCad 10 still writes the `schematic_parity`
+key as an *empty* array, so the parser from #245 read "never asked" as
+"checked, none found" and every board reported parity `0` (#516). The flag is
+now always sent.
+
+Two visible consequences:
+
+- **`schematic_parity` becomes non-zero on boards that reported `0`**, and the
+  review and readiness verdicts that fold DRC in change on them. A board whose
+  footprints disagree with its schematic — KiCad's own `ecc83` demo included —
+  now reports `footprint_symbol_mismatch` / `missing_footprint` /
+  `extra_footprint` items under `schematic_parity` and is no longer `READY` /
+  `LOOKS GOOD` on that evidence.
+- **`null` keeps meaning "not checked", and gains a reason.** With the flag on
+  and no root schematic for the board's project, kicad-cli exits 0, prints
+  *Failed to fetch schematic netlist for parity tests* to stderr, and writes an
+  empty array — the same silent zero, one layer down. Konnect reads that
+  statement and reports `schematic_parity: null`, lists it under
+  `categories_not_reported`, and adds `schematic_parity_diagnostic` quoting
+  KiCad's statement and naming the root schematic the test reads: the one
+  sharing the board's file stem, i.e. the board's own project's root. A
+  project of a different name beside the board is not consulted, because KiCad
+  does not consult it either. A non-empty parity array is always kept as
+  KiCad's evidence, whatever that lookup says. Review and manufacturing
+  diagnostics carry the same reason.
+
+`schematic_parity_diagnostic` is additive and absent when parity was checked
+or when the kicad-cli never reported the category at all. No tool, argument, or
+existing field was renamed or removed.
+
 ## Unreleased: `add_mounting_hole` uses KiCad's shipped footprint names (minor release)
 
 `add_mounting_hole` wrote `MountingHole:MountingHole_{drill:.1}mm`. KiCad 10

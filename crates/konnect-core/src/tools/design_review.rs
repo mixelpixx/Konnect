@@ -1171,13 +1171,23 @@ async fn handle_run_design_review(
         match cli::run_drc(&ctx.config.kicad_cli, &board_path, false).await {
             Ok(report) => {
                 for missing in report.missing_categories() {
+                    // Parity is null for one of two reasons, and the fix is
+                    // different: an older kicad-cli, or no schematic beside
+                    // the board for it to compare against (#516).
+                    let message = match (missing, &report.schematic_parity_diagnostic) {
+                        ("schematic_parity", Some(reason)) => format!(
+                            "schematic parity was not checked: {reason}; this review \
+                             cannot speak to whether the board matches its schematic"
+                        ),
+                        _ => format!(
+                            "kicad-cli did not report '{missing}', so this review \
+                             cannot speak to that class of problem"
+                        ),
+                    };
                     diagnostics.push(json!({
                         "code": "drc_category_not_reported",
                         "source": board_path.display().to_string(),
-                        "message": format!(
-                            "kicad-cli did not report '{missing}', so this review \
-                             cannot speak to that class of problem"
-                        )
+                        "message": message
                     }));
                 }
                 drc_summary = Some(json!({

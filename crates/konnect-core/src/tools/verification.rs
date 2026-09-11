@@ -267,6 +267,10 @@ async fn handle_run_drc(
             "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
             "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
             "categories_not_reported": missing,
+            // Present only when parity is null because no schematic sits
+            // beside the board — kicad-cli writes an empty array then, which
+            // is not a checked zero (#516).
+            "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
             "filtered_count": filtered.len(),
             "errors": errors,
             "warnings": warnings,

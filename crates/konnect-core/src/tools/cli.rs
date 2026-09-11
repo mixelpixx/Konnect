@@ -186,11 +186,21 @@ pub struct DrcReport {
     /// `None` means this kicad-cli did not report the category at all, which
     /// is not the same as "there are none" and must not be rendered as zero.
     pub unconnected_items: Option<Vec<DrcViolation>>,
+    /// `None` also when the parity test could not compare anything: kicad-cli
+    /// writes an *empty* array when no schematic exists beside the board,
+    /// which is not a checked zero (#516). `schematic_parity_diagnostic` says
+    /// which of the two it was.
     pub schematic_parity: Option<Vec<DrcViolation>>,
     /// Why ownership enrichment was unavailable for this report. Absent when
     /// enrichment completed normally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership_diagnostic: Option<String>,
+    /// Why `schematic_parity` is `None` although the parity test was requested:
+    /// there was no schematic beside the board for kicad-cli to compare against.
+    /// Absent when parity was checked, or when this kicad-cli never reported the
+    /// category at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schematic_parity_diagnostic: Option<String>,
 }
 
 impl DrcReport {
@@ -287,8 +297,22 @@ pub(crate) fn resolve_cli_executable(configured: &str) -> std::path::PathBuf {
     }
 }
 
+/// What a kicad-cli run wrote. `stderr` is where KiCad states what it could
+/// not do while still exiting 0 — the parity test's "Failed to fetch schematic
+/// netlist" is one such statement — so a caller that must not mistake a silent
+/// skip for a clean result reads it.
+struct CliOutput {
+    stdout: String,
+    stderr: String,
+}
+
 /// Run a kicad-cli command with arguments and capture stdout.
 async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<String> {
+    Ok(run_cli_captured(cli, args, timeout_dur).await?.stdout)
+}
+
+/// [`run_cli`], keeping stderr as well.
+async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<CliOutput> {
     info!("[BETA] kicad-cli {} {}", cli, args.join(" "));
 
     let exe = resolve_cli_executable(cli);
@@ -323,7 +347,10 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
         );
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(CliOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 /// An export command returning success is necessary but not sufficient: KiCad
@@ -590,22 +617,16 @@ fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
 // ─── DRC ─────────────────────────────────────────────────────────────────────
 
 /// Run DRC on a PCB and return parsed violations.
-/// KiCAD 10: `pcb drc --output <path> --format json [--refill-zones] <input>`
+/// KiCAD 10: `pcb drc --output <path> --format json --schematic-parity
+/// [--refill-zones] <input>`
 pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcReport> {
     let out_path = pcb.with_extension("drc.json");
-    let mut args = vec![
-        "pcb",
-        "drc",
-        "--output",
+    let args = drc_args(
         out_path.to_str().unwrap(),
-        "--format",
-        "json",
-    ];
-    if refill_zones {
-        args.push("--refill-zones");
-    }
-    args.push(pcb.to_str().unwrap());
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
+        refill_zones,
+        pcb.to_str().unwrap(),
+    );
+    let output = run_cli_captured(cli, &args, LONG_TIMEOUT).await?;
 
     let json_str = tokio::fs::read_to_string(&out_path)
         .await
@@ -614,6 +635,7 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     let _ = tokio::fs::remove_file(&out_path).await;
 
     let mut report = parse_drc_report(&raw)?;
+    apply_parity_evidence(&mut report, &output.stderr, pcb);
 
     // Ownership comes from the exact board this DRC ran on, and it is attached
     // here — the one path `run_drc` and `get_drc_violations` share — so the two
@@ -634,6 +656,80 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     }
 
     Ok(report)
+}
+
+/// The `kicad-cli pcb drc` argument list. Split out so a test can pin what is
+/// sent without running kicad-cli.
+///
+/// `--schematic-parity` is always requested: without it KiCad 10 still writes
+/// the `schematic_parity` key, as an empty array, so the parser read "never
+/// asked" as "checked, none found" and a board whose footprints disagreed with
+/// its schematic in 129 places reported parity `0` (#516).
+fn drc_args<'a>(out_path: &'a str, refill_zones: bool, pcb: &'a str) -> Vec<&'a str> {
+    let mut args = vec![
+        "pcb",
+        "drc",
+        "--output",
+        out_path,
+        "--format",
+        "json",
+        "--schematic-parity",
+    ];
+    if refill_zones {
+        args.push("--refill-zones");
+    }
+    args.push(pcb);
+    args
+}
+
+/// KiCad's own statement that the parity test compared nothing. Written to
+/// stderr, with exit 0 and an empty `schematic_parity` array, whenever the
+/// board's project has no root schematic to read.
+const PARITY_NOT_RUN: &str = "Failed to fetch schematic netlist for parity tests";
+
+/// The schematic kicad-cli's parity test reads: the root of the board's own
+/// project, which shares the board's file stem — the same project↔root
+/// relation `resolve_schematic_ownership` uses (`<project>.kicad_pro` ↔
+/// `<project>.kicad_sch`). Measured on KiCad 10: the root beside a board is
+/// read with or without its `.kicad_pro`, and a project of a different name
+/// in the same directory is *not* consulted (KiCad reports
+/// [`PARITY_NOT_RUN`] and writes an empty array). So this names one path and
+/// never scans the directory: a root found under another project's name
+/// would be a schematic KiCad did not compare against.
+fn parity_root_schematic(pcb: &Path) -> std::path::PathBuf {
+    pcb.with_extension("kicad_pro").with_extension("kicad_sch")
+}
+
+/// Turn kicad-cli's "nothing to compare" back into "not checked".
+///
+/// With `--schematic-parity` and no root schematic for the board's project,
+/// kicad-cli exits 0, prints [`PARITY_NOT_RUN`] to stderr, and writes
+/// `"schematic_parity": []` — the same silent zero #245 removed from Konnect's
+/// side, now produced by KiCad. KiCad's own statement is the signal, not a
+/// filesystem guess; the expected root path only names what was missing.
+///
+/// A **non-empty** array is KiCad's evidence and is kept whatever stderr or
+/// the filesystem say: findings cannot be un-found by a lookup failing.
+fn apply_parity_evidence(report: &mut DrcReport, stderr: &str, pcb: &Path) {
+    let Some(parity) = report.schematic_parity.as_ref() else {
+        return;
+    };
+    if !parity.is_empty() || !stderr.contains(PARITY_NOT_RUN) {
+        return;
+    }
+    let expected = parity_root_schematic(pcb);
+    let root_state = if expected.is_file() {
+        "which exists but could not be read for parity"
+    } else {
+        "which does not exist"
+    };
+    report.schematic_parity = None;
+    report.schematic_parity_diagnostic = Some(format!(
+        "kicad-cli reported \"{PARITY_NOT_RUN}\" for {}: the parity test reads the project's root \
+         schematic {} ({root_state}), so the empty parity result it wrote is not a checked zero",
+        pcb.display(),
+        expected.display()
+    ));
 }
 
 /// Name what owns every item of every violation, by exact UUID.
@@ -703,6 +799,7 @@ fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
         unconnected_items: category(raw, "unconnected_items"),
         schematic_parity: category(raw, "schematic_parity"),
         ownership_diagnostic: None,
+        schematic_parity_diagnostic: None,
     })
 }
 
@@ -1783,6 +1880,199 @@ mod drc_parse_tests {
             report.missing_categories(),
             vec!["unconnected_items", "schematic_parity"]
         );
+    }
+
+    /// #516: the parity test is opt-in on the kicad-cli side. Without the flag
+    /// KiCad writes the key as an empty array, which #245's parser correctly
+    /// read as a checked zero — so the flag must be on every invocation, and
+    /// this pins it at the argv level, where it disappeared.
+    #[test]
+    fn drc_always_asks_kicad_for_schematic_parity() {
+        for refill in [false, true] {
+            let args = drc_args("/out/board.drc.json", refill, "/in/board.kicad_pcb");
+            let flag = args
+                .iter()
+                .position(|argument| *argument == "--schematic-parity")
+                .expect("--schematic-parity is sent");
+            // Flags before the positional input file, as kicad-cli expects.
+            assert_eq!(args.last(), Some(&"/in/board.kicad_pcb"));
+            assert!(flag < args.len() - 1);
+            assert_eq!(args.contains(&"--refill-zones"), refill);
+            assert_eq!(&args[..2], ["pcb", "drc"]);
+        }
+    }
+
+    const NOT_RUN_STDERR: &str = "Failed to fetch schematic netlist for parity tests.\n\
+                                   Schematic parity tests require a fully annotated schematic.\n";
+
+    /// Measured on KiCad 10: no root schematic for the board's project → exit
+    /// 0, this stderr, `"schematic_parity": []`. It must come back as "not
+    /// checked", with KiCad's statement and the root it would have read.
+    #[test]
+    fn kicads_parity_not_run_statement_makes_an_empty_array_unchecked() {
+        let mut report = parse_drc_report(&real_report()).unwrap();
+        assert_eq!(report.schematic_parity.as_ref().map(Vec::len), Some(0));
+        let pcb = Path::new("/nowhere/lone.kicad_pcb");
+
+        apply_parity_evidence(&mut report, NOT_RUN_STDERR, pcb);
+
+        assert!(report.schematic_parity.is_none());
+        assert!(report.missing_categories().contains(&"schematic_parity"));
+        let reason = report.schematic_parity_diagnostic.as_deref().unwrap();
+        assert!(reason.contains(PARITY_NOT_RUN), "{reason}");
+        assert!(reason.contains("lone.kicad_sch"), "{reason}");
+        assert!(reason.contains("does not exist"), "{reason}");
+        // The other categories are untouched.
+        assert_eq!(report.violations.len(), 2);
+        assert_eq!(report.unconnected_items.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// A non-empty array is KiCad's evidence and survives whatever the lookup
+    /// says — even a stderr that claims the test did not run.
+    #[test]
+    fn a_non_empty_parity_array_is_kept_whatever_the_lookup_says() {
+        let mut raw = real_report();
+        raw["schematic_parity"] = raw["violations"].clone();
+        let mut report = parse_drc_report(&raw).unwrap();
+        assert_eq!(report.schematic_parity.as_ref().map(Vec::len), Some(2));
+
+        apply_parity_evidence(
+            &mut report,
+            NOT_RUN_STDERR,
+            Path::new("/nowhere/lone.kicad_pcb"),
+        );
+
+        assert_eq!(report.schematic_parity.as_ref().map(Vec::len), Some(2));
+        assert!(report.schematic_parity_diagnostic.is_none());
+        assert!(!report.missing_categories().contains(&"schematic_parity"));
+    }
+
+    /// No statement from KiCad and an empty array is a real checked zero.
+    #[test]
+    fn a_silent_empty_parity_array_is_a_checked_zero() {
+        let mut report = parse_drc_report(&real_report()).unwrap();
+
+        apply_parity_evidence(&mut report, "", Path::new("/somewhere/board.kicad_pcb"));
+
+        assert_eq!(report.schematic_parity.as_ref().map(Vec::len), Some(0));
+        assert!(report.schematic_parity_diagnostic.is_none());
+    }
+
+    /// A kicad-cli that never reported the category stays "not reported" and
+    /// gains no diagnostic claiming a schematic was missing.
+    #[test]
+    fn a_missing_parity_category_is_left_alone() {
+        let mut report = parse_drc_report(&serde_json::json!({ "violations": [] })).unwrap();
+
+        apply_parity_evidence(&mut report, NOT_RUN_STDERR, Path::new("/x/board.kicad_pcb"));
+
+        assert!(report.schematic_parity.is_none());
+        assert!(report.schematic_parity_diagnostic.is_none());
+    }
+
+    /// The root the parity test reads is the board's own project's, through
+    /// the project↔root stem relation; a project of another name beside the
+    /// board is not it (measured: KiCad does not consult it).
+    #[test]
+    fn the_parity_root_is_the_boards_own_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("ecc83-pp.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(tmp.path().join("ecc83-pp.kicad_pro"), "{}").unwrap();
+        std::fs::write(tmp.path().join("ecc83-pp.kicad_sch"), "(kicad_sch)").unwrap();
+        std::fs::write(tmp.path().join("other.kicad_pro"), "{}").unwrap();
+        std::fs::write(tmp.path().join("other.kicad_sch"), "(kicad_sch)").unwrap();
+
+        let root = parity_root_schematic(&board);
+        assert_eq!(root, tmp.path().join("ecc83-pp.kicad_sch"));
+        assert!(root.is_file());
+
+        let renamed = tmp.path().join("renamed.kicad_pcb");
+        let root = parity_root_schematic(&renamed);
+        assert_eq!(root, tmp.path().join("renamed.kicad_sch"));
+        assert!(
+            !root.is_file(),
+            "another project's root is not this board's"
+        );
+    }
+
+    /// Live, against KiCad's own ecc83 demo: with its schematic beside the
+    /// board the parity test reports real `footprint_symbol_mismatch` items
+    /// (six on KiCad 10.0), and the same board copied alone reports the
+    /// category as unchecked, not zero.
+    ///
+    ///     KICAD_CLI=C:/KiCad/10.0/bin/kicad-cli.exe \
+    ///     KICAD_DEMOS=C:/KiCad/10.0/share/kicad/demos \
+    ///     cargo test -p konnect-core --lib drc_parse_tests::live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli and the bundled KiCad demos"]
+    async fn live_parity_is_checked_when_the_schematic_is_beside_the_board() {
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let demos = std::env::var("KICAD_DEMOS")
+            .unwrap_or_else(|_| "C:/KiCad/10.0/share/kicad/demos".to_string());
+        let demo = Path::new(&demos).join("ecc83");
+        let tmp = tempfile::tempdir().unwrap();
+
+        let with_sch = tmp.path().join("with_sch");
+        std::fs::create_dir(&with_sch).unwrap();
+        for name in [
+            "ecc83-pp.kicad_pcb",
+            "ecc83-pp.kicad_sch",
+            "ecc83-pp.kicad_pro",
+            "ecc83-pp.kicad_sym",
+            "fp-lib-table",
+        ] {
+            std::fs::copy(demo.join(name), with_sch.join(name)).unwrap();
+        }
+        let report = run_drc(&cli, &with_sch.join("ecc83-pp.kicad_pcb"), false)
+            .await
+            .expect("kicad-cli pcb drc on the demo with its schematic");
+        let parity = report.schematic_parity.as_ref().expect("parity checked");
+        assert!(!parity.is_empty(), "KiCad's own demo has parity findings");
+        assert!(parity.iter().any(|v| v.rule == "footprint_symbol_mismatch"));
+        assert!(report.schematic_parity_diagnostic.is_none());
+
+        let lone = tmp.path().join("lone");
+        std::fs::create_dir(&lone).unwrap();
+        std::fs::copy(
+            demo.join("ecc83-pp.kicad_pcb"),
+            lone.join("ecc83-pp.kicad_pcb"),
+        )
+        .unwrap();
+        let report = run_drc(&cli, &lone.join("ecc83-pp.kicad_pcb"), false)
+            .await
+            .expect("kicad-cli pcb drc on the lone board");
+        assert!(report.schematic_parity.is_none());
+        assert!(report.missing_categories().contains(&"schematic_parity"));
+        assert!(report
+            .schematic_parity_diagnostic
+            .as_deref()
+            .is_some_and(|reason| reason.contains(PARITY_NOT_RUN)));
+
+        // A project of another name beside the board is not consulted.
+        let renamed = tmp.path().join("renamed");
+        std::fs::create_dir(&renamed).unwrap();
+        for name in [
+            "ecc83-pp.kicad_pro",
+            "ecc83-pp.kicad_sch",
+            "ecc83-pp.kicad_sym",
+            "fp-lib-table",
+        ] {
+            std::fs::copy(demo.join(name), renamed.join(name)).unwrap();
+        }
+        std::fs::copy(
+            demo.join("ecc83-pp.kicad_pcb"),
+            renamed.join("other.kicad_pcb"),
+        )
+        .unwrap();
+        let report = run_drc(&cli, &renamed.join("other.kicad_pcb"), false)
+            .await
+            .expect("kicad-cli pcb drc on the renamed board");
+        assert!(report.schematic_parity.is_none());
+        assert!(report
+            .schematic_parity_diagnostic
+            .as_deref()
+            .is_some_and(|reason| reason.contains("other.kicad_sch")));
     }
 }
 
