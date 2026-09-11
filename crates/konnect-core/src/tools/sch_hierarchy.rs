@@ -1573,10 +1573,20 @@ async fn handle_import_sheet_pins(
     // pin on the sheet instead — which is what this did — starts the stack past
     // the other three edges' pins and walks it straight off the end of this one.
     // The rotation is what says which edge a pin is on, so it is what is counted.
+    //
+    // A pin whose rotation names no edge — absent, or an angle KiCad does not
+    // map — is counted here too. The blunt total had that safety by accident,
+    // and making the count precise would otherwise have taken it away: if we
+    // cannot tell which edge a pin is on, it could be this one, and stacking
+    // further out is always safe where stacking over it is not. A well-formed
+    // file has no such pin, so this changes nothing for one.
     let occupied = sheet
         .pins
         .iter()
-        .filter(|pin| sheet_pin_side_for_rotation(pin.at.rotation) == Some(side.as_str()))
+        .filter(|pin| match sheet_pin_side_for_rotation(pin.at.rotation) {
+            Some(pin_side) => pin_side == side.as_str(),
+            None => true,
+        })
         .count();
 
     // Plan the whole import before any of it is written. These positions are
@@ -3489,6 +3499,67 @@ mod tests {
             body["side"],
             serde_json::Value::Null,
             "an import that saved no pin has no side to report"
+        );
+    }
+
+    /// Give a pin a rotation that names no edge — the shape a file written by
+    /// something other than these tools can carry.
+    fn set_pin_rotation(root: &Path, pin_name: &str, rotation: Option<f64>) {
+        let mut sch = cse::Schematic::load(root).unwrap();
+        sch.sheets
+            .by_name_mut("A")
+            .unwrap()
+            .pin_by_name_mut(pin_name)
+            .unwrap()
+            .at
+            .rotation = rotation;
+        sch.overwrite().unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_counts_a_pin_whose_rotation_names_no_edge() {
+        // Counting only the pins on the selected edge is more precise than
+        // counting every pin on the sheet, and precision cost a safety margin
+        // the blunt count had by accident: a pin whose rotation names no edge
+        // belongs to no edge under that filter, so the stack walks over it.
+        // If we cannot tell which edge a pin is on, we have to assume it could
+        // be this one — stacking further out is safe, stacking over it is not.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "ODD", "pin_type": "passive",
+                     "x": 50.0, "y": 52.54, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // Exactly where the first imported left-edge pin would otherwise land.
+        set_pin_rotation(&root, "ODD", None);
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        let vin = sheet.pin_by_name("VIN").unwrap();
+        let odd = sheet.pin_by_name("ODD").unwrap();
+        assert_ne!(
+            (vin.at.x, vin.at.y),
+            (odd.at.x, odd.at.y),
+            "an import must not stack over a pin whose edge it cannot determine"
+        );
+        assert_eq!(
+            vin.at.y, 55.08,
+            "the unattributable pin has to occupy a slot, so the import starts at the next one"
         );
     }
 
