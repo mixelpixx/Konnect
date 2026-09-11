@@ -95,6 +95,14 @@ pub enum ToolErrorKind {
         before_kiids: Vec<String>,
         after_kiids: Vec<String>,
     },
+    /// A file mutation committed, but its immediate readback did not prove the
+    /// requested result. Callers must inspect or reload the named document
+    /// before retrying because the operation was not a no-op.
+    MutationOutcomeUncertain {
+        operation: String,
+        path: String,
+        reason: String,
+    },
     /// Saved KiCad structure cannot prove one exact destination for a
     /// cross-probe source object.
     UnresolvedCrossProbeDestination {
@@ -133,6 +141,7 @@ impl ToolErrorKind {
             Self::EditorUnavailable { .. } => "editor_unavailable",
             Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::ReadbackMismatch { .. } => "readback_mismatch",
+            Self::MutationOutcomeUncertain { .. } => "mutation_outcome_uncertain",
             Self::UnresolvedCrossProbeDestination { .. } => "unresolved_cross_probe_destination",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
@@ -292,6 +301,11 @@ mod tests {
                 requested_kiids: vec!["b".into()],
                 before_kiids: vec!["a".into()],
                 after_kiids: vec!["a".into()],
+            },
+            ToolErrorKind::MutationOutcomeUncertain {
+                operation: "edit".into(),
+                path: "p".into(),
+                reason: "r".into(),
             },
             ToolErrorKind::UnresolvedCrossProbeDestination {
                 source_kiid: "sym".into(),

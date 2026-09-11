@@ -547,6 +547,28 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     )
 }
 
+/// Report that a write completed but its immediate readback could not prove
+/// the requested state. Callers must not turn this into a stale-target refusal:
+/// the file may already contain the mutation or an external follow-up edit.
+pub(crate) fn mutation_outcome_uncertain(
+    path: &std::path::Path,
+    operation: &str,
+    reason: impl Into<String>,
+) -> CallToolResult {
+    let path = path.display().to_string();
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+            operation: operation.to_owned(),
+            path: path.clone(),
+            reason: reason.clone(),
+        },
+        format!(
+            "{operation} committed a schematic mutation, but immediate readback did not prove the requested result. The file at '{path}' may have changed; reload and inspect it before retrying. {reason}"
+        ),
+    )
+}
+
 /// The reason string for a footprint file whose root is not `(footprint ...)`.
 ///
 /// A pre-6.0 library file has a `(module ...)` root instead, and those are

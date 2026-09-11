@@ -134,6 +134,18 @@ impl Schematic {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = konnect_sexp::read_consistent(path).map_err(map_sexp_error)?;
+        Self::from_source(path, content)
+    }
+
+    /// Parse schematic source without reading or writing its path.
+    ///
+    /// The path remains part of the model's identity and is used by later
+    /// revision-checked saves. Callers can therefore validate a prospective
+    /// document with the same parser and semantic model as a committed file,
+    /// before allowing that document to reach disk.
+    pub fn from_source(path: impl AsRef<Path>, content: impl Into<String>) -> Result<Self> {
+        let path = path.as_ref();
+        let content = content.into();
         let root = parser::parse(&content)?;
         Self::from_sexp(root, path.to_path_buf(), content)
     }

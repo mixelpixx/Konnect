@@ -3,6 +3,32 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: atomic validation for schematic edits (minor release)
+
+`edit_schematic_component`, `add_component_annotation`, and
+`group_components` now parse and semantically validate the exact prospective
+command result before committing it. A missing UUID, wrong reference, unit,
+library, hierarchy path, position, rotation, mirror, requested property, or
+field-text placement returns `stale_target` while leaving the schematic
+byte-for-byte unchanged. `edit_sheet`, `move_sheet`, `import_sheet_pins`,
+`add_sheet_pin`, `edit_sheet_pin`, and `delete_sheet_pin` use the same contract:
+their prospective document must contain exactly one sheet with the bound UUID
+and its complete serialized state must match the edited intent. `delete_sheet`
+must instead prove that the bound sheet UUID is absent. A mismatch refuses the
+operation before writing.
+
+Committed-file readback remains an independent backstop. If that second
+observation cannot load the schematic or cannot prove the requested component
+or hierarchy state, every tool listed above now returns the new structured
+error kind `mutation_outcome_uncertain`, carrying `operation`, `path`, and
+`reason`. The message explicitly says the file may have changed and must be
+reloaded and inspected before retrying. It does not return `stale_target`,
+because that kind is used for a pre-commit refusal whose no-write result has
+been established.
+
+No tool or argument was renamed or removed. The new error shape is an additive
+public response change and is planned for the next minor release.
+
 ## Unreleased: mirrored schematic placement (minor release)
 
 `add_schematic_component` and every entry of `batch_place_components` accept a
@@ -280,11 +306,11 @@ Writes use the direct-child form; KiCad 10.0.6 treats the two identically.
 
 `units[].field_placements` reports each field's `x`, `y`, `rotation` and `hide`
 **as observed in the committed file**, not as requested, and is present for
-every property carrying an `(at …)`. Every requested placement is compared
-against that readback before success is reported; a mismatch refuses with
-`stale_target`. As with the other schematic mutations, that verification
-follows a committed write, so inspect and reload the saved schematic before
-retrying.
+every property carrying an `(at …)`. Every requested placement is first
+compared against the prospective command result; a mismatch returns
+`stale_target` without writing. The committed file is checked again before
+success is reported. Failure of that second observation returns
+`mutation_outcome_uncertain`, explicitly naming the file that may have changed.
 
 A malformed existing placement is refused before anything is written.
 `(at …)` is parsed positionally and must carry finite numeric x and y, and a
@@ -316,15 +342,16 @@ and rotations preserve relative unit angles. Coordinate/angle comparisons allow
 only serialization rounding below 0.000001 mm/degrees.
 
 Missing, malformed, stale-revision, or wrong-document identities refuse with
-`stale_target`, including mismatched intended values. Component-target
+`stale_target`, including mismatched intended values, before edits,
+annotations, or grouping are committed. Component-target
 resolution and committed readback reject duplicate UUID, reference/unit,
 property, or instance identities and conflicting project, instance-unit,
 or cross-unit hierarchy records
 with the new `ambiguous_target` kind and include their candidates whenever
 Konnect cannot prove one top-level symbol per bound UUID and one logical
-reference across its units. A
-post-write verification refusal can follow a committed write, so inspect and
-reload the saved schematic before retrying. A move commits the symbol placement
+reference across its units. A post-commit verification failure from edits,
+annotations, or grouping returns `mutation_outcome_uncertain`, so inspect and
+reload the named schematic before retrying. A move commits the symbol placement
 before a separate junction-reconciliation write; if that second write or final
 readback refuses, the move can already be durable. This additive response
 change is planned for the next minor release; no tool or argument was renamed
