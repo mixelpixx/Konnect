@@ -119,7 +119,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component.",
+            "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component, and move or hide the text of any of them.",
             json!({
                 "type": "object",
                 "properties": {
@@ -132,6 +132,23 @@ pub fn tools() -> Vec<ToolDef> {
                     "fields": {
                         "type": "object",
                         "description": "Additional property fields to set as key:value pairs"
+                    },
+                    "field_placements": {
+                        "type": "object",
+                        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body.",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "rotation": { "type": "number" },
+                                "hide": { "type": "boolean", "description": "true hides the field's text on the sheet; false shows it." }
+                            }
+                        }
+                    },
+                    "unit": {
+                        "type": "integer",
+                        "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
                     }
                 },
                 "required": ["schematic", "reference"]
@@ -1223,6 +1240,43 @@ fn component_mutation_readback_from_schematic(
             )
             .into_result());
         }
+        // Where each field's text actually sits, read back from the committed
+        // file so a move can be checked rather than taken on trust.
+        let mut field_placements = serde_json::Map::new();
+        for property in &symbol.properties {
+            // KiCad writes a *placement's* hidden flag inside the property's
+            // `(effects …)`; the property-level token is what `lib_symbols`
+            // definitions carry. Reading only direct children therefore
+            // reports every field KiCad itself hid as visible — and, because
+            // the writer's own check is textual and does see the nested
+            // token, it also turned "hide an already-hidden field" into a
+            // post-write refusal over a file that was already correct.
+            // Both forms render identically in KiCad 10.0.6, and a file may
+            // hold either, so accept both.
+            fn hide_yes(node: &cse::sexp::SexpNode) -> bool {
+                node.tag() == Some("hide") && node.value() == Some("yes")
+            }
+            let hidden = property.sub_nodes.iter().any(|node| {
+                hide_yes(node)
+                    || (node.tag() == Some("effects") && node.children().iter().any(hide_yes))
+            });
+            if let Some(at) = property
+                .sub_nodes
+                .iter()
+                .filter(|node| node.tag() == Some("at"))
+                .find_map(cse::At::from_sexp)
+            {
+                field_placements.insert(
+                    property.name.clone(),
+                    json!({
+                        "x": at.x,
+                        "y": at.y,
+                        "rotation": at.rotation.unwrap_or(0.0),
+                        "hide": hidden
+                    }),
+                );
+            }
+        }
         units.push(json!({
             "uuid": symbol.uuid,
             "unit": symbol.unit,
@@ -1231,6 +1285,7 @@ fn component_mutation_readback_from_schematic(
             "rotation": symbol.at.rotation.unwrap_or(0.0),
             "lib_id": symbol.lib_id,
             "fields": fields,
+            "field_placements": field_placements,
             "instance_paths": instance_paths,
             "instance_references": instance_references
         }));
@@ -2053,6 +2108,266 @@ fn set_property_value(
     ))
 }
 
+/// What `edit_schematic_component` may change about where a field's text sits.
+/// Every part is optional: an absent one leaves the file's value alone rather
+/// than defaulting, so moving a field cannot silently unhide it.
+#[derive(Debug, Default, Clone, Copy)]
+struct FieldPlacement {
+    x: Option<f64>,
+    y: Option<f64>,
+    rotation: Option<f64>,
+    hide: Option<bool>,
+}
+
+impl FieldPlacement {
+    fn is_empty(&self) -> bool {
+        self.x.is_none() && self.y.is_none() && self.rotation.is_none() && self.hide.is_none()
+    }
+
+    fn moves_the_text(&self) -> bool {
+        self.x.is_some() || self.y.is_some()
+    }
+}
+
+/// Does the committed file show the placement that was asked for?
+///
+/// Only the parts the caller set are compared; an absent one was never
+/// requested, so whatever the file holds for it is correct. Extracted so the
+/// comparison can be tested directly — a silent write failure cannot be
+/// induced through the tool, and an untested guard is one nobody has watched
+/// fail.
+fn placement_landed(seen: &serde_json::Value, placement: &FieldPlacement) -> bool {
+    let agrees = |key: &str, want: Option<f64>| {
+        want.is_none_or(|want| {
+            seen[key]
+                .as_f64()
+                .is_some_and(|got| (got - want).abs() < 1e-6)
+        })
+    };
+    agrees("x", placement.x)
+        && agrees("y", placement.y)
+        && agrees("rotation", placement.rotation)
+        && placement
+            .hide
+            .is_none_or(|want| seen["hide"].as_bool() == Some(want))
+}
+
+/// Move or hide one field's text on a placed symbol.
+///
+/// KiCad stores a field's position in absolute schematic millimetres on the
+/// placement, not as an offset from the body, so a multi-unit part carries one
+/// position per unit and a single coordinate cannot be right for all of them —
+/// `only_unit` is how the caller says which placement it means.
+///
+/// The edit is scoped to the field's own `(property …)` block: a symbol's own
+/// `(at …)` and its other fields' `(at …)` sit in the same instance block, and
+/// a search that is not bounded by the property would move the body instead of
+/// the text.
+/// Why a field placement was refused, and how far the refusal reaches.
+///
+/// A malformed *file* makes the whole call unsafe: this handler edits text and
+/// commits once at the end, so letting a sibling edit proceed would commit a
+/// file we have already found to be broken. A target that simply was not there
+/// is local to the field the caller named.
+#[derive(Debug)]
+enum PlacementRefusal {
+    /// The existing property or its placement is malformed. Aborts the call
+    /// before anything is committed.
+    MalformedFile(String),
+    /// The named symbol, field or unit was not found. Refuses this field only.
+    TargetMissing(String),
+}
+
+impl PlacementRefusal {
+    fn reason(&self) -> &str {
+        match self {
+            Self::MalformedFile(reason) | Self::TargetMissing(reason) => reason,
+        }
+    }
+}
+
+fn set_property_placement(
+    content: &str,
+    reference: &str,
+    field: &str,
+    placement: &FieldPlacement,
+    only_unit: Option<u32>,
+) -> Result<(String, usize), PlacementRefusal> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        return Err(PlacementRefusal::TargetMissing(format!(
+            "symbol '{reference}' not found in this schematic"
+        )));
+    }
+    let escaped_field = escape_property_text(field);
+    let field_search = format!(r#"(property "{escaped_field}" ""#);
+    let mut edits = Vec::new();
+    let mut touched = 0usize;
+
+    for (start, end) in blocks {
+        let block = &content[start..end];
+        if let Some(wanted) = only_unit {
+            let unit = block
+                .find("(unit ")
+                .and_then(|rel| {
+                    let from = start + rel + "(unit ".len();
+                    content[from..end]
+                        .find(')')
+                        .and_then(|to| content[from..from + to].trim().parse::<u32>().ok())
+                })
+                .unwrap_or(1);
+            if unit != wanted {
+                continue;
+            }
+        }
+        let Some(relative) = block.find(&field_search) else {
+            return Err(PlacementRefusal::TargetMissing(format!(
+                "'{reference}' has no '{field}' property on one of its placed units"
+            )));
+        };
+        let (_prop_start, prop_end) =
+            konnect_sexp::writer::find_enclosing_block(content, "property", start + relative)
+                .ok_or_else(|| {
+                    PlacementRefusal::MalformedFile(format!(
+                        "'{field}' property on '{reference}' is malformed"
+                    ))
+                })?;
+
+        // Everything below searches for tokens *after* the property's value
+        // string. A field value is arbitrary text and may contain "(at " or
+        // "(hide " — searching the whole property block rewrites the value
+        // instead of the placement, and the result is still valid
+        // S-expression, so nothing downstream notices.
+        let value_start = start + relative + field_search.len();
+        let value_end = closing_quote(content, value_start).ok_or_else(|| {
+            PlacementRefusal::MalformedFile(format!(
+                "'{field}' property on '{reference}' is malformed"
+            ))
+        })?;
+        let body_start = value_end + 1;
+        let property = &content[body_start..prop_end];
+
+        // The field's own (at x y [rot]); a property carries exactly one.
+        let at_rel = property.find("(at ").ok_or_else(|| {
+            PlacementRefusal::MalformedFile(format!(
+                "'{field}' property on '{reference}' carries no (at …)"
+            ))
+        })?;
+        let at_start = body_start + at_rel;
+        let at_end = at_start
+            + content[at_start..prop_end].find(')').ok_or_else(|| {
+                PlacementRefusal::MalformedFile(format!(
+                    "'{field}' property on '{reference}' is malformed"
+                ))
+            })?
+            + 1;
+        // Parse the existing placement *positionally* and strictly. Dropping
+        // unparseable tokens and defaulting the gaps to zero silently shifts
+        // the remaining ones left: `(at bad 20 90)` reads as x=20, y=90, and a
+        // rotation-only request then commits `(at 20 90 NEW)` — a position the
+        // caller never asked for and the file never held. A malformed
+        // placement is refused here, before anything is committed, because a
+        // wrong coordinate written into a schematic is silent.
+        let raw = &content[at_start + "(at ".len()..at_end - 1];
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let coordinate = |index: usize, axis: &str| -> Result<f64, PlacementRefusal> {
+            let token = tokens.get(index).ok_or_else(|| {
+                PlacementRefusal::MalformedFile(format!(
+                    "'{field}' placement on '{reference}' has no {axis} in `(at {raw})`"
+                ))
+            })?;
+            match token.parse::<f64>() {
+                Ok(value) if value.is_finite() => Ok(value),
+                _ => Err(PlacementRefusal::MalformedFile(format!(
+                    "'{field}' placement on '{reference}' has a non-numeric {axis} \
+                     '{token}' in `(at {raw})`"
+                ))),
+            }
+        };
+        let current_x = coordinate(0, "x")?;
+        let current_y = coordinate(1, "y")?;
+        // KiCad writes `(at x y)` or `(at x y rotation)`; anything longer is
+        // not a placement it produces, and rewriting it as three tokens would
+        // drop whatever the extra ones carried.
+        let current_rot = match tokens.len() {
+            2 => 0.0,
+            3 => coordinate(2, "rotation")?,
+            count => {
+                return Err(PlacementRefusal::MalformedFile(format!(
+                    "'{field}' placement on '{reference}' has {count} values in \
+                     `(at {raw})`; expected x, y and an optional rotation"
+                )))
+            }
+        };
+        if placement.x.is_some() || placement.y.is_some() || placement.rotation.is_some() {
+            edits.push(SexpEdit::replace(
+                at_start,
+                at_end,
+                format!(
+                    "(at {} {} {})",
+                    cse::types::fmt_f64(placement.x.unwrap_or(current_x)),
+                    cse::types::fmt_f64(placement.y.unwrap_or(current_y)),
+                    cse::types::fmt_f64(placement.rotation.unwrap_or(current_rot))
+                ),
+            ));
+        }
+
+        if let Some(hide) = placement.hide {
+            // Written as a direct child of the property. KiCad's own writer
+            // nests the flag inside `(effects …)` on a placement and puts it
+            // at property level in `lib_symbols`, but the two are equivalent
+            // to it: at 10.0.6 a file in either form exports byte-identical
+            // SVG, and its writer round-trips this one unchanged. The
+            // readback accepts both, so a field KiCad hid reads as hidden.
+            let existing_hide = property.find("(hide ").map(|rel| body_start + rel);
+            match (hide, existing_hide) {
+                (true, None) => {
+                    // Match the indentation of the (at …) it follows, so the
+                    // file keeps the shape its writer gave it (#210).
+                    let line_start = content[..at_start].rfind('\n').map_or(0, |nl| nl + 1);
+                    let indent = &content[line_start..at_start];
+                    edits.push(SexpEdit::insert(at_end, format!("\n{indent}(hide yes)")));
+                }
+                (false, Some(at)) => {
+                    let token_end =
+                        at + content[at..prop_end].find(')').ok_or_else(|| {
+                            PlacementRefusal::MalformedFile(format!(
+                                "'{field}' hide flag on '{reference}' is malformed"
+                            ))
+                        })? + 1;
+                    // Take the indentation before the token, and the newline
+                    // too *only* if the token had the line to itself. Deleting
+                    // back to the newline unconditionally eats whatever shares
+                    // the line — on a file that writes `(at …) (hide yes)`
+                    // together, that is the field's own position.
+                    let bytes = content.as_bytes();
+                    let mut from = at;
+                    while from > 0 && matches!(bytes[from - 1], b' ' | b'\t') {
+                        from -= 1;
+                    }
+                    if from == 0 || bytes[from - 1] != b'\n' {
+                        // Shared line: leave the neighbours and their spacing.
+                        from = at;
+                    } else {
+                        from -= 1;
+                    }
+                    edits.push(SexpEdit::replace(from, token_end, String::new()));
+                }
+                _ => {}
+            }
+        }
+        touched += 1;
+    }
+
+    if touched == 0 {
+        return Err(PlacementRefusal::TargetMissing(format!(
+            "'{reference}' has no placed unit {}",
+            only_unit.map(|u| u.to_string()).unwrap_or_default()
+        )));
+    }
+    Ok((apply_edits(content.to_string(), edits), touched))
+}
+
 /// Rewrite the `(reference "…")` inside every unit's `(instances …)` block.
 ///
 /// Returns the updated content and how many were rewritten. A multi-unit part
@@ -2201,12 +2516,132 @@ async fn handle_edit_schematic_component(
         }
     }
 
+    // Field text placement. Separate from `fields`, which sets values: a
+    // caller moving the Value text is not changing what it says, and
+    // overloading one argument's value type would make the schema lie about
+    // what it accepts.
+    let placements = args["field_placements"].as_object();
+    let mut applied_placements: Vec<(String, FieldPlacement)> = Vec::new();
+    let mut placement_unit: Option<u32> = None;
+    if let Some(placements) = placements {
+        let only_unit = match &args["unit"] {
+            serde_json::Value::Null => None,
+            value => {
+                let Some(unit) = value.as_u64() else {
+                    return Ok(crate::tools::invalid_arg(
+                        "unit",
+                        "expected a positive integer unit number",
+                    ));
+                };
+                // `as u32` truncates rather than refusing: 4294967297 becomes
+                // 1 and would silently edit a real unit's field text.
+                match u32::try_from(unit) {
+                    Ok(unit) if unit >= 1 => Some(unit),
+                    Ok(_) => {
+                        return Ok(crate::tools::invalid_arg(
+                            "unit",
+                            "expected a positive integer unit number",
+                        ))
+                    }
+                    Err(_) => {
+                        return Ok(crate::tools::invalid_arg(
+                            "unit",
+                            &format!(
+                                "unit {unit} is out of range; a placed unit number \
+                                 fits in 32 bits"
+                            ),
+                        ))
+                    }
+                }
+            }
+        };
+        for (name, spec) in placements {
+            let Some(spec) = spec.as_object() else {
+                errors.push(format!("{name}: field_placements entries must be objects"));
+                continue;
+            };
+            let mut placement = FieldPlacement::default();
+            let mut bad = false;
+            for (key, slot) in [
+                ("x", &mut placement.x),
+                ("y", &mut placement.y),
+                ("rotation", &mut placement.rotation),
+            ] {
+                match spec.get(key) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(value) => match value.as_f64() {
+                        Some(number) => *slot = Some(number),
+                        None => {
+                            errors.push(format!("{name}.{key}: expected a number"));
+                            bad = true;
+                        }
+                    },
+                }
+            }
+            match spec.get("hide") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(value) => match value.as_bool() {
+                    Some(hide) => placement.hide = Some(hide),
+                    None => {
+                        errors.push(format!("{name}.hide: expected true or false"));
+                        bad = true;
+                    }
+                },
+            }
+            if bad {
+                continue;
+            }
+            if placement.is_empty() {
+                errors.push(format!(
+                    "{name}: field_placements entry sets nothing — give x, y, rotation or hide"
+                ));
+                continue;
+            }
+            // A field's position is absolute, so one coordinate cannot be
+            // right for several placements. Writing it to every unit would
+            // stack the text of a quad gate's four Values on one point and
+            // report success.
+            if placement.moves_the_text() && only_unit.is_none() && target.units.len() > 1 {
+                errors.push(format!(
+                    "{name}: '{reference}' has {} placed units, so a field position needs 'unit' — \
+                     an absolute coordinate cannot be right for all of them",
+                    target.units.len()
+                ));
+                continue;
+            }
+            match set_property_placement(&content, edit_reference, name, &placement, only_unit) {
+                Ok((updated, touched)) => {
+                    content = updated;
+                    applied_placements.push((name.clone(), placement));
+                    placement_unit = only_unit;
+                    changed.push(format!("{name} placement ({touched} unit(s))"));
+                }
+                // A malformed file aborts the whole call. This handler edits
+                // text and commits once, at the end, so a sibling edit that
+                // succeeded would otherwise be written into a file already
+                // found to be broken: the refusal would be reported while the
+                // write went ahead anyway.
+                Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
+                    return Ok(CallToolResult::error(format!(
+                        "No fields were updated on '{reference}': {name}: {}",
+                        refusal.reason()
+                    )))
+                }
+                Err(refusal) => errors.push(format!("{name}: {}", refusal.reason())),
+            }
+        }
+    }
+
     // A request that changed nothing is a failure, not a success — silently
     // reporting `"changes": []` is what let the tab-indentation bug hide, and
     // what made a fields-only call report success while dropping every field
     // (#158): with `fields` unread, both `changed` and `errors` came back
     // empty and this guard never fired.
-    if changed.is_empty() && custom_fields.is_some_and(|f| !f.is_empty()) && errors.is_empty() {
+    if changed.is_empty()
+        && (custom_fields.is_some_and(|f| !f.is_empty())
+            || placements.is_some_and(|p| !p.is_empty()))
+        && errors.is_empty()
+    {
         return Ok(CallToolResult::error(format!(
             "No fields were updated on '{reference}'"
         )));
@@ -2238,6 +2673,28 @@ async fn handle_edit_schematic_component(
             Ok(observed) => observed,
             Err(error) => return Ok(error),
         };
+    // Every placement is checked against the committed file. A move that did
+    // not land must not be reported as a change; this handler edits source
+    // text, and a search that matched nothing would otherwise pass silently.
+    for (name, placement) in &applied_placements {
+        for unit in observed["units"].as_array().into_iter().flatten() {
+            if placement_unit.is_some_and(|wanted| unit["unit"].as_u64() != Some(u64::from(wanted)))
+            {
+                continue;
+            }
+            if !placement_landed(&unit["field_placements"][name], placement) {
+                return Ok(ComponentDeleteTargetError::stale(
+                    &sch_path,
+                    format!(
+                        "post-write placement of '{name}' on unit {} differs from what was requested",
+                        unit["unit"]
+                    ),
+                )
+                .into_result());
+            }
+        }
+    }
+
     let mut result = json!({
         "reference": observed["reference"],
         "changes": changed
@@ -6013,6 +6470,515 @@ mod multi_unit_component_tests {
         placed.sort_by_key(|instance| instance.unit);
         assert!((placed[0].x - placed[1].x).abs() < 0.001);
         assert!(((placed[1].y - placed[0].y) - 20.0).abs() < 0.001);
+    }
+
+    /// Moving a field's text must move the text and nothing else: the value
+    /// stays, the symbol's own `(at ...)` stays, and the position is read back
+    /// from the committed file rather than echoed.
+    #[tokio::test]
+    async fn field_placement_moves_the_text_and_keeps_its_value() {
+        let (_directory, path) = eeschema_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let body_at = before
+            .find("(property \"Reference\" \"P3\"")
+            .map(|at| before[..at].to_owned())
+            .expect("P3 exists");
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "P3",
+                    "field_placements": { "Value": { "x": 12.5, "y": 34.5, "rotation": 90.0 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        let observed = &result["units"][0]["field_placements"]["Value"];
+        assert_eq!(observed["x"], 12.5);
+        assert_eq!(observed["y"], 34.5);
+        assert_eq!(observed["rotation"], 90.0);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 12.5 34.5 90)"));
+        assert_eq!(
+            after[..after.find("(property \"Reference\" \"P3\"").unwrap()],
+            body_at,
+            "nothing before the edited symbol may change"
+        );
+    }
+
+    /// `hide` writes `(hide yes)` as a direct child of the placed symbol's
+    /// property. That is not the form KiCad's own writer uses on a placement
+    /// — it nests the flag in `(effects ...)` there, and uses the direct
+    /// child in `lib_symbols` — but the two are equivalent to KiCad 10.0.6,
+    /// which exports byte-identical SVG from either and round-trips this one
+    /// unchanged. The other form is covered by
+    /// `field_placement_reads_the_hidden_flag_kicad_nests_in_effects`.
+    #[tokio::test]
+    async fn field_placement_hides_then_shows_a_field() {
+        let (_directory, path) = eeschema_fixture();
+        for (hide, expected) in [(true, 1usize), (false, 0usize)] {
+            let result = handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "P3",
+                    "field_placements": { "Value": { "hide": hide } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let after = std::fs::read_to_string(&path).unwrap();
+            // Scope to P3's own Value property. No `unwrap_or(0)` fallback:
+            // a search that finds nothing must fail the test, not silently
+            // count over the whole file.
+            let value_start = after
+                .find("(property \"Value\" \"POWER\"")
+                .expect("P3 carries a Value property");
+            let (_, value_end) =
+                konnect_sexp::writer::find_enclosing_block(&after, "property", value_start)
+                    .expect("the Value property is a balanced block");
+            let block = &after[value_start..value_end];
+            assert_eq!(
+                block.matches("(hide yes)").count(),
+                expected,
+                "hide={hide} produced {block}"
+            );
+        }
+    }
+
+    /// KiCad nests a *placement's* hidden flag inside the property's
+    /// `(effects …)`; the property-level token is what `lib_symbols`
+    /// definitions carry. Reading only the property's direct children
+    /// therefore reported every field KiCad itself hid as visible, and —
+    /// because the writer's own check is textual and does see the nested
+    /// token — turned "hide an already-hidden field" into a post-write
+    /// refusal over a file that was already correct. This fixture is real
+    /// KiCad output and hides Datasheet and Description in KiCad's own form.
+    #[tokio::test]
+    async fn field_placement_reads_the_hidden_flag_kicad_nests_in_effects() {
+        let (_directory, path) = eeschema_fixture();
+        // Scope every count to R1's own placement. No whole-file count and no
+        // `unwrap_or(0)`: a search that finds nothing must fail the test.
+        let hidden_tokens = |content: &str| {
+            let blocks = find_all_symbol_instance_blocks(content, "R1");
+            assert_eq!(blocks.len(), 1, "R1 is placed exactly once here");
+            let (start, end) = blocks[0];
+            content[start..end].matches("(hide yes)").count()
+        };
+        assert_eq!(
+            hidden_tokens(&std::fs::read_to_string(&path).unwrap()),
+            2,
+            "the fixture hides Datasheet and Description"
+        );
+
+        // The readback describes the file, not merely its direct children.
+        let observed = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "field_placements": { "Value": { "rotation": 90.0 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        for field in ["Datasheet", "Description"] {
+            assert_eq!(
+                observed["units"][0]["field_placements"][field]["hide"],
+                json!(true),
+                "{field} is hidden in the file"
+            );
+        }
+
+        // Hiding one again is a no-op the post-write comparison must accept,
+        // and it must not write a second token beside KiCad's.
+        let before = hidden_tokens(&std::fs::read_to_string(&path).unwrap());
+        let observed = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "field_placements": { "Datasheet": { "hide": true } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            observed["units"][0]["field_placements"]["Datasheet"]["hide"],
+            json!(true)
+        );
+        assert_eq!(
+            hidden_tokens(&std::fs::read_to_string(&path).unwrap()),
+            before,
+            "hiding an already-hidden field must not add a second token"
+        );
+
+        // Showing it removes KiCad's nested token, leaving the other alone.
+        let observed = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "R1",
+                    "field_placements": { "Datasheet": { "hide": false } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            observed["units"][0]["field_placements"]["Datasheet"]["hide"],
+            json!(false)
+        );
+        assert_eq!(
+            observed["units"][0]["field_placements"]["Description"]["hide"],
+            json!(true),
+            "the neighbouring hidden field is untouched"
+        );
+        assert_eq!(
+            hidden_tokens(&std::fs::read_to_string(&path).unwrap()),
+            before - 1
+        );
+    }
+
+    /// The post-write comparison, tested directly: a silent write failure
+    /// cannot be induced through the tool, so the guard is exercised here.
+    #[test]
+    fn placement_landed_compares_only_what_was_requested() {
+        let seen = json!({ "x": 10.0, "y": 20.0, "rotation": 90.0, "hide": false });
+        let want = |x, y, rotation, hide| FieldPlacement {
+            x,
+            y,
+            rotation,
+            hide,
+        };
+        assert!(placement_landed(&seen, &want(Some(10.0), None, None, None)));
+        assert!(placement_landed(
+            &seen,
+            &want(None, None, None, Some(false))
+        ));
+        assert!(placement_landed(&seen, &want(None, None, None, None)));
+        assert!(!placement_landed(
+            &seen,
+            &want(Some(10.5), None, None, None)
+        ));
+        assert!(!placement_landed(
+            &seen,
+            &want(None, Some(21.0), None, None)
+        ));
+        assert!(!placement_landed(&seen, &want(None, None, Some(0.0), None)));
+        assert!(!placement_landed(
+            &seen,
+            &want(None, None, None, Some(true))
+        ));
+        // A field the readback never saw cannot be reported as placed.
+        assert!(!placement_landed(
+            &json!(null),
+            &want(Some(10.0), None, None, None)
+        ));
+    }
+
+    /// A field's value is arbitrary text and may itself contain "(at " or
+    /// "(hide ". Searching the whole property block finds the token inside the
+    /// quoted value and rewrites *that* — the result is still valid
+    /// S-expression, so nothing downstream notices and the field's text is
+    /// silently changed. Found by adversarial review, not by the happy path.
+    #[tokio::test]
+    async fn field_placement_never_rewrites_a_value_that_looks_like_a_placement() {
+        let (_directory, path) = eeschema_fixture();
+        for (field, value) in [("Note", "mounted (at 45 deg)"), ("Trap", "see (hide yes)")] {
+            let result = handle_edit_schematic_component(
+                &json!({ "schematic": path, "reference": "P3", "fields": { field: value } }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+        }
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "P3",
+                "field_placements": { "Note": { "x": 11.0, "y": 22.0 }, "Trap": { "hide": false } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(r#""mounted (at 45 deg)""#),
+            "the value must survive a move of its own placement"
+        );
+        assert!(
+            after.contains(r#""see (hide yes)""#),
+            "the value must survive a change to its own visibility"
+        );
+        assert!(
+            after.contains("(at 11 22 0)"),
+            "the placement must still move"
+        );
+    }
+
+    /// Removing the hide token must not take whatever shares its line. Files
+    /// are not all written one node per line — this fixture is deliberately
+    /// not KiCad's own layout, because the hazard only exists in layouts KiCad
+    /// does not produce but is still asked to read.
+    #[tokio::test]
+    async fn field_placement_hide_removal_keeps_a_neighbour_on_the_same_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sameline.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(uuid \"u\")\n\t(lib_symbols)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 10 10 0)\n\t\t(unit 1)\n\t\t(uuid \"s\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 1 2 0) (hide yes)\n\t\t\t(effects (font (size 1 1)))\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "field_placements": { "Reference": { "hide": false } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(at 1 2 0)"),
+            "the field's own position must survive: {after}"
+        );
+        assert!(
+            !after.contains("(hide yes)"),
+            "the flag must be gone: {after}"
+        );
+    }
+
+    /// A field position is absolute, so one coordinate cannot be right for a
+    /// symbol placed as several units. Writing it to each would stack a quad
+    /// gate's four Values on one point and report success.
+    #[tokio::test]
+    async fn field_placement_refuses_a_position_across_units_without_one_named() {
+        let (_directory, path) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "U1",
+                "field_placements": { "Value": { "x": 10.0, "y": 10.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Naming the unit is how the caller says which placement it means.
+    #[tokio::test]
+    async fn field_placement_targets_one_named_unit() {
+        let (_directory, path) = fixture();
+        let result = body(
+            handle_edit_schematic_component(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "unit": 2,
+                    "field_placements": { "Value": { "x": 10.0, "y": 10.0 } }
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("(at 10 10 ")
+                .count(),
+            1,
+            "only the named unit's field moves"
+        );
+    }
+
+    /// The *file's* existing placement can be malformed, which is a different
+    /// door from a malformed request. Dropping the unparseable token and
+    /// defaulting the gap to zero shifts the rest left: `(at bad 85.09 90)`
+    /// reads as x=85.09, y=90, so a rotation-only edit would commit
+    /// `(at 85.09 90 0)` — moving the text to a position the caller never
+    /// asked for and the file never held. Refused before anything is written.
+    #[tokio::test]
+    async fn field_placement_refuses_a_malformed_existing_placement_without_writing() {
+        let (_directory, path) = eeschema_fixture();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let corrupted = original.replacen(
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at 157.48 85.09 90)",
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at bad 85.09 90)",
+            1,
+        );
+        assert_ne!(
+            corrupted, original,
+            "the fixture must still carry R1's Value placement"
+        );
+        std::fs::write(&path, &corrupted).unwrap();
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "field_placements": { "Value": { "rotation": 0.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        // Assert the reason, not merely that something failed: this handler
+        // has several ways to error, and a test that accepts any of them
+        // passes with the strict parse gone.
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("non-numeric x") && message.contains("bad"),
+            "the refusal must name the malformed coordinate: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupted,
+            "a refusal must leave the file byte-identical"
+        );
+    }
+
+    /// A malformed placement must abort the *whole* call, not just its own
+    /// field. This handler edits text and commits once at the end, so a valid
+    /// sibling edit in the same request would otherwise be committed while the
+    /// call reported a refusal. The placement-only test cannot see this: with
+    /// nothing else in the request there is no sibling to commit, so it passes
+    /// either way.
+    #[tokio::test]
+    async fn malformed_placement_aborts_a_combined_edit_without_writing() {
+        let (_directory, path) = eeschema_fixture();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let corrupted = original.replacen(
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at 157.48 85.09 90)",
+            "(property \"Value\" \"1.5K\"\n\t\t\t(at bad 85.09 90)",
+            1,
+        );
+        assert_ne!(
+            corrupted, original,
+            "the fixture must still carry R1's Value placement"
+        );
+        std::fs::write(&path, &corrupted).unwrap();
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                // A perfectly good sibling edit, which must not be committed.
+                "fields": { "Description": "sibling edit that must not land" },
+                "reference": "R1",
+                "field_placements": { "Value": { "rotation": 0.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("non-numeric x") && message.contains("bad"),
+            "the refusal must name the malformed coordinate: {message}"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, corrupted,
+            "a refusal must leave the file byte-identical"
+        );
+        assert!(
+            !after.contains("sibling edit that must not land"),
+            "the sibling field edit must not have been committed"
+        );
+    }
+
+    /// `unit` is a u64 from JSON narrowed to u32. `as` truncates rather than
+    /// refusing, so 4294967297 becomes 1 and would silently move unit 1's
+    /// field text — a real unit the caller never named.
+    #[tokio::test]
+    async fn an_oversized_unit_is_refused_rather_than_wrapping_to_a_real_unit() {
+        let (_directory, path) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "U1",
+                "unit": 4_294_967_297u64,
+                "field_placements": { "Value": { "x": 10.0, "y": 10.0 } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        // Assert the reason: wrapping would produce a *successful* edit of
+        // unit 1, so a test that accepted any error would pass with the
+        // checked conversion removed only if it also checked the file.
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument"),
+            "{result:?}"
+        );
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("out of range"),
+            "the refusal must say why: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "no unit's field text may move"
+        );
+    }
+
+    /// A malformed entry is refused rather than partly applied — an `x` that
+    /// is not a number is a caller asking for a move.
+    #[tokio::test]
+    async fn field_placement_refuses_a_non_numeric_coordinate_without_writing() {
+        let (_directory, path) = eeschema_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "P3",
+                // `hide` is valid, so the entry is not empty: only the
+                // coordinate check can refuse this one.
+                "field_placements": { "Value": { "x": "over there", "hide": true } }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        // Assert the reason, not merely that something failed: this handler
+        // has several ways to error, and a test that accepts any of them
+        // passes with the coordinate check gone.
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("Value.x") && message.contains("expected a number"),
+            "the refusal must name the coordinate: {message}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[tokio::test]

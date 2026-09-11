@@ -203,6 +203,50 @@ observed segment rather than echoed from the request. Results add
 `preimage`, and `postcondition: "absent_from_trace_readback"`. No argument or
 tool was renamed or removed.
 
+## Unreleased: schematic field text placement (minor release)
+
+`edit_schematic_component` accepts two new optional arguments and returns one
+new response field. Nothing is renamed or removed, and omitting both arguments
+reproduces the previous behaviour exactly.
+
+`field_placements` is an object keyed by field name — `Reference`, `Value`,
+`Footprint`, or any custom property — whose entries each set any of `x`, `y`,
+`rotation` and `hide`. An omitted member leaves that aspect as the committed
+file holds it, so moving a field cannot change its visibility and hiding one
+cannot move it. Coordinates are absolute schematic millimetres as KiCad stores
+them, not offsets from the symbol body, and they are not snapped to the 1.27 mm
+grid that component placement applies.
+
+Because a field position is absolute it belongs to one placement, so `unit`
+names which placed unit `field_placements` applies to. It is required when `x`
+or `y` is given and the component has more than one placed unit; that request
+is refused rather than writing one coordinate to every unit, which would stack
+a multi-unit part's field text on a single point. `hide` and `rotation` without
+a coordinate apply to every placed unit when `unit` is omitted.
+
+Visibility is read in both forms KiCad writes: `(hide yes)` as a direct child
+of the property, which is what `lib_symbols` definitions carry, and nested
+inside the property's `(effects …)`, which is what KiCad writes on a placement.
+Writes use the direct-child form; KiCad 10.0.6 treats the two identically.
+
+`units[].field_placements` reports each field's `x`, `y`, `rotation` and `hide`
+**as observed in the committed file**, not as requested, and is present for
+every property carrying an `(at …)`. Every requested placement is compared
+against that readback before success is reported; a mismatch refuses with
+`stale_target`. As with the other schematic mutations, that verification
+follows a committed write, so inspect and reload the saved schematic before
+retrying.
+
+A malformed existing placement is refused before anything is written.
+`(at …)` is parsed positionally and must carry finite numeric x and y, and a
+finite rotation when a third value is present; a placement with more values
+than that is refused too. Previously an unparseable token was dropped and the
+remaining values shifted left, so a rotation-only edit could commit a position
+the file never held.
+
+This additive change is planned for the next minor release; no tool or argument
+was renamed or removed.
+
 ## Unreleased: committed schematic component mutation readback (minor release)
 
 Schematic component placement, batch placement, field edits and renames, moves,
