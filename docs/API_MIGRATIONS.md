@@ -26,13 +26,23 @@ whose file did not describe the pin the editor showed. Surfacing that is what
 the argument is for; omit `side` to keep the old behavior.
 
 `import_sheet_pins` stacks a `top` or `bottom` import along the edge in x, as a
-`right` or `left` import stacks down it in y. It validates nothing, because it
-derives every position itself.
+`right` or `left` import stacks down it in y, and continues below the pins
+already on the edge it was given rather than below every pin on the sheet. It
+derives every position itself, so it validates every one of them against that
+edge before it writes any: an import that would run past a corner is refused
+entire, with nothing written, rather than letting KiCad clamp the overflow onto
+the corner. A sheet whose labels no longer fit on one edge therefore returns an
+error where it previously returned success over a silently relocated pin.
 
 Response `x`, `y`, and `side` are derived from the sheet pin read back out of
 the committed file rather than echoed from the request; `import_sheet_pins`
 reads `side` off a pin it actually saved and reports `null` when it saved none.
-Existing response fields keep their names and their meanings.
+
+`edit_sheet_pin` gains `changed` and `requested_fields` next to the existing
+`changed_fields`, matching `edit_sheet`. `changed_fields` now carries `side`
+only when the rotation actually differs, so restating the edge a pin is already
+on is reported as the no-op it is and commits nothing. The other fields keep the
+behavior they had. Existing response fields keep their names and their meanings.
 
 No tool, argument, or existing response field was renamed or removed. This
 additive schema and response change is planned for the next minor release.
