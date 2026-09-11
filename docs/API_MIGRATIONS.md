@@ -3,6 +3,27 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `check_clearance` says what it measures (minor release)
+
+`check_clearance` returned the straight-line distance between two footprints'
+placement anchors under a description that said "physical clearance". Read as
+copper-to-copper spacing, a `21.125` answer stood in for a courtyard gap of
+about 3 mm (#410). Footprint size and shape were never considered.
+
+Stage 1 changes nothing about the number and everything about what the
+response says it is:
+
+- `measurement: "anchor_to_anchor"` and `anchor_distance_mm` are added; the
+  latter is the value `distance_mm` carried.
+- `distance_mm` is kept, identical, as a **deprecated** alias, listed in a new
+  `deprecated_fields` array so a consumer can see it without reading prose. It
+  will be removed by the stage-2 PR that adds a real physical-spacing mode.
+- `note` states in words that this is not pad, trace or courtyard clearance.
+- The tool description and the directory row no longer claim clearance, and
+  point to `run_drc` for the question the old description implied.
+
+No argument changed. This is `Part of #410`; the terminal change is stage 2.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and

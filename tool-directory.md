@@ -406,7 +406,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
-| `check_clearance` | Check the physical clearance (distance) between two components on the PCB. |
+| `check_clearance` | Measure the straight-line distance between two footprints' placement anchors on the saved board, in mm. Anchor-to-anchor only — not pad, trace, copper or courtyard clearance, and no predictor of a DRC clash; the response says so (`measurement: "anchor_to_anchor"`, `anchor_distance_mm`, with `distance_mm` kept as a deprecated alias). Use `run_drc` for clearance. |
 
 ---
 
