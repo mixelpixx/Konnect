@@ -1026,11 +1026,25 @@ async fn handle_validate_for_manufacturing(
                 }));
             }
             for missing in report.missing_categories() {
+                // Two different fixes hide behind a null parity count: an
+                // older kicad-cli, or no schematic beside the board (#516).
+                let (issue, fix) = match (missing, &report.schematic_parity_diagnostic) {
+                    ("schematic_parity", Some(reason)) => (
+                        format!("DRC schematic parity was not checked: {reason}"),
+                        "Readiness cannot be established without it; save the project's \
+                         schematic beside the board (same file stem) so kicad-cli can \
+                         compare them, then re-run",
+                    ),
+                    _ => (
+                        format!("kicad-cli did not report DRC '{missing}'"),
+                        "Readiness cannot be established without it; check the \
+                         kicad-cli version",
+                    ),
+                };
                 issues.push(json!({
                     "severity": "error",
-                    "issue": format!("kicad-cli did not report DRC '{missing}'"),
-                    "fix": "Readiness cannot be established without it; check the \
-                            kicad-cli version"
+                    "issue": issue,
+                    "fix": fix
                 }));
             }
             json!({

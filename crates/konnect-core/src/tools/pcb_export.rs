@@ -1118,6 +1118,7 @@ async fn handle_get_drc_violations(
         "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
         "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
         "categories_not_reported": report.missing_categories(),
+        "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
         "filtered_count": filtered.len(),
         "severity_filter": severity_filter,
         "violations": filtered.iter().map(|v| json!({

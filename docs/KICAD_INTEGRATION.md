@@ -112,7 +112,13 @@ ad-hoc command lines.
 The DRC result model preserves design-rule violations, unconnected items, and
 schematic parity. `verification.rs`, `pcb_export.rs`, `design_review.rs`, and
 `manufacturing.rs` consume that complete result; unavailable categories or a
-failed CLI run cannot be treated as a clean board.
+failed CLI run cannot be treated as a clean board. Parity is opt-in on the
+kicad-cli side (`--schematic-parity`), so `run_drc` always requests it; and
+because KiCad writes an empty parity array — while stating on stderr that it
+failed to fetch the schematic netlist — when the board's project has no root
+schematic, `run_drc` reads that statement and reports the category as
+unchecked, with a diagnostic naming the root it would have read, rather than
+as zero. A non-empty parity array is kept as KiCad's evidence regardless.
 
 Konnect's Freerouting bridge keeps the KiCad and routing responsibilities
 separate: `export_specctra_dsn` snapshots the live board and writes a
