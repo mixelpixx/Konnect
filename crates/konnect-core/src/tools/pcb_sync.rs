@@ -22,6 +22,39 @@ use sha2::{Digest, Sha256};
 struct ExportedDesign {
     components: Vec<DesignComponent>,
     skipped: Vec<SkippedComponent>,
+    /// Components the export names but carries no `(footprint …)` for: their
+    /// `Footprint` property is empty. Nothing can be placed for them, so they
+    /// are reported rather than planned — and never fatal (#507).
+    unassigned: Vec<UnassignedComponent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnassignedComponent {
+    reference: String,
+    value: String,
+    lib_id: Option<String>,
+    symbol_path: String,
+}
+
+/// What the board holds for a component whose schematic footprint is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UnassignedBoardState {
+    /// No footprint on the board: nothing is added, the part is reported.
+    Absent,
+    /// A footprint with this identity or reference already exists; it is left
+    /// exactly as it is, the way eeschema skips "cannot update … no footprint
+    /// assigned" and continues.
+    Kept,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct UnassignedFootprint {
+    reference: String,
+    value: String,
+    lib_id: Option<String>,
+    symbol_path: String,
+    board_state: UnassignedBoardState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +133,9 @@ struct SyncCounts {
     pads_reassigned: CountPair,
     board_only_preserved: CountPair,
     skipped_by_flag: CountPair,
+    /// Schematic components with no footprint assigned: reported, never
+    /// planned, never fatal (#507).
+    unassigned_footprint: CountPair,
     conflicts: CountPair,
 }
 
@@ -148,6 +184,9 @@ struct SyncPlan {
     counts: SyncCounts,
     changes: Vec<PlannedChange>,
     diagnostics: Vec<SyncDiagnostic>,
+    /// Survives a conflict: it is a report about the schematic, not a change
+    /// the plan would make.
+    unassigned: Vec<UnassignedFootprint>,
 }
 
 #[derive(Debug)]
@@ -321,6 +360,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             plan.counts.board_only_preserved.applied =
                 plan.counts.board_only_preserved.planned;
             plan.counts.skipped_by_flag.applied = plan.counts.skipped_by_flag.planned;
+            plan.counts.unassigned_footprint.applied = plan.counts.unassigned_footprint.planned;
             Ok(sync_response(&plan, "applied", hierarchy.len(), true))
         },
     )
@@ -366,10 +406,16 @@ fn sync_response(
             "pads_reassigned": plan.counts.pads_reassigned,
             "board_only_preserved": plan.counts.board_only_preserved,
             "skipped_by_flag": plan.counts.skipped_by_flag,
+            "unassigned_footprint": plan.counts.unassigned_footprint,
             "conflicts": plan.counts.conflicts
         },
         "changes": plan.changes,
         "diagnostics": plan.diagnostics,
+        // Schematic components with no footprint: reported per part with what
+        // the board holds for them, never planned and never fatal (#507). A
+        // collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
+        // `coverage` entry beside it is a count category and stays singular.
+        "unassigned_footprints": plan.unassigned,
         "undo": if applied { Some("Ctrl-Z reverses the whole schematic-to-PCB update.") } else { None }
     });
     CallToolResult::json(&value)
@@ -385,6 +431,7 @@ fn conflict_result(message: String) -> CallToolResult {
             "pads_reassigned": CountPair::default(),
             "board_only_preserved": CountPair::default(),
             "skipped_by_flag": CountPair::default(),
+            "unassigned_footprint": CountPair::default(),
             "conflicts": CountPair { planned: 1, applied: 0 }
         },
         "diagnostics": [{ "code": "preflight_conflict", "message": message }]
@@ -424,6 +471,12 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 .skipped
                 .iter()
                 .map(|skipped| skipped.reference.as_str()),
+        )
+        .chain(
+            design
+                .unassigned
+                .iter()
+                .map(|unassigned| unassigned.reference.as_str()),
         )
         .collect::<HashSet<_>>();
 
@@ -487,6 +540,39 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 Some(&skipped.reference),
             ));
         }
+    }
+
+    // No footprint assigned: nothing can be placed, so the part is reported
+    // with what the board holds for it and the sync goes on for everything
+    // else — eeschema's own Update PCB behaviour. Never a diagnostic: a
+    // diagnostic clears the whole plan, which is exactly what #507 fixes.
+    let mut unassigned = Vec::new();
+    for component in &design.unassigned {
+        counts.unassigned_footprint.planned += 1;
+        let existing = board_by_path
+            .get(component.symbol_path.as_str())
+            .copied()
+            .or_else(|| {
+                board_by_reference
+                    .get(component.reference.as_str())
+                    .copied()
+            });
+        let board_state = match existing {
+            Some(index) => {
+                // Left untouched, as KiCad leaves it; counted as matched so
+                // it is not reported as a board-only footprint.
+                matched.insert(index);
+                UnassignedBoardState::Kept
+            }
+            None => UnassignedBoardState::Absent,
+        };
+        unassigned.push(UnassignedFootprint {
+            reference: component.reference.clone(),
+            value: component.value.clone(),
+            lib_id: component.lib_id.clone(),
+            symbol_path: component.symbol_path.clone(),
+            board_state,
+        });
     }
 
     for component in &design.components {
@@ -698,6 +784,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         counts,
         changes,
         diagnostics,
+        unassigned,
     }
 }
 
@@ -807,9 +894,16 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
 
     let mut components = Vec::new();
     let mut by_reference = HashMap::new();
+    let mut unassigned = Vec::new();
+    let mut unassigned_references = HashSet::new();
+    let mut seen_references = HashSet::new();
     for component_node in components_node.find_all("comp") {
         let reference = required_value(component_node, "ref")?;
-        if by_reference.contains_key(&reference) {
+        // One invariant for every exported component, checked before the
+        // footprint branch: an unassigned component never enters
+        // `by_reference`, so a check there alone let a reference repeat
+        // across the two roles and reach the plan (#507 review).
+        if !seen_references.insert(reference.clone()) {
             bail!("KiCad netlist contains duplicate component reference {reference}");
         }
 
@@ -831,19 +925,46 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
                 || property.get(1).and_then(SexpNode::as_str) == Some("dnp")
         });
 
+        let value = required_value(component_node, "value")?;
+        // kicad-cli writes no `(footprint …)` node at all for a symbol whose
+        // Footprint property is empty — only a bare `(field (name
+        // "Footprint"))`. That is a legitimate state (a generic `Device:R`
+        // whose package has not been chosen yet), and it used to fail the
+        // whole sync for every other component with it (#507).
+        let footprint_id = component_node
+            .find_str("footprint")
+            .map(str::trim)
+            .filter(|footprint| !footprint.is_empty())
+            .map(str::to_owned);
+        let Some(footprint_id) = footprint_id else {
+            let lib_id = component_node.find("libsource").and_then(|source| {
+                let lib = source.find_str("lib")?;
+                let part = source.find_str("part")?;
+                (!lib.is_empty() || !part.is_empty()).then(|| format!("{lib}:{part}"))
+            });
+            unassigned_references.insert(reference.clone());
+            unassigned.push(UnassignedComponent {
+                reference,
+                value,
+                lib_id,
+                symbol_path,
+            });
+            continue;
+        };
+
         let index = components.len();
         by_reference.insert(reference.clone(), index);
         components.push(DesignComponent {
             reference,
-            value: required_value(component_node, "value")?,
-            footprint_id: required_value(component_node, "footprint")?,
+            value,
+            footprint_id,
             symbol_path,
             dnp,
             pad_nets: BTreeMap::new(),
         });
     }
 
-    if components.is_empty() {
+    if components.is_empty() && unassigned.is_empty() {
         bail!("KiCad netlist contains zero components");
     }
 
@@ -854,6 +975,12 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
                 let reference = required_value(node, "ref")?;
                 let pin = required_value(node, "pin")?;
                 let Some(&index) = by_reference.get(&reference) else {
+                    // A wired pin of a component with no footprint: there is
+                    // no pad to carry the net, so the node is dropped, not
+                    // fatal.
+                    if unassigned_references.contains(&reference) {
+                        continue;
+                    }
                     bail!("net {net_name} refers to unknown component {reference}");
                 };
                 if components[index]
@@ -870,6 +997,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
     Ok(ExportedDesign {
         components,
         skipped: Vec::new(),
+        unassigned,
     })
 }
 
@@ -1273,6 +1401,33 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             return false;
         }
         component.dnp = entry.dnp;
+        true
+    });
+    // The same flags govern a component with no footprint: excluded from the
+    // BOM it is dropped, excluded from the board it is skipped by flag rather
+    // than reported as unassigned.
+    design.unassigned.retain(|component| {
+        let path_match = flags
+            .iter()
+            .find(|entry| entry.symbol_path == component.symbol_path);
+        let entry = path_match.or_else(|| {
+            flags
+                .iter()
+                .find(|entry| entry.reference == component.reference)
+        });
+        let Some(entry) = entry else {
+            return true;
+        };
+        if !entry.in_bom {
+            return false;
+        }
+        if !entry.on_board {
+            design.skipped.push(SkippedComponent {
+                reference: entry.reference.clone(),
+                symbol_path: entry.symbol_path.clone(),
+            });
+            return false;
+        }
         true
     });
     let mut skipped_references = HashSet::new();
@@ -1721,6 +1876,214 @@ mod tests {
         assert!(!component.dnp);
     }
 
+    /// Real `kicad-cli sch export netlist` output: `R1` never had a footprint
+    /// assigned, so the export carries no `(footprint …)` node for it and
+    /// still nets its pin 1 to `C1`. Provenance in
+    /// `tests/fixtures/unassigned_footprint.README.md`.
+    const UNASSIGNED: &str = include_str!("../../tests/fixtures/unassigned_footprint.net");
+
+    /// #507: one footprint-less symbol failed the whole sync with "KiCad
+    /// netlist node is missing footprint" — nothing about which component,
+    /// every other component blocked with it.
+    #[test]
+    fn a_component_without_a_footprint_is_reported_not_fatal() {
+        let design = parse_exported_netlist(UNASSIGNED).expect("a real export parses");
+
+        let mut placed: Vec<&str> = design
+            .components
+            .iter()
+            .map(|component| component.reference.as_str())
+            .collect();
+        placed.sort_unstable();
+        assert_eq!(placed, ["C1", "R2"]);
+        assert_eq!(design.unassigned.len(), 1);
+        let unassigned = &design.unassigned[0];
+        assert_eq!(unassigned.reference, "R1");
+        assert_eq!(unassigned.value, "R");
+        assert_eq!(unassigned.lib_id.as_deref(), Some("Device:R"));
+        assert!(unassigned.symbol_path.starts_with('/'));
+        // Its wired pin names a component with no pads; the net node is
+        // dropped, and C1's side of the same net is kept.
+        let c1 = design
+            .components
+            .iter()
+            .find(|component| component.reference == "C1")
+            .unwrap();
+        assert_eq!(
+            c1.pad_nets.get("1").map(String::as_str),
+            Some("Net-(C1-Pad1)")
+        );
+    }
+
+    fn unassigned_design() -> ExportedDesign {
+        parse_exported_netlist(UNASSIGNED).unwrap()
+    }
+
+    /// The real export with one `(comp …)` block copied under another
+    /// reference's name, placed *after* `after`. kicad-cli cannot produce a
+    /// duplicate reference, so the order-sensitive inputs are the real file
+    /// with one block duplicated by hand.
+    fn with_duplicate_of(copied: &str, renamed_to: &str, after: &str) -> String {
+        let block = comp_block(UNASSIGNED, copied).replace(
+            &format!("(ref \"{copied}\")"),
+            &format!("(ref \"{renamed_to}\")"),
+        );
+        let anchor = comp_block(UNASSIGNED, after);
+        let at = UNASSIGNED.find(anchor).unwrap() + anchor.len();
+        format!("{}{}{}", &UNASSIGNED[..at], block, &UNASSIGNED[at..])
+    }
+
+    fn comp_block<'a>(source: &'a str, reference: &str) -> &'a str {
+        let start = source.find(&format!("(ref \"{reference}\")")).unwrap();
+        let start = source[..start].rfind("(comp").unwrap();
+        let mut depth = 0usize;
+        for (offset, ch) in source[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..start + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        unreachable!("unbalanced comp block")
+    }
+
+    fn refuses_duplicate(source: &str) {
+        let error = parse_exported_netlist(source)
+            .expect_err("a duplicate reference must refuse before any plan")
+            .to_string();
+        assert!(error.contains("duplicate component reference"), "{error}");
+    }
+
+    /// Order-sensitive: the second `R1` is unassigned like the first.
+    #[test]
+    fn a_repeated_unassigned_reference_is_refused() {
+        refuses_duplicate(&with_duplicate_of("R1", "R1", "R1"));
+    }
+
+    /// Unassigned `R1` first, then an assigned component renamed to `R1`.
+    #[test]
+    fn an_assigned_repeat_of_an_unassigned_reference_is_refused() {
+        refuses_duplicate(&with_duplicate_of("R2", "R1", "R1"));
+    }
+
+    /// Assigned `C1` first, then an unassigned component renamed to `C1`.
+    #[test]
+    fn an_unassigned_repeat_of_an_assigned_reference_is_refused() {
+        refuses_duplicate(&with_duplicate_of("R1", "C1", "C1"));
+    }
+
+    /// Assigned then assigned, the case the parser already refused.
+    #[test]
+    fn a_repeated_assigned_reference_is_still_refused() {
+        refuses_duplicate(&with_duplicate_of("R2", "C1", "R2"));
+    }
+
+    /// Nothing asserted the *response* keys — every other test here reads the
+    /// `SyncPlan` struct — so a renamed or dropped JSON field was invisible to
+    /// the suite. This pins the two names a caller reads.
+    #[test]
+    fn the_response_names_the_collection_in_the_plural_and_the_count_in_the_singular() {
+        let design = unassigned_design();
+        let plan = plan_sync(UNASSIGNED, &design, &board_with(vec![]));
+        let result = sync_response(&plan, "ready", 1, false);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let unassigned = value["unassigned_footprints"]
+            .as_array()
+            .expect("the collection is a plural-named array");
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0]["reference"], "R1");
+        assert_eq!(unassigned[0]["board_state"], "absent");
+        // The count category keeps its singular name.
+        assert_eq!(value["coverage"]["unassigned_footprint"]["planned"], 1);
+        assert!(value.get("unassigned_footprint").is_none());
+    }
+
+    /// The helper builds what it claims: the duplicated block parses as a
+    /// second component when it is given a fresh reference instead.
+    #[test]
+    fn the_duplicate_helper_produces_a_parseable_export() {
+        let design = parse_exported_netlist(&with_duplicate_of("R2", "R3", "R2")).unwrap();
+        assert_eq!(design.components.len(), 3);
+        assert_eq!(design.unassigned.len(), 1);
+    }
+
+    /// Empty board: the two assigned components are planned as additions, the
+    /// unassigned one is listed as absent, and the plan is ready — not a
+    /// conflict, and R1 is not counted under `added`.
+    #[test]
+    fn the_sync_goes_on_for_every_assigned_component() {
+        let design = unassigned_design();
+        let plan = plan_sync(UNASSIGNED, &design, &board_with(vec![]));
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert!(plan.diagnostics.is_empty());
+        assert_eq!(plan.counts.added.planned, 2);
+        assert_eq!(plan.counts.unassigned_footprint.planned, 1);
+        assert_eq!(plan.unassigned.len(), 1);
+        assert_eq!(plan.unassigned[0].reference, "R1");
+        assert_eq!(plan.unassigned[0].board_state, UnassignedBoardState::Absent);
+        assert!(plan.changes.iter().all(|change| {
+            !matches!(change, PlannedChange::Add { reference, .. } if reference == "R1")
+        }));
+    }
+
+    /// A footprint already on the board for the unassigned symbol is kept as
+    /// it is and counted as matched — not board-only, not a conflict.
+    #[test]
+    fn an_existing_board_footprint_for_an_unassigned_symbol_is_kept() {
+        let design = unassigned_design();
+        let r1_path = design.unassigned[0].symbol_path.clone();
+        let plan = plan_sync(
+            UNASSIGNED,
+            &design,
+            &board_with(vec![board_resistor("R1", Some(&r1_path))]),
+        );
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert!(plan.diagnostics.is_empty());
+        assert_eq!(plan.unassigned[0].board_state, UnassignedBoardState::Kept);
+        assert_eq!(plan.counts.board_only_preserved.planned, 0);
+        assert!(!plan.changes.iter().any(
+            |change| matches!(change, PlannedChange::Update { reference, .. } if reference == "R1")
+        ));
+    }
+
+    /// Nothing but unassigned parts is a no-op that still names them.
+    #[test]
+    fn an_all_unassigned_schematic_is_a_noop_with_the_list() {
+        let mut design = unassigned_design();
+        design.components.clear();
+        let plan = plan_sync(UNASSIGNED, &design, &board_with(vec![]));
+
+        assert_eq!(plan.status, PlanStatus::Noop);
+        assert_eq!(plan.counts.unassigned_footprint.planned, 1);
+        assert_eq!(plan.unassigned.len(), 1);
+    }
+
+    /// A genuine conflict still clears the changes, but the report about the
+    /// schematic survives it.
+    #[test]
+    fn the_unassigned_list_survives_a_conflict() {
+        let design = unassigned_design();
+        let mut stranger = board_resistor("C1", Some("/other/identity"));
+        stranger.footprint_id = "Capacitor_SMD:C_0603_1608Metric".to_string();
+        let plan = plan_sync(UNASSIGNED, &design, &board_with(vec![stranger]));
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.unassigned.len(), 1);
+    }
+
     fn resistor(reference: &str, symbol_path: &str) -> DesignComponent {
         DesignComponent {
             reference: reference.to_string(),
@@ -1776,6 +2139,7 @@ mod tests {
                 resistor("R3", "/sheet/new"),
             ],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
         let board = BoardState {
             footprints: vec![
@@ -2211,6 +2575,7 @@ mod tests {
                 ..resistor("R1", "/sheet/existing")
             }],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
         let board = BoardState {
             footprints: vec![BoardFootprint {
@@ -2251,6 +2616,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
         let plan = plan_sync(
             "netlist",
@@ -2268,6 +2634,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.footprint_id = "Resistor_SMD:R_0805_2012Metric".to_string();
@@ -2295,6 +2662,7 @@ mod tests {
                 reference: "R1".to_string(),
                 symbol_path: "/sheet/existing".to_string(),
             }],
+            unassigned: Vec::new(),
         };
         let absent = plan_sync("netlist", &design, &board_with(Vec::new()));
         assert_eq!(absent.status, PlanStatus::Noop);
@@ -2317,6 +2685,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R2", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
         let plan = plan_sync(
             "netlist",
@@ -2359,6 +2728,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/new")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
         let first = plan_sync("netlist", &design, &board_with(Vec::new()));
         let mut changed_board = board_with(Vec::new());
@@ -2598,6 +2968,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -2653,6 +3024,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
 
         let mut footprint =
@@ -2690,6 +3062,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R5", "/sheet/new")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
 
         let plan = plan_sync(
@@ -2726,6 +3099,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -2763,6 +3137,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -2802,6 +3177,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -2841,6 +3217,7 @@ mod tests {
                 reference: "R9".to_string(),
                 symbol_path: "/sheet/excluded".to_string(),
             }],
+            unassigned: Vec::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
@@ -2876,6 +3253,7 @@ mod tests {
         let design = ExportedDesign {
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
+            unassigned: Vec::new(),
         };
 
         let plan = plan_sync("netlist", &design, &board);
