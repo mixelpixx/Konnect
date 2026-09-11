@@ -1696,6 +1696,9 @@ async fn handle_add_power_symbol(
         x,
         y,
         rotation,
+        // add_power_symbol takes no mirror; a power symbol is placed upright
+        // and the readback asserts nothing put a reflection on it.
+        None,
         &pwr_ref,
         Some(&power_net),
         1,

@@ -375,6 +375,18 @@ impl Symbol {
     pub fn set_rotation(&mut self, rot: f64) {
         self.at.rotation = Some(rot);
     }
+
+    /// Set or clear the placement mirror. `Some("x")` / `Some("y")` write
+    /// eeschema's `(mirror x)` / `(mirror y)`; `None` removes the token
+    /// entirely, which is how eeschema records an unmirrored symbol — it does
+    /// not write `(mirror none)`.
+    ///
+    /// The axes are mutually exclusive in eeschema: a symbol carries at most
+    /// one `SYM_MIRROR_*` flag, and mirroring about both axes is rotation by
+    /// 180 degrees, which belongs in `at`.
+    pub fn set_mirror(&mut self, mirror: Option<&str>) {
+        self.mirror = mirror.map(str::to_owned);
+    }
 }
 
 impl std::fmt::Display for Symbol {

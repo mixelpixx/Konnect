@@ -3,6 +3,55 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: mirrored schematic placement (minor release)
+
+`add_schematic_component` and every entry of `batch_place_components` accept a
+new optional `mirror`, and the schematic component responses gain two boolean
+fields. Nothing is renamed or removed, and omitting `mirror` reproduces the
+previous behaviour exactly: no `(mirror …)` token is written and the symbol is
+placed upright.
+
+`mirror` uses the file format's own vocabulary — `"x"`, `"y"` or `"none"`.
+`"x"` negates screen-Y and `"y"` negates screen-X, which is eeschema's meaning
+for the tokens it writes, and `"none"` is the explicit spelling of unmirrored,
+which KiCad records by omitting the token rather than writing one. There is
+deliberately no way to ask for both axes: KiCad stores at most one mirror flag
+per symbol and reflecting both is rotation 180, so a pair of booleans would let
+a caller request a state the format cannot hold. Mirroring is applied after
+rotation, and it does not substitute for rotation 180 on a symbol whose pins
+are not symmetric — 180 keeps every pin's coordinates correct but reverses
+their visual order along the body.
+
+Any other value is refused rather than dropped. `add_schematic_component`
+returns `invalid_argument` naming `mirror` and writes nothing;
+`batch_place_components` refuses only the offending entry, reporting it in
+`errors` and placing the rest, as it already does for every other per-entry
+problem. A caller who misspells the axis is asking for a reflection, so placing
+the symbol upright and reporting success is the failure this argument exists to
+end.
+
+A placement's field anchors follow the mirror. `Reference` and `Value` are
+positioned through the same transform as the symbol body, which previously
+hardcoded an unmirrored frame, so a mirrored symbol's field text sat on its
+unmirrored side (#101).
+
+Responses add `mirror_x` and `mirror_y`, at the top level and in each `units[]`
+entry, for every tool that shares the committed-file component readback:
+`add_schematic_component`, `batch_place_components`, `add_power_symbol`,
+`edit_schematic_component`, `move_schematic_component`,
+`rotate_schematic_component` and `add_component_annotation`. Both are read from
+the reparsed committed schematic beside `x`, `y`, `rotation`, `lib_id` and
+`units[].field_placements` — never echoed from the request — and the requested
+axis is bound as placement intent, so a reflection that did not reach the file
+refuses with `stale_target` rather than reporting success. The mutations that
+do not change a reflection bind the axis the file already carries, which makes
+them assert they left an existing one alone; `add_power_symbol` binds none,
+because a power symbol is placed upright.
+
+No tool mirrors an already-placed symbol: changing a placement's reflection
+still means deleting it and placing it again. This additive change is planned
+for the next minor release; no tool or argument was renamed or removed.
+
 ## Unreleased: `add_mounting_hole` uses KiCad's shipped footprint names (minor release)
 
 `add_mounting_hole` wrote `MountingHole:MountingHole_{drill:.1}mm`. KiCad 10

@@ -373,6 +373,7 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
             symbol.at.x,
             symbol.at.y,
             symbol.at.rotation.unwrap_or(0.0),
+            symbol.mirror.as_deref(),
             symbol.reference().unwrap(),
             symbol.value_str(),
             symbol.unit,
@@ -438,6 +439,7 @@ fn native_placement_readback_requires_requested_values() {
             symbol.at.x + if mismatch == "x" { 1.27 } else { 0.0 },
             symbol.at.y + if mismatch == "y" { 1.27 } else { 0.0 },
             symbol.at.rotation.unwrap_or(0.0) + if mismatch == "rotation" { 90.0 } else { 0.0 },
+            symbol.mirror.as_deref(),
             symbol.reference().unwrap(),
             if mismatch == "Value" {
                 Some("wrong-value")
