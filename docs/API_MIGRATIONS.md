@@ -26,8 +26,21 @@ whose file did not describe the pin the editor showed. Surfacing that is what
 the argument is for; omit `side` to keep the old behavior.
 
 `import_sheet_pins` stacks a `top` or `bottom` import along the edge in x, as a
-`right` or `left` import stacks down it in y, and continues below the pins
-already on the edge it was given rather than below every pin on the sheet. It
+`right` or `left` import stacks down it in y, and continues after the pin that
+reaches furthest along the edge it was given rather than after every pin on the
+sheet or after a count of them — an edge holding pins in slots 1 and 3 is filled
+through slot 3, so the import takes slot 4 and the gap at slot 2 is left alone.
+
+**This can refuse an import that previously succeeded.** A single pin sitting on
+an edge's last slot fills it through that slot while every slot before it stays
+empty; the import continues after the furthest pin rather than filling the gap,
+so it now returns an error where it used to place pins into the free space. The
+refusal says how many slots below the outlying pin are empty and names moving or
+deleting that pin as the remedy, rather than sending the caller to `edit_sheet`.
+A pin that names an edge but lies past the end of it — `edit_sheet` resizes a
+sheet without moving its pins, so shrinking one strands them — does not fill the
+edge at all; like a pin whose rotation names no edge, it reserves a slot so the
+stack moves outward, and imports onto that edge keep working. It
 derives every position itself, so it validates every one of them against that
 edge before it writes any: an import that would run past a corner is refused
 entire, with nothing written, rather than letting KiCad clamp the overflow onto
