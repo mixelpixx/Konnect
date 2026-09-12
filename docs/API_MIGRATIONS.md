@@ -37,10 +37,19 @@ empty; the import continues after the furthest pin rather than filling the gap,
 so it now returns an error where it used to place pins into the free space. The
 refusal says how many slots below the outlying pin are empty and names moving or
 deleting that pin as the remedy, rather than sending the caller to `edit_sheet`.
-A pin that names an edge but lies past the end of it — `edit_sheet` resizes a
-sheet without moving its pins, so shrinking one strands them — does not fill the
-edge at all; like a pin whose rotation names no edge, it reserves a slot so the
-stack moves outward, and imports onto that edge keep working. It
+An imported pin is never written onto a coordinate something already stands on.
+The stack still continues after the furthest pin genuinely on the edge rather
+than filling gaps below it, but any slot already occupied is stepped over — by a
+pin the rotation cannot attribute to an edge, by one `edit_sheet` stranded past
+the end when it shrank the sheet, and by the corner KiCad would clamp such a pin
+back onto. A count of those pins is not enough: it says how many to step past,
+not where they are, so an import of several labels used to walk onto them.
+
+Edge capacity is measured with the same slack the slot arithmetic uses. A span
+that is an exact number of slots long does not divide to an exact integer once
+it has been through a subtraction, so an edge could be judged one slot shorter
+than it is — which decided whether a pin counted as being on the edge at all,
+and so whether an import could overwrite it. It
 derives every position itself, so it validates every one of them against that
 edge before it writes any: an import that would run past a corner is refused
 entire, with nothing written, rather than letting KiCad clamp the overflow onto
