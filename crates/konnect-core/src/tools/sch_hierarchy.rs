@@ -428,25 +428,53 @@ fn ensure_pin_is_on_sheet_edge(
 ///
 /// `import_sheet_pins` derives every position itself, so the caller cannot see
 /// the overflow in its own arguments the way `add_sheet_pin`'s caller can. The
-/// message therefore has to say how many pins the edge holds and how many are
-/// already on it, and that nothing was written — the import is refused entire.
+/// message therefore has to say how many pins the edge holds and how far down it
+/// is already filled, and that nothing was written — the import is refused entire.
+///
+/// `filled_through` is a slot, not a pin count: an edge holding two pins in slots
+/// 1 and 3 is filled through slot 3, and saying it "carries 2" would leave the
+/// reader unable to work out why the import ran out of room.
+/// How many 2.54 mm slots an edge has room for, counting from the corner.
+///
+/// Both the refusal below and `import_sheet_pins` need this number, and they
+/// have to agree: the import decides a pin is off the edge by it, and the
+/// refusal tells the caller how many the edge holds. Two copies of the
+/// expression could drift into saying different things about the same edge.
+fn sheet_pin_edge_capacity(sheet_box: SheetBox, side: &str) -> usize {
+    sheet_box
+        .edge(side)
+        .map(|edge| ((edge.span_end - edge.span_start) / SHEET_PIN_SPACING_MM).floor() as usize)
+        .unwrap_or(0)
+}
+
 fn sheet_pin_edge_is_full(
     sheet_box: SheetBox,
     sheet_name: &str,
     side: &str,
-    occupied: usize,
+    filled_through: usize,
+    free_below: usize,
     first_that_did_not_fit: &str,
 ) -> CallToolResult {
-    let capacity = sheet_box
-        .edge(side)
-        .map(|edge| ((edge.span_end - edge.span_start) / SHEET_PIN_SPACING_MM).floor() as usize)
-        .unwrap_or(0);
+    let capacity = sheet_pin_edge_capacity(sheet_box, side);
+    // One pin parked at the far end fills the edge "through" its slot while
+    // leaving the slots before it empty. Telling that caller to enlarge the
+    // sheet sends them to the wrong remedy, so the gap is named instead.
+    let gaps = if free_below > 0 {
+        format!(
+            " {free_below} slot(s) before it are empty, but an import continues after the \
+             furthest pin rather than filling gaps, so moving or deleting the outlying pin is \
+             the smaller fix here."
+        )
+    } else {
+        String::new()
+    };
     CallToolResult::error(format!(
         "The '{side}' edge of sheet '{sheet_name}' holds {capacity} sheet pins at \
-         {SHEET_PIN_SPACING_MM} mm apart and already carries {occupied}, so '{first_that_did_not_fit}' \
+         {SHEET_PIN_SPACING_MM} mm apart and is already filled through slot {filled_through}, \
+         so '{first_that_did_not_fit}' \
          and everything after it would be placed past a corner. KiCad clamps such a pin back onto \
          the box, piling the overflow on the corner instead of leaving it where it was written, \
-         so the import is refused entire and nothing was written. Enlarge the sheet with \
+         so the import is refused entire and nothing was written.{gaps} Enlarge the sheet with \
          edit_sheet, or import onto more than one side."
     ))
 }
@@ -1569,25 +1597,61 @@ async fn handle_import_sheet_pins(
         sheet_y
     };
 
-    // The stack continues below the pins already on *this* edge. Counting every
-    // pin on the sheet instead — which is what this did — starts the stack past
-    // the other three edges' pins and walks it straight off the end of this one.
-    // The rotation is what says which edge a pin is on, so it is what is counted.
+    // The stack continues after the pin that reaches furthest down *this* edge.
+    // How many pins are on the edge does not say where they are: an edge holding
+    // pins in slots 1 and 3 holds two, and starting at slot 3 puts the import on
+    // top of the second one. Only the coordinate can answer where the stack ends,
+    // so the slot each pin occupies is derived from it and the largest is taken.
+    // The rotation is what says which edge a pin is on, so it is what selects
+    // the pins to measure.
     //
-    // A pin whose rotation names no edge — absent, or an angle KiCad does not
-    // map — is counted here too. The blunt total had that safety by accident,
-    // and making the count precise would otherwise have taken it away: if we
-    // cannot tell which edge a pin is on, it could be this one, and stacking
-    // further out is always safe where stacking over it is not. A well-formed
-    // file has no such pin, so this changes nothing for one.
-    let occupied = sheet
-        .pins
-        .iter()
-        .filter(|pin| match sheet_pin_side_for_rotation(pin.at.rotation) {
-            Some(pin_side) => pin_side == side.as_str(),
-            None => true,
-        })
-        .count();
+    // A coordinate that is not on a slot rounds outward, so the next slot clears
+    // it, and one before the edge's origin cannot drag the stack backwards. The
+    // tolerance absorbs the division's own error — 7.62 / 2.54 is 3.0000000000000004
+    // and must be slot 3, not 4 — while staying a thousand times finer than the
+    // nanometre KiCad stores a coordinate in.
+    let slot_origin = if stacks_in_y { sheet_y } else { sheet_x };
+    let slot_of = |coord: f64| -> usize {
+        (((coord - slot_origin) / SHEET_PIN_SPACING_MM) - 1e-9)
+            .ceil()
+            .max(0.0) as usize
+    };
+    //
+    // Two kinds of pin cannot say where the stack ends, and neither may be
+    // measured. A pin whose rotation names no edge — absent, or an angle KiCad
+    // does not map — belongs to no edge, and one sitting on the opposite edge
+    // would measure as this edge's far corner. A pin that names this edge but
+    // lies past the end of it is the same problem from the other direction:
+    // `edit_sheet` resizes a sheet without moving its pins, so shrinking one
+    // strands them beyond the new corner, and measuring such a pin refuses
+    // every later import onto an edge that holds no valid pin at all — a call
+    // that used to work, turned into an error by the precision.
+    //
+    // Both reserve a slot instead. That pushes the stack outward, which is
+    // always safe, without ever inventing an overflow. A well-formed file has
+    // neither kind, so this changes nothing for one.
+    let capacity = sheet_pin_edge_capacity(sheet_box, &side);
+    let mut furthest = 0usize;
+    let mut reserved = 0usize;
+    let mut on_edge = 0usize;
+    for pin in &sheet.pins {
+        match sheet_pin_side_for_rotation(pin.at.rotation) {
+            Some(pin_side) if pin_side == side.as_str() => {
+                let slot = slot_of(if stacks_in_y { pin.at.y } else { pin.at.x });
+                if slot <= capacity {
+                    furthest = furthest.max(slot);
+                    if slot >= 1 {
+                        on_edge += 1;
+                    }
+                } else {
+                    reserved += 1;
+                }
+            }
+            Some(_) => {}
+            None => reserved += 1,
+        }
+    }
+    let occupied = furthest + reserved;
 
     // Plan the whole import before any of it is written. These positions are
     // generated here rather than supplied, so an overflow is not something the
@@ -1621,6 +1685,7 @@ async fn handle_import_sheet_pins(
                 &sheet_name,
                 &side,
                 occupied,
+                furthest.saturating_sub(on_edge),
                 &name,
             ));
         }
@@ -3737,6 +3802,197 @@ mod tests {
         assert_eq!(
             vin.at.y, 52.54,
             "the left edge is empty, so the first imported pin takes its first slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_starts_after_the_furthest_pin_on_a_sparse_edge() {
+        // The next slot came from the *count* of pins on the edge, not from how
+        // far down the edge they actually reach. Two pins in slots 1 and 3 count
+        // as two, so the import took slot 3 and landed on top of the second one.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        for (name, y) in [("A1", 52.54), ("A3", 57.62)] {
+            handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input",
+                         "x": 50.0, "y": y, "side": "left" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        }
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        let vin = sheet.pin_by_name("VIN").unwrap();
+        let a3 = sheet.pin_by_name("A3").unwrap();
+        assert_ne!(
+            (vin.at.x, vin.at.y),
+            (a3.at.x, a3.at.y),
+            "an import must not stack over a pin already on the selected edge"
+        );
+        assert_eq!(
+            vin.at.y, 60.16,
+            "the stack continues after the furthest pin on the edge, not after the count of them"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_reads_a_slot_the_division_cannot_represent_exactly() {
+        // Deriving a slot from a coordinate is a division, and the spacing does
+        // not divide cleanly in binary: (62.7 - 50.0) / 2.54 is 5.000000000000001,
+        // so rounding outward without a tolerance reads slot 5 as slot 6 and the
+        // import skips a slot. It goes wrong at slots 5, 10, 12, 13, 17, 24, 26
+        // and 31 within one sheet; the other tests here sit on 1, 3 and 19, where
+        // the error happens to fall the harmless way, so none of them can see it.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "FIFTH", "pin_type": "input",
+                     "x": 50.0, "y": 62.7, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let vin = parent
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name("VIN")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            vin.at.y, 65.24,
+            "a pin on slot 5 must be read as slot 5, so the import takes slot 6"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_ignores_a_pin_the_sheet_shrank_away_from() {
+        // `edit_sheet` resizes a sheet without moving its pins, so shrinking one
+        // strands them past the new corner. Such a pin names the edge but is not
+        // on it, and measuring it would report the edge filled through a slot it
+        // no longer has — refusing an import onto an edge that holds no valid pin
+        // at all. It reserves a slot instead, as an unattributable pin does.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "DEEP", "pin_type": "input",
+                     "x": 50.0, "y": 98.26, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // The 50 mm left edge becomes a 20 mm one; DEEP is now off the box.
+        handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "width": 80.0, "height": 20.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.is_error,
+            "a pin the sheet shrank away from must not refuse the import: {:?}",
+            result.content
+        );
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let vin = parent
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name("VIN")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            vin.at.y, 55.08,
+            "the stranded pin reserves a slot rather than setting the furthest, so the import \
+             takes the second one and stays on the shortened edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_names_the_free_slots_when_one_outlying_pin_fills_the_edge() {
+        // Continuing after the furthest pin is what #514's review asked for, and
+        // it has a consequence worth stating: one pin parked on the last slot
+        // fills the edge "through" that slot while every slot before it is free,
+        // so the import refuses where it used to place pins into the gap. The
+        // behaviour is intended; sending that caller to `edit_sheet` would not be.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "LAST", "pin_type": "input",
+                     "x": 50.0, "y": 98.26, "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let child_path = tmp.path().join("a.kicad_sch");
+        add_label(&child_path, "VIN", "input", 5.0, 5.0);
+        let result = handle_import_sheet_pins(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "the edge is filled through its last slot");
+
+        let message = format!("{:?}", result.content);
+        assert!(
+            message.contains("18 slot(s) before it are empty"),
+            "the refusal must say the slots below the outlying pin are free: {message}"
+        );
+        assert!(
+            message.contains("moving or deleting the outlying pin"),
+            "and must name the remedy that actually applies: {message}"
+        );
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        assert_eq!(
+            parent.sheets.by_name("A").unwrap().pins.len(),
+            1,
+            "no pin was written"
         );
     }
 
