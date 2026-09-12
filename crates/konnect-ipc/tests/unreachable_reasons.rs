@@ -7,7 +7,6 @@
 //! the way the failing endpoint does.
 
 use konnect_ipc::{KiCadIpcClient, PingOutcome, UnreachableReason};
-use std::time::{Duration, Instant};
 
 fn reason_of(outcome: &PingOutcome) -> Option<UnreachableReason> {
     match outcome {
@@ -33,6 +32,7 @@ fn an_address_nothing_listens_on_reports_no_listener() {
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use std::time::{Duration, Instant};
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
     /// A pipe name unique to this test and process, and the address NNG maps
