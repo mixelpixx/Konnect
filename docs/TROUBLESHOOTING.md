@@ -30,8 +30,8 @@ KiCad launches itself), then the platform default — `<temp dir>/kicad/api.sock
 used only if something is actually listening there. The startup log on stderr
 says which it picked, and warns when nothing was found.
 
-So on Linux and macOS, **if KiCad is already running with the API enabled when
-Konnect starts**, no configuration is needed. That order matters and is easy to
+So **if KiCad is already running with the API enabled when Konnect starts**,
+no configuration is needed on any platform. That order matters and is easy to
 get wrong: an MCP client normally launches the Konnect server itself, before
 you open KiCad. Konnect does not re-probe afterwards, so a server started first
 stays unresolved for its whole life no matter what you open later. Start KiCad
@@ -39,9 +39,13 @@ first, or restart the Konnect server (in most clients, reconnect the MCP
 server) once KiCad is up — or set `ipc_address` explicitly, which never depends
 on ordering.
 
-Windows detects nothing either way: KiCad's `ipc://` endpoint is a named pipe
-there and this probe cannot ask it whether anyone is listening, so a Windows
-setup is configured by hand exactly as it was before.
+Where the probe looks differs by platform, because the endpoint does. On Linux
+and macOS the socket is a filesystem entry and its metadata is read. On Windows
+KiCad's `ipc://` endpoint is a **named pipe**, which has no filesystem presence
+at all, so the same path is looked up in the pipe namespace (`\\.\pipe\`)
+instead. Before that was true, Windows detected nothing and every setup had to
+be configured by hand (#529); if you are on a Konnect older than that fix, set
+`ipc_address` or `KICAD_API_SOCKET` explicitly.
 
 If the address is unresolved, both of the following must be correct — neither
 happens automatically:
