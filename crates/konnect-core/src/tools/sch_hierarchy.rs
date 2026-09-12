@@ -468,9 +468,15 @@ fn sheet_pin_edge_is_full(
     } else {
         String::new()
     };
+    // An edge with nothing on it is not "filled through slot 0".
+    let filled = if filled_through == 0 {
+        "is empty".to_string()
+    } else {
+        format!("is already filled through slot {filled_through}")
+    };
     CallToolResult::error(format!(
         "The '{side}' edge of sheet '{sheet_name}' holds {capacity} sheet pins at \
-         {SHEET_PIN_SPACING_MM} mm apart and is already filled through slot {filled_through}, \
+         {SHEET_PIN_SPACING_MM} mm apart and {filled}, \
          so '{first_that_did_not_fit}' \
          and everything after it would be placed past a corner. KiCad clamps such a pin back onto \
          the box, piling the overflow on the corner instead of leaving it where it was written, \
@@ -3742,7 +3748,9 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            message.contains("'top' edge") && message.contains("31 sheet pins"),
+            message.contains("'top' edge")
+                && message.contains("31 sheet pins")
+                && message.contains("is empty"),
             "the refusal must name the edge and its capacity, got: {message}"
         );
         assert!(
