@@ -10,7 +10,7 @@ use konnect_ipc::gen::kiapi;
 use konnect_ipc::{
     IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
     IpcSelectionMutationError, IpcSelectionMutationErrorKind, IpcSelectionObservationError,
-    IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient,
+    IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient, PingOutcome,
 };
 use nng::options::Options;
 use prost::Message;
@@ -465,6 +465,7 @@ fn ping_roundtrips_through_mock() {
 
     let client = KiCadIpcClient::new(&mock.url);
     assert!(client.ping().unwrap());
+    assert_eq!(client.ping_outcome(), PingOutcome::Responsive);
 }
 
 #[test]
@@ -496,6 +497,15 @@ fn kicad_error_status_maps_to_err() {
     // ping() swallows errors into Ok(false) by design — that's the
     // "KiCAD unreachable" UX. It must not be Ok(true) and must not hang.
     assert!(!client.ping().unwrap());
+
+    // KiCad received this request and refused it, so it is not "unreachable":
+    // ping_outcome must not name a transport reason for it (#532).
+    match client.ping_outcome() {
+        PingOutcome::RequestFailed { message } => {
+            assert!(message.contains("no board open"), "{message}")
+        }
+        other => panic!("a KiCad error status is not a transport failure: {other:?}"),
+    }
 
     // A typed call surfaces the error text.
     let err = client.get_open_documents().unwrap_err().to_string();

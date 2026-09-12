@@ -649,6 +649,21 @@ pub fn require_u64(args: &Value, key: &str) -> Result<u64, CallToolResult> {
         .ok_or_else(|| invalid_arg(key, "missing or not a non-negative integer"))
 }
 
+/// `ipc_failure` evidence for a response that pinged KiCad: `null` when KiCad
+/// answered, otherwise `{kind, message}` naming why it did not (#532).
+///
+/// `kind` comes from the typed [`konnect_ipc::PingOutcome`] — never from the
+/// message — so a caller can branch on it: `not_configured`, `no_listener`,
+/// `access_denied`, `handshake_failed`, `transport_error`, or
+/// `request_failed` for a request KiCad received and did not answer with
+/// success.
+pub fn ipc_failure_evidence(outcome: &konnect_ipc::PingOutcome) -> Value {
+    match (outcome.failure_kind(), outcome.failure_message()) {
+        (Some(kind), Some(message)) => serde_json::json!({ "kind": kind, "message": message }),
+        _ => Value::Null,
+    }
+}
+
 /// A required argument was absent or the wrong type.
 ///
 /// Carried inside the `anyhow::Error` that [`get_path`] returns so the MCP
@@ -2464,5 +2479,32 @@ pub(crate) mod schematic_target_tests {
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("conflict")
         );
+    }
+}
+
+#[cfg(test)]
+mod ipc_failure_evidence_tests {
+    use super::ipc_failure_evidence;
+    use konnect_ipc::{PingOutcome, UnreachableReason};
+
+    #[test]
+    fn a_responsive_endpoint_has_no_failure() {
+        assert!(ipc_failure_evidence(&PingOutcome::Responsive).is_null());
+    }
+
+    #[test]
+    fn the_kind_is_the_typed_reason_and_the_message_is_kept() {
+        let evidence = ipc_failure_evidence(&PingOutcome::Unreachable {
+            reason: UnreachableReason::AccessDenied,
+            message: "refused".to_string(),
+        });
+        assert_eq!(evidence["kind"], "access_denied");
+        assert_eq!(evidence["message"], "refused");
+
+        let evidence = ipc_failure_evidence(&PingOutcome::RequestFailed {
+            message: "AS_NOT_READY".to_string(),
+        });
+        assert_eq!(evidence["kind"], "request_failed");
+        assert_eq!(evidence["message"], "AS_NOT_READY");
     }
 }

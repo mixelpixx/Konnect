@@ -124,7 +124,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_kicad_ui",
-            "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout.",
+            "Check whether the KiCad GUI application is running and whether IPC responds within a bounded timeout. When IPC does not answer, ipc_failure.kind says why: not_configured, no_listener, access_denied (the endpoint belongs to another operating-system account, as with a sandboxed client), handshake_failed (the listener did not complete NNG's handshake, so it is probably not KiCad; this takes NNG's 10 s limit, so pass timeout_seconds above 10 to see it), transport_error, or request_failed (KiCad received the request and did not answer with success, e.g. AS_NOT_READY).",
             json!({
                 "type": "object",
                 "properties": {
@@ -822,22 +822,22 @@ async fn handle_check_kicad_ui(
     let started = std::time::Instant::now();
     let check = async move {
         let process_detected = task::spawn_blocking(is_kicad_running).await?;
-        let ipc_responsive = task::spawn_blocking(move || {
-            konnect_ipc::client::KiCadIpcClient::new(&addr)
-                .ping()
-                .unwrap_or(false)
+        let ipc = task::spawn_blocking(move || {
+            konnect_ipc::client::KiCadIpcClient::new(&addr).ping_outcome()
         })
         .await?;
-        Ok::<_, tokio::task::JoinError>((process_detected, ipc_responsive))
+        Ok::<_, tokio::task::JoinError>((process_detected, ipc))
     };
 
     match bounded_health_check(std::time::Duration::from_secs(timeout_seconds), check).await {
         Ok(result) => {
-            let (process_detected, ipc_responsive) = result?;
+            let (process_detected, ipc) = result?;
+            let ipc_responsive = ipc.is_responsive();
             Ok(CallToolResult::json(&json!({
                 "running": ui_running(process_detected, ipc_responsive),
                 "process_detected": process_detected,
                 "ipc_responsive": ipc_responsive,
+                "ipc_failure": crate::tools::ipc_failure_evidence(&ipc),
                 "timed_out": false,
                 "timeout_seconds": timeout_seconds,
                 "elapsed_ms": started.elapsed().as_millis() as u64
@@ -847,6 +847,7 @@ async fn handle_check_kicad_ui(
             "running": null,
             "process_detected": null,
             "ipc_responsive": false,
+            "ipc_failure": null,
             "timed_out": true,
             "timeout_seconds": timeout_seconds,
             "elapsed_ms": started.elapsed().as_millis() as u64,
@@ -1309,6 +1310,33 @@ mod tests {
         assert!(ui_running(false, true));
         assert!(ui_running(true, false));
         assert!(!ui_running(false, false));
+    }
+
+    #[tokio::test]
+    async fn check_kicad_ui_names_why_ipc_did_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address =
+            format!("ipc://{}", dir.path().join("no-kicad-here.sock").display());
+
+        let result = handle_check_kicad_ui(&json!({ "timeout_seconds": 60 }), &ctx)
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(response["timed_out"], false, "{response}");
+        assert_eq!(response["ipc_responsive"], false, "{response}");
+        assert_eq!(response["ipc_failure"]["kind"], "no_listener", "{response}");
+        assert!(
+            response["ipc_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Nothing is listening there")),
+            "{response}"
+        );
     }
 
     #[tokio::test]

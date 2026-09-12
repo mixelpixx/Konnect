@@ -29,3 +29,8 @@ prost-build = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Builds a pipe whose security descriptor refuses this account, the condition a
+# sandboxed client running as another Windows user meets.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
