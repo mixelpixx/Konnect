@@ -977,6 +977,67 @@ mod tests {
         );
     }
 
+    /// A rep0 endpoint that answers every request with `AS_NOT_READY`, the
+    /// status KiCad returns while an editor is still loading.
+    fn spawn_not_ready_kicad() -> String {
+        use nng::options::Options;
+        use prost::Message;
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+        std::thread::spawn(move || {
+            while socket.recv().is_ok() {
+                let response = konnect_ipc::gen::kiapi::common::ApiResponse {
+                    status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
+                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsNotReady as i32,
+                        error_message: "KiCad is not ready".to_string(),
+                    }),
+                    header: None,
+                    message: None,
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn open_project_says_kicad_answered_when_it_answered_with_an_error() {
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address = spawn_not_ready_kicad();
+
+        let result = handle_open_project(&json!({}), &ctx).await.unwrap();
+        let response = response_json(&result);
+
+        assert_eq!(response["ipc_available"], false, "{response}");
+        assert_eq!(
+            response["ipc_failure"]["kind"], "request_failed",
+            "{response}"
+        );
+        assert!(
+            response["ipc_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("KiCad is not ready")),
+            "{response}"
+        );
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("KiCad IPC received the request")),
+            "a KiCad that answered must not be reported as unreachable: {response}"
+        );
+    }
+
     #[test]
     fn the_open_project_headline_follows_the_failure_kind() {
         use konnect_ipc::{PingOutcome, UnreachableReason};
