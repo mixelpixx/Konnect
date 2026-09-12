@@ -774,8 +774,8 @@ impl KiCadIpcClient {
         socket.dial(&dial_url).map_err(|error| {
             let reason = UnreachableReason::from_dial_error(error);
             anyhow::Error::new(TransportUnreachable { reason }).context(format!(
-                "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. {} (guide: \
-                 https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md)",
+                "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. {} Guide: \
+                 https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
                 reason.explanation()
             ))
         })?;
@@ -850,10 +850,16 @@ impl KiCadIpcClient {
                     },
                     e
                 );
-                let message = format!("{e:#}");
+                // An unreachable failure's outermost context is already the
+                // whole sentence; the chain below it is only the marker.
                 match unreachable_reason(&e) {
-                    Some(reason) => PingOutcome::Unreachable { reason, message },
-                    None => PingOutcome::RequestFailed { message },
+                    Some(reason) => PingOutcome::Unreachable {
+                        reason,
+                        message: e.to_string(),
+                    },
+                    None => PingOutcome::RequestFailed {
+                        message: format!("{e:#}"),
+                    },
                 }
             }
         }
