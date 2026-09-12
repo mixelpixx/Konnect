@@ -3,6 +3,72 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `side` on the sheet-pin tools (minor release)
+
+`add_sheet_pin`, `edit_sheet_pin`, and `import_sheet_pins` take one optional
+`side`: `right`, `left`, `top`, or `bottom`, written as the KiCad rotations
+`0`, `180`, `90`, and `270`. KiCad reads a sheet pin's edge from that rotation,
+so `top` and `bottom` were unreachable: `add_sheet_pin` and `edit_sheet_pin`
+had no rotation input at all and always wrote `0`, and `import_sheet_pins.side`
+accepted only `right` and `left`.
+
+Omitting `side` keeps the existing behavior exactly — the pin is written at
+rotation `0`, on the right edge, and its position is not checked. **No existing
+call changes meaning**, and nothing a caller could do before is refused now.
+
+Supplying `side` also selects validation. The position is checked against the
+named edge on both axes — the coordinate the edge pins the pin to, and the span
+it runs along, corners inclusive — and a point that is not on it is refused with
+`invalid_argument` naming the offending axis, before anything is written. Such a
+point was previously written and then relocated by KiCad on load, so a caller
+that starts passing `side` can see a refusal where it used to see a success
+whose file did not describe the pin the editor showed. Surfacing that is what
+the argument is for; omit `side` to keep the old behavior.
+
+`import_sheet_pins` stacks a `top` or `bottom` import along the edge in x, as a
+`right` or `left` import stacks down it in y, and continues after the pin that
+reaches furthest along the edge it was given rather than after every pin on the
+sheet or after a count of them — an edge holding pins in slots 1 and 3 is filled
+through slot 3, so the import takes slot 4 and the gap at slot 2 is left alone.
+
+**This can refuse an import that previously succeeded.** A single pin sitting on
+an edge's last slot fills it through that slot while every slot before it stays
+empty; the import continues after the furthest pin rather than filling the gap,
+so it now returns an error where it used to place pins into the free space. The
+refusal says how many slots below the outlying pin are empty and names moving or
+deleting that pin as the remedy, rather than sending the caller to `edit_sheet`.
+An imported pin is never written onto a coordinate something already stands on.
+The stack still continues after the furthest pin genuinely on the edge rather
+than filling gaps below it, but any slot already occupied is stepped over — by a
+pin the rotation cannot attribute to an edge, by one `edit_sheet` stranded past
+the end when it shrank the sheet, and by the corner KiCad would clamp such a pin
+back onto. A count of those pins is not enough: it says how many to step past,
+not where they are, so an import of several labels used to walk onto them.
+
+Edge capacity is measured with the same slack the slot arithmetic uses. A span
+that is an exact number of slots long does not divide to an exact integer once
+it has been through a subtraction, so an edge could be judged one slot shorter
+than it is — which decided whether a pin counted as being on the edge at all,
+and so whether an import could overwrite it. It
+derives every position itself, so it validates every one of them against that
+edge before it writes any: an import that would run past a corner is refused
+entire, with nothing written, rather than letting KiCad clamp the overflow onto
+the corner. A sheet whose labels no longer fit on one edge therefore returns an
+error where it previously returned success over a silently relocated pin.
+
+Response `x`, `y`, and `side` are derived from the sheet pin read back out of
+the committed file rather than echoed from the request; `import_sheet_pins`
+reads `side` off a pin it actually saved and reports `null` when it saved none.
+
+`edit_sheet_pin` gains `changed` and `requested_fields` next to the existing
+`changed_fields`, matching `edit_sheet`. `changed_fields` now carries `side`
+only when the rotation actually differs, so restating the edge a pin is already
+on is reported as the no-op it is and commits nothing. The other fields keep the
+behavior they had. Existing response fields keep their names and their meanings.
+
+No tool, argument, or existing response field was renamed or removed. This
+additive schema and response change is planned for the next minor release.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and
