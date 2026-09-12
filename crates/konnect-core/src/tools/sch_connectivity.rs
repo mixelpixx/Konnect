@@ -36,7 +36,7 @@ use konnect_sexp::{
     },
     SexpNode,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The coincidence tolerance the connectivity tools have always used, in mm.
 /// `find_orphan_items` takes its own as an argument; the rest use this.
@@ -181,24 +181,85 @@ pub(crate) fn pt_key(x: f64, y: f64) -> (i64, i64) {
     ((x * 1000.0).round() as i64, (y * 1000.0).round() as i64)
 }
 
+/// A name a label puts on a point, with the kind of label that put it there.
+///
+/// The kind is what makes [`NetGraph::name_of_root`] deterministic: one net can
+/// carry several names, and which one it is *called* follows KiCad's own
+/// precedence rather than whichever the map happened to yield first.
+#[derive(Clone)]
+struct NetName {
+    name: String,
+    kind: LabelKind,
+}
+
+/// KiCad's net-name precedence, highest first: a global label outranks a power
+/// symbol, which outranks a local label, which outranks a hierarchical one.
+///
+/// Verified against KiCad 10.0.5 by netlisting one net carrying each pair:
+/// `+3V3` power symbol with a `LOCAL_VCC` label nets as `+3V3`, either with a
+/// `GLOBAL_SYS` global label nets as `GLOBAL_SYS`, and a local label beats a
+/// hierarchical one. It is `CONNECTION_SUBGRAPH`'s driver priority, minus the
+/// sheet-pin and pin ranks below it — neither names a net here.
+fn driver_priority(kind: LabelKind) -> u8 {
+    match kind {
+        LabelKind::GlobalLabel => 3,
+        LabelKind::PowerSymbol => 2,
+        LabelKind::NetLabel => 1,
+        LabelKind::HierarchicalLabel => 0,
+    }
+}
+
+/// Whether `a` names the net in preference to `b`. Equal priority is broken on
+/// the name, ascending, which is KiCad's own tie-break (two local labels on one
+/// net gave `AAA` over `LOCAL_VCC`, and `LOCAL_VCC` over `ZZZ`).
+fn names_ahead_of(a: &NetName, b: &NetName) -> bool {
+    let (pa, pb) = (driver_priority(a.kind), driver_priority(b.kind));
+    pa > pb || (pa == pb && a.name < b.name)
+}
+
+/// A net's identity: the union-find root every point on that net resolves to.
+///
+/// Distinct from a net *name*, which a net may have several of or none at all.
+pub(crate) type NetRoot = (i64, i64);
+
+/// A graph of points joined into nets, and the name each net carries.
+///
+/// Built only by [`seed_net_graph`], which is why every mutator below is
+/// private: once seeding calls [`NetGraph::name_nets`] the graph is frozen, and
+/// `root_names` cannot go stale behind a later union. Callers get the two
+/// questions they actually ask — [`root_at`](Self::root_at) for a net's
+/// identity, [`name_of_root`](Self::name_of_root) for what it is called.
 pub(crate) struct NetGraph {
-    pub(crate) point_nets: HashMap<(i64, i64), String>,
-    pub(crate) parent: HashMap<(i64, i64), (i64, i64)>,
+    /// Every name at a point, not just the winning one. A rail label written
+    /// over the power symbol that names it puts two names on one coordinate,
+    /// and dropping the loser would keep it out of
+    /// [`merge_named_nets`](Self::merge_named_nets) — so a point carrying
+    /// `AAA` and `ZZZ` would never join a disconnected `ZZZ` segment.
+    point_nets: HashMap<(i64, i64), Vec<NetName>>,
+    parent: HashMap<(i64, i64), NetRoot>,
+    /// The winning name per root, resolved once at the end of seeding.
+    root_names: HashMap<NetRoot, String>,
+    /// Every name on each root, sorted. A caller classifying a net — is this a
+    /// rail? is it ground? — must read all of them: the winning name can be a
+    /// global label that says nothing about the `+3V3` alias beside it.
+    root_aliases: HashMap<NetRoot, BTreeSet<String>>,
 }
 
 impl NetGraph {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         NetGraph {
             point_nets: HashMap::new(),
             parent: HashMap::new(),
+            root_names: HashMap::new(),
+            root_aliases: HashMap::new(),
         }
     }
 
-    pub(crate) fn ensure(&mut self, k: (i64, i64)) {
+    fn ensure(&mut self, k: (i64, i64)) {
         self.parent.entry(k).or_insert(k);
     }
 
-    pub(crate) fn find(&mut self, k: (i64, i64)) -> (i64, i64) {
+    fn find(&mut self, k: (i64, i64)) -> NetRoot {
         self.ensure(k);
         let p = self.parent[&k];
         if p == k {
@@ -209,7 +270,7 @@ impl NetGraph {
         root
     }
 
-    pub(crate) fn union(&mut self, a: (i64, i64), b: (i64, i64)) {
+    fn union(&mut self, a: (i64, i64), b: (i64, i64)) {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra != rb {
@@ -217,7 +278,7 @@ impl NetGraph {
         }
     }
 
-    pub(crate) fn add_wire(&mut self, w: &Wire) {
+    fn add_wire(&mut self, w: &Wire) {
         let a = pt_key(w.x1, w.y1);
         let b = pt_key(w.x2, w.y2);
         self.ensure(a);
@@ -225,23 +286,124 @@ impl NetGraph {
         self.union(a, b);
     }
 
-    pub(crate) fn add_label(&mut self, x: f64, y: f64, net: &str) {
+    fn add_label(&mut self, x: f64, y: f64, net: &str, kind: LabelKind) {
         let k = pt_key(x, y);
         self.ensure(k);
-        self.point_nets.insert(k, net.to_string());
+        let held = self.point_nets.entry(k).or_default();
+        // Kept whole, and ranked only when a name has to be *chosen*: every
+        // name at this point still has to reach `merge_named_nets`, or a net
+        // joined to this one by the losing name would stay a net of its own.
+        if !held.iter().any(|name| name.name == net) {
+            held.push(NetName {
+                name: net.to_string(),
+                kind,
+            });
+        }
     }
 
-    pub(crate) fn net_at(&mut self, x: f64, y: f64) -> Option<String> {
-        let k = pt_key(x, y);
-        self.ensure(k);
-        let root = self.find(k);
-        let labels: Vec<_> = self.point_nets.clone().into_iter().collect();
-        for (lk, net) in labels {
-            if self.find(lk) == root {
-                return Some(net);
+    /// The graph node a point belongs to. Two points share a root exactly when
+    /// they are on one net — through wire and junction geometry, and through
+    /// [`merge_named_nets`](Self::merge_named_nets) for the pieces KiCad joins
+    /// by name alone.
+    ///
+    /// This is the comparison a caller wants wherever it would otherwise
+    /// compare net *names*: a net carrying two names has one root and would
+    /// fail a name comparison against itself.
+    pub(crate) fn root_at(&mut self, x: f64, y: f64) -> NetRoot {
+        self.find(pt_key(x, y))
+    }
+
+    /// What the net at `root` is called, or `None` when no label names it.
+    ///
+    /// A net can carry more than one name — a rail named by a `+3V3` power
+    /// symbol that also has a label on it, a local label on a net that also
+    /// carries a global one. The answer is the one KiCad's netlister would
+    /// choose (see [`driver_priority`]), not whichever the map yielded first:
+    /// that was `HashMap` iteration order, so the name moved between runs of
+    /// the same binary and the audits reported the losing name as a rail of its
+    /// own.
+    pub(crate) fn name_of_root(&self, root: NetRoot) -> Option<String> {
+        self.root_names.get(&root).cloned()
+    }
+
+    /// Every name on the net at `root`, sorted, empty when nothing names it.
+    ///
+    /// [`name_of_root`](Self::name_of_root) answers what the net is *called*;
+    /// this answers what it is *known as*, which is the question a classifier
+    /// asks. A rail whose winning name is the global label `SYS` is still the
+    /// `+3V3` rail, and reading only the winner made it neither a rail to
+    /// decouple nor a pull-up destination.
+    pub(crate) fn aliases_of_root(&self, root: NetRoot) -> BTreeSet<String> {
+        self.root_aliases.get(&root).cloned().unwrap_or_default()
+    }
+
+    /// Join the points that carry the same name.
+    ///
+    /// KiCad nets a sheet by name as well as by wire: two segments each
+    /// carrying a `SIG` label are one net, and every `GND` power symbol on the
+    /// sheet is the same rail. Wires and junctions alone answer for one piece
+    /// of copper, so without this a root is a *segment* rather than a net —
+    /// and a decoupling capacitor drawn the normal way, on its own stub with
+    /// its own `+3V3` symbol, shares no root with the pin it decouples.
+    ///
+    /// Anchoring each name at the first point that carries it and unioning the
+    /// rest into it makes every same-named point one root, whatever order the
+    /// map yields them in.
+    fn merge_named_nets(&mut self) {
+        let mut anchors: HashMap<String, (i64, i64)> = HashMap::new();
+        let named: Vec<((i64, i64), Vec<String>)> = self
+            .point_nets
+            .iter()
+            .map(|(k, names)| (*k, names.iter().map(|name| name.name.clone()).collect()))
+            .collect();
+        for (k, names) in named {
+            for name in names {
+                match anchors.get(&name) {
+                    Some(&anchor) => self.union(anchor, k),
+                    None => {
+                        anchors.insert(name, k);
+                    }
+                }
             }
         }
-        None
+    }
+
+    /// Resolve one winning name per root. Called once, by [`seed_net_graph`],
+    /// after the last union — a name is a property of the finished net, so
+    /// there is nothing to resolve until the graph stops moving.
+    fn name_nets(&mut self) {
+        let mut best: HashMap<NetRoot, NetName> = HashMap::new();
+        let mut aliases: HashMap<NetRoot, BTreeSet<String>> = HashMap::new();
+        for k in self.point_nets.keys().copied().collect::<Vec<_>>() {
+            let root = self.find(k);
+            for candidate in self.point_nets[&k].clone() {
+                aliases
+                    .entry(root)
+                    .or_default()
+                    .insert(candidate.name.clone());
+                let wins = match best.get(&root) {
+                    Some(held) => names_ahead_of(&candidate, held),
+                    None => true,
+                };
+                if wins {
+                    best.insert(root, candidate);
+                }
+            }
+        }
+        self.root_names = best
+            .into_iter()
+            .map(|(root, name)| (root, name.name))
+            .collect();
+        self.root_aliases = aliases;
+    }
+
+    /// The name of the net at a point — [`root_at`](Self::root_at) then
+    /// [`name_of_root`](Self::name_of_root). For reporting a single point only:
+    /// a caller asking whether two points are on one net wants their roots, not
+    /// their names, since a net can carry more than one.
+    pub(crate) fn net_at(&mut self, x: f64, y: f64) -> Option<String> {
+        let root = self.root_at(x, y);
+        self.name_of_root(root)
     }
 
     pub(crate) fn points_on_net(&mut self, net: &str) -> Vec<(i64, i64)> {
@@ -249,14 +411,23 @@ impl NetGraph {
         let net_keys: Vec<(i64, i64)> = self
             .point_nets
             .iter()
-            .filter(|(_, n)| n.as_str() == net)
+            .filter(|(_, names)| names.iter().any(|name| name.name == net))
             .map(|(k, _)| *k)
             .collect();
-        let net_roots: HashSet<(i64, i64)> = net_keys.iter().map(|k| self.find(*k)).collect();
+        let net_roots: HashSet<NetRoot> = net_keys.iter().map(|k| self.find(*k)).collect();
+        self.points_on_roots(&net_roots)
+    }
+
+    /// Every point on any of `roots` — the same walk [`points_on_net`] does,
+    /// for a caller that already holds identities rather than a name. Asking
+    /// once for several nets also walks the graph once instead of per net.
+    ///
+    /// [`points_on_net`]: Self::points_on_net
+    pub(crate) fn points_on_roots(&mut self, roots: &HashSet<NetRoot>) -> Vec<(i64, i64)> {
         let all_keys: Vec<(i64, i64)> = self.parent.keys().cloned().collect();
         all_keys
             .into_iter()
-            .filter(|k| net_roots.contains(&self.find(*k)))
+            .filter(|k| roots.contains(&self.find(*k)))
             .collect()
     }
 }
@@ -293,7 +464,7 @@ fn seed_net_graph(
         }
     };
     for label in labels {
-        graph.add_label(label.x, label.y, &label.net);
+        graph.add_label(label.x, label.y, &label.net, label.kind);
         attach(&mut graph, label.x, label.y);
     }
     for &(x, y) in junctions {
@@ -303,6 +474,8 @@ fn seed_net_graph(
     for &(x, y) in sheet_pins {
         graph.ensure(pt_key(x, y));
     }
+    graph.merge_named_nets();
+    graph.name_nets();
     graph
 }
 
@@ -319,7 +492,7 @@ pub(crate) fn label_roots<'a>(
 ) -> Vec<((i64, i64), &'a Label)> {
     labels
         .iter()
-        .map(|label| (graph.find(pt_key(label.x, label.y)), label))
+        .map(|label| (graph.root_at(label.x, label.y), label))
         .collect()
 }
 
@@ -759,6 +932,39 @@ mod agreement_tests {
         format!(
             "\t(symbol\n\t\t(lib_id \"power:GND\")\n\t\t(at {x} {y} 0)\n\t\t(unit 1)\n\t\t(uuid \"p1\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t\t(property \"Value\" \"{value}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t)\n"
         )
+    }
+
+    /// The real KiCad fixture, at the graph level: `TP7` reaches the `+3V3`
+    /// rail only through the `ALT` label sitting on the second `+3V3` power
+    /// symbol's own pin. KiCad nets them together (`+3V3` has five pins), so a
+    /// graph that keeps one name per point loses that join — and with it the
+    /// alias every classifier reads.
+    ///
+    /// Provenance and KiCad's own net table: `two_name_nets.README.md`.
+    #[tokio::test]
+    async fn an_alias_on_a_power_symbol_pin_joins_its_segment() {
+        let sch = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
+        let (tree, wires, labels) = index_for(sch);
+        let mut graph = net_graph_for(&tree, &wires, &labels);
+
+        // TP7's pin, and U1's VCC pin at the other end of the rail.
+        let stub = graph.root_at(30.48, 88.9);
+        let rail = graph.root_at(110.49, 72.39);
+        assert_eq!(stub, rail, "TP7 joins the rail through the ALT alias");
+        assert_eq!(graph.name_of_root(rail), Some("+3V3".to_string()));
+        assert!(
+            graph.aliases_of_root(rail).contains("ALT"),
+            "the alias survives to the classifiers: {:?}",
+            graph.aliases_of_root(rail)
+        );
+
+        // The same join without an alias: two `+3V3` power symbols on separate
+        // stubs are one rail, and C1's pin reaches U1's through it.
+        assert_eq!(graph.root_at(59.69, 96.52), rail);
+
+        // And a plain label doing it: `U1.5` and `R1.2` carry `SDA` on segments
+        // that share no wire. KiCad nets both (`/SDA` has two pins).
+        assert_eq!(graph.root_at(120.65, 77.47), graph.root_at(160.02, 63.5));
     }
 
     /// A power symbol's net name is synthesised as a pseudo-label sitting on

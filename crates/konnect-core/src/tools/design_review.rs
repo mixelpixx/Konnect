@@ -8,7 +8,7 @@
 use super::cli;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::sch_connectivity::{net_graph_for, NetGraph};
+use crate::tools::sch_connectivity::{net_graph_for, NetGraph, NetRoot};
 use crate::tools::{
     get_path, invalid_arg, placed_pins_by_reference, project_name_for, sch_hierarchy, ToolContext,
     ToolDef,
@@ -23,7 +23,7 @@ use konnect_sexp::{
     },
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -245,7 +245,7 @@ async fn handle_audit_decoupling_file(
     let mut total_power_pins = 0;
 
     // Collect all capacitor references and their net connections
-    let (cap_nets, _) = capacitor_nets(&mut graph, &placed);
+    let (cap_roots, _) = capacitor_nets(&mut graph, &placed);
 
     // For each IC (non-passive, non-connector component), check power pins
     for (inst, pins) in &placed {
@@ -273,17 +273,12 @@ async fn handle_audit_decoupling_file(
             let (px, py) = pin_endpoint(pin, *transform);
 
             // Check if there's a capacitor connected to a net that this pin is on
-            let pin_net = graph.net_at(px, py);
+            let pin_root = graph.root_at(px, py);
 
-            let has_decoupling = if let Some(ref net) = pin_net {
-                cap_nets.contains(net)
-            } else {
-                false
-            };
-
-            if has_decoupling {
+            if cap_roots.contains(&pin_root) {
                 pass_count += 1;
             } else {
+                let pin_net = graph.name_of_root(pin_root);
                 findings.push(AuditFinding {
                     severity: "error",
                     category: "decoupling",
@@ -337,7 +332,7 @@ async fn handle_audit_connections_file(
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
     let mut graph = net_graph_for(&tree, &wires, &labels);
-    let pull_up_nets = pull_up_nets(&mut graph, &placed);
+    let pull_up_roots = pull_up_nets(&mut graph, &placed);
 
     let mut findings = Vec::new();
 
@@ -352,9 +347,10 @@ async fn handle_audit_connections_file(
             for (pin_name, placed_pin) in [("SDA", named("SDA")), ("SCL", named("SCL"))] {
                 if let Some((pin, transform)) = placed_pin {
                     let (px, py) = pin_endpoint(pin, *transform);
-                    let net = graph.net_at(px, py);
+                    let root = graph.root_at(px, py);
+                    let net = graph.name_of_root(root);
                     if let Some(ref net_name) = net {
-                        if !pull_up_nets.contains(net_name) {
+                        if !pull_up_roots.contains(&root) {
                             findings.push(AuditFinding {
                                 severity: "warning",
                                 category: "connection",
@@ -381,9 +377,10 @@ async fn handle_audit_connections_file(
                 && !name_upper.contains("OUT")
             {
                 let (px, py) = pin_endpoint(pin, *transform);
-                let net = graph.net_at(px, py);
+                let root = graph.root_at(px, py);
+                let net = graph.name_of_root(root);
                 if let Some(ref net_name) = net {
-                    if !pull_up_nets.contains(net_name) {
+                    if !pull_up_roots.contains(&root) {
                         findings.push(AuditFinding {
                             severity: "warning",
                             category: "connection",
@@ -431,17 +428,20 @@ async fn handle_audit_power_rails_file(
     let mut findings = Vec::new();
 
     // Find all power nets (from power symbols and labels)
-    let power_nets = collect_power_nets(&labels);
+    let rails = power_rails(&mut graph, &labels);
 
     // Check each power net for bulk capacitance
-    let (cap_nets, bulk_cap_nets) = capacitor_nets(&mut graph, &placed);
+    let (cap_roots, bulk_cap_roots) = capacitor_nets(&mut graph, &placed);
 
-    for net in &power_nets {
-        if net.to_uppercase().contains("GND") || net.to_uppercase().contains("VSS") {
+    for rail in &rails {
+        let PowerRail {
+            root, name: net, ..
+        } = rail;
+        if rail.any_name_contains("GND") || rail.any_name_contains("VSS") {
             continue; // Ground nets don't need caps
         }
 
-        if !cap_nets.contains(net.as_str()) {
+        if !cap_roots.contains(root) {
             findings.push(AuditFinding {
                 severity: "error",
                 category: "power",
@@ -449,7 +449,7 @@ async fn handle_audit_power_rails_file(
                 issue: format!("Power rail '{}' has no decoupling capacitors", net),
                 recommendation: format!("Add at least one 100nF ceramic cap on the '{}' rail", net),
             });
-        } else if !bulk_cap_nets.contains(net.as_str()) {
+        } else if !bulk_cap_roots.contains(root) {
             findings.push(AuditFinding {
                 severity: "warning",
                 category: "power",
@@ -464,12 +464,15 @@ async fn handle_audit_power_rails_file(
     }
 
     // Check for test points on power rails
-    let test_point_nets = test_point_nets(&mut graph, &placed);
-    for net in &power_nets {
-        if net.to_uppercase().contains("GND") {
+    let test_point_roots = test_point_nets(&mut graph, &placed);
+    for rail in &rails {
+        let PowerRail {
+            root, name: net, ..
+        } = rail;
+        if rail.any_name_contains("GND") {
             continue;
         }
-        if !test_point_nets.contains(net.as_str()) {
+        if !test_point_roots.contains(root) {
             findings.push(AuditFinding {
                 severity: "info",
                 category: "power",
@@ -483,9 +486,9 @@ async fn handle_audit_power_rails_file(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "audit": "power_rails",
-            "power_nets": power_nets,
+            "power_nets": rails.iter().map(|rail| &rail.name).collect::<Vec<_>>(),
             "findings": findings,
-            "summary": format!("{} power rail issues found across {} rails.", findings.len(), power_nets.len())
+            "summary": format!("{} power rail issues found across {} rails.", findings.len(), rails.len())
         }))
         .unwrap(),
     ))
@@ -1454,25 +1457,30 @@ type PlacedPin = (
 /// A placed unit and the pins it draws — one entry of [`placed_pins_by_reference`].
 type PlacedUnit = (konnect_sexp::schematic::SymbolInstance, Vec<PlacedPin>);
 
-/// Every net a placed unit's pins reach.
+/// Every net a placed unit's pins reach, as graph roots.
 ///
 /// Nets come from the shared net graph, so a pin reaches its net along the
 /// wires and junctions it is drawn with, and a rail named by a power symbol is
 /// a net like any other. The audits used to scan the file for a label within
 /// 0.5 mm of the pin, which followed neither.
 ///
+/// Roots rather than names, because an audit asks whether two pins are on *one
+/// net* and a net can carry more than one name. Comparing names made a rail
+/// named by both a power symbol and a label fail that comparison against
+/// itself, reporting the name the capacitors did not resolve to as an
+/// undecoupled rail of its own. A pin on an unnamed net has a root like any
+/// other and is counted here; it is the reporting sites that need a name.
+///
 /// `pins` comes from [`placed_pins_by_reference`], so it holds this unit's pins
 /// only: a triode of an ECC83 does not report the heater's net at its own
 /// coordinates (#182).
-fn pin_nets(graph: &mut NetGraph, pins: &[PlacedPin]) -> HashSet<String> {
-    let mut nets = HashSet::new();
-    for (pin, transform) in pins {
-        let (px, py) = pin_endpoint(pin, *transform);
-        if let Some(net) = graph.net_at(px, py) {
-            nets.insert(net);
-        }
-    }
-    nets
+fn pin_net_roots(graph: &mut NetGraph, pins: &[PlacedPin]) -> HashSet<NetRoot> {
+    pins.iter()
+        .map(|(pin, transform)| {
+            let (px, py) = pin_endpoint(pin, *transform);
+            graph.root_at(px, py)
+        })
+        .collect()
 }
 
 /// `C1` is a capacitor, `CN1` is a connector.
@@ -1504,11 +1512,11 @@ fn is_bulk_capacitor_value(value: &str) -> bool {
 fn capacitor_nets(
     graph: &mut NetGraph,
     placed: &[PlacedUnit],
-) -> (HashSet<String>, HashSet<String>) {
+) -> (HashSet<NetRoot>, HashSet<NetRoot>) {
     let mut all = HashSet::new();
     let mut bulk = HashSet::new();
     for (inst, pins) in placed.iter().filter(|(inst, _)| is_capacitor(inst)) {
-        let nets = pin_nets(graph, pins);
+        let nets = pin_net_roots(graph, pins);
         if is_bulk_capacitor_value(&inst.value) {
             bulk.extend(nets.iter().cloned());
         }
@@ -1518,13 +1526,13 @@ fn capacitor_nets(
 }
 
 /// Nets with a test point on them.
-fn test_point_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<String> {
+fn test_point_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<NetRoot> {
     let is_test_point = |inst: &konnect_sexp::schematic::SymbolInstance| {
         inst.reference.starts_with("TP") || inst.value.to_uppercase().contains("TESTPOINT")
     };
     let mut nets = HashSet::new();
     for (_, pins) in placed.iter().filter(|(inst, _)| is_test_point(inst)) {
-        nets.extend(pin_nets(graph, pins));
+        nets.extend(pin_net_roots(graph, pins));
     }
     nets
 }
@@ -1534,18 +1542,46 @@ fn test_point_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<Strin
 ///
 /// Built once per sheet. Asking per pin instead re-walked every resistor on
 /// the sheet for each I2C or reset pin found.
-fn pull_up_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<String> {
+fn pull_up_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<NetRoot> {
     let mut pulled = HashSet::new();
     for (_, pins) in placed
         .iter()
         .filter(|(inst, _)| inst.reference.starts_with('R'))
     {
-        let nets = pin_nets(graph, pins);
-        if nets.iter().any(|net| is_power_net_name(net)) {
+        let nets = pin_net_roots(graph, pins);
+        // Every name on the net, not the winning one: a rail KiCad calls `SYS`
+        // because a global label outranks its `+3V3` symbol is still the rail
+        // this resistor pulls to.
+        let on_a_rail = nets.iter().any(|root| {
+            graph
+                .aliases_of_root(*root)
+                .iter()
+                .any(|net| is_power_net_name(net))
+        });
+        if on_a_rail {
             pulled.extend(nets);
         }
     }
     pulled
+}
+
+/// One rail of the sheet: the net's graph root, and what that net is called.
+struct PowerRail {
+    root: NetRoot,
+    /// The name KiCad would print for this net.
+    name: String,
+    /// Every name on it. The ground skips read all of them: a rail a power
+    /// symbol calls `GND` and a global label calls `RETURN` is still ground,
+    /// even though the global label wins the name.
+    names: BTreeSet<String>,
+}
+
+impl PowerRail {
+    fn any_name_contains(&self, needle: &str) -> bool {
+        self.names
+            .iter()
+            .any(|name| name.to_uppercase().contains(needle))
+    }
 }
 
 /// The power rails on the sheet: every net a power symbol names, plus every
@@ -1554,14 +1590,40 @@ fn pull_up_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<String> 
 /// `labels` must be `extract_all_net_labels` — a `+3V3` symbol names a rail
 /// exactly as a label does. `PWR_FLAG` is not a rail and does not appear: its
 /// pin is `power_out`, which the extractor skips.
-fn collect_power_nets(labels: &[Label]) -> Vec<String> {
-    labels
+///
+/// One rail per *net*, not per name. A rail named by both a `+3V3` power symbol
+/// and a `VCC` label is one net that KiCad calls `+3V3`, and listing it twice
+/// made every audit below report the name the capacitors did not resolve to as
+/// a rail with nothing on it. The name is [`NetGraph::name_of_root`]'s, so it is
+/// the one KiCad's netlister would print.
+fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
+    // Which nets are rails, and what each is known as, are separate questions,
+    // asked in that order. Collecting names while deciding made the answer
+    // depend on label order: a rail claimed by the `+3V3` symbol lost the `VCC`
+    // label read before it.
+    let mut rail_roots: BTreeSet<NetRoot> = BTreeSet::new();
+    for label in labels
         .iter()
         .filter(|label| label.kind == LabelKind::PowerSymbol || is_power_net_name(&label.net))
-        .map(|label| label.net.clone())
-        .collect::<std::collections::BTreeSet<_>>()
+    {
+        rail_roots.insert(graph.root_at(label.x, label.y));
+    }
+    let mut rails: Vec<PowerRail> = rail_roots
         .into_iter()
-        .collect()
+        .map(|root| {
+            let names = graph.aliases_of_root(root);
+            PowerRail {
+                name: graph
+                    .name_of_root(root)
+                    .or_else(|| names.iter().next().cloned())
+                    .unwrap_or_default(),
+                root,
+                names,
+            }
+        })
+        .collect();
+    rails.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
+    rails
 }
 
 fn is_power_net_name(name: &str) -> bool {
@@ -2453,6 +2515,119 @@ mod net_resolution_tests {
             ],
             "{body}"
         );
+    }
+
+    /// The real KiCad fixture. Provenance, KiCad's own netlist and the ERC
+    /// precedence statements are in `two_name_nets.README.md`; the assertions
+    /// below are that table, not this crate's opinion of it.
+    const TWO_NAME_NETS: &str = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
+
+    /// `U1.8` and the capacitors share the `+3V3` rail and no wire. KiCad nets
+    /// them together (5 pins on `+3V3`), so the audit has to as well.
+    #[tokio::test]
+    async fn a_capacitor_on_another_stub_of_the_rail_decouples_the_pin() {
+        let file = sheet(TWO_NAME_NETS);
+        let body = audit_json(
+            handle_audit_decoupling(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(body["total_power_pins"], 1, "{body}");
+        assert_eq!(body["pass_count"], 1, "{body}");
+        assert_eq!(body["findings"].as_array().unwrap().len(), 0, "{body}");
+    }
+
+    /// Three rails, one entry each, under the name KiCad prints — and nothing
+    /// to report: `+3V3` and `SYS` carry bulk capacitance and a test point, and
+    /// `RETURN` is ground under a global label's name.
+    ///
+    /// Every failure mode this fixture exists for lands here: a rail counted
+    /// once per stub or once per alias, a rail whose capacitors resolved to a
+    /// different name, and a ground net reported as an undecoupled rail because
+    /// only its winning name was read.
+    #[tokio::test]
+    async fn each_rail_is_audited_once_under_kicads_name() {
+        let file = sheet(TWO_NAME_NETS);
+        let body = audit_json(
+            handle_audit_power_rails(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(
+            body["power_nets"],
+            json!(["+3V3", "RETURN", "SYS"]),
+            "{body}"
+        );
+        assert_eq!(
+            body["findings"].as_array().unwrap(),
+            &vec![] as &Vec<Value>,
+            "{body}"
+        );
+    }
+
+    /// `R1`/`R2` pull `SDA`/`SCL` up to a rail KiCad calls `SYS`, because the
+    /// global label outranks the `+5V` symbol beside it, and they sit on
+    /// segments joined to `U1`'s pins by name. Reading the winning name alone,
+    /// or the wire alone, reports both pull-ups missing.
+    #[tokio::test]
+    async fn a_pull_up_behind_a_global_alias_is_found() {
+        let findings = connection_findings(TWO_NAME_NETS).await;
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// The `+3V3` rail of [`WIRED_SHEET`] with a `VCC` label on it as well —
+    /// one net, two names, which is how a rail named by a power symbol and
+    /// labelled for readability is drawn.
+    ///
+    /// Both names were listed as rails while every capacitor resolved to one of
+    /// them, so the other was reported as an `error`-severity undecoupled rail,
+    /// and which of the two it was moved between runs. Twenty runs, because the
+    /// name came out of `HashMap` order.
+    #[tokio::test]
+    async fn a_rail_named_twice_is_audited_as_one_rail() {
+        let sheet_text = WIRED_SHEET.replace(
+            "  (junction (at 110 100)",
+            "  (label \"VCC\" (at 140 125 0) (uuid \"cccccccc-0000-4000-8000-000000000002\"))\n  (junction (at 110 100)",
+        );
+
+        for attempt in 0..20 {
+            let file = sheet(&sheet_text);
+            let body = audit_json(
+                handle_audit_power_rails(
+                    &json!({ "schematic": file.path().to_str().unwrap() }),
+                    &test_ctx(),
+                )
+                .await
+                .unwrap(),
+            );
+
+            // `+3V3` is the power symbol's name and KiCad's own choice over the
+            // label's; `VCC` is the same net and not a rail of its own.
+            assert_eq!(
+                body["power_nets"],
+                json!(["+3V3", "VBUS"]),
+                "attempt {attempt}: {body}"
+            );
+            let errors: Vec<&str> = body["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["severity"] == "error")
+                .map(|finding| finding["issue"].as_str().unwrap())
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "attempt {attempt}: C2 decouples that rail under either name: {errors:?}"
+            );
+        }
     }
 
     /// `run_design_review`'s coverage counts the rails power symbols name, and

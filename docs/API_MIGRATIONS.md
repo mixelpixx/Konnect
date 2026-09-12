@@ -227,6 +227,61 @@ count rather than a substring count clamped to a minimum of two; a board with
 no `(layers …)` table reports `0` and a warning rather than an invented `2`.
 `validate_for_manufacturing`'s `board_info.copper_layers` changes value on any
 board with non-`signal` copper; its shape is unchanged.
+## Unreleased: schematic nets resolve by identity (minor release)
+
+One electrical net can carry several names — a rail named by a `+3V3` power
+symbol that also has a `VCC` label, a local label on a net that also carries a
+global one — and KiCad nets a sheet by name as well as by wire, so two segments
+each carrying a `SIG` label are one net. The shared net graph now joins
+same-named points, and every audit compares net *identity* rather than a net
+name. Where a name is reported it is the one KiCad's netlister would choose:
+global label, then power symbol, then local label, then hierarchical label,
+ties broken on the name ascending.
+
+Two response shapes change meaning:
+
+- `audit_power_rails.power_nets` lists one entry per **net**, named the way
+  KiCad names it. It previously listed one entry per name, so a rail named by
+  both a power symbol and a label appeared twice, as did a rail named by two
+  power symbols on separate stubs. `summary`'s rail count follows. A consumer
+  counting rails gets a smaller, truer number; one matching a specific string
+  should match the KiCad name, since an alias may no longer appear.
+- `get_connected_items.nets` is sorted and deduplicated, where it was in
+  `HashSet` order. Its `labels` array now carries every label on the queried
+  component's nets rather than only those spelling a net its winning way, and
+  its `wires`/`connected_components` now include items on a net that carries no
+  label at all, which were omitted entirely.
+
+Two more tools change what they report, through the shared graph rather than
+through any code of their own:
+
+- `find_shorted_nets` keys off the same label-to-root relation, so a net
+  carrying more than one name is now reported as a short. On a sheet where a
+  rail is named by a power symbol and labelled for readability, that is a new
+  finding per such net — five on this change's own fixture (`+3V3`/`ALT`/`VCC`,
+  `RETURN`/`GND`, `SYS`/`+5V`/`PULLUP`, `AAA`/`ZZZ`, `MIX`/`MIX_H`), reported as
+  one group per net rather than one per pair. It is the same condition KiCad's
+  own ERC reports as `multiple_net_names`, and the tool description now says so.
+- `points_on_net(name)` resolves the whole merged net, so `get_net_components`,
+  `get_net_connections` and `count_net_connections` return the complete net for
+  any name on it. Querying an alias — `VCC` on a rail KiCad calls `+3V3` —
+  returns everything on that rail rather than the segment the alias sits on.
+
+Findings change with them, in the direction of fewer false positives:
+`audit_decoupling`, `audit_power_rails` and `audit_connections` no longer report
+a decoupled rail as undecoupled, a rail twice, or a fitted pull-up as missing
+when the capacitor or resistor sits on another segment of the same net. The
+ground skips read every name on a rail, so a `GND` net that a global label
+renames is skipped rather than reported as an undecoupled power rail.
+
+`net_at`-backed reporting — `get_pin_net`, `get_component_nets`,
+`trace_from_point`, `export_netlist_summary` — returns a stable name across
+processes. For a net with one name the answer is unchanged; for a net with
+several, callers that happened to see an alias now always see the KiCad name.
+
+No tool, argument, or response field was renamed or removed. These changes are
+planned for the next minor release.
+
 ## Unreleased: `find_single_pin_nets` counts pins, not labels (minor release)
 
 `find_single_pin_nets` counted label instances per net name, so an ordinary net

@@ -150,7 +150,7 @@ fn at_positions(nodes: Vec<&SexpNode>) -> Vec<(f64, f64)> {
 
 // ─── Net label ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelKind {
     NetLabel,
     GlobalLabel,
@@ -212,7 +212,7 @@ pub fn extract_labels(tree: &SexpNode) -> Vec<Label> {
                 .and_then(|u| u.as_str())
                 .map(String::from);
             labels.push(Label {
-                kind: kind.clone(),
+                kind: *kind,
                 net,
                 x,
                 y,
