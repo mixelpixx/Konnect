@@ -3,6 +3,28 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: IPC health responses say why KiCad did not answer (minor release)
+
+`check_kicad_ui` and `open_project` gain an `ipc_failure` field (#532). It is
+`null` when KiCad answered the Ping, and otherwise `{ "kind", "message" }`,
+where `kind` is one of `not_configured`, `no_listener`, `access_denied`,
+`handshake_failed`, `transport_error`, or `request_failed`. Before this, every
+one of those surfaced only as `ipc_responsive: false` or
+`ipc_available: false`. A KiCad that was listening but refused this account
+looked exactly like one that was closed.
+
+No existing field changed value. `open_project`'s `message` now follows the
+kind. `access_denied`, `handshake_failed`, and `request_failed` get their own
+headline; the other kinds keep "KiCad IPC is not reachable…". When an IPC
+tool's dial fails, its error text now explains the classified cause instead of
+listing every possible one.
+
+`check_kicad_ui`'s timed-out response carries `ipc_failure: null`, because the
+health check's own deadline expired before the Ping finished and no kind was
+established. A listener that accepts but never negotiates takes NNG's
+10-second limit to report `handshake_failed`, which is longer than the default
+`timeout_seconds` of 5.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and

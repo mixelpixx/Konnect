@@ -298,7 +298,8 @@ async fn handle_open_project(
         Err(error) => return Ok(error),
     };
     let ipc = konnect_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
-    let connected = ipc.ping().unwrap_or(false);
+    let ping = ipc.ping_outcome();
+    let connected = ping.is_responsive();
     let (open_boards, open_boards_error) = if connected {
         match ipc.get_open_board_paths() {
             Ok(paths) => (
@@ -341,7 +342,7 @@ async fn handle_open_project(
     };
 
     let message = if !connected {
-        "KiCad IPC is not reachable. Start KiCad and enable the IPC API, or work in file-only mode."
+        unanswered_message(&ping)
     } else if requested_open == Some(true) {
         "The requested board is open in KiCad."
     } else if requested_open == Some(false) {
@@ -354,6 +355,7 @@ async fn handle_open_project(
         "kicad_ui_running": connected,
         "ipc_available": connected,
         "ipc_address": ctx.config.ipc_address,
+        "ipc_failure": crate::tools::ipc_failure_evidence(&ping),
         "open_board_count": open_boards.len(),
         "open_boards": open_boards,
         "open_boards_error": open_boards_error,
@@ -363,6 +365,38 @@ async fn handle_open_project(
         "requested_check_error": requested_check_error,
         "message": message
     })))
+}
+
+/// The headline for an `open_project` call KiCad did not answer.
+///
+/// Chosen from the typed failure, so the recovery step it names is the one
+/// that applies: "start KiCad" is wrong advice when KiCad is listening and
+/// refused this account.
+fn unanswered_message(ping: &konnect_ipc::PingOutcome) -> &'static str {
+    use konnect_ipc::{PingOutcome, UnreachableReason};
+    match ping {
+        PingOutcome::Unreachable {
+            reason: UnreachableReason::AccessDenied,
+            ..
+        } => {
+            "KiCad IPC refused this account. Konnect must run as the same operating-system user \
+             as KiCad; see ipc_failure."
+        }
+        PingOutcome::Unreachable {
+            reason: UnreachableReason::HandshakeFailed,
+            ..
+        } => {
+            "A listener at the KiCad IPC address did not complete NNG's handshake, so it is \
+             probably not KiCad; see ipc_failure."
+        }
+        PingOutcome::RequestFailed { .. } => {
+            "KiCad IPC received the request but did not answer with success; KiCad may still be \
+             starting. See ipc_failure."
+        }
+        PingOutcome::Responsive | PingOutcome::Unreachable { .. } => {
+            "KiCad IPC is not reachable. Start KiCad and enable the IPC API, or work in file-only mode."
+        }
+    }
 }
 
 async fn handle_save_project(
@@ -921,6 +955,117 @@ mod tests {
         .expect_err("missing PCB PDF must fail the snapshot call");
         assert!(error.to_string().contains("did not create"), "{error:#}");
         assert!(error.to_string().contains("pcb"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn open_project_reports_why_kicad_did_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address =
+            format!("ipc://{}", dir.path().join("no-kicad-here.sock").display());
+
+        let result = handle_open_project(&json!({}), &ctx).await.unwrap();
+        let response = response_json(&result);
+
+        assert_eq!(response["ipc_available"], false, "{response}");
+        assert_eq!(response["ipc_failure"]["kind"], "no_listener", "{response}");
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("KiCad IPC is not reachable")),
+            "{response}"
+        );
+    }
+
+    /// A rep0 endpoint that answers every request with `AS_NOT_READY`, the
+    /// status KiCad returns while an editor is still loading.
+    fn spawn_not_ready_kicad() -> String {
+        use nng::options::Options;
+        use prost::Message;
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+        std::thread::spawn(move || {
+            while socket.recv().is_ok() {
+                let response = konnect_ipc::gen::kiapi::common::ApiResponse {
+                    status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
+                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsNotReady as i32,
+                        error_message: "KiCad is not ready".to_string(),
+                    }),
+                    header: None,
+                    message: None,
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn open_project_says_kicad_answered_when_it_answered_with_an_error() {
+        let mut ctx = test_ctx();
+        ctx.config.ipc_address = spawn_not_ready_kicad();
+
+        let result = handle_open_project(&json!({}), &ctx).await.unwrap();
+        let response = response_json(&result);
+
+        assert_eq!(response["ipc_available"], false, "{response}");
+        assert_eq!(
+            response["ipc_failure"]["kind"], "request_failed",
+            "{response}"
+        );
+        assert!(
+            response["ipc_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("KiCad is not ready")),
+            "{response}"
+        );
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("KiCad IPC received the request")),
+            "a KiCad that answered must not be reported as unreachable: {response}"
+        );
+    }
+
+    #[test]
+    fn the_open_project_headline_follows_the_failure_kind() {
+        use konnect_ipc::{PingOutcome, UnreachableReason};
+        let unreachable = |reason| PingOutcome::Unreachable {
+            reason,
+            message: String::new(),
+        };
+        assert!(
+            unanswered_message(&unreachable(UnreachableReason::AccessDenied))
+                .contains("same operating-system user")
+        );
+        assert!(
+            unanswered_message(&unreachable(UnreachableReason::HandshakeFailed))
+                .contains("probably not KiCad")
+        );
+        assert!(unanswered_message(&PingOutcome::RequestFailed {
+            message: String::new()
+        })
+        .contains("did not answer with success"));
+        for reason in [
+            UnreachableReason::NotConfigured,
+            UnreachableReason::NoListener,
+            UnreachableReason::TransportError,
+        ] {
+            assert!(
+                unanswered_message(&unreachable(reason)).starts_with("KiCad IPC is not reachable")
+            );
+        }
     }
 
     fn response_json(result: &CallToolResult) -> serde_json::Value {
