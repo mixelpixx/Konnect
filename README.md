@@ -110,6 +110,11 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
 | Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
 
+Explore the request path and safety boundaries in the
+[interactive architecture diagrams](docs/ARCHITECTURE_DIAGRAMS.md). They are
+published from a standalone documentation repository and add no dependencies to
+Konnect.
+
 ## Installation
 
 ### From the KiCAD Plugin Manager (recommended)
