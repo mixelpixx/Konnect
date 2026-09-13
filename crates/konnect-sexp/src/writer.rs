@@ -400,12 +400,55 @@ pub fn write_new_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
     write_new_atomic_unlocked(path, content)
 }
 
+/// What mode a *create-only* atomic write should ask for on Unix.
+///
+/// The create path has no destination to copy a mode from, so the caller has
+/// to say what the new file is. Ordinary artifacts belong to whoever owns the
+/// directory and the process umask decides how wide they are. Private content
+/// must never be wider than its owner, whatever the umask says.
+#[derive(Clone, Copy)]
+enum NewFileMode {
+    /// `0o666 & !umask` — the mode a plain `open(O_CREAT, 0o666)` would get.
+    Ordinary,
+    /// `0o600` — owner read/write only, independent of the umask.
+    Private,
+}
+
 pub(crate) fn write_new_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
+    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Ordinary)
+}
+
+/// Create-only atomic write for private content (transaction journals).
+pub(crate) fn write_new_atomic_unlocked_private(
+    path: &Path,
+    content: &str,
+) -> Result<(), SexpError> {
+    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Private)
+}
+
+fn write_new_atomic_unlocked_with_mode(
+    path: &Path,
+    content: &str,
+    mode: NewFileMode,
+) -> Result<(), SexpError> {
     ensure_kicad_design_document_is_closed(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".konnect-")
-        .tempfile_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".konnect-");
+    // `tempfile` creates its scratch file at 0o600 by design. The create path
+    // has no destination to copy a mode from, so ask for the ordinary create
+    // mode instead: the kernel applies the umask, giving 0o666 & !umask — the
+    // same default `create_scratch_file` already gets on the replace path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bits = match mode {
+            NewFileMode::Ordinary => 0o666,
+            NewFileMode::Private => 0o600,
+        };
+        builder.permissions(std::fs::Permissions::from_mode(bits));
+    }
+    let mut temporary = builder.tempfile_in(parent)?;
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
@@ -1470,6 +1513,35 @@ mod atomic_write_tests {
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_create_honors_the_process_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("solo.kicad_sch");
+
+        write_new_atomic(&path, "(kicad_sch)").unwrap();
+
+        // An ordinary create in the same directory draws exactly the mode the
+        // kernel gives a 0o666 open: 0o666 & !umask. Comparing against it
+        // keeps the assertion true under any umask while still failing for
+        // tempfile's 0o600 default.
+        let control = directory.path().join("control");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&control)
+            .unwrap();
+        let expected = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+        let actual = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(
+            actual, expected,
+            "created files must follow the umask, not tempfile's 0o600 default"
         );
     }
 
