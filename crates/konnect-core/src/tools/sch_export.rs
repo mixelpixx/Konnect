@@ -181,7 +181,9 @@ pub fn tools() -> Vec<ToolDef> {
             "update_pcb_from_schematic",
             "Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. \
              Defaults to a non-mutating dry run; apply requires its exact plan revision. \
-             Preserves placement, routing, board-only footprints, and footprint artwork.",
+             Preserves placement, routing, board-only footprints, and footprint artwork. \
+             A symbol with no footprint assigned is reported under `unassigned_footprints` \
+             and the sync proceeds for every other component.",
             json!({
                 "type": "object",
                 "properties": {

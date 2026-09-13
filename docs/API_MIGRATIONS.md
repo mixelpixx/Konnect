@@ -113,6 +113,37 @@ Two visible consequences:
 or when the kicad-cli never reported the category at all. No tool, argument, or
 existing field was renamed or removed.
 
+## Unreleased: `update_pcb_from_schematic` reports an unassigned footprint (minor release)
+
+`kicad-cli sch export netlist` writes no `(footprint …)` node for a symbol whose
+`Footprint` property is empty, and the sync required one for every component.
+One footprint-less symbol — a legitimate state for a generic `Device:R` whose
+package has not been chosen yet, and until #506 every symbol Konnect itself
+placed — failed the whole sync with *KiCad netlist node is missing footprint*,
+naming no component and blocking every other one (#507).
+
+Such a component is now **reported, not fatal**, the way eeschema's own Update
+PCB dialog says "footprint not assigned" and continues:
+
+- `coverage.unassigned_footprint` — a `{planned, applied}` count pair beside
+  `skipped_by_flag`.
+- top-level `unassigned_footprints` — one entry per component: `reference`,
+  `value`, `lib_id` (from the export's `libsource`, when present), `symbol_path`,
+  and `board_state`: `absent` (nothing is added; the part is not counted under
+  `footprints_added`) or `kept` (a footprint with that identity or reference
+  already exists on the board and is left exactly as it is — it is counted as
+  matched, so it does not appear under `board_only_preserved`).
+- A wired pin of such a component is dropped from the plan's net assignments,
+  since there is no pad to carry it. Its saved `on_board` / `in_bom` flags
+  still apply.
+
+A schematic whose every component is unassigned is a `noop` that still names
+them, and a genuine conflict still clears `changes` while keeping the list.
+
+Both additions are additive; `status`, `changes`, `diagnostics` and every
+existing count keep their names and meanings. No argument was renamed or
+removed.
+
 ## Unreleased: `add_mounting_hole` uses KiCad's shipped footprint names (minor release)
 
 `add_mounting_hole` wrote `MountingHole:MountingHole_{drill:.1}mm`. KiCad 10
