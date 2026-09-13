@@ -3,6 +3,34 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: Windows discovers KiCad's IPC endpoint (patch release)
+
+No tool, argument, or response field changed shape. What changes on **Windows**
+is which path a hybrid tool takes, and therefore the value it reports in
+`source`.
+
+NNG maps `ipc://` to a named pipe there, which has no filesystem presence, and
+discovery probed the candidate path as a file — so it never found anything.
+A Konnect launched by an MCP client with no `ipc_address` and no
+`KICAD_API_SOCKET` reported the transport unreachable even with KiCad running,
+and every hybrid tool took its direct-file fallback while KiCad held the board
+open (#529). Discovery now looks the same path up in the pipe namespace.
+
+For a Windows caller this means:
+
+- Tools that reported `source: "file"` with a `fallback_reason` of
+  `transport_unreachable` now report `source: "ipc"` when KiCad is running with
+  the API server enabled, and their edits go through KiCad rather than to the
+  saved file.
+- Live-only tools (`update_pcb_from_schematic`, `refill_zones`, the routing
+  tools) stop refusing and start working.
+- `get_installation_info` reports the discovered endpoint instead of a null one.
+
+Nothing changes on Linux or macOS, where discovery already worked, and nothing
+changes for any caller that set the address explicitly. Discovery still only
+ever runs at startup, so a server launched before KiCad stays unresolved for its
+lifetime — see `docs/TROUBLESHOOTING.md`.
+
 ## Unreleased: atomic validation for schematic edits (minor release)
 
 `edit_schematic_component`, `add_component_annotation`, and

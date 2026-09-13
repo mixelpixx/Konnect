@@ -19,8 +19,18 @@ conflict rather than an overwrite.
 ## KiCad IPC
 
 `crates/konnect-ipc` sends typed protobuf requests over NNG. The socket comes
-from `ipc_address` or `KICAD_API_SOCKET`; KiCad-provided credentials such as
+from `ipc_address`, then `KICAD_API_SOCKET`, then discovery of KiCad's default
+endpoint by `konnect-ipc/src/socket.rs`; KiCad-provided credentials such as
 `KICAD_API_TOKEN` are carried in the IPC client request metadata.
+
+Discovery is per-platform because the endpoint is: a Unix socket is a
+filesystem entry whose metadata is read and whose owner must be this user,
+while NNG's `ipc://` on Windows is a named pipe with no filesystem presence, so
+the candidate path is looked up in the pipe namespace instead. Neither branch
+opens the endpoint — a stream connect that does not complete NNG's handshake
+wedges KiCad's server for every client (#498), and on Windows opening the pipe
+would also consume a server instance. Liveness stays the job of the bounded
+`Ping` in `client.rs`.
 
 The three board-write gates are:
 

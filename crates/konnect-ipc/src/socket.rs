@@ -5,11 +5,15 @@
 //! fails as unconfigured. KiCad's own default is predictable —
 //! `<temp dir>/kicad/api.sock` — so look there before giving up.
 //!
-//! Looking is all this module does. It reads the filesystem's own metadata and
-//! never opens a connection: what sits at that path is KiCad's NNG endpoint,
-//! and dialling it outside the NNG protocol is what wedged the editor in #498.
-//! Whether the endpoint answers is decided later, by the bounded NNG `Ping` in
-//! [`crate::client`].
+//! Looking is all this module does, and it never opens a connection: what
+//! sits at that path is KiCad's NNG endpoint, and dialling it outside the NNG
+//! protocol is what wedged the editor in #498. Whether the endpoint answers is
+//! decided later, by the bounded NNG `Ping` in [`crate::client`].
+//!
+//! Where "looking" happens is per-platform, because the endpoint is. On Unix
+//! the socket is a filesystem entry and this reads its metadata. On Windows
+//! NNG maps `ipc://` to a **named pipe**, which has no filesystem presence at
+//! all, so the same path is looked for in the pipe namespace instead (#529).
 
 use std::path::{Path, PathBuf};
 
@@ -112,20 +116,68 @@ fn is_adoptable_owned_by(path: &Path, is_ours: impl Fn(&Path) -> bool) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
 }
 
-/// NNG's `ipc://` on Windows is a named pipe, so there is no filesystem entry
-/// at the path to inspect and this check cannot answer.
+/// The Windows pipe namespace. NNG derives a pipe name by prefixing the
+/// `ipc://` path with this, verbatim and separators intact, so the candidate
+/// list needs no new entries — only a different place to look them up.
+#[cfg(windows)]
+const PIPE_NAMESPACE: &str = r"\\.\pipe";
+
+/// Whether a candidate path may be adopted as the board endpoint.
 ///
-/// It answers "no" rather than taking the default on trust. Detecting nothing
-/// is what keeps `IpcAddressSource::Unresolved` reachable, and with it the
-/// two messages a Windows user needs most: the "socket path not configured"
-/// error carrying the settings-dialog steps, and the startup warning naming
-/// the candidates. Trusting the default retires both and hands over a dial
-/// failure against an address nobody chose — worse than the unconfigured
-/// state it replaced, since Windows had no auto-detection to begin with.
+/// On Windows the endpoint is not a file. NNG maps `ipc://<path>` to the named
+/// pipe `\\.\pipe\<path>`, and with KiCad running the path itself does not
+/// exist while that pipe does. Probing the path therefore answered "no" on
+/// every Windows install, and a client-launched Konnect — the shipped PCM
+/// package registered with an MCP client, with no `ipc_address` and no
+/// `KICAD_API_SOCKET` — took the file fallback on every hybrid tool while
+/// KiCad held the board open. That is the one outcome `attempt_ipc_write`'s
+/// gate exists to prevent, reached because discovery could not see a
+/// reachable transport (#529).
 ///
-/// Inspecting the pipe (`GetFileAttributesW` against the name NNG derives) is
-/// the real answer and is left for a change that can be tested on Windows.
-#[cfg(not(unix))]
+/// Enumerating the namespace is the whole check. `FindFirstFileW` over
+/// `\\.\pipe` lists names without opening any of them, which keeps the
+/// metadata-only rule #498 made non-negotiable — and note that
+/// `std::fs::metadata` is *not* metadata-only here: on Windows it opens a
+/// handle, which against KiCad's endpoint would consume a server instance.
+///
+/// Matching is case-insensitive because Windows paths are, and the name KiCad
+/// derives comes from its own spelling of the temp directory rather than ours.
+///
+/// One limit, stated rather than papered over: the pipe namespace is
+/// machine-global and any local account may create a name in it, so another
+/// user could bind this name before KiCad does and be adopted. Unix answers
+/// that with an ownership check; the Windows equivalent needs the pipe's
+/// security descriptor, which means opening it. An explicitly configured
+/// `ipc_address` has always carried the same exposure, so this is the state of
+/// the art on this platform rather than something detection introduces.
+#[cfg(windows)]
+fn is_adoptable(path: &Path) -> bool {
+    is_adoptable_among(path, pipe_names)
+}
+
+/// Every name currently bound in the pipe namespace, or nothing when it cannot
+/// be read. `file_name()` returns the bound name verbatim, backslashes and
+/// drive letter included, which is exactly the candidate path to compare with.
+#[cfg(windows)]
+fn pipe_names() -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(PIPE_NAMESPACE)
+        .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+        .unwrap_or_default()
+}
+
+/// [`is_adoptable`] with the namespace listing supplied, so a test can state
+/// what is bound instead of binding it.
+#[cfg(windows)]
+fn is_adoptable_among(path: &Path, names: impl Fn() -> Vec<std::ffi::OsString>) -> bool {
+    let wanted = path.as_os_str().to_string_lossy().to_lowercase();
+    names()
+        .iter()
+        .any(|name| name.to_string_lossy().to_lowercase() == wanted)
+}
+
+/// Neither a Unix socket nor a Windows pipe to look for, so nothing is
+/// adopted and `IpcAddressSource::Unresolved` keeps its guidance.
+#[cfg(not(any(unix, windows)))]
 fn is_adoptable(_path: &Path) -> bool {
     false
 }
@@ -322,16 +374,104 @@ mod tests {
         );
     }
 
+    /// The candidate is adopted when a pipe carries its name — the case that
+    /// answered "no" for every Windows install before #529.
     #[test]
-    #[cfg(not(unix))]
-    fn windows_discovery_adopts_nothing() {
-        // Exercise the production non-Unix check rather than a supplied test
-        // closure. NNG maps ipc:// to a named pipe on Windows, and this crate
-        // does not guess that mapping.
-        assert!(candidate_socket_paths()
-            .iter()
-            .all(|path| !is_adoptable(path)));
-        assert!(detect_ipc_address().is_none());
+    #[cfg(windows)]
+    fn a_pipe_named_for_the_candidate_is_adopted() {
+        let path = Path::new(r"C:\Users\someone\AppData\Local\Temp\kicad\api.sock");
+        let bound = vec![
+            std::ffi::OsString::from(r"some-other-pipe"),
+            std::ffi::OsString::from(path),
+        ];
+
+        assert!(is_adoptable_among(path, || bound.clone()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_candidate_with_no_pipe_is_not_adopted() {
+        let path = Path::new(r"C:\Users\someone\AppData\Local\Temp\kicad\api.sock");
+        let bound = vec![std::ffi::OsString::from(r"C:\elsewhere\kicad\api.sock")];
+
+        assert!(!is_adoptable_among(path, || bound.clone()));
+        // An unreadable namespace lists nothing and adopts nothing, which is
+        // the same answer as a KiCad that is not running.
+        assert!(!is_adoptable_among(path, Vec::new));
+    }
+
+    /// Windows paths are case-insensitive, and the bound name is KiCad's
+    /// spelling of the temp directory rather than ours.
+    #[test]
+    #[cfg(windows)]
+    fn pipe_matching_ignores_case_as_windows_paths_do() {
+        let path = Path::new(r"C:\Users\Someone\AppData\Local\Temp\kicad\api.sock");
+        let bound = vec![std::ffi::OsString::from(
+            r"c:\users\someone\appdata\local\temp\kicad\API.SOCK",
+        )];
+
+        assert!(is_adoptable_among(path, || bound.clone()));
+    }
+
+    /// The Windows counterpart of `detection_never_connects_to_a_candidate`,
+    /// against a real pipe server: discovery must find it by name and must not
+    /// become a client of it. A connect that never completes NNG's handshake
+    /// is what wedged KiCad in #498, and on Windows it would also consume a
+    /// server instance of the endpoint.
+    ///
+    /// Note the pipe name embeds a path that does not exist on disk. That is
+    /// the whole point: the endpoint is not a filesystem object, so a
+    /// filesystem probe can never see it.
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn detection_finds_a_live_pipe_without_connecting_to_it() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let path = std::env::temp_dir()
+            .join(format!("konnect-529-{}", std::process::id()))
+            .join("kicad")
+            .join("api.sock");
+        let pipe_name = format!(r"{PIPE_NAMESPACE}\{}", path.display());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("bind the pipe KiCad's endpoint would bind");
+        assert!(!path.exists(), "sanity: the endpoint is not a file");
+
+        let detected = detect_ipc_address_in(std::slice::from_ref(&path), is_adoptable);
+        assert_eq!(
+            detected,
+            Some(format_address(&path)),
+            "a bound pipe carrying the candidate's name must be detected"
+        );
+
+        // Nothing connected: the server is still waiting for its first client.
+        let connected =
+            tokio::time::timeout(std::time::Duration::from_millis(100), server.connect()).await;
+        assert!(
+            connected.is_err(),
+            "detection became a client of the endpoint; against KiCad's NNG server \
+             that is the wedge in #498"
+        );
+    }
+
+    /// With KiCad running, detection works with no configuration at all —
+    /// the property #529 is about, and the one no offline test can assert.
+    ///
+    ///     cargo test -p konnect-ipc --lib live_kicad -- --ignored --nocapture
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "needs a running KiCad with the API server enabled"]
+    fn live_kicad_is_discovered_with_no_configuration() {
+        let detected = detect_ipc_address();
+        assert!(
+            detected.is_some(),
+            "no KiCad endpoint discovered; candidates were {:?}",
+            candidate_socket_paths()
+        );
+        let address = detected.unwrap();
+        assert!(address.starts_with("ipc://"), "{address}");
+        println!("discovered {address}");
     }
 
     #[test]
