@@ -201,7 +201,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_clearance",
-            "Check the physical clearance (distance) between two components on the PCB.",
+            "Measure the straight-line distance between two footprints' placement anchors \
+             on the saved board, in mm. This is anchor-to-anchor only: it does not account \
+             for footprint size or shape, so it is NOT pad, trace, copper or courtyard \
+             clearance and cannot predict a DRC clash — two parts whose courtyards nearly \
+             touch can be tens of mm apart by this measure. For real clearance run \
+             `run_drc`; for pad geometry use `get_component_pads`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1223,15 +1228,33 @@ async fn handle_check_clearance(
     let dx = pos2.0 - pos1.0;
     let dy = pos2.1 - pos1.1;
     let distance = (dx * dx + dy * dy).sqrt();
+    let anchor_distance_mm = (distance * 1000.0).round() / 1000.0;
 
+    // The number has always been the distance between the two placement
+    // anchors. Under a description that said "physical clearance" it was read
+    // as copper-to-copper spacing and a 21 mm answer stood in for a 3 mm
+    // courtyard gap (#410). Stage 1 names what the number is; `distance_mm`
+    // stays as a deprecated alias so no consumer breaks before stage 2 adds
+    // real geometry.
     Ok(CallToolResult::json(&json!({
         "ref1": ref1,
         "ref2": ref2,
         "pos1": { "x": pos1.0, "y": pos1.1 },
         "pos2": { "x": pos2.0, "y": pos2.1 },
-        "distance_mm": (distance * 1000.0).round() / 1000.0
+        "measurement": MEASUREMENT_ANCHOR_TO_ANCHOR,
+        "anchor_distance_mm": anchor_distance_mm,
+        "distance_mm": anchor_distance_mm,
+        // A collection takes a self-describing plural noun
+        // (docs/NAMING_CONVENTIONS.md): what it holds is field names.
+        "deprecated_fields": ["distance_mm"],
+        "note": "anchor-to-anchor distance only; not pad, trace or courtyard clearance — \
+                 footprint size and shape are not considered. Use run_drc for clearance."
     })))
 }
+
+/// What `check_clearance` measures today. A stage-2 physical-spacing mode
+/// will add its own value; this one never changes meaning.
+const MEASUREMENT_ANCHOR_TO_ANCHOR: &str = "anchor_to_anchor";
 
 /// Look up the board-space (x, y) position of a footprint by its reference designator.
 fn find_footprint_position(
@@ -1565,6 +1588,59 @@ mod tests {
         assert!(rules.contains("(constraint clearance (min 0.25mm))"));
         assert!(rules.contains("(constraint track_width (min 0.25mm))"));
         assert!(rules.contains("(layer \"F.Cu\")"));
+    }
+
+    /// #410 stage 1: the number is the distance between two placement
+    /// anchors, and the response now says so. Real KiCad-saved board
+    /// (`specctra_two_resistors.kicad_pcb`, see its README).
+    #[tokio::test]
+    async fn check_clearance_names_its_measurement_and_keeps_the_alias() {
+        let board = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let result = handle_check_clearance(
+            &json!({ "board": board.to_str().unwrap(), "ref1": "R1", "ref2": "R2" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let value: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+
+        assert_eq!(value["measurement"], MEASUREMENT_ANCHOR_TO_ANCHOR);
+        // The alias is the same number, not a second measurement.
+        assert_eq!(value["anchor_distance_mm"], value["distance_mm"]);
+        assert_eq!(value["deprecated_fields"], json!(["distance_mm"]));
+        assert!(value.get("deprecated").is_none());
+        // And the number is exactly the anchor-to-anchor distance of the two
+        // positions the response itself reports.
+        let dx = value["pos2"]["x"].as_f64().unwrap() - value["pos1"]["x"].as_f64().unwrap();
+        let dy = value["pos2"]["y"].as_f64().unwrap() - value["pos1"]["y"].as_f64().unwrap();
+        let expected = ((dx * dx + dy * dy).sqrt() * 1000.0).round() / 1000.0;
+        assert_eq!(value["anchor_distance_mm"].as_f64().unwrap(), expected);
+        assert!(value["note"]
+            .as_str()
+            .unwrap()
+            .contains("not pad, trace or courtyard clearance"));
+    }
+
+    /// The description is the contract an LLM reads before calling. It must
+    /// not claim clearance again; this pins the wording, not just the code.
+    #[test]
+    fn check_clearance_description_claims_no_clearance() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "check_clearance")
+            .expect("check_clearance is registered");
+        let description = tool.description.to_lowercase();
+        assert!(description.contains("anchor"), "{description}");
+        assert!(
+            description.contains("not pad, trace, copper or courtyard clearance"),
+            "{description}"
+        );
+        assert!(
+            !description.starts_with("check the physical clearance"),
+            "{description}"
+        );
     }
 }
 
