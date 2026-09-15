@@ -760,6 +760,66 @@ mod required_argument_dispatch_tests {
         }
     }
 
+    /// The advertised `side` enum is enforced at dispatch, so widening it to
+    /// four edges is what makes `top` and `bottom` reachable at all. Every
+    /// other test of this feature calls the handlers directly and never passes
+    /// through this validator, so a schema narrowed back to two edges would
+    /// leave the whole feature unreachable with the entire suite still green.
+    /// The `middle` case is this test's own positive control: if it stops
+    /// being refused, the validator is not running and the rest proves nothing.
+    #[tokio::test]
+    async fn the_dispatch_accepts_all_four_sheet_pin_edges_and_refuses_a_fifth() {
+        let handler = handler().await;
+        let sch = std::env::temp_dir().join("konnect-sides.kicad_sch");
+        let s = sch.display().to_string();
+
+        // Each tool gets only its own arguments: the records are closed, so a
+        // stray key is refused before `side` is ever looked at.
+        let args_for = |tool: &str, side: &str| match tool {
+            "add_sheet_pin" => json!({ "schematic": s, "sheet_name": "A", "pin_name": "P",
+                                       "pin_type": "input", "x": 50.0, "y": 60.0, "side": side }),
+            "edit_sheet_pin" => json!({ "schematic": s, "sheet_name": "A", "pin_name": "P",
+                                        "side": side }),
+            _ => json!({ "schematic": s, "sheet_name": "A", "side": side }),
+        };
+
+        for tool in ["add_sheet_pin", "edit_sheet_pin", "import_sheet_pins"] {
+            for side in ["right", "left", "top", "bottom"] {
+                let args = args_for(tool, side);
+                let (result, _, _) = handler.dispatch_tool(tool, &args).await;
+                if result.is_error {
+                    let text = match result.content.first() {
+                        Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                        other => panic!("{tool}/{side}: expected text, got {other:?}"),
+                    };
+                    let parsed: Value = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("{tool}/{side}: {e}: {text}"));
+                    assert_ne!(
+                        parsed["error"]["field"], "side",
+                        "{tool}: the schema refused the advertised edge {side}: {text}"
+                    );
+                }
+            }
+
+            let args = args_for(tool, "middle");
+            let (result, _, _) = handler.dispatch_tool(tool, &args).await;
+            assert!(
+                result.is_error,
+                "{tool}: control — an edge that does not exist must be refused"
+            );
+            let text = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                other => panic!("{tool}: expected text, got {other:?}"),
+            };
+            let parsed: Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}: {text}"));
+            assert_eq!(
+                parsed["error"]["field"], "side",
+                "{tool}: control — the refusal must name `side`, or this test is inert: {text}"
+            );
+        }
+    }
+
     /// An explicitly empty list is a coherent request — "operate on nothing" —
     /// and must stay distinguishable from forgetting to say what to operate
     /// on. Refusing both would trade one conflated pair for another.
