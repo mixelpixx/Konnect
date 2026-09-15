@@ -115,6 +115,35 @@ free number for a prefix (a gap between `R1` and `R3` is filled; before, the
 next number was always the maximum plus one), and `#`-prefixed designators
 spelled `#PWR01`, `#PWR010`, `#PWR0100` as eeschema spells them (before:
 `#PWR1`). Both places a designator lives are written.
+## Unreleased: `trace_from_point` reports pins and junctions (minor release)
+
+`trace_from_point`'s answer to "what is at this point" listed wires and labels
+only. A component pin and a junction dot at the same coordinate were omitted,
+and no `pins_here` or `junctions_here` key was present to be empty, so a caller
+could not tell the two had been skipped (#539).
+
+The response gains two arrays, always present:
+
+- `pins_here` — every placed pin at the point, each carrying `reference`,
+  `pin`, `pin_name`, `electrical_type`, `x` and `y`, spelled as
+  `find_orphan_items` already spells them. Pins stacked on one point are all
+  reported. Only the unit actually placed contributes, so a multi-unit symbol
+  never answers with another unit's pins.
+- `junctions_here` — every junction dot at the point, as `x`/`y`.
+
+`x`, `y`, `net`, `wires_here` and `labels_here` are unchanged in name, shape
+and content, and the `tolerance` argument governs the two new arrays exactly as
+it governs the existing ones — which is to say it does not reach `net`,
+resolved by the shared net graph at its own fixed tolerance. No argument
+changed. A caller that reads only the old keys is unaffected; one that treated
+the absence of `pins_here` as "no pin here" was reading a key that never
+existed.
+
+Hierarchical sheet pins and no-connect flags can also sit on a point and are
+still not reported. The tool description now names the four kinds it does
+report, and says so, rather than promising "what is at that point" in the
+abstract.
+
 
 ## Unreleased: tool input schemas are enforced at dispatch (patch release)
 
