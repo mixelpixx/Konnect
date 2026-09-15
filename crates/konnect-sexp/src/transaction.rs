@@ -9,6 +9,7 @@
 use crate::writer::{
     ensure_kicad_design_document_is_closed, open_document_lock, read_string_unlocked,
     sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
+    write_new_atomic_unlocked_private,
 };
 use crate::SexpError;
 use fs4::FileExt;
@@ -725,7 +726,8 @@ fn persist_journal(path: &Path, journal: &Journal) -> Result<(), SexpError> {
     let source = serde_json::to_string(journal).map_err(|error| {
         SexpError::InvalidValue(format!("could not serialize journal: {error}"))
     })?;
-    write_new_atomic_unlocked(path, &source)
+    // Journals carry complete before/after design images, so they stay 0600.
+    write_new_atomic_unlocked_private(path, &source)
 }
 
 fn remove_journal(path: &Path) -> Result<(), SexpError> {
@@ -834,6 +836,42 @@ mod tests {
         let decoded = read_validated_journal(&root, &path).expect("journal deserializes");
         assert_eq!(decoded.entries[0].path, journal.entries[0].path);
         remove_journal(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_journal_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        let (journal, _target) = non_unicode_journal_fixture(&root);
+        let path = journal_path(&root, &journal.id);
+
+        persist_journal(&path, &journal).expect("journal serializes");
+
+        // Inspect the journal while it still exists — recovery would remove it.
+        let journal_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+
+        // Control: an ordinary create in the same directory follows the umask.
+        let control = root.join("ordinary-control");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&control)
+            .unwrap();
+        let ordinary_mode = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+
+        remove_journal(&path).unwrap();
+
+        assert_eq!(
+            journal_mode, 0o600,
+            "transaction journals must stay owner-only regardless of umask"
+        );
+        assert_ne!(
+            journal_mode, ordinary_mode,
+            "the journal must not inherit the ordinary create mode"
+        );
     }
 
     // Linux filesystems accept arbitrary non-NUL filename bytes. macOS APIs
