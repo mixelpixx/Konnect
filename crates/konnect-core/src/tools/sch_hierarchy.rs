@@ -4387,10 +4387,12 @@ mod tests {
 
     #[tokio::test]
     async fn import_sheet_pins_survives_a_sheet_with_a_negative_size() {
-        // `edit_sheet` writes any size it is given, so a box whose span runs
-        // backwards is reachable from this crate's own API. Turning a coordinate
-        // into a slot must not assert on the bound order: a panic here takes the
-        // server down, where an error or a placement does not.
+        // A backwards span is no longer reachable through `edit_sheet` — it
+        // refuses a non-positive size — but a file written by an older Konnect,
+        // by hand, or by another tool can still carry one, so the guard still
+        // has a job. Turning a coordinate into a slot must not assert on the
+        // bound order: a panic here takes the server down, where an error or a
+        // placement does not.
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
@@ -4403,13 +4405,27 @@ mod tests {
         .await
         .unwrap();
         assert!(!added.is_error, "the pin must exist before the resize");
-        handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 80.0, "height": -20.0 }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        // Invert the span in the file itself, and prove the inversion landed.
+        // The previous version of this test asked `edit_sheet` to do it and
+        // discarded the result; once that call began refusing, the sheet stayed
+        // rectangular and this test passed while exercising nothing.
+        let written = std::fs::read_to_string(&root).unwrap();
+        let inverted = written.replace("(size 80 50)", "(size 80 -20)");
+        assert_ne!(
+            inverted, written,
+            "fixture: the sheet's size literal was not found, so the span was never inverted"
+        );
+        std::fs::write(&root, &inverted).unwrap();
+        assert_eq!(
+            cse::Schematic::load(&root)
+                .unwrap()
+                .sheets
+                .by_name("A")
+                .unwrap()
+                .height,
+            -20.0,
+            "fixture: the sheet must read back with a backwards span"
+        );
 
         let child_path = tmp.path().join("a.kicad_sch");
         add_label(&child_path, "VIN", "input", 5.0, 5.0);
