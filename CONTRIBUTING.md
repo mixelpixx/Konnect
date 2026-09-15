@@ -102,6 +102,13 @@ bring the branch back to current `upstream/main` when required, rerun the eviden
 wait for review of the new head. After merge, GitHub deletes the topic branch
 automatically; retain any later dependent work on its own branch.
 
+After merging, maintainers verify the resulting content and issue closure.
+Required hosted CI on the reviewed exact head is the merge evidence, not a
+reason to rerun the entire suite locally. A content discrepancy, unavailable
+required evidence, or a specific post-merge symptom triggers risk-proportionate
+retesting under [GOVERNANCE.md](GOVERNANCE.md). Required CI and release validation
+remain mandatory.
+
 You do not need personal access to every supported operating system, KiCad
 version, or hardware configuration. For an environment-dependent check you
 cannot run, name the missing environment, provide the deterministic and hosted

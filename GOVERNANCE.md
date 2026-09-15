@@ -45,7 +45,16 @@ independent.
 - A write collaborator cannot bypass the ruleset. Any owner-only direct-push
   exception is reserved for the documented release recipe's bump/stamp commits;
   it is not an ordinary merge shortcut.
-- **Run the full local gate after each merge** before landing the next one:
+- **Required CI on the reviewed exact head is the merge evidence.** After
+  merging, synchronize local `main`, verify the merge commit and resulting
+  content against the reviewed head plus current base, and reconcile terminal
+  issue closure. Do not repeat the full local gate solely because a PR merged.
+- **Retest when there is a specific reason:** merged content differs from the
+  reviewed head plus current base, required evidence was unavailable, or a
+  post-merge symptom creates new uncertainty. Missing required evidence remains
+  a pre-merge blocker; this rule is not permission to bypass it. Run the focused
+  checks that address the uncertainty, escalating to the full local gate when
+  the affected scope or risk warrants it:
 
   ```
   cargo fmt --all -- --check
@@ -74,7 +83,8 @@ independent.
    the appropriate state, review the new exact head, and arm it again only after
    the gate is restored. GitHub may automatically disable auto-merge after a
    fork contributor pushes; that is expected safety behavior.
-5. After merge, synchronize local `main`, run the complete local gate below,
+5. After merge, synchronize local `main`, verify the resulting content and apply
+   the risk-triggered retest rule above,
    verify terminal issue closure and post the acceptance evidence, then promote
    only the next PR in the documented dependency order. GitHub deletes the
    merged topic branch automatically.
@@ -148,7 +158,8 @@ Within an overlap set the order is not arbitrary:
 6. **Release, version and count changes land last** — never through the middle
    of an active queue. v0.10.0 ignored this and invalidated eleven open PRs in
    one push. This rule exists because of that, not in anticipation of it.
-7. After each merge: update `main`, run the full gate, promote the next PR,
+7. After each merge: update `main`, verify the merge and apply risk-triggered
+   retesting, promote the next PR,
    and arm auto-merge only once the exact head has been reviewed.
 
 ## Releases

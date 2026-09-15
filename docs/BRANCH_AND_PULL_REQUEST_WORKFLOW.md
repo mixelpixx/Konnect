@@ -172,8 +172,10 @@ For the one next-to-land PR in an overlap set:
 4. A new commit, rewritten head, base change, failed or missing required check,
    or unresolved conversation returns the PR to review. Recheck the new exact
    head before arming auto-merge again.
-5. After GitHub merges it, update local `main`, run the complete gate from
-   `GOVERNANCE.md`, verify terminal issue closure, post the acceptance mapping,
+5. After GitHub merges it, update local `main`, verify the resulting content
+   against the reviewed head plus current base, and apply the risk-triggered
+   retest rule in `GOVERNANCE.md` rather than automatically repeating hosted CI.
+   Verify terminal issue closure, post the acceptance mapping,
    and only then promote or reconstruct the immediate successor.
 
 Auto-merge removes waiting time; it does not relax admission control, review,
