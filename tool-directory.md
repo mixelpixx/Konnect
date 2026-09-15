@@ -166,7 +166,7 @@ and Windows servers do not.
 | `get_pin_net_name` | Return just the net name for a specific pin on a component. |
 | `get_component_nets` | Get all nets connected to every pin of a component. |
 | `get_net_components` | Get all components (and their pins) connected to a named net. |
-| `trace_from_point` | Trace connectivity from any (X,Y) point — returns what is at that point and the net it belongs to. |
+| `trace_from_point` | Trace connectivity from any (X,Y) point — returns the wires, labels, component pins and junction dots at that point, and the net it belongs to. Hierarchical sheet pins and no-connect flags are not reported, so an empty pins_here does not prove a wire dangles. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |

@@ -14,9 +14,9 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_sheet_pins, extract_symbol_instances,
-        extract_wires, find_lib_symbol, read_schematic, symbol_bounds_for_instance, Label,
-        LabelKind, LibPin, SymbolBounds, Wire,
+        extract_all_net_labels, extract_junctions, extract_labels, extract_sheet_pins,
+        extract_symbol_instances, extract_wires, find_lib_symbol, read_schematic,
+        symbol_bounds_for_instance, Label, LabelKind, LibPin, SymbolBounds, Wire,
     },
 };
 use serde_json::json;
@@ -120,7 +120,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "trace_from_point",
-            "Trace connectivity from any (X,Y) point — returns what is at that point and the net it belongs to.",
+            "Trace connectivity from any (X,Y) point — returns the wires, labels, component \
+             pins and junction dots at that point, and the net it belongs to. Hierarchical \
+             sheet pins and no-connect flags are not reported, so an empty pins_here does \
+             not prove a wire dangles.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -467,9 +470,43 @@ async fn handle_trace_from_point(
         .filter(|l| points_coincident(x, y, l.x, l.y, tol))
         .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind) }))
         .collect();
-    Ok(CallToolResult::json(
-        &json!({ "x": x, "y": y, "net": g.net_at(x, y), "wires_here": on_wire, "labels_here": at_label }),
-    ))
+    // A pin and a junction dot sit on a point as readily as a wire or a label,
+    // and this is the tool whose whole promise is what is there (#539).
+    //
+    // `placed_pins_by_reference` is the unit-aware source the rest of this file
+    // reads, so a multi-unit symbol contributes only the unit actually placed
+    // and never another unit's pins as phantom points (#35).
+    let mut at_pin: Vec<serde_json::Value> = Vec::new();
+    for (instance, pins) in placed_pins_by_reference(&tree) {
+        for (pin, transform) in pins {
+            let (px, py) = konnect_sexp::schematic::pin_endpoint(&pin, transform);
+            if !points_coincident(x, y, px, py, tol) {
+                continue;
+            }
+            at_pin.push(json!({
+                "reference": &instance.reference,
+                "pin": pin.number,
+                "pin_name": pin.name,
+                "electrical_type": pin.electrical_type,
+                "x": px,
+                "y": py
+            }));
+        }
+    }
+    let at_junction: Vec<_> = extract_junctions(&tree)
+        .into_iter()
+        .filter(|(jx, jy)| points_coincident(x, y, *jx, *jy, tol))
+        .map(|(jx, jy)| json!({ "x": jx, "y": jy }))
+        .collect();
+    Ok(CallToolResult::json(&json!({
+        "x": x,
+        "y": y,
+        "net": g.net_at(x, y),
+        "wires_here": on_wire,
+        "labels_here": at_label,
+        "pins_here": at_pin,
+        "junctions_here": at_junction
+    })))
 }
 
 async fn handle_find_orphan_items(
@@ -1874,5 +1911,129 @@ mod two_name_net_tests {
             .map(|component| component["reference"].as_str().unwrap())
             .collect();
         assert_eq!(components, ["TP9"], "{items}");
+    }
+}
+
+/// What `trace_from_point` reports as being at a point, on the real KiCad
+/// fixture (#539). Wires and labels were already answered; a pin and a junction
+/// dot were not, and there was no empty key to show they had been skipped.
+#[cfg(test)]
+mod trace_from_point_tests {
+    use super::tool_call_support::call;
+    use super::*;
+
+    const SCH: &str = include_str!("../../tests/fixtures/trace_point_kicad10.kicad_sch");
+
+    async fn at(x: f64, y: f64) -> serde_json::Value {
+        call(SCH, "trace_from_point", json!({ "x": x, "y": y })).await
+    }
+
+    /// The references and pin numbers reported at a point, sorted, so the
+    /// assertion does not depend on the order symbols sit in the file.
+    fn pins(trace: &serde_json::Value) -> Vec<String> {
+        let mut found: Vec<String> = trace["pins_here"]
+            .as_array()
+            .expect("pins_here is always present")
+            .iter()
+            .map(|pin| {
+                format!(
+                    "{}.{}",
+                    pin["reference"].as_str().unwrap(),
+                    pin["pin"].as_str().unwrap()
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// How many entries a `*_here` key carries. Every one of them is always
+    /// present, so an absent key is a failure rather than a zero.
+    fn count(trace: &serde_json::Value, key: &str) -> usize {
+        trace[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} is always present: {trace}"))
+            .len()
+    }
+
+    /// The filed case: `R1` pin 1, two wire ends, a junction dot and net `NETA`
+    /// all at `(100.33, 96.52)`. The net and the wires were already right; the
+    /// pin and the dot were the two the response dropped.
+    #[tokio::test]
+    async fn the_pin_and_the_dot_at_a_point_are_both_reported() {
+        let trace = at(100.33, 96.52).await;
+
+        assert_eq!(trace["net"], "NETA", "{trace}");
+        assert_eq!(count(&trace, "wires_here"), 2, "{trace}");
+        assert_eq!(pins(&trace), ["R1.1"], "{trace}");
+        assert_eq!(count(&trace, "junctions_here"), 1, "{trace}");
+    }
+
+    /// A reported pin carries enough to act on without a second call.
+    #[tokio::test]
+    async fn a_reported_pin_names_itself_and_its_position() {
+        let trace = at(100.33, 96.52).await;
+        let pin = &trace["pins_here"][0];
+
+        assert_eq!(pin["reference"], "R1", "{trace}");
+        assert_eq!(pin["pin"], "1", "{trace}");
+        assert_eq!(pin["electrical_type"], "passive", "{trace}");
+        assert_eq!(pin["x"], 100.33, "{trace}");
+        assert_eq!(pin["y"], 96.52, "{trace}");
+    }
+
+    /// `R1` pin 2, wired but with no dot on it. A pin must not imply a junction.
+    #[tokio::test]
+    async fn a_pin_without_a_dot_reports_no_junction() {
+        let trace = at(100.33, 104.14).await;
+
+        assert_eq!(pins(&trace), ["R1.2"], "{trace}");
+        assert_eq!(count(&trace, "junctions_here"), 0, "{trace}");
+        assert_eq!(count(&trace, "wires_here"), 1, "{trace}");
+    }
+
+    /// A branch landing mid-span: the dot `add_wire` inserts, with no pin under
+    /// it. A junction must not imply a pin either.
+    #[tokio::test]
+    async fn a_dot_without_a_pin_reports_no_pin() {
+        let trace = at(130.81, 121.92).await;
+
+        assert_eq!(count(&trace, "junctions_here"), 1, "{trace}");
+        assert!(pins(&trace).is_empty(), "{trace}");
+        assert_eq!(count(&trace, "wires_here"), 2, "{trace}");
+    }
+
+    /// `R2` pin 2 and `R3` pin 1 sit on one point with no wire between them —
+    /// KiCad's own netlist resolves them as the single net `Net-(R2-Pad2)`.
+    /// Reporting one of them would be the same defect in a smaller form.
+    #[tokio::test]
+    async fn both_of_two_stacked_pins_are_reported() {
+        let trace = at(160.02, 104.14).await;
+
+        assert_eq!(pins(&trace), ["R2.2", "R3.1"], "{trace}");
+    }
+
+    /// Both units of `U1` are placed, 30mm apart. Reading the pins off the
+    /// library symbol rather than the placed unit would put unit 1's pins on
+    /// unit 2's point (#35).
+    #[tokio::test]
+    async fn a_point_on_one_unit_reports_only_that_unit() {
+        let unit_two = at(198.12, 130.81).await;
+        assert_eq!(pins(&unit_two), ["U1.7"], "{unit_two}");
+
+        let unit_one = at(198.12, 100.33).await;
+        assert_eq!(pins(&unit_one), ["U1.1"], "{unit_one}");
+    }
+
+    /// The omission was invisible because no key was there to be empty. On bare
+    /// paper all four lists are present and empty.
+    #[tokio::test]
+    async fn a_bare_point_answers_with_four_empty_lists() {
+        let trace = at(210.0, 50.0).await;
+
+        assert_eq!(trace["net"], serde_json::Value::Null, "{trace}");
+        for key in ["wires_here", "labels_here", "pins_here", "junctions_here"] {
+            assert_eq!(count(&trace, key), 0, "{key} should be empty: {trace}");
+        }
     }
 }
