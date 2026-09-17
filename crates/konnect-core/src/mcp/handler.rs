@@ -1071,6 +1071,68 @@ mod annotate_dispatch_tests {
 }
 
 #[cfg(test)]
+mod rotate_junction_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// `rotate_schematic_component`'s `junctions_added_count` and
+    /// `junctions_pruned_count` are public response fields (#615); prove they
+    /// survive the served `tools/call` boundary on the KiCad-authored fixture,
+    /// with the dot actually written to the file.
+    #[tokio::test]
+    async fn rotate_reports_the_junction_it_added_across_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("rotate.kicad_sch");
+        std::fs::write(
+            &schematic,
+            include_str!("../../tests/fixtures/rotate_junctions_kicad10.kicad_sch"),
+        )
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "rotate_schematic_component",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "reference": "R2",
+                        "rotation": 90
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["junctions_added_count"], 1, "{body}");
+        assert_eq!(body["junctions_pruned_count"], 0, "{body}");
+        // R2 pin 1 turns onto the NETB wire mid-span; without the dot KiCad
+        // leaves it on unconnected-(R2-Pad1).
+        assert!(std::fs::read_to_string(&schematic)
+            .unwrap()
+            .contains("(at 154.94 160.02)"));
+    }
+}
+
+#[cfg(test)]
 mod ipc_failure_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;

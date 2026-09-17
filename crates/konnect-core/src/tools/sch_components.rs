@@ -209,7 +209,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "rotate_schematic_component",
-            "Set the lowest-numbered unit's absolute rotation and rotate every other placed unit by the same delta.",
+            "Set the lowest-numbered unit's absolute rotation and rotate every other placed unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged where the pins turned: a dot the pins leave unjustified is removed and a pin landing mid-span on a wire gains one, reported as junctions_pruned_count and junctions_added_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3216,16 +3216,8 @@ async fn handle_move_schematic_component(
     let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
 
     // Pin positions before the move, so the dots the pins vacate can be judged
-    // afterwards (#120). Wires do not change here — pins do. A sheet with no
-    // wires has nothing to reconcile, and skipping spares it the symbol walk.
-    let before_pins = if read_consistent(&sch_path)
-        .map(|c| c.contains("(wire"))
-        .unwrap_or(false)
-    {
-        pin_endpoints_of(&sch_path)
-    } else {
-        Vec::new()
-    };
+    // afterwards (#120). Wires do not change here — pins do.
+    let before_pins = pins_before_placement_change(&sch_path);
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
@@ -3254,7 +3246,7 @@ async fn handle_move_schematic_component(
         symbol.translate(dx, dy);
     }
     sch.overwrite()?;
-    let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
+    let (added, pruned) = reconcile_junctions_after_placement(&sch_path, &before_pins)?;
     let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -3270,6 +3262,22 @@ async fn handle_move_schematic_component(
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
+}
+
+/// Pin endpoints to diff against once a placement change has been written.
+///
+/// A sheet with no wire has no dot to strand and nowhere for a pin to land, so
+/// it answers empty from the one read rather than walking its symbols.
+fn pins_before_placement_change(path: &std::path::Path) -> Vec<(f64, f64)> {
+    let Ok(content) = read_consistent(path) else {
+        return Vec::new();
+    };
+    if !content.contains("(wire") {
+        return Vec::new();
+    }
+    parse_sexp(&content)
+        .map(|tree| crate::tools::all_pin_endpoints(&tree))
+        .unwrap_or_default()
 }
 
 /// Pin endpoints on the sheet as it currently stands on disk, or empty if it
@@ -3288,7 +3296,10 @@ fn pin_endpoints_of(path: &std::path::Path) -> Vec<(f64, f64)> {
 /// a dot at a vacated position may now be stranded, and a pin that has landed
 /// mid-span on a wire needs one. Everything else on the sheet is untouched, so
 /// unrelated dots cannot be disturbed.
-fn reconcile_junctions_after_move(
+///
+/// Named for the placement rather than the move because a turn relocates pin
+/// endpoints exactly as a move does, and reaches this by the same route (#615).
+fn reconcile_junctions_after_placement(
     path: &std::path::Path,
     before_pins: &[(f64, f64)],
 ) -> anyhow::Result<(usize, usize)> {
@@ -3332,6 +3343,12 @@ async fn handle_rotate_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    // A turn relocates pin endpoints exactly as a move does, so it owes the
+    // sheet the same junction reconciliation (#615): the dot a pin turns off
+    // is stranded, and a pin that turns onto a wire mid-span needs one or the
+    // connection is absent from the netlist.
+    let before_pins = pins_before_placement_change(&sch_path);
+
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
         Ok(target) => target,
@@ -3364,6 +3381,7 @@ async fn handle_rotate_schematic_component(
         symbol.set_rotation(new_rotation);
     }
     sch.overwrite()?;
+    let (added, pruned) = reconcile_junctions_after_placement(&sch_path, &before_pins)?;
     let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -3372,7 +3390,9 @@ async fn handle_rotate_schematic_component(
         "rotated": observed["reference"],
         "rotation": observed["rotation"],
         "rotated_units": observed["unit_count"],
-        "placements": observed["units"]
+        "placements": observed["units"],
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
@@ -8402,5 +8422,161 @@ mod multi_unit_component_tests {
             .as_str()
             .unwrap()
             .contains("may have changed"));
+    }
+}
+
+/// A turn relocates pin endpoints exactly as a move does, so it owes the sheet
+/// the same junction reconciliation (#615).
+///
+/// Every case runs on `rotate_junctions_kicad10.kicad_sch`, which is KiCad
+/// 10.0.6's own serialization — see its README for provenance and for the
+/// netlist KiCad answers with, which is where these expectations come from.
+#[cfg(test)]
+mod rotate_junction_reconciliation_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/rotate_junctions_kicad10.kicad_sch");
+
+    /// The dot `move_schematic_component` left under R1 pin 1, mid-span on the
+    /// NETA wire.
+    const STRANDED_DOT: (f64, f64) = (127.0, 97.79);
+    /// Where R2 pin 1 lands once R2 is turned to 90°: mid-span on the NETB wire.
+    const LANDING_POINT: (f64, f64) = (154.94, 160.02);
+    /// The wire T in the corner of the sheet, which no turn here goes near.
+    const UNRELATED_DOT: (f64, f64) = (190.5, 88.9);
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rotate.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn has_junction(content: &str, (x, y): (f64, f64)) -> bool {
+        let tree = parse_sexp(content).unwrap();
+        konnect_sexp::schematic::extract_junctions(&tree)
+            .iter()
+            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(x, y, jx, jy, 0.01))
+    }
+
+    async fn rotate(path: &std::path::Path, reference: &str, rotation: f64) -> CallToolResult {
+        handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": reference, "rotation": rotation }),
+            &context(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn turning_a_pin_off_a_wire_prunes_the_dot_it_strands() {
+        let (_directory, path) = fixture(SHEET);
+        assert!(has_junction(SHEET, STRANDED_DOT));
+
+        let response = body(&rotate(&path, "R1", 90.0).await);
+
+        assert_eq!(response["junctions_pruned_count"], 1);
+        assert_eq!(response["junctions_added_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !has_junction(&committed, STRANDED_DOT),
+            "the dot has only the wire passing through it now"
+        );
+        assert!(
+            has_junction(&committed, UNRELATED_DOT),
+            "the wire T is justified independently of R1"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_a_pin_onto_a_wire_adds_the_junction_it_needs() {
+        let (_directory, path) = fixture(SHEET);
+        assert!(!has_junction(SHEET, LANDING_POINT));
+
+        let response = body(&rotate(&path, "R2", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 1);
+        assert_eq!(response["junctions_pruned_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            has_junction(&committed, LANDING_POINT),
+            "without the dot KiCad leaves the pin on unconnected-(R2-Pad1)"
+        );
+        assert!(
+            has_junction(&committed, STRANDED_DOT),
+            "R1's dot is nowhere near the turn and stays as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_connect_at_the_landing_point_keeps_the_dot_away() {
+        // The caller has said this pin stays unconnected; a turn must not
+        // overrule that by wiring it into the net it lands on.
+        let closing = SHEET.rfind("\n)").unwrap();
+        let marker = format!(
+            "\t(no_connect\n\t\t(at {} {})\n\t\t(uuid \"no-connect-on-the-landing-point\")\n\t)\n",
+            LANDING_POINT.0, LANDING_POINT.1
+        );
+        let original = format!("{}{marker}{}", &SHEET[..closing + 1], &SHEET[closing + 1..]);
+        let (_directory, path) = fixture(&original);
+
+        let response = body(&rotate(&path, "R2", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(!has_junction(&committed, LANDING_POINT));
+        assert!(committed.contains("no-connect-on-the-landing-point"));
+    }
+
+    #[tokio::test]
+    async fn a_pin_leaving_a_wire_end_neither_adds_nor_prunes() {
+        // R0 pin 1 turns off the *end* of the NETA wire, not its interior. A
+        // wire end needs no dot, so there is none to prune and none to add —
+        // and the counts are still reported rather than omitted.
+        let (_directory, path) = fixture(SHEET);
+
+        let response = body(&rotate(&path, "R0", 90.0).await);
+
+        assert_eq!(response["junctions_added_count"], 0);
+        assert_eq!(response["junctions_pruned_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(has_junction(&committed, STRANDED_DOT));
+        assert!(has_junction(&committed, UNRELATED_DOT));
+    }
+
+    #[tokio::test]
+    async fn a_refused_turn_writes_nothing() {
+        let (_directory, path) = fixture(SHEET);
+
+        let result = rotate(&path, "R404", 90.0).await;
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
     }
 }

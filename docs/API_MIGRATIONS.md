@@ -27,6 +27,36 @@ with the requested path and operation. Inspect/reconcile the editor and saved
 file before retrying; Konnect does not replay a possibly applied mutation or
 fall back to a different board. See [DRC synchronization](DRC_SYNCHRONIZATION.md).
 
+## Unreleased: `rotate_schematic_component` reconciles junctions (minor release)
+
+A turn relocates a symbol's pin endpoints exactly as a move does, but only
+`move_schematic_component` re-judged the junction dots at the points its pins
+left and arrived at. A pin turned off a wire left its dot behind with nothing
+to justify it, and — the half that changes the design rather than the picture —
+a pin turned *onto* a wire mid-span got no dot, so KiCad left it off the net it
+visibly touches (#615).
+
+`rotate_schematic_component` now makes the same reconciliation call, with the
+same rules: a dot is pruned when nothing is left to justify it, and one is
+added only where a pin has landed mid-span on exactly one wire with no
+no-connect flag at the point.
+
+The response gains the two keys the move has always carried, always present:
+
+- `junctions_added_count`
+- `junctions_pruned_count`
+
+Both are derived from the reconciliation that actually ran, not predicted. No
+argument changed and no existing response key changed in name, shape or
+content. A caller that reads only the old keys is unaffected; one that assumed
+a turn never touches junction dots will now see the dots it used to have to
+repair by hand.
+
+Sheets a previous version left behind are not migrated by this change. A
+stranded dot costs no connectivity and can be deleted at leisure; a *missing*
+dot does cost connectivity, and the repair is `add_junction` at the pin's
+coordinate, or re-running the turn.
+
 ## Unreleased: fixed tool arguments reject unknown keys (patch release)
 
 Following #551's validator, #546 closes fixed tool argument records before
