@@ -9,6 +9,7 @@ use crate::tools::{
     get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
+use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
@@ -759,6 +760,486 @@ fn wires_in_ranges(content: &str, ranges: &[(usize, usize)]) -> Vec<Wire> {
 /// the file.
 fn round6(v: f64) -> f64 {
     (v * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// A no-connect marker's owner, as far as a placement change is concerned.
+///
+/// The marker is a sheet item at a coordinate, but what it means is "this pin
+/// stays unconnected", so a placement change has to follow the *pin* (#626).
+/// Coordinate coincidence cannot say which pin that is: two pins may share a
+/// point and only one of them be moving.
+///
+/// The symbol instance UUID, the unit it places, and the pin number are the
+/// native identity. Library-local pin geometry joins them because a number is
+/// not unique on its own: one unit may declare the same pin number twice at
+/// different local positions, and that geometry is invariant under a placement
+/// change, so it separates them without ever separating a pin from itself. A
+/// mutation that changes the symbol definition moves it, which is how a
+/// replacement that renumbers the protected pin is refused rather than guessed
+/// at. Two pins genuinely stacked on one local point share an identity and are
+/// refused as unmappable — this key splits duplicates, it does not resolve
+/// them.
+///
+/// Quantized with [`crate::tools::sch_connectivity::pt_key`], the crate's
+/// coordinate equality key, rather than a private rounding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinIdentity {
+    symbol_uuid: String,
+    unit: u32,
+    number: String,
+    local_key: (i64, i64),
+}
+
+/// A placed pin, with the identity that survives a placement change.
+struct IdentifiedPin {
+    identity: PinIdentity,
+    reference: String,
+    at: (f64, f64),
+}
+
+/// Every placed pin with its identity.
+///
+/// Fails rather than answering short: a `lib_symbols` lookup that failed, or an
+/// instance with no UUID, is stale state and not evidence that no pin is there.
+/// [`reconcile_junctions_at`] draws the same distinction with `pins_known`,
+/// more coarsely — it cannot see one symbol of ten failing to resolve.
+fn identified_pins(
+    tree: &konnect_sexp::SexpNode,
+) -> Result<Vec<IdentifiedPin>, NoConnectCarryError> {
+    let unresolved = || NoConnectCarryError::Unmappable {
+        reason: format!(
+            "{}, so the pin each no-connect protects cannot be identified",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        ),
+    };
+    let grouped = crate::tools::resolved_placed_pins_by_reference(tree).ok_or_else(unresolved)?;
+    let mut pins = Vec::new();
+    for (instance, placed) in grouped {
+        let symbol_uuid = instance.uuid.clone().ok_or_else(unresolved)?;
+        for (pin, transform) in placed {
+            pins.push(IdentifiedPin {
+                identity: PinIdentity {
+                    symbol_uuid: symbol_uuid.clone(),
+                    unit: instance.unit,
+                    number: pin.number.clone(),
+                    local_key: crate::tools::sch_connectivity::pt_key(pin.local_x, pin.local_y),
+                },
+                reference: instance.reference.clone(),
+                at: pin_endpoint(&pin, transform),
+            });
+        }
+    }
+    Ok(pins)
+}
+
+/// A no-connect marker following its pin to where the pin has landed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NoConnectCarry {
+    pub(crate) uuid: String,
+    pub(crate) from: (f64, f64),
+    pub(crate) to: (f64, f64),
+}
+
+/// Why a placement change must refuse rather than write.
+#[derive(Debug)]
+pub(crate) enum NoConnectCarryError {
+    /// The marker's pin does not map onto one arrival point.
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
+    },
+    /// The sheet cannot be read well enough to follow the marker at all.
+    Unmappable { reason: String },
+}
+
+impl NoConnectCarryError {
+    pub(crate) fn into_result(self, path: &std::path::Path) -> CallToolResult {
+        match self {
+            Self::Ambiguous { target, candidates } => {
+                let reason = format!(
+                    "the pin it protects does not map onto one arrival point: {}",
+                    candidates.join(", ")
+                );
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                        target: target.clone(),
+                        candidates,
+                    },
+                    format!("refusing to move {target}: {reason}. Nothing was written."),
+                )
+            }
+            Self::Unmappable { reason } => {
+                let target = path.display().to_string();
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::StaleTarget {
+                        target: target.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!(
+                        "refusing to change placement in '{target}': {reason}. Nothing was written."
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/// How a marker is described when it is the subject of a refusal.
+fn marker_label(uuid: &str, (x, y): (f64, f64)) -> String {
+    format!("no-connect {uuid} at ({x}, {y})")
+}
+
+/// Plan where a placement change leaves each no-connect marker, given the
+/// sheet before the change and the sheet the change produces.
+///
+/// [`reconcile_junctions_at`] refuses to add a dot where a no-connect sits,
+/// but it looks at the point the pin *arrives* at while the marker is still at
+/// the point the pin *left* — so on its own that guard misses exactly the case
+/// it exists for, and a pin the user declared unconnected is wired into the
+/// net it lands on (#626). The marker has to travel with the pin, in the same
+/// write as the symbol, for the guard to see it.
+///
+/// A marker is carried only when the pins under it map one-to-one onto a
+/// single arrival point. It refuses when:
+///
+/// * a pin under the marker is gone from the result or its identity no longer
+///   resolves — a replacement that removes or renumbers the pin;
+/// * the pins under the marker land on different points, one moving and one
+///   staying say, where carrying it would strip the protection from the pin
+///   left behind;
+/// * carrying it would stack it on a marker it did not start with, leaving two
+///   markers on one point and no way to tell which pin either belongs to.
+///
+/// A marker with no pin under it is already dangling and stays where it is;
+/// that is ERC's to report, not this pass's to move.
+///
+/// Note this derives "which pins moved where" from pin *identity*, while
+/// [`reconcile_junctions_at`]'s callers derive it from the symmetric
+/// difference of pin *coordinates*. The identity derivation is the stricter
+/// of the two — it sees a pin vacating a point another pin still occupies,
+/// which the coordinate difference cannot. Folding the junction pass onto it
+/// would change which dots that pass judges, so the two are kept apart here
+/// and the unification tracked separately.
+///
+/// The gap that leaves: two pins of one symbol *swapping* coordinates — a
+/// `Device:R` turned 180° — leave the coordinate sets equal, so the junction
+/// pass gets no candidates and any dot between them stands. A marker carried
+/// onto that dot then sits on a pin that is still on the net. Measured against
+/// KiCad 10.0.6, the pin is on that net with or without this carry, so the
+/// carry does not cause it; what changes is that ERC now reports it as
+/// `no_connect_connected` instead of leaving a stranded marker and a silent
+/// connection. Closing it needs the junction pass to take its candidates from
+/// the identity derivation above.
+///
+/// A placement tool adopts this contract in three steps, in this order: plan
+/// here, apply with [`carry_no_connects`] (typed model) or
+/// [`apply_no_connect_carries`] (S-expression edits) in the same write as the
+/// symbol, then report with [`observed_no_connect_moves`] after it. #622, #623
+/// and #625 reconcile no junctions yet and join by the same route when they do.
+pub(crate) fn plan_no_connect_carry(
+    before: &konnect_sexp::SexpNode,
+    after: &konnect_sexp::SexpNode,
+) -> Result<Vec<NoConnectCarry>, NoConnectCarryError> {
+    const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
+    let coincident = |a: (f64, f64), b: (f64, f64)| {
+        konnect_sexp::geometry::points_coincident(a.0, a.1, b.0, b.1, TOL)
+    };
+
+    let mut markers: Vec<(String, (f64, f64))> = Vec::new();
+    for node in before.find_all("no_connect") {
+        let Some((x, y, _)) = parse_at(node) else {
+            continue;
+        };
+        // An empty UUID counts as absent: the typed model reads a missing one
+        // as "" and writes it back as (uuid ""), so accepting it would let the
+        // typed path carry a marker the S-expression path refuses — and two of
+        // them would share that one key.
+        let Some(uuid) = node.find_str("uuid").filter(|uuid| !uuid.is_empty()) else {
+            return Err(NoConnectCarryError::Unmappable {
+                reason: format!("the no-connect at ({x}, {y}) has no UUID to follow"),
+            });
+        };
+        markers.push((uuid.to_owned(), (x, y)));
+    }
+    if markers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (before_pins, after_pins) = (identified_pins(before)?, identified_pins(after)?);
+
+    let mut carries: Vec<NoConnectCarry> = Vec::new();
+    for (uuid, from) in &markers {
+        let owners = before_pins.iter().filter(|p| coincident(p.at, *from));
+        let mut arrivals: Vec<(&IdentifiedPin, (f64, f64))> = Vec::new();
+        for owner in owners {
+            let landed: Vec<&IdentifiedPin> = after_pins
+                .iter()
+                .filter(|p| p.identity == owner.identity)
+                .collect();
+            let [arrival] = landed[..] else {
+                return Err(NoConnectCarryError::Unmappable {
+                    reason: format!(
+                        "{} is protected by {}, which the change leaves {} matching pins",
+                        marker_label(uuid, *from),
+                        pin_label(owner),
+                        landed.len()
+                    ),
+                });
+            };
+            arrivals.push((owner, arrival.at));
+        }
+        // No pin under the marker: already dangling, and not this pass's to fix.
+        let Some(&(_, to)) = arrivals.first() else {
+            continue;
+        };
+        if arrivals.iter().any(|&(_, at)| !coincident(at, to)) {
+            return Err(NoConnectCarryError::Ambiguous {
+                target: marker_label(uuid, *from),
+                candidates: sorted_labels(
+                    arrivals
+                        .iter()
+                        .map(|(owner, at)| format!("{} -> ({}, {})", pin_label(owner), at.0, at.1)),
+                ),
+            });
+        }
+        if coincident(to, *from) {
+            continue;
+        }
+        carries.push(NoConnectCarry {
+            uuid: uuid.clone(),
+            from: *from,
+            to,
+        });
+    }
+
+    // Where every marker ends up, so a carry cannot silently stack one marker
+    // on another. Markers that started on one point stay a pair; a carry that
+    // creates the pair is the outcome with no one-to-one reading.
+    struct Landing<'a> {
+        uuid: &'a str,
+        from: (f64, f64),
+        to: (f64, f64),
+    }
+    let landings: Vec<Landing<'_>> = markers
+        .iter()
+        .map(|(uuid, from)| Landing {
+            uuid,
+            from: *from,
+            to: carries
+                .iter()
+                .find(|carry| carry.uuid == *uuid)
+                .map_or(*from, |carry| carry.to),
+        })
+        .collect();
+    for (index, landing) in landings.iter().enumerate() {
+        for other in &landings[index + 1..] {
+            if !coincident(landing.to, other.to) || coincident(landing.from, other.from) {
+                continue;
+            }
+            // Whichever of the pair moved is the one being refused; if both
+            // did, either names the collision as well as the other.
+            let moved = carries
+                .iter()
+                .find(|carry| carry.uuid == landing.uuid || carry.uuid == other.uuid)
+                .expect("a newly created collision has at least one carried marker");
+            return Err(NoConnectCarryError::Ambiguous {
+                target: marker_label(&moved.uuid, moved.from),
+                candidates: sorted_labels([
+                    marker_label(landing.uuid, landing.from),
+                    marker_label(other.uuid, other.from),
+                ]),
+            });
+        }
+    }
+    Ok(carries)
+}
+
+/// The refusal a caller raises when it cannot parse a sheet well enough to
+/// follow its markers.
+///
+/// Shared so a caller's own parse failure is the same `stale_target` the
+/// planner raises rather than a different kind of answer on each path.
+pub(crate) fn no_connect_carry_unreadable(path: &std::path::Path) -> CallToolResult {
+    NoConnectCarryError::Unmappable {
+        reason: "the schematic cannot be re-parsed to follow its no-connect markers".into(),
+    }
+    .into_result(path)
+}
+
+/// The refusal a caller raises when a planned carry cannot be located in the
+/// content it is about to write.
+pub(crate) fn no_connect_carry_unwritable(path: &std::path::Path) -> CallToolResult {
+    NoConnectCarryError::Unmappable {
+        reason: "a no-connect marker that must travel with a pin cannot be located".into(),
+    }
+    .into_result(path)
+}
+
+/// Refusal candidates, ordered so a caller comparing two runs sees one list.
+fn sorted_labels(labels: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut labels: Vec<String> = labels.into_iter().collect();
+    labels.sort();
+    labels
+}
+
+/// How a pin is named in a refusal: the reference a caller sees, plus the
+/// identity behind it, because a pre-annotation sheet is all `R?`.
+fn pin_label(pin: &IdentifiedPin) -> String {
+    format!(
+        "{} [{}] unit {} pin {}",
+        pin.reference, pin.identity.symbol_uuid, pin.identity.unit, pin.identity.number
+    )
+}
+
+/// Rewrite each carried marker's `(at …)` in `content`.
+///
+/// Returns `None` when a marker cannot be located, which the caller must treat
+/// as a refusal: writing the placement change without its markers is the very
+/// outcome this pass exists to prevent.
+pub(crate) fn apply_no_connect_carries(
+    content: String,
+    carries: &[NoConnectCarry],
+) -> Option<String> {
+    if carries.is_empty() {
+        return Some(content);
+    }
+    let ranges = no_connect_at_ranges(&content);
+    let edits = carries
+        .iter()
+        .map(|carry| {
+            let &(start, end) = ranges.get(carry.uuid.as_str())?;
+            Some(SexpEdit::replace(
+                start,
+                end,
+                format!("{} {}", fmt_f64(carry.to.0), fmt_f64(carry.to.1)),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(apply_edits(content, edits))
+}
+
+/// Every marker's UUID against the byte range of the coordinates inside its
+/// `(at …)`.
+///
+/// Built in one pass: locating a marker costs a scan of the whole file, so a
+/// per-carry lookup would rescan it once per marker moved.
+fn no_connect_at_ranges(content: &str) -> std::collections::HashMap<&str, (usize, usize)> {
+    let mut ranges = std::collections::HashMap::new();
+    for start in find_block_starts(content, "no_connect") {
+        let Some((_, end)) = find_balanced_block(content, start) else {
+            continue;
+        };
+        let block = &content[start..end];
+        let Some(uuid) = parse_sexp(block)
+            .ok()
+            .as_ref()
+            .and_then(|node| node.find_str("uuid"))
+            .and_then(|uuid| block.find(uuid).map(|at| &block[at..at + uuid.len()]))
+        else {
+            continue;
+        };
+        let Some(at_rel) = block.find("(at ").map(|offset| offset + "(at ".len()) else {
+            continue;
+        };
+        let Some(close_rel) = block[at_rel..].find(')') else {
+            continue;
+        };
+        ranges.insert(uuid, (start + at_rel, start + at_rel + close_rel));
+    }
+    ranges
+}
+
+/// Move the no-connect markers a placement change relocates, in the same
+/// mutation as the symbols themselves.
+///
+/// `before_source` is the sheet as it was loaded; `sch` already carries the
+/// placement change but has not been written. The markers are applied to `sch`
+/// so one `overwrite` commits symbol and marker together — a marker written
+/// separately would leave a window where the pin is on a net it was declared
+/// off (#626).
+///
+/// This is the typed-model half of the apply step;
+/// [`apply_no_connect_carries`] is the S-expression half. Refuses before any
+/// write when a marker's pin cannot be followed one-to-one, and returns the
+/// carries for the caller to confirm against the written file with
+/// [`observed_no_connect_moves`].
+pub(crate) fn carry_no_connects(
+    path: &std::path::Path,
+    before_source: &str,
+    sch: &mut cse::Schematic,
+) -> Result<Vec<NoConnectCarry>, CallToolResult> {
+    if sch.no_connects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let after_source = sch.to_source();
+    let (Ok(before), Ok(after)) = (parse_sexp(before_source), parse_sexp(&after_source)) else {
+        return Err(no_connect_carry_unreadable(path));
+    };
+    let carries =
+        plan_no_connect_carry(&before, &after).map_err(|error| error.into_result(path))?;
+    for carry in &carries {
+        let Some(marker) = sch
+            .no_connects
+            .iter_mut()
+            .find(|marker| marker.uuid == carry.uuid)
+        else {
+            return Err(no_connect_carry_unwritable(path));
+        };
+        marker.x = carry.to.0;
+        marker.y = carry.to.1;
+    }
+    Ok(carries)
+}
+
+/// The marker moves as the written file records them.
+///
+/// Planned positions are not evidence: a move is reported only where the file
+/// now has that marker at that point, and a marker the readback cannot find
+/// there makes the whole mutation's outcome uncertain rather than a success
+/// with a footnote.
+pub(crate) fn observed_no_connect_moves(
+    path: &std::path::Path,
+    operation: &str,
+    carries: &[NoConnectCarry],
+) -> anyhow::Result<Result<Vec<serde_json::Value>, CallToolResult>> {
+    if carries.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let content = read_consistent(path)?;
+    let Ok(tree) = parse_sexp(&content) else {
+        return Ok(Err(crate::tools::mutation_outcome_uncertain(
+            path,
+            operation,
+            "the written schematic cannot be parsed to confirm the no-connect markers moved",
+        )));
+    };
+    let markers = tree.find_all("no_connect");
+    let mut moves = Vec::new();
+    for carry in carries {
+        let landed = markers.iter().find_map(|node| {
+            (node.find_str("uuid") == Some(carry.uuid.as_str()))
+                .then(|| konnect_sexp::schematic::parse_at(node))
+                .flatten()
+        });
+        let Some((x, y, _)) = landed.filter(|&(x, y, _)| {
+            konnect_sexp::geometry::points_coincident(x, y, carry.to.0, carry.to.1, 0.01)
+        }) else {
+            return Ok(Err(crate::tools::mutation_outcome_uncertain(
+                path,
+                operation,
+                format!(
+                    "no-connect {} is not at ({}, {}) in the written file, so the pin it protects may be on a net",
+                    carry.uuid, carry.to.0, carry.to.1
+                ),
+            )));
+        };
+        moves.push(json!({
+            "uuid": carry.uuid,
+            "from": { "x": carry.from.0, "y": carry.from.1 },
+            "to": { "x": x, "y": y }
+        }));
+    }
+    Ok(Ok(moves))
 }
 
 /// Re-evaluate the junction dots at `points` after geometry moved.
@@ -3631,6 +4112,80 @@ mod power_symbol_tests {
             ["#PWR001", "#PWR002", "#PWR003"],
             "the freed number belongs to the new symbol, and nothing may repeat"
         );
+    }
+}
+
+#[cfg(test)]
+mod no_connect_carry_tests {
+    use super::*;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+
+    /// The marker on `R2` pin 1, as KiCad wrote it into the fixture.
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+
+    fn tree(content: &str) -> konnect_sexp::SexpNode {
+        parse_sexp(content).expect("the fixture parses")
+    }
+
+    /// The fixture with `reference`'s placed symbol block cut out, standing in
+    /// for a mutation that removes the pin a marker protects.
+    fn without_symbol(reference: &str) -> String {
+        let blocks = crate::tools::find_all_symbol_instance_blocks(CARRY, reference);
+        assert_eq!(blocks.len(), 1, "the fixture places {reference} once");
+        let (start, end) = blocks[0];
+        format!("{}{}", &CARRY[..start], &CARRY[end..])
+    }
+
+    #[test]
+    fn a_sheet_no_placement_change_touched_carries_nothing() {
+        let carries = plan_no_connect_carry(&tree(CARRY), &tree(CARRY)).expect("nothing refuses");
+        assert!(carries.is_empty(), "{carries:?}");
+    }
+
+    #[test]
+    fn a_marker_whose_pin_left_the_result_refuses_rather_than_orphaning_it() {
+        let after = without_symbol("R2");
+        let error = plan_no_connect_carry(&tree(CARRY), &tree(&after))
+            .expect_err("R2 pin 1 is gone, so its marker cannot be followed");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable refusal, got {error:?}");
+        };
+        assert!(reason.contains(R2_MARKER), "{reason}");
+        assert!(reason.contains("0 matching pins"), "{reason}");
+    }
+
+    #[test]
+    fn unresolved_library_geometry_refuses_rather_than_reading_absence_as_no_pin() {
+        // Cutting lib_symbols leaves every placed symbol without pin geometry,
+        // which is stale state rather than evidence no pin is under a marker.
+        let (start, end) = find_block_starts(CARRY, "lib_symbols")
+            .first()
+            .and_then(|&start| find_balanced_block(CARRY, start))
+            .expect("the fixture carries lib_symbols");
+        let stripped = format!("{}{}", &CARRY[..start], &CARRY[end..]);
+        let error = plan_no_connect_carry(&tree(&stripped), &tree(&stripped))
+            .expect_err("pins that do not resolve cannot answer for a marker");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable refusal, got {error:?}");
+        };
+        assert!(
+            reason.contains("unresolved library pin geometry"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_marker_with_no_uuid_refuses_rather_than_being_left_behind() {
+        let anchor = format!("\t\t(uuid \"{R2_MARKER}\")\n");
+        assert_eq!(CARRY.matches(anchor.as_str()).count(), 1);
+        let anonymous = CARRY.replace(anchor.as_str(), "");
+        let error = plan_no_connect_carry(&tree(&anonymous), &tree(&anonymous))
+            .expect_err("a marker with no UUID cannot be identified to move");
+        let NoConnectCarryError::Unmappable { reason } = error else {
+            panic!("expected an unmappable refusal, got {error:?}");
+        };
+        assert!(reason.contains("has no UUID"), "{reason}");
     }
 }
 

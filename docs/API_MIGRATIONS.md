@@ -3,6 +3,58 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a placement change carries the no-connect on the pin it moves (minor release)
+
+A no-connect marker is a sheet item at a coordinate, so
+`move_schematic_component`, `rotate_schematic_component` and
+`bulk_move_schematic_components` used to leave it where it was while the pin it
+protected moved away. The junction pass then saw
+an unprotected pin, and where that pin had landed mid-span on a wire it wrote a
+dot — putting the pin the caller had explicitly declared unconnected onto that
+net (#626). ERC reported the stranded marker; nothing reported the new
+connection.
+
+All three now treat the marker as intent attached to a pin. The marker is
+followed by symbol instance UUID, unit, pin number and library pin geometry —
+never by coordinate coincidence alone — and moves in the same write as the
+symbol, so the junction pass sees it at the arrival point and adds no dot.
+
+All three responses gain `no_connects_moved_count` and `no_connects_moved`, an array
+of `{ uuid, from: { x, y }, to: { x, y } }` read back from the written file.
+A placement change that carries nothing reports `0` and `[]`. No existing field
+changes meaning, and `junctions_added_count` on a move or bulk shift can now be
+`0` where it was `1`, which is the fix.
+
+`move_region`, `replace_component` and `batch_place_components` reconcile no
+junctions at all yet (#622, #623, #625) and are unchanged here; they inherit
+this contract when they gain reconciliation.
+
+A placement change that cannot follow a marker one-to-one now **refuses before
+writing** instead of orphaning it:
+
+- `ambiguous_target` when the pins under one marker land on different points —
+  two pins stacked on it with only one of them moving — or when carrying it
+  would stack two markers on one point. `target` names the marker and its
+  position; `candidates` name the competing pins or markers.
+- `stale_target` when the sheet cannot answer for the marker at all: a
+  `lib_symbols` lookup that failed, a placed symbol with no UUID, or a marker
+  with no UUID to follow.
+
+A refusal leaves the file byte-identical. The remedy depends on which one it is:
+
+- For `ambiguous_target`, delete or replace the competing marker with
+  `delete_no_connect` / `add_no_connect`, then repeat the placement change.
+- For `stale_target` naming unresolved pin geometry, repair the sheet rather
+  than the marker: the refusal is sheet-wide, so **one** placed symbol whose
+  `lib_symbols` entry is missing blocks every placement change on a sheet that
+  has any no-connect, including changes nowhere near a marker. An unresolvable
+  symbol means Konnect cannot tell which pins sit under a marker at all, and
+  `delete_schematic_component` already refuses the same way for the same
+  reason. Re-embed the definition (re-place the symbol, or restore the
+  `lib_symbols` entry) and retry.
+- For `stale_target` naming a marker with no UUID, delete and re-add that
+  marker so KiCad's writer gives it one.
+
 ## Unreleased: explicit live-board synchronization for CLI DRC
 
 `run_drc` and `get_drc_violations` accept `sync_live_board: false` and

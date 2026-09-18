@@ -152,7 +152,10 @@ pub fn tools() -> Vec<ToolDef> {
             "Move multiple components by a uniform dx/dy offset in a single atomic file \
              write. Junction dots are re-judged where the pins moved: a dot the pins \
              leave unjustified is removed and a pin landing mid-span on a wire gains \
-             one, reported as junctions_pruned_count and junctions_added_count.",
+             one, reported as junctions_pruned_count and junctions_added_count. A \
+             no-connect flag travels with the pin it protects, reported as \
+             no_connects_moved; the shift is refused before writing when that pin \
+             cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -951,31 +954,34 @@ async fn handle_bulk_move(
         }
     }
 
-    // Pin positions before the shift, so a dot the pins vacate can be re-judged
-    // and a pin landing mid-span gets one (#120). A move changes no wires.
     const TOL: f64 = 0.01;
-    let pins_of = |src: &str| -> Vec<(f64, f64)> {
-        konnect_sexp::parse_sexp(src)
-            .ok()
-            .map(|t| crate::tools::all_pin_endpoints(&t))
-            .unwrap_or_default()
+    // Junction reconciliation needs the pins that moved (#120); the no-connect
+    // carry needs the symbols behind them (#626). Both read the same two sheet
+    // states, so each side is parsed once and the tree shared. A sheet with
+    // neither wires nor markers has no work for either and is not parsed at
+    // all.
+    let needs_trees = expected.contains("(wire") || expected.contains("(no_connect");
+    let tree_of = |src: &str| -> Option<konnect_sexp::SexpNode> {
+        needs_trees
+            .then(|| konnect_sexp::parse_sexp(src).ok())
+            .flatten()
     };
-    // No wires means nothing can be justified and nothing can be landed on, so
-    // the whole pass — including two full symbol/lib_symbols walks — is skipped.
-    let has_wires = expected.contains("(wire");
-    let before_pins = if has_wires {
-        pins_of(&expected)
-    } else {
-        Vec::new()
-    };
+    let before_tree = tree_of(&expected);
 
     let new_content = apply_edits(content, edits);
+    let after_tree = tree_of(&new_content);
 
-    let after_pins = if has_wires {
-        pins_of(&new_content)
-    } else {
-        Vec::new()
+    // No wires means nothing can be justified and nothing can be landed on, so
+    // the junction pass gets no candidates — the marker carry below still runs,
+    // since a marker follows its pin whether or not the sheet has wires.
+    let has_wires = expected.contains("(wire");
+    let pins_of = |tree: &Option<konnect_sexp::SexpNode>| -> Vec<(f64, f64)> {
+        tree.as_ref()
+            .filter(|_| has_wires)
+            .map(crate::tools::all_pin_endpoints)
+            .unwrap_or_default()
     };
+    let (before_pins, after_pins) = (pins_of(&before_tree), pins_of(&after_tree));
     let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
         a.iter()
             .copied()
@@ -987,10 +993,44 @@ async fn handle_bulk_move(
     };
     let mut points = differs(&before_pins, &after_pins);
     points.extend(differs(&after_pins, &before_pins));
+
+    // A no-connect belongs to the pin, not to the coordinate it was dropped
+    // on, so it travels in this same write — and the reconciliation below then
+    // sees it at the arrival point and adds no dot (#626).
+    let carried = if expected.contains("(no_connect") {
+        let (Some(before), Some(after)) = (&before_tree, &after_tree) else {
+            return Ok(crate::tools::sch_wiring::no_connect_carry_unreadable(
+                &sch_path,
+            ));
+        };
+        match crate::tools::sch_wiring::plan_no_connect_carry(before, after) {
+            Ok(carried) => carried,
+            Err(error) => return Ok(error.into_result(&sch_path)),
+        }
+    } else {
+        Vec::new()
+    };
+    let Some(new_content) =
+        crate::tools::sch_wiring::apply_no_connect_carries(new_content, &carried)
+    else {
+        return Ok(crate::tools::sch_wiring::no_connect_carry_unwritable(
+            &sch_path,
+        ));
+    };
+
     let (new_content, junctions_added, junctions_pruned) =
         crate::tools::sch_wiring::reconcile_junctions_at(new_content, &points);
 
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+
+    let moved_markers = match crate::tools::sch_wiring::observed_no_connect_moves(
+        &sch_path,
+        "bulk_move_schematic_components",
+        &carried,
+    )? {
+        Ok(moved) => moved,
+        Err(error) => return Ok(error),
+    };
 
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
@@ -998,6 +1038,8 @@ async fn handle_bulk_move(
         "dx": dx, "dy": dy,
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers,
         "errors": errors
     })))
 }
@@ -3301,6 +3343,98 @@ mod insert_order_tests {
             close > inst,
             "this test is meaningless if the last paren precedes the instances"
         );
+    }
+}
+
+#[cfg(test)]
+mod bulk_move_no_connect_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("carry.kicad_sch");
+        std::fs::write(&path, CARRY).unwrap();
+        (directory, path)
+    }
+
+    fn text(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// A bulk shift reconciles junctions like the single-component move, so it
+    /// owes the markers the same trip (#626).
+    #[tokio::test]
+    async fn a_bulk_shift_carries_the_marker_and_adds_no_dot() {
+        let (_directory, path) = fixture();
+        // R2 pin 1 goes from (158.75, 156.21) to (154.94, 160.02), mid-span on
+        // the NETB wire — the same arrival the single-component move lands on.
+        let result = handle_bulk_move(
+            &json!({ "schematic": path, "references": ["R2"], "dx": -3.81, "dy": 3.81 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = text(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        assert_eq!(
+            response["no_connects_moved"][0]["uuid"], R2_MARKER,
+            "{response}"
+        );
+        assert_eq!(
+            response["no_connects_moved"][0]["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+        assert_eq!(response["junctions_added_count"], 0, "{response}");
+
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(committed.contains("(at 154.94 160.02)"), "{committed}");
+    }
+
+    #[tokio::test]
+    async fn a_bulk_shift_that_cannot_follow_a_marker_writes_nothing() {
+        let (_directory, path) = fixture();
+        // R3 alone leaves R5 pin 1 behind under the marker they share.
+        let result = handle_bulk_move(
+            &json!({ "schematic": path, "references": ["R3"], "dx": -12.7, "dy": 0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("ambiguous_target".to_string()),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CARRY);
     }
 }
 

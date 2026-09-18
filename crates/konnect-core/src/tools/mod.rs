@@ -939,21 +939,23 @@ pub(crate) fn is_power_symbol_reference(reference: &str) -> bool {
     reference.starts_with('#')
 }
 
+/// Each placed symbol instance with the pins it put on the sheet, as
+/// [`placed_pins_by_reference`] reports them.
+pub(crate) type PlacedPinsByReference = Vec<(
+    konnect_sexp::schematic::SymbolInstance,
+    Vec<(
+        konnect_sexp::schematic::LibPin,
+        konnect_sexp::geometry::PinTransform,
+    )>,
+)>;
+
 /// [`placed_pins`], grouped under the instance that placed each unit, for
 /// callers that report pins by name rather than position. The whole instance
 /// is returned because a caller reporting a pin usually wants its reference
 /// *and* something else about the component — value, uuid, unit — and a
 /// reference alone collapses on a pre-annotation sheet where every part is
 /// `R?`.
-pub(crate) fn placed_pins_by_reference(
-    tree: &konnect_sexp::SexpNode,
-) -> Vec<(
-    konnect_sexp::schematic::SymbolInstance,
-    Vec<(
-        konnect_sexp::schematic::LibPin,
-        konnect_sexp::geometry::PinTransform,
-    )>,
-)> {
+pub(crate) fn placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedPinsByReference {
     use konnect_sexp::schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
     };
@@ -978,6 +980,25 @@ pub(crate) fn placed_pins_by_reference(
     }
     by_reference
 }
+
+/// [`placed_pins_by_reference`], but only when *every* placed symbol resolved.
+///
+/// A `lib_symbols` lookup that failed is stale state, not evidence that the
+/// symbol has no pins, so a caller deciding what is attached to a coordinate
+/// must be able to tell the two apart. `None` says the sheet cannot answer;
+/// it never means "no pins here".
+pub(crate) fn resolved_placed_pins_by_reference(
+    tree: &konnect_sexp::SexpNode,
+) -> Option<PlacedPinsByReference> {
+    let grouped = placed_pins_by_reference(tree);
+    let placed = konnect_sexp::schematic::extract_symbol_instances(tree).len();
+    (grouped.len() == placed).then_some(grouped)
+}
+
+/// The reason a sheet cannot answer for its own pins, shared by every caller
+/// that refuses on [`resolved_placed_pins_by_reference`] returning `None`.
+pub(crate) const UNRESOLVED_PIN_GEOMETRY: &str =
+    "one or more placed symbols have unresolved library pin geometry";
 
 /// All symbol pin connection points in a parsed schematic tree. These drive
 /// junction insertion, and a dot dropped on a phantom pin where two wires

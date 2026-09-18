@@ -11,7 +11,9 @@ use crate::mcp::{
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
-    require_array, require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
+    require_array, require_f64, require_str,
+    sch_wiring::{carry_no_connects, observed_no_connect_moves},
+    ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -194,7 +196,9 @@ pub fn tools() -> Vec<ToolDef> {
              other placed unit by the same delta. Does NOT adjust connected wires. \
              Junction dots are re-judged where the pins moved: a dot the pins leave \
              unjustified is removed and a pin landing mid-span on a wire gains one, \
-             reported as junctions_pruned_count and junctions_added_count.",
+             reported as junctions_pruned_count and junctions_added_count. A no-connect \
+             flag travels with the pin it protects, reported as no_connects_moved; the \
+             move is refused before writing when that pin cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -209,7 +213,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "rotate_schematic_component",
-            "Set the lowest-numbered unit's absolute rotation and rotate every other placed unit by the same delta.",
+            "Set the lowest-numbered unit's absolute rotation and rotate every other placed \
+             unit by the same delta. A no-connect flag travels with the pin it protects, \
+             reported as no_connects_moved; the turn is refused before writing when that \
+             pin cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2139,14 +2146,9 @@ pub(crate) fn plan_component_and_item_deletions(
     let grouped = if selected.is_empty() {
         Vec::new()
     } else {
-        let grouped = crate::tools::placed_pins_by_reference(&tree);
-        if grouped.len() != instances.len() {
-            return Err(ComponentDeleteTargetError::stale(
-                path,
-                "one or more placed symbols have unresolved library pin geometry",
-            ));
-        }
-        grouped
+        crate::tools::resolved_placed_pins_by_reference(&tree).ok_or_else(|| {
+            ComponentDeleteTargetError::stale(path, crate::tools::UNRESOLVED_PIN_GEOMETRY)
+        })?
     };
     let selected_ids = unit_uuids.iter().cloned().collect::<BTreeSet<_>>();
     let mut affected = Vec::new();
@@ -3228,7 +3230,8 @@ async fn handle_move_schematic_component(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let before_source = sch.to_source();
+    let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -3253,8 +3256,19 @@ async fn handle_move_schematic_component(
     {
         symbol.translate(dx, dy);
     }
+    // A no-connect belongs to the pin, not to the coordinate it was dropped
+    // on, so it travels in this same write (#626).
+    let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+        Ok(carried) => carried,
+        Err(error) => return Ok(error),
+    };
     sch.overwrite()?;
     let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
+    let moved_markers =
+        match observed_no_connect_moves(&sch_path, "move_schematic_component", &carried)? {
+            Ok(moved) => moved,
+            Err(error) => return Ok(error),
+        };
     let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -3266,7 +3280,9 @@ async fn handle_move_schematic_component(
         "moved_units": observed["unit_count"],
         "placements": observed["units"],
         "junctions_added_count": added,
-        "junctions_pruned_count": pruned
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
@@ -3333,7 +3349,8 @@ async fn handle_rotate_schematic_component(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut target = match component_target_from_source(&sch_path, &sch.to_source(), &reference) {
+    let before_source = sch.to_source();
+    let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -3363,7 +3380,18 @@ async fn handle_rotate_schematic_component(
         let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
         symbol.set_rotation(new_rotation);
     }
+    // A turn relocates pin endpoints exactly as a move does, so the markers on
+    // those pins travel with them here too (#626).
+    let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+        Ok(carried) => carried,
+        Err(error) => return Ok(error),
+    };
     sch.overwrite()?;
+    let moved_markers =
+        match observed_no_connect_moves(&sch_path, "rotate_schematic_component", &carried)? {
+            Ok(moved) => moved,
+            Err(error) => return Ok(error),
+        };
     let observed = match load_component_mutation_readback(&sch_path, &target)? {
         Ok(observed) => observed,
         Err(error) => return Ok(error),
@@ -3372,7 +3400,9 @@ async fn handle_rotate_schematic_component(
         "rotated": observed["reference"],
         "rotation": observed["rotation"],
         "rotated_units": observed["unit_count"],
-        "placements": observed["units"]
+        "placements": observed["units"],
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
@@ -6378,6 +6408,284 @@ mod move_connected_tests {
 }
 
 #[cfg(test)]
+mod no_connect_carry_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::tools::{sch_wiring::NoConnectCarry, ServerConfig};
+    use std::sync::Arc;
+
+    use super::component_delete_connectivity_tests::has_junction;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+
+    /// The marker KiCad wrote onto `R2` pin 1, and the one it wrote on nothing.
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+    const DANGLING_MARKER: &str = "493fbe64-0015-4848-87bd-797fff8aa3fd";
+    const STACKED_MARKER: &str = "3627efa6-e463-4121-ac35-b9056319db36";
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("carry.kicad_sch");
+        std::fs::write(&path, CARRY).unwrap();
+        (directory, path)
+    }
+
+    /// The tool's JSON body, whether it succeeded or refused — the caller
+    /// asserts which it expected.
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Where the file now has the marker with this UUID.
+    fn marker_at(content: &str, uuid: &str) -> (f64, f64) {
+        let tree = parse_sexp(content).expect("the written sheet parses");
+        tree.find_all("no_connect")
+            .into_iter()
+            .find(|node| node.find_str("uuid") == Some(uuid))
+            .and_then(konnect_sexp::schematic::parse_at)
+            .map(|(x, y, _)| (x, y))
+            .unwrap_or_else(|| panic!("no-connect {uuid} is missing from the written sheet"))
+    }
+
+    #[tokio::test]
+    async fn a_move_carries_the_marker_and_leaves_the_protected_pin_off_the_wire() {
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "x": 154.94, "y": 163.83 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        let moved = &response["no_connects_moved"][0];
+        assert_eq!(moved["uuid"], R2_MARKER, "{response}");
+        assert_eq!(
+            moved["from"],
+            json!({ "x": 158.75, "y": 156.21 }),
+            "{response}"
+        );
+        assert_eq!(
+            moved["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+        // The pin lands mid-span on the NETB wire. KiCad reaches it only
+        // through a junction dot, so the carried marker must stop the dot
+        // being written — otherwise the pin joins /NETB (#626).
+        assert_eq!(response["junctions_added_count"], 0, "{response}");
+
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (154.94, 160.02));
+        assert!(!has_junction(&committed, 154.94, 160.02));
+    }
+
+    #[tokio::test]
+    async fn a_turn_carries_the_marker_the_same_way_a_move_does() {
+        let (_directory, path) = fixture();
+        let result = handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "rotation": 90 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        let moved = &response["no_connects_moved"][0];
+        assert_eq!(moved["uuid"], R2_MARKER, "{response}");
+        assert_eq!(
+            moved["to"],
+            json!({ "x": 154.94, "y": 160.02 }),
+            "{response}"
+        );
+
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (154.94, 160.02));
+    }
+
+    #[tokio::test]
+    async fn a_placement_change_carrying_nothing_leaves_every_marker_alone() {
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R4", "x": 139.7, "y": 175.26 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(response["no_connects_moved_count"], 0, "{response}");
+        assert_eq!(response["no_connects_moved"], json!([]), "{response}");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(marker_at(&committed, R2_MARKER), (158.75, 156.21));
+        assert_eq!(marker_at(&committed, DANGLING_MARKER), (180.34, 120.65));
+        assert_eq!(marker_at(&committed, STACKED_MARKER), (114.3, 105.41));
+    }
+
+    #[tokio::test]
+    async fn a_marker_under_two_pins_refuses_the_move_and_writes_nothing() {
+        for (reference, x, y) in [("R3", 101.6, 101.6), ("R5", 101.6, 109.22)] {
+            let (_directory, path) = fixture();
+            let result = handle_move_schematic_component(
+                &json!({ "schematic": path, "reference": reference, "x": x, "y": y }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{result:?}");
+            let response = body(&result);
+
+            assert_eq!(
+                extract_error_kind(&result),
+                Some("ambiguous_target".to_string()),
+                "{response}"
+            );
+            assert_eq!(
+                response["error"]["target"],
+                format!("no-connect {STACKED_MARKER} at (114.3, 105.41)"),
+                "{response}"
+            );
+            let candidates = response["error"]["candidates"]
+                .as_array()
+                .expect("candidates are listed")
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(candidates.len(), 2, "{response}");
+            assert!(
+                candidates
+                    .iter()
+                    .any(|c| c.contains("R3") && c.contains("pin 2")),
+                "{response}"
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .any(|c| c.contains("R5") && c.contains("pin 1")),
+                "{response}"
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                CARRY,
+                "refusing {reference} must leave the file byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_the_written_file_does_not_show_makes_the_outcome_uncertain() {
+        // The report is read back from the file, never from the plan: a marker
+        // the write did not land is the difference between "your pin is still
+        // protected" and "your pin may be on a net".
+        let (_directory, path) = fixture();
+        let landed = crate::tools::sch_wiring::NoConnectCarry {
+            uuid: R2_MARKER.to_owned(),
+            from: (158.75, 156.21),
+            to: (158.75, 156.21),
+        };
+        let reported = observed_no_connect_moves(
+            &path,
+            "move_schematic_component",
+            std::slice::from_ref(&landed),
+        )
+        .unwrap()
+        .expect("the fixture does have that marker at that point");
+        assert_eq!(reported[0]["to"], json!({ "x": 158.75, "y": 156.21 }));
+
+        let elsewhere = NoConnectCarry {
+            to: (1.0, 1.0),
+            ..landed
+        };
+        let result = observed_no_connect_moves(&path, "move_schematic_component", &[elsewhere])
+            .unwrap()
+            .expect_err("the marker is not at (1, 1), so the outcome is not proven");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("mutation_outcome_uncertain".to_string()),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marker_with_an_empty_uuid_refuses_on_the_typed_path_too() {
+        // The typed model reads a missing UUID as "" and writes it back as
+        // (uuid ""), so a marker that the S-expression path refuses must not
+        // slip through here keyed on the empty string — two of them would
+        // share that key and the carry would follow the wrong one.
+        let (_directory, path) = fixture();
+        let anonymous = CARRY.replace(&format!("\t\t(uuid \"{R2_MARKER}\")\n"), "");
+        assert!(!anonymous.contains(R2_MARKER));
+        std::fs::write(&path, &anonymous).unwrap();
+
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "x": 154.94, "y": 163.83 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("stale_target".to_string()),
+            "{:?}",
+            body(&result)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), anonymous);
+    }
+
+    #[tokio::test]
+    async fn a_carry_that_would_stack_two_markers_refuses_and_writes_nothing() {
+        // R2 pin 1 lands exactly on the marker that is dangling on purpose.
+        // Two markers on one point belong to neither pin, so this refuses
+        // rather than writing a sheet no caller can read back.
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R2", "x": 180.34, "y": 124.46 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let response = body(&result);
+
+        assert_eq!(
+            extract_error_kind(&result),
+            Some("ambiguous_target".to_string()),
+            "{response}"
+        );
+        let candidates = response["error"]["candidates"].to_string();
+        assert!(candidates.contains(R2_MARKER), "{response}");
+        assert!(candidates.contains(DANGLING_MARKER), "{response}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CARRY);
+    }
+}
+
+#[cfg(test)]
 mod component_delete_connectivity_tests {
     use super::*;
     use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
@@ -6416,7 +6724,7 @@ mod component_delete_connectivity_tests {
         serde_json::from_str(text).unwrap()
     }
 
-    fn has_junction(content: &str, x: f64, y: f64) -> bool {
+    pub(super) fn has_junction(content: &str, x: f64, y: f64) -> bool {
         let tree = parse_sexp(content).unwrap();
         konnect_sexp::schematic::extract_junctions(&tree)
             .iter()

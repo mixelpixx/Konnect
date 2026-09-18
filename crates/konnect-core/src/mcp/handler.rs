@@ -1012,6 +1012,107 @@ mod reliability_contract_dispatch_tests {
 }
 
 #[cfg(test)]
+mod no_connect_carry_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const CARRY: &str = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+    const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, name: &str, arguments: Value) -> Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .expect("request returns a response");
+        response.result.expect("successful JSON-RPC response")
+    }
+
+    fn text_body(result: &Value) -> Value {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        serde_json::from_str(text).expect("tool body is JSON")
+    }
+
+    /// `no_connects_moved` and `no_connects_moved_count` are public response
+    /// fields (#626); prove they survive the served `tools/call` boundary with
+    /// the marker actually written to the file.
+    #[tokio::test]
+    async fn a_move_reports_the_marker_it_carried_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("carry.kicad_sch");
+        std::fs::write(&schematic, CARRY).unwrap();
+
+        let result = call(
+            &handler,
+            "move_schematic_component",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "reference": "R2",
+                "x": 154.94,
+                "y": 163.83
+            }),
+        )
+        .await;
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body = text_body(&result);
+        assert_eq!(body["no_connects_moved_count"], 1, "{body}");
+        assert_eq!(body["no_connects_moved"][0]["uuid"], R2_MARKER, "{body}");
+        assert_eq!(body["junctions_added_count"], 0, "{body}");
+        assert!(std::fs::read_to_string(&schematic)
+            .unwrap()
+            .contains("(at 154.94 160.02)"));
+    }
+
+    /// The refusal has to survive the same boundary, structured and with the
+    /// file untouched — a caller that only sees `isError` still must not be
+    /// told a placement change happened.
+    #[tokio::test]
+    async fn an_unfollowable_marker_refuses_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("carry.kicad_sch");
+        std::fs::write(&schematic, CARRY).unwrap();
+
+        let result = call(
+            &handler,
+            "move_schematic_component",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "reference": "R3",
+                "x": 101.6,
+                "y": 101.6
+            }),
+        )
+        .await;
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let body = text_body(&result);
+        assert_eq!(body["error"]["kind"], "ambiguous_target", "{body}");
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), CARRY);
+    }
+}
+
+#[cfg(test)]
 mod annotate_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;
