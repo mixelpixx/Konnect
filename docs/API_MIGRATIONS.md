@@ -171,6 +171,24 @@ it refuses. `board_source: "saved"` inspects that snapshot deliberately.
 Callers that want the previous behaviour exactly should pass
 `board_source: "saved"`.
 
+## Unreleased: `add_power_symbol` spells designators as eeschema does (patch release)
+
+`add_power_symbol` numbered its hidden designators `#PWR001`, `#PWR002`, and
+past ninety-nine `#PWR100`. eeschema writes the prefix, a `0`, then the number:
+`#PWR01`, `#PWR010`, `#PWR0100`. `annotate_schematic` already follows eeschema,
+so one sheet could carry both spellings of the same series.
+
+`add_power_symbol` now uses the same rule. The `reference` it reports, and
+writes to the `Reference` property and to each instance record, changes for
+numbers 1 to 9 (`#PWR001` becomes `#PWR01`) and from 100 upward (`#PWR100`
+becomes `#PWR0100`). For 10 to 99 the two spellings are the same text. No field
+is added, removed or renamed.
+
+Designators already in a file are not rewritten. The older spellings still
+count toward the free-number search, so a sheet holding `#PWR001` and `#PWR002`
+is handed `#PWR03`, never a duplicate. A caller that matched the literal text
+`#PWR001` should read `reference` from the response instead.
+
 ## Unreleased: force-directed refinement refuses unsafe plans
 
 `refine_placement_force_directed` is deprecated as a recommended bulk-cleanup
