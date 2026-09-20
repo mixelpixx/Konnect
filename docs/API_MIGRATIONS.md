@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `run_erc` refuses a report it does not recognise (patch release)
+
+`run_erc` decoded kicad-cli's JSON report leniently: a missing or wrong-typed
+`sheets` array produced an empty violation list, and a sheet without a
+`violations` array was skipped. Zero violations is what a clean schematic looks
+like, so a report Konnect did not recognise — the configured `kicad_cli` not
+being KiCad's, a wrapper script, a truncated file, a future schema — was served
+as `total: 0, errors: 0, warnings: 0` (#581). `run_drc` already refused the
+equivalent DRC case.
+
+`run_erc` now returns an error that says what was wrong: no `sheets` array
+(naming the top-level keys it found), an empty `sheets` array, or a sheet with
+no `violations` array (naming the sheet). kicad-cli writes all three for every
+schematic; a blank sheet still reports its root with `"violations": []`
+(measured on 10.0.5), so a real ERC run is unaffected. Fields the schema leaves
+optional (`items`, `pos`, `uuid`) stay optional. No argument or success-path
+response field changed.
+
 ## Unreleased: force-directed refinement refuses unsafe plans
 
 `refine_placement_force_directed` is deprecated as a recommended bulk-cleanup

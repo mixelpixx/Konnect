@@ -145,7 +145,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "run_erc",
             "Run the Electrical Rules Check (ERC) on the schematic via kicad-cli \
-             and return a list of violations filtered by severity.",
+             and return a list of violations filtered by severity. A report that is not in \
+             kicad-cli's ERC shape is an error, never zero violations.",
             json!({
                 "type": "object",
                 "properties": {

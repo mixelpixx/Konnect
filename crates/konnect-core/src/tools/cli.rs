@@ -668,8 +668,9 @@ async fn run_erc_with_temp_root(
         let json_str = tokio::fs::read_to_string(&out_path)
             .await
             .context("ERC output file not found")?;
-        let raw: serde_json::Value = serde_json::from_str(&json_str)?;
-        Ok(parse_erc_json(&raw))
+        let raw: serde_json::Value =
+            serde_json::from_str(&json_str).context("kicad-cli's ERC report is not valid JSON")?;
+        parse_erc_json(&raw)
     }
     .await;
 
@@ -686,22 +687,53 @@ async fn run_erc_with_temp_root(
     }
 }
 
-fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
+/// Decode `kicad-cli sch erc --format json`.
+///
+/// A report Konnect does not recognise is an error, never an empty list. Zero
+/// violations is what a clean schematic looks like, so a missing `sheets`
+/// array, an empty one, or a sheet without a `violations` array would each
+/// read as "ERC passed" (#581). kicad-cli writes all three for every
+/// schematic — a blank sheet still reports its root with `"violations": []`
+/// (measured on 10.0.5) — so their absence means this is not an ERC report.
+/// `parse_drc_report` makes the same decision for DRC. Fields the schema
+/// leaves optional (`items`, `pos`, `uuid`) stay optional.
+fn parse_erc_json(raw: &serde_json::Value) -> Result<Vec<ErcViolation>> {
     // KiCAD's ERC report (https://schemas.kicad.org/erc.v1.json) nests
     // violations per sheet — { "sheets": [ { "path": …, "violations": […] } ] }
     // — with positions on the affected items. There is no top-level
     // "violations" key (that's the DRC report's shape), so reading one here
-    // silently returned zero violations for every schematic.
-    let Some(sheets) = raw.get("sheets").and_then(|s| s.as_array()) else {
-        return Vec::new();
-    };
+    // silently returned zero violations for every schematic (#31).
+    let sheets = raw
+        .get("sheets")
+        .and_then(|s| s.as_array())
+        .with_context(|| {
+            format!(
+                "ERC report has no 'sheets' array; kicad-cli did not produce an ERC report ({})",
+                describe_report_root(raw)
+            )
+        })?;
+    if sheets.is_empty() {
+        anyhow::bail!(
+            "ERC report lists no sheets, so nothing was checked; kicad-cli reports at least the \
+             root sheet for every schematic"
+        );
+    }
 
     let mut out = Vec::new();
-    for sheet in sheets {
+    for (index, sheet) in sheets.iter().enumerate() {
         let sheet_path = sheet.get("path").and_then(|p| p.as_str()).map(String::from);
-        let Some(violations) = sheet.get("violations").and_then(|v| v.as_array()) else {
-            continue;
-        };
+        let violations = sheet
+            .get("violations")
+            .and_then(|v| v.as_array())
+            .with_context(|| {
+                let which = match &sheet_path {
+                    Some(path) => format!("'{path}'"),
+                    None => format!("#{index}"),
+                };
+                format!(
+                    "ERC report sheet {which} has no 'violations' array, so its result is unknown"
+                )
+            })?;
         for v in violations {
             let items: Vec<ReportItem> = v
                 .get("items")
@@ -727,7 +759,19 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
             });
         }
     }
-    out
+    Ok(out)
+}
+
+/// What the top of an unrecognised report looks like, for the refusal.
+fn describe_report_root(raw: &serde_json::Value) -> String {
+    match raw.as_object() {
+        Some(object) if object.is_empty() => "the document is an empty object".to_string(),
+        Some(object) => format!(
+            "top-level keys: {}",
+            object.keys().cloned().collect::<Vec<_>>().join(", ")
+        ),
+        None => "the document root is not an object".to_string(),
+    }
 }
 
 /// Decode one item of an ERC or DRC violation — the two reports spell it the
@@ -2176,6 +2220,10 @@ mod erc_parse_tests {
         )
     }
 
+    /// A report kicad-cli could write for a schematic with nothing wrong.
+    /// No character in it is special to `cmd.exe`'s `echo`.
+    const CLEAN_REPORT: &str = r#"{"sheets":[{"path":"/","violations":[]}]}"#;
+
     fn assert_empty(directory: &Path) {
         assert_eq!(
             std::fs::read_dir(directory).unwrap().count(),
@@ -2259,7 +2307,7 @@ mod erc_parse_tests {
             control.path(),
             "erc-success",
             &observed,
-            Some(r#"{"sheets":[]}"#),
+            Some(CLEAN_REPORT),
             0,
         );
 
@@ -2298,20 +2346,8 @@ mod erc_parse_tests {
 
         let observed_a = control.path().join("observed-a.txt");
         let observed_b = control.path().join("observed-b.txt");
-        let cli_a = erc_cli(
-            control.path(),
-            "erc-a",
-            &observed_a,
-            Some(r#"{"sheets":[]}"#),
-            0,
-        );
-        let cli_b = erc_cli(
-            control.path(),
-            "erc-b",
-            &observed_b,
-            Some(r#"{"sheets":[]}"#),
-            0,
-        );
+        let cli_a = erc_cli(control.path(), "erc-a", &observed_a, Some(CLEAN_REPORT), 0);
+        let cli_b = erc_cli(control.path(), "erc-b", &observed_b, Some(CLEAN_REPORT), 0);
 
         let (result_a, result_b) = tokio::join!(
             run_erc_with_temp_root(cli_a.to_str().unwrap(), &schematic, Some(scratch.path())),
@@ -2371,7 +2407,7 @@ mod erc_parse_tests {
 
     #[test]
     fn parses_violations_nested_under_sheets() {
-        let violations = parse_erc_json(&real_report());
+        let violations = parse_erc_json(&real_report()).unwrap();
         assert_eq!(
             violations.len(),
             3,
@@ -2395,7 +2431,7 @@ mod erc_parse_tests {
     /// caller back to `kicad-cli` by hand.
     #[test]
     fn every_item_of_a_violation_survives() {
-        let conflict = &parse_erc_json(&real_report())[2];
+        let conflict = &parse_erc_json(&real_report()).unwrap()[2];
         assert_eq!(conflict.items.len(), 2);
         assert!(conflict.items[0].description.contains("#PWR031"));
         let explains = &conflict.items[1];
@@ -2410,7 +2446,7 @@ mod erc_parse_tests {
     /// `type` is the addressable key; `description` beside it is prose.
     #[test]
     fn violations_carry_kicads_rule_key() {
-        let violations = parse_erc_json(&real_report());
+        let violations = parse_erc_json(&real_report()).unwrap();
         assert_eq!(violations[0].rule, "pin_not_connected");
         assert_eq!(violations[2].rule, "pin_to_pin");
     }
@@ -2419,7 +2455,7 @@ mod erc_parse_tests {
     /// second item must not change what it says.
     #[test]
     fn the_description_still_names_the_first_item_only() {
-        let conflict = &parse_erc_json(&real_report())[2];
+        let conflict = &parse_erc_json(&real_report()).unwrap()[2];
         assert!(conflict.description.contains("#PWR031"));
         assert!(!conflict.description.contains("U2"));
     }
@@ -2438,22 +2474,87 @@ mod erc_parse_tests {
                     "type": "label_dangling"
                 }]
             }]
-        }));
+        }))
+        .unwrap();
         assert_eq!(violations[0].items.len(), 1);
         assert!(violations[0].items[0].pos.is_none());
         assert!(violations[0].items[0].uuid.is_none());
         assert!(violations[0].description.contains("Label VIN"));
     }
 
+    /// What kicad-cli 10.0.5 writes for a schematic with nothing wrong: the
+    /// root sheet is always listed and always carries a `violations` array.
     #[test]
-    fn empty_or_alien_reports_yield_no_violations() {
-        assert!(parse_erc_json(&serde_json::json!({})).is_empty());
-        assert!(parse_erc_json(&serde_json::json!({ "sheets": [] })).is_empty());
-        // DRC-shaped input (top-level violations) is not an ERC report.
-        assert!(
-            parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
-                .is_empty()
-        );
+    fn a_clean_report_is_an_empty_list() {
+        let clean: serde_json::Value = serde_json::from_str(CLEAN_REPORT).unwrap();
+        assert!(parse_erc_json(&clean).unwrap().is_empty());
+        let hierarchy = serde_json::json!({
+            "$schema": "https://schemas.kicad.org/erc.v1.json",
+            "sheets": [
+                { "path": "/", "uuid_path": "/a", "violations": [] },
+                { "path": "/ampli_ht_vertical/", "uuid_path": "/a/b", "violations": [] }
+            ]
+        });
+        assert!(parse_erc_json(&hierarchy).unwrap().is_empty());
+    }
+
+    /// Zero violations is what a clean schematic looks like, so a report of
+    /// any other shape must be an error and must say what was wrong with it
+    /// (#581). This used to be pinned the other way round.
+    #[test]
+    fn reports_of_another_shape_are_refused_not_read_as_clean() {
+        for (report, names) in [
+            (serde_json::json!({}), "'sheets'"),
+            // DRC-shaped input (top-level violations) is not an ERC report.
+            (
+                serde_json::json!({ "violations": [{ "severity": "error" }] }),
+                "top-level keys: violations",
+            ),
+            (serde_json::json!({ "sheets": "not an array" }), "'sheets'"),
+            (serde_json::json!([]), "not an object"),
+            (serde_json::json!({ "sheets": [] }), "no sheets"),
+            (
+                serde_json::json!({ "sheets": [{ "path": "/power/" }] }),
+                "sheet '/power/'",
+            ),
+            (
+                serde_json::json!({ "sheets": [
+                    { "path": "/", "violations": [] },
+                    { "violations": "not an array" }
+                ] }),
+                "sheet #1",
+            ),
+        ] {
+            let error =
+                parse_erc_json(&report).expect_err("an unrecognised report is not a clean result");
+            let message = format!("{error:#}");
+            assert!(message.contains(names), "{report}: {message}");
+        }
+    }
+
+    /// The same refusal through the real invocation path, with a stand-in
+    /// kicad-cli that exits 0 and writes a report of the wrong shape.
+    #[tokio::test]
+    async fn run_erc_refuses_an_unrecognised_report_and_cleans_up() {
+        for (stem, report) in [
+            ("erc-empty-object", "{}"),
+            ("erc-drc-shaped", r#"{"violations":[]}"#),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            let control = tempfile::tempdir().unwrap();
+            let schematic = project.path().join("clock.kicad_sch");
+            std::fs::write(&schematic, "(kicad_sch)").unwrap();
+            let observed = control.path().join("observed.txt");
+            let cli = erc_cli(control.path(), stem, &observed, Some(report), 0);
+
+            let error =
+                run_erc_with_temp_root(cli.to_str().unwrap(), &schematic, Some(scratch.path()))
+                    .await
+                    .expect_err("a report of the wrong shape is not zero violations");
+            assert!(format!("{error:#}").contains("'sheets'"), "{error:#}");
+            assert_empty(scratch.path());
+        }
     }
 }
 

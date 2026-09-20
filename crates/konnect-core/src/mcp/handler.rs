@@ -2212,3 +2212,98 @@ mod client_adaptation_tests {
         assert!(!client_caches_tool_list(""));
     }
 }
+
+#[cfg(test)]
+mod erc_report_shape_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// A blank KiCad schematic: enough for `run_erc` to accept it as a project
+    /// root before it reaches the stand-in kicad-cli.
+    const BLANK_SCHEMATIC: &str = "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(generator_version \"9.0\")\n\t(uuid \"6f1c2f0a-3b7e-4c55-9a53-0d6c5c1f7a11\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\t(sheet_instances\n\t\t(path \"/\"\n\t\t\t(page \"1\")\n\t\t)\n\t)\n)\n";
+
+    /// A stand-in kicad-cli that exits 0 and writes `report` to the `--output`
+    /// path (`sch erc --output <path> …`, so the fourth argument).
+    fn erc_cli_writing(dir: &std::path::Path, stem: &str, report: &str) -> std::path::PathBuf {
+        crate::tools::cli::test_support::write_script(
+            dir,
+            stem,
+            &format!("#!/bin/sh\nprintf '%s' '{report}' > \"$4\"\nexit 0\n"),
+            &format!("@echo off\r\n> \"%~4\" echo {report}\r\nexit /b 0\r\n"),
+        )
+    }
+
+    async fn run_erc_through_dispatch(stem: &str, report: &str) -> (bool, String) {
+        let control = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let schematic = project.path().join("clock.kicad_sch");
+        std::fs::write(&schematic, BLANK_SCHEMATIC).unwrap();
+        let cli = erc_cli_writing(control.path(), stem, report);
+
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_erc",
+                    "arguments": { "schematic": schematic.display().to_string() }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns text")
+            .to_string();
+        (result["isError"] == json!(true), text)
+    }
+
+    /// #581 through the served boundary: a kicad-cli that exits 0 and writes
+    /// something that is not an ERC report must not come back as a clean ERC.
+    #[tokio::test]
+    async fn an_unrecognised_erc_report_is_an_error_not_zero_violations() {
+        for (stem, report) in [
+            ("erc-empty-object", "{}"),
+            ("erc-drc-shaped", r#"{"violations":[]}"#),
+            ("erc-no-sheets", r#"{"sheets":[]}"#),
+            (
+                "erc-sheet-without-violations",
+                r#"{"sheets":[{"path":"/"}]}"#,
+            ),
+        ] {
+            let (is_error, text) = run_erc_through_dispatch(stem, report).await;
+            assert!(is_error, "{report} was served as a result: {text}");
+            assert!(text.contains("ERC report"), "{report}: {text}");
+            assert!(
+                !text.contains("\"total\""),
+                "{report}: no violation count may be reported: {text}"
+            );
+        }
+    }
+
+    /// The control: a report kicad-cli could write for a clean schematic is a
+    /// clean result, so the refusal above is about shape and not about zero.
+    #[tokio::test]
+    async fn a_conforming_clean_report_is_still_a_clean_result() {
+        let (is_error, text) =
+            run_erc_through_dispatch("erc-clean", r#"{"sheets":[{"path":"/","violations":[]}]}"#)
+                .await;
+        assert!(!is_error, "{text}");
+        let body: Value = serde_json::from_str(&text).expect("tool body is JSON");
+        assert_eq!(body["total"], 0, "{body}");
+        assert_eq!(body["errors"], 0, "{body}");
+    }
+}
