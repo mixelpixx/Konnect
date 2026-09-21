@@ -9,6 +9,7 @@
 use crate::writer::{
     ensure_kicad_design_document_is_closed, open_document_lock, read_string_unlocked,
     sync_parent_directory, write_atomic_unlocked, write_new_atomic_unlocked,
+    write_new_atomic_unlocked_private,
 };
 use crate::SexpError;
 use fs4::FileExt;
@@ -725,7 +726,9 @@ fn persist_journal(path: &Path, journal: &Journal) -> Result<(), SexpError> {
     let source = serde_json::to_string(journal).map_err(|error| {
         SexpError::InvalidValue(format!("could not serialize journal: {error}"))
     })?;
-    write_new_atomic_unlocked(path, &source)
+    // A journal holds complete before and after images of the project, so it
+    // is created owner-only rather than at the ordinary create mode.
+    write_new_atomic_unlocked_private(path, &source)
 }
 
 fn remove_journal(path: &Path) -> Result<(), SexpError> {
@@ -834,6 +837,61 @@ mod tests {
         let decoded = read_validated_journal(&root, &path).expect("journal deserializes");
         assert_eq!(decoded.entries[0].path, journal.entries[0].path);
         remove_journal(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    const JOURNAL_MODE_PROBE: &str = "transaction::tests::report_journal_mode";
+    #[cfg(unix)]
+    const PROBE_JOURNAL_ID: &str = "mode-probe";
+    #[cfg(unix)]
+    const PROBE_SHEET: &str = "sheet.kicad_sch";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "probe: run by transaction_journal_is_created_private under an explicit umask"]
+    fn report_journal_mode() {
+        let root = crate::writer::mode_probe::directory();
+        let journal = Journal {
+            version: JOURNAL_VERSION,
+            id: PROBE_JOURNAL_ID.to_owned(),
+            entries: vec![JournalEntry {
+                path: PathBuf::from(PROBE_SHEET),
+                expected: None,
+                replacement: "created".to_owned(),
+            }],
+        };
+
+        persist_journal(&journal_path(&root, &journal.id), &journal).expect("journal serializes");
+        // The design file the parent compares the journal against, created by
+        // the same transaction machinery in the same run — the two creation
+        // policies have to differ. The journal is deliberately left in place
+        // for the parent to inspect.
+        apply_entry(&root, &journal.entries[0]).expect("entry applies");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_journal_is_created_private() {
+        use crate::writer::mode_probe;
+
+        // 0o000 and 0o277 are the two ways the umask can break this: the first
+        // would widen a journal that followed the ordinary policy to 0o666,
+        // the second would narrow one created at 0o600 down to 0o400.
+        for (umask, design) in [("000", 0o666), ("277", 0o400)] {
+            let directory = mode_probe::run_under_umask(JOURNAL_MODE_PROBE, umask);
+            let root = directory.path();
+
+            mode_probe::assert_owner_only(
+                "a transaction journal",
+                mode_probe::mode_of(&journal_path(root, PROBE_JOURNAL_ID)),
+                umask,
+            );
+            assert_eq!(
+                mode_probe::mode_of(&root.join(PROBE_SHEET)),
+                design,
+                "a design file created beside the journal follows the umask under umask {umask}"
+            );
+        }
     }
 
     // Linux filesystems accept arbitrary non-NUL filename bytes. macOS APIs
