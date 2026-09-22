@@ -536,6 +536,12 @@ where
 /// KiCad positively identifies it. Observation happens before `f`, so a later
 /// command rejection, timeout, or editor crash cannot make the next file
 /// fallback treat this board as never having been live.
+///
+/// `f` receives the document KiCad resolved, exactly as
+/// [`with_bound_board_ipc_classified`] hands it over — asking for it again
+/// costs a second `GetOpenDocuments` (#676). The difference between the two
+/// helpers is only what an endpoint that served no board becomes: here it is
+/// flattened into a rejection, for the callers that had no name for it.
 pub(crate) async fn with_board_ipc_classified<T, F>(
     ctx: &ToolContext,
     board_path: &std::path::Path,
@@ -543,10 +549,15 @@ pub(crate) async fn with_board_ipc_classified<T, F>(
 ) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
 where
     T: Send + 'static,
-    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+    F: FnOnce(
+            &konnect_ipc::client::KiCadIpcClient,
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
 {
     Ok(
-        match with_bound_board_ipc_classified(ctx, board_path, move |client, _| f(client)).await? {
+        match with_bound_board_ipc_classified(ctx, board_path, f).await? {
             Ok(BoardBinding::Bound(value)) => Ok(value),
             // Preserved, not decided. Every caller of this helper saw an
             // endpoint that served no board as a plain rejection before those

@@ -22,7 +22,7 @@ use super::cli;
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
         let requested_board = get_path($args, "board")?;
-        match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
+        match with_board_ipc_classified($ctx, &requested_board, move |$c, _| $body).await? {
             Ok(v) => v,
             Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
                 return Ok(crate::tools::ipc_target_error_result(&error))
@@ -638,8 +638,7 @@ async fn handle_plan_specctra_ses_import(
         .canonicalize()
         .with_context(|| format!("resolve board {}", board.display()))?;
     let board_for_ipc = board.clone();
-    let result = with_board_ipc_classified(ctx, &board, move |client| {
-        let document = client.find_open_board(&board_for_ipc)?;
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let before = client.save_document_to_string_in(document.clone())?;
         let plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
@@ -784,7 +783,7 @@ async fn handle_apply_specctra_ses(
     let cli_path = ctx.config.kicad_cli.clone();
     let runtime = tokio::runtime::Handle::current();
 
-    let result = with_board_ipc_classified(ctx, &board, move |client| {
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
         let open_boards = client.get_open_board_paths()?;
         if open_boards.len() != 1 {
             anyhow::bail!(
@@ -797,7 +796,6 @@ async fn handle_apply_specctra_ses(
                     .join(", ")
             );
         }
-        let document = client.find_open_board(&board_for_ipc)?;
         let before = client.save_document_to_string_in(document.clone())?;
         let plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
@@ -1038,7 +1036,7 @@ async fn handle_delete_trace(
 
     let board_ipc = board.clone();
     let uuid_ipc = uuid.clone();
-    let deleted = match with_board_ipc_classified(ctx, &board, move |client| {
+    let deleted = match with_board_ipc_classified(ctx, &board, move |client, _| {
         client.delete_trace_segment_verified(&board_ipc, &uuid_ipc)
     })
     .await?

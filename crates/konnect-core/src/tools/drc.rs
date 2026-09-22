@@ -85,7 +85,7 @@ pub(crate) async fn refill(
     board: &Path,
 ) -> anyhow::Result<Result<(), CallToolResult>> {
     let path = board.to_path_buf();
-    let result = with_board_ipc_classified(ctx, board, move |client| {
+    let result = with_board_ipc_classified(ctx, board, move |client, _| {
         Ok(client
             .refill_zones()
             .and_then(|()| client.wait_for_board_ready(READY_TIMEOUT))
@@ -148,7 +148,7 @@ pub(crate) async fn run(
     let mut saved_snapshot = None;
     if sync {
         let path = board.to_path_buf();
-        let synchronized = with_board_ipc_classified(ctx, board, move |client| {
+        let synchronized = with_board_ipc_classified(ctx, board, move |client, _| {
             let operation = || -> anyhow::Result<String> {
                 if refill {
                     client.refill_zones()?;
