@@ -184,7 +184,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "list_schematic_components",
             "List all symbol instances in a schematic with their positions, values, \
-             footprints, and pin locations.",
+             footprints, and properties.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3126,6 +3126,18 @@ async fn handle_edit_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+/// Every property of a placed symbol by name. A repeated name keeps its first
+/// value, the one `value` and `footprint` are read from.
+fn symbol_properties(symbol: &cse::Symbol) -> BTreeMap<&str, &str> {
+    let mut properties = BTreeMap::new();
+    for property in &symbol.properties {
+        properties
+            .entry(property.name.as_str())
+            .or_insert(property.value.as_str());
+    }
+    properties
+}
+
 async fn handle_get_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -3180,7 +3192,8 @@ async fn handle_get_schematic_component(
         "mirror_y": mirror.contains('y'),
         "uuid": anchor.uuid,
         "unit_count": units.len(),
-        "units": units
+        "units": units,
+        "properties": symbol_properties(anchor)
     })))
 }
 
@@ -3207,7 +3220,8 @@ async fn handle_list_schematic_components(
                 "y": y,
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
-                "mirror_y": mirror.contains('y')
+                "mirror_y": mirror.contains('y'),
+                "properties": symbol_properties(sym)
             })
         })
         .collect();
@@ -8422,6 +8436,67 @@ mod multi_unit_component_tests {
             .unwrap()
             .iter()
             .any(|unit| unit["unit"] == 2 && unit["y"] == 120.0));
+    }
+
+    #[tokio::test]
+    async fn get_reads_the_lowest_unit_and_list_reads_each_unit() {
+        // `Note` is on the unit saved first: the lowest as written, and not
+        // once it is renumbered 3.
+        let renumbered = SCHEMATIC.replace("(unit 1)", "(unit 3)");
+        assert_ne!(renumbered, SCHEMATIC);
+        for (source, lowest_has_note) in [(SCHEMATIC.to_owned(), true), (renumbered, false)] {
+            let (_directory, path) = fixture();
+            std::fs::write(&path, source).unwrap();
+            let has_note = |value: &serde_json::Value| value["properties"].get("Note").is_some();
+
+            let component = body(
+                handle_get_schematic_component(
+                    &json!({ "schematic": path, "reference": "U1" }),
+                    &context(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(has_note(&component), lowest_has_note, "{component}");
+
+            let listed = body(
+                handle_list_schematic_components(&json!({ "schematic": path }), &context())
+                    .await
+                    .unwrap(),
+            );
+            for row in listed["components"].as_array().unwrap() {
+                assert_eq!(has_note(row), row["y"] == 100.0, "{listed}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_property_reads_its_first_value() {
+        let property = "    (property \"Value\" \"OLD\" (at 100 102 0))\n";
+        let repeated = property.replace("OLD", "NEW");
+        let source = SCHEMATIC.replacen(property, &format!("{property}{repeated}"), 1);
+        assert_ne!(source, SCHEMATIC);
+        let (_directory, path) = fixture();
+        std::fs::write(&path, source).unwrap();
+
+        let component = body(
+            handle_get_schematic_component(
+                &json!({ "schematic": path, "reference": "U1" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(component["properties"]["Value"], "OLD", "{component}");
+        assert_eq!(component["value"], "OLD", "{component}");
+        let listed = body(
+            handle_list_schematic_components(&json!({ "schematic": path }), &context())
+                .await
+                .unwrap(),
+        );
+        for row in listed["components"].as_array().unwrap() {
+            assert_eq!(row["properties"]["Value"], row["value"], "{listed}");
+        }
     }
 
     #[tokio::test]

@@ -2334,3 +2334,142 @@ mod config_state_dispatch_tests {
         assert_eq!(reloaded["config"]["fab"]["house"], "JLCPCB", "{reloaded}");
     }
 }
+
+#[cfg(test)]
+mod component_properties_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/component_fields_kicad10.kicad_sch");
+    const R1_UUID: &str = "8b9b7750-3421-4b18-92a3-4bddb63e9056";
+    const U1_UNIT_1: &str = "db4e5e3c-9adc-40eb-a748-d1a1a0578a45";
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, tool: &str, arguments: Value) -> Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 679,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        serde_json::from_str(text).expect("tool body is JSON")
+    }
+
+    fn schematic(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("properties.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        path.display().to_string()
+    }
+
+    /// R1 as the fixture stores it: every existing field of its list row, and
+    /// its properties with the standard and empty ones included.
+    fn r1_row() -> Value {
+        json!({
+            "reference": "R1",
+            "value": "10k",
+            "footprint": "",
+            "lib_id": "Device:R",
+            "x": 101.6,
+            "y": 76.2,
+            "rotation": 0.0,
+            "mirror_x": false,
+            "mirror_y": false,
+            "properties": {
+                "Reference": "R1",
+                "Value": "10k",
+                "Footprint": "",
+                "Datasheet": "",
+                "Description": "Resistor",
+                "LCSC": "C679001",
+                "MPN": "MPN-679-R1"
+            }
+        })
+    }
+
+    /// `properties` is a public response field (#679); prove KiCad-saved
+    /// `LCSC` and `MPN` survive the served `tools/call` boundary and leave
+    /// every existing field as it was.
+    #[tokio::test]
+    async fn get_reports_custom_properties_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = schematic(&dir);
+
+        let r1 = call(
+            &handler,
+            "get_schematic_component",
+            json!({ "schematic": schematic, "reference": "R1" }),
+        )
+        .await;
+        let mut expected = r1_row();
+        expected["uuid"] = json!(R1_UUID);
+        expected["unit_count"] = json!(1);
+        expected["units"] = json!([{
+            "unit": 1,
+            "x": 101.6,
+            "y": 76.2,
+            "rotation": 0.0,
+            "mirror_x": false,
+            "mirror_y": false,
+            "uuid": R1_UUID
+        }]);
+        assert_eq!(r1, expected);
+
+        // KiCad saved U1's unit 2 first; the component is still unit 1.
+        let u1 = call(
+            &handler,
+            "get_schematic_component",
+            json!({ "schematic": schematic, "reference": "U1" }),
+        )
+        .await;
+        assert_eq!(u1["uuid"], U1_UNIT_1, "{u1}");
+        assert_eq!(u1["properties"]["LCSC"], "C679002", "{u1}");
+        assert_eq!(u1["properties"]["MPN"], "MPN-679-U1", "{u1}");
+    }
+
+    /// The same through `list_schematic_components`, one object on each placed
+    /// unit's row.
+    #[tokio::test]
+    async fn list_reports_custom_properties_across_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let listed = call(
+            &handler,
+            "list_schematic_components",
+            json!({ "schematic": schematic(&dir) }),
+        )
+        .await;
+        assert_eq!(listed["count"], 4, "{listed}");
+        for row in listed["components"].as_array().unwrap() {
+            match row["reference"].as_str() {
+                Some("R1") => assert_eq!(*row, r1_row()),
+                Some("U1") => {
+                    assert_eq!(row["properties"]["LCSC"], "C679002", "{listed}");
+                    assert_eq!(row["properties"]["MPN"], "MPN-679-U1", "{listed}");
+                }
+                other => panic!("unexpected reference {other:?}: {listed}"),
+            }
+        }
+    }
+}

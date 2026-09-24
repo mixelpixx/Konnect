@@ -43,6 +43,19 @@ defaults in place of one that cannot be used.
 No argument changed. A caller that relied on a broken preferences file being
 silently reset must now repair or remove it.
 
+## Unreleased: `get_schematic_component` and `list_schematic_components` return every property (minor release)
+
+Both tools answered from a fixed list of keys, so neither reported a custom
+property such as `LCSC` or `MPN` (#679).
+
+Each now carries one `properties` object: every property on the placed symbol
+by name, standard and custom alike. `get_schematic_component` reads it from the
+lowest-numbered unit, the unit that already supplies `x`, `y` and `uuid`; each
+`list_schematic_components` row reads its own unit. A name repeated on one
+symbol reports its first value, the one `value` and `footprint` are read from.
+
+No tool, argument, or existing response field was renamed or removed.
+
 ## Unreleased: `add_power_symbol` snaps to the schematic grid (patch release)
 
 `add_schematic_component` and `batch_place_components` snap the requested
