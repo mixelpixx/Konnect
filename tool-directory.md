@@ -98,7 +98,7 @@ and Windows servers do not.
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
 | `edit_schematic_component` | Update shared fields consistently across every placed unit of a component, and move or hide any field's text. |
 | `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
-| `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
+| `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. Does NOT adjust connected wires; junction dots are re-judged where the pins turned, and a no-connect flag travels with the pin it protects. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
