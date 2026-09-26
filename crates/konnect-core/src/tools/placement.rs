@@ -210,9 +210,10 @@ async fn handle_score_placement(
     // disk yet — the failure mode #595 was filed against. The saved file
     // remains the disclosed fallback for a closed or unreachable board;
     // scoring policy itself is unchanged either way.
-    let live =
-        with_board_ipc_classified(ctx, &board, move |client| client.save_document_to_string())
-            .await?;
+    let live = with_board_ipc_classified(ctx, &board, move |client, _| {
+        client.save_document_to_string()
+    })
+    .await?;
     let (content, source) = match live {
         Ok(content) => (content, "ipc"),
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => match read_saved_board(&board)? {
@@ -883,7 +884,7 @@ async fn handle_bga_fanout(
             )
         })
         .collect();
-    let created = match super::with_board_ipc_classified(ctx, &board, move |c| {
+    let created = match super::with_board_ipc_classified(ctx, &board, move |c, _| {
         c.apply_fanout(
             &net_stubs,
             &via_list,

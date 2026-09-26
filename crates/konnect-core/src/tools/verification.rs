@@ -1238,9 +1238,7 @@ async fn handle_check_clearance(
     // Prefer the exact unsaved board KiCad owns. Falling back only when the
     // requested board is not open gives both modes the same live/file
     // semantics and prevents a plausible answer from stale placement data.
-    let ipc_board = board.clone();
-    let live = with_board_ipc_classified(ctx, &board, move |client| {
-        let document = client.find_open_board(&ipc_board)?;
+    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
         client.save_document_to_string_in(document)
     })
     .await?;

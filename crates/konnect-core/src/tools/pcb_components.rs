@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
         let requested_board = get_path($args, "board")?;
-        match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
+        match with_board_ipc_classified($ctx, &requested_board, move |$c, _| $body).await? {
             Ok(v) => v,
             // Only an unreachable transport justifies "KiCAD must be running".
             // This used to say it for every failure, so a tool that refused a
@@ -3394,10 +3394,8 @@ async fn handle_get_component_pads(
     // pads in the file at all, so reading the file would either error or
     // answer about a stale board while the writers in this toolset act on the
     // live one. The file stays the fallback for an offline session.
-    let ipc_board = board_path.clone();
     let ipc_reference = reference.clone();
-    let live = with_board_ipc_classified(ctx, &board_path, move |c| {
-        let document = c.find_open_board(&ipc_board)?;
+    let live = with_board_ipc_classified(ctx, &board_path, move |c, document| {
         c.get_footprint_pads_in(document, &ipc_reference)
     })
     .await?;
@@ -3700,7 +3698,7 @@ async fn handle_place_array(
     }
 
     let footprint_id = footprint.clone();
-    let placed = match with_board_ipc_classified(ctx, &board, move |c| {
+    let placed = match with_board_ipc_classified(ctx, &board, move |c, _| {
         let existing = c
             .list_footprints()?
             .into_iter()
@@ -3797,7 +3795,7 @@ async fn handle_align_components(
         Err(e) => return Ok(e),
     };
 
-    let aligned = match with_board_ipc_classified(ctx, &board, move |c| {
+    let aligned = match with_board_ipc_classified(ctx, &board, move |c, _| {
         c.run_commit("Align footprints", |c| {
             references
                 .iter()

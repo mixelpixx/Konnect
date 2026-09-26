@@ -1495,10 +1495,8 @@ async fn handle_get_board_info(
     // state of the last save — on a board with unsaved edits it disagreed with
     // the IPC-backed writers in this toolset, most visibly as layer_count 0 /
     // net_count 0 on a board KiCad was showing fully populated.
-    let ipc_board = board_path.clone();
     if let Ok((title_block, enabled, nets)) =
-        with_board_ipc_classified(ctx, &board_path, move |c| {
-            let document = c.find_open_board(&ipc_board)?;
+        with_board_ipc_classified(ctx, &board_path, move |c, document| {
             Ok((
                 c.get_title_block_in(document.clone())?,
                 c.get_enabled_layers_in(document.clone())?,
@@ -1607,10 +1605,9 @@ async fn handle_get_board_extents(
     // Try IPC first; fall through to file-based computation on error.
     // Addressed to the requested board, not the first open one — with two
     // boards open, first-document targeting silently measures the other, and
-    // ensure_board_is_active only checks it is open somewhere.
-    let ipc_board = board_path.clone();
-    if let Ok(ext) = with_board_ipc_classified(ctx, &board_path, move |c| {
-        c.get_board_extents_in(c.find_open_board(&ipc_board)?)
+    // the binding step is what proves the document is this board.
+    if let Ok(ext) = with_board_ipc_classified(ctx, &board_path, move |c, document| {
+        c.get_board_extents_in(document)
     })
     .await?
     {
@@ -3113,7 +3110,7 @@ mod board_session_safety_tests {
         let server = spawn_one_document_response(&board);
         let ctx = ctx_talking_to(server.address().to_string());
 
-        let observation = with_board_ipc_classified(&ctx, &board, |_| Ok(()))
+        let observation = with_board_ipc_classified(&ctx, &board, |_, _| Ok(()))
             .await
             .unwrap();
         assert!(observation.is_ok());
@@ -3419,7 +3416,7 @@ mod board_session_safety_tests {
         let server = spawn_one_document_response(&board);
         let ctx = ctx_talking_to(server.address().to_string());
 
-        let rejected = with_board_ipc_classified(&ctx, &board, |_| -> anyhow::Result<()> {
+        let rejected = with_board_ipc_classified(&ctx, &board, |_, _| -> anyhow::Result<()> {
             anyhow::bail!("mock mutation rejected after board identification")
         })
         .await
@@ -3449,7 +3446,7 @@ mod board_session_safety_tests {
         let server = super::mounting_hole_tests::spawn_rejecting_kicad();
         let ctx = ctx_talking_to(server.address().to_string());
 
-        let result = with_board_ipc_classified(&ctx, &board, |_| Ok(()))
+        let result = with_board_ipc_classified(&ctx, &board, |_, _| Ok(()))
             .await
             .unwrap();
 
@@ -5175,5 +5172,114 @@ mod board_info_paper_tests {
 
         assert_eq!(info["paper"], json!("A3"));
         assert_eq!(info["paper_size_mm"], serde_json::Value::Null);
+    }
+}
+
+/// One board read is one board lookup (#676).
+///
+/// `with_board_ipc_classified` resolves the requested board before it runs
+/// its closure and hands the document over. A closure that calls
+/// `find_open_board` itself instead would pay a second `GetOpenDocuments`,
+/// each on its own socket, for a document it had already been given.
+#[cfg(test)]
+mod single_board_lookup_tests {
+    use super::board_mock::ctx_talking_to;
+    use super::*;
+    use crate::test_support::MockIpcServer;
+    use konnect_ipc::gen::kiapi;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A KiCad holding `board`, counting how many times it is asked which
+    /// documents are open.
+    fn spawn_kicad_counting_lookups(board: &Path, lookups: Arc<AtomicUsize>) -> MockIpcServer {
+        let document = super::board_mock::board_document(&board.to_string_lossy());
+        MockIpcServer::spawn("counting-lookups", move |request| {
+            let command = request.message.expect("a command");
+            let body = if command.type_url.ends_with("GetOpenDocuments") {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![document.clone()],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))
+            } else if command.type_url.ends_with("GetTitleBlockInfo") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::types::TitleBlockInfo {
+                        title: "Counted".to_string(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.types.TitleBlockInfo",
+                ))
+            } else if command.type_url.ends_with("GetBoardEnabledLayers") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                        ],
+                        copper_layer_count: 2,
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ))
+            } else if command.type_url.ends_with("GetNets") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: vec![kiapi::board::types::Net {
+                            code: Some(kiapi::board::types::NetCode { value: 1 }),
+                            name: "GND".to_string(),
+                        }],
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ))
+            } else {
+                None
+            };
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message: body,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn get_board_info_asks_which_board_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("counted.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\"))",
+        )
+        .unwrap();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let server = spawn_kicad_counting_lookups(&board, lookups.clone());
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_get_board_info(
+            &serde_json::json!({ "board": board.to_string_lossy() }),
+            &ctx,
+        )
+        .await
+        .expect("a board KiCad holds is answered over IPC");
+
+        let body: serde_json::Value = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert_eq!(body["source"], "ipc", "{body}");
+        assert_eq!(body["title"], "Counted", "{body}");
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            1,
+            "the document the binding step resolved is handed to the closure, \
+             so nothing asks KiCad for it a second time"
+        );
     }
 }
