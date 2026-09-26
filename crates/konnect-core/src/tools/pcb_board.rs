@@ -3394,6 +3394,90 @@ mod board_session_safety_tests {
         assert_eq!(error_reason(&refusal), "board_previously_observed_live");
     }
 
+    /// A KiCad that answers every command with `status` and so never names a
+    /// board: the project manager alone (`AS_UNHANDLED`), or a build without
+    /// the open-document command (`AS_UNIMPLEMENTED`).
+    fn spawn_kicad_serving_no_board(status: kiapi::common::ApiStatusCode) -> MockIpcServer {
+        MockIpcServer::spawn("serving-no-board", move |request| {
+            assert!(request.message.is_some(), "a command");
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: status as i32,
+                    error_message: format!("the double answers {}", status.as_str_name()),
+                }),
+                header: None,
+                message: None,
+            }
+        })
+    }
+
+    /// The two answers `live_board::observe` reports as `Unserved`.
+    const SERVING_NO_BOARD: [kiapi::common::ApiStatusCode; 2] = [
+        kiapi::common::ApiStatusCode::AsUnhandled,
+        kiapi::common::ApiStatusCode::AsUnimplemented,
+    ];
+
+    /// Pins today's mapping, not a decision. A mutating tool whose KiCad
+    /// serves no board refuses and leaves the file alone, exactly as it did
+    /// before #656 gave those answers a name. Whether an editor proven absent
+    /// should permit the file edit is #577's question; this test exists so
+    /// that answer shows up as a changed test rather than a silent one.
+    #[tokio::test]
+    async fn a_mutating_tool_refuses_when_kicad_serves_no_board() {
+        for status in SERVING_NO_BOARD {
+            let dir = tempfile::tempdir().unwrap();
+            let board = super::mounting_hole_tests::blank_board(dir.path());
+            let before = std::fs::read(&board).unwrap();
+            let server = spawn_kicad_serving_no_board(status);
+            let ctx = ctx_talking_to(server.address().to_string());
+
+            let result = super::handle_add_mounting_hole(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "x": 5.0,
+                    "y": 6.0,
+                    "reference": "H1"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            let text = super::mounting_hole_tests::result_text(&result);
+            assert!(result.is_error, "{status:?} was written: {text}");
+            assert!(
+                text.contains("The board file was not modified"),
+                "{status:?}: {text}"
+            );
+            assert_eq!(std::fs::read(&board).unwrap(), before, "{status:?}");
+        }
+    }
+
+    /// The other gate's half of the same preserved mapping. The file-only
+    /// guard, for tools with no IPC path, lets the edit through when KiCad
+    /// serves no board, as it let any rejection through before #656. The two
+    /// gates disagree about this state and that disagreement is #577's to
+    /// settle; pinned here so it cannot move by accident.
+    #[tokio::test]
+    async fn the_file_only_guard_still_lets_an_unserved_endpoint_through() {
+        for status in SERVING_NO_BOARD {
+            let dir = tempfile::tempdir().unwrap();
+            let board = super::mounting_hole_tests::blank_board(dir.path());
+            let server = spawn_kicad_serving_no_board(status);
+            let ctx = ctx_talking_to(server.address().to_string());
+
+            let guarded = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+                .await
+                .unwrap();
+
+            assert!(
+                guarded.is_none(),
+                "{status:?} refused: {:?}",
+                guarded.map(|result| super::mounting_hole_tests::result_text(&result))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_file_only_guard_blocks_a_previously_live_board_after_transport_loss() {
         let dir = tempfile::tempdir().unwrap();

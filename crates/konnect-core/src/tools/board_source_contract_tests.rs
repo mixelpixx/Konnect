@@ -164,6 +164,12 @@ impl Scene {
         Self::build(|_| Some(spawn_kicad_not_implementing_open_documents())).await
     }
 
+    /// KiCad is reachable and refuses the open-document list with `status`,
+    /// so no board is named and nothing says whether one is open.
+    async fn refusing_before_identification(status: kiapi::common::ApiStatusCode) -> Self {
+        Self::build(move |_| Some(spawn_kicad_refusing_everything_with(status))).await
+    }
+
     async fn build(kicad: impl FnOnce(&Path) -> Option<MockIpcServer>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let board = fixture_board(dir.path());
@@ -274,6 +280,22 @@ fn spawn_kicad_not_implementing_open_documents() -> MockIpcServer {
                 status: kiapi::common::ApiStatusCode::AsUnimplemented as i32,
                 error_message: "kiapi.common.commands.GetOpenDocuments is not implemented"
                     .to_string(),
+            }),
+            header: None,
+            message: None,
+        }
+    })
+}
+
+/// A KiCad that answers every command, `GetOpenDocuments` included, with
+/// `status`: reachable, and refusing before it has named any board.
+fn spawn_kicad_refusing_everything_with(status: kiapi::common::ApiStatusCode) -> MockIpcServer {
+    MockIpcServer::spawn("refusing-before-identification", move |request| {
+        assert!(request.message.is_some(), "a command");
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: status as i32,
+                error_message: format!("the double answers {}", status.as_str_name()),
             }),
             header: None,
             message: None,
@@ -742,6 +764,56 @@ async fn an_unimplemented_open_document_command_claims_nothing_about_editors() {
     let refused = scene.call("get_layer_list", Some("live")).await;
     assert!(refused.is_error, "{:?}", body_of(&refused));
     assert_eq!(kind_of(&refused).as_deref(), Some("editor_unavailable"));
+}
+
+/// The other side of the classifier. Only `AS_UNHANDLED` and
+/// `AS_UNIMPLEMENTED` on the open-document list mean that no board was served.
+/// Any other refusal of that list comes from a KiCad that may hold this board:
+/// busy with an operation, or still starting with the board open. The default
+/// therefore refuses rather than answering from a file that may be older than
+/// the editor, exactly as a refusal after identification does. `saved` still
+/// answers, because it asked for the file.
+///
+/// Every other failure status in KiCad's `envelope.proto` is covered, so a
+/// classifier widened to "any status refusing the list means no editor"
+/// fails here rather than reading a busy editor's board from disk.
+#[tokio::test]
+async fn any_other_refusal_of_the_open_document_list_is_not_read_as_no_editor() {
+    use kiapi::common::ApiStatusCode as Status;
+
+    for status in [
+        Status::AsBusy,
+        Status::AsNotReady,
+        Status::AsTimeout,
+        Status::AsBadRequest,
+        Status::AsTokenMismatch,
+    ] {
+        let scene = Scene::refusing_before_identification(status).await;
+
+        for tool in ["get_layer_list", "get_netclasses"] {
+            for mode in [None, Some("auto"), Some("live")] {
+                let refused = scene.call(tool, mode).await;
+                assert!(
+                    refused.is_error,
+                    "{status:?} {tool} {mode:?} was answered: {}",
+                    body_of(&refused)
+                );
+                assert_eq!(
+                    kind_of(&refused).as_deref(),
+                    Some("editor_unavailable"),
+                    "{status:?} {tool} {mode:?}: {}",
+                    body_of(&refused)
+                );
+            }
+
+            let saved = scene.body(tool, Some("saved")).await;
+            assert_eq!(
+                saved["source_evidence"]["reason"],
+                json!("explicitly_requested"),
+                "{status:?} {tool}: {saved}"
+            );
+        }
+    }
 }
 
 /// The regression the maintainer caught on a real KiCad: with only the project
