@@ -18,6 +18,64 @@ appears in the written symbol, its `(instances …)` records and the response's
 failure entry, which still reports `"reference": "?"` for an entry that named
 none.
 
+## Unreleased: `run_erc` reports coordinates that can be found on the sheet (minor release)
+
+KiCad's ERC **JSON** writer divided every violation coordinate by 100, from
+the release that introduced it (8.0) through 10.0.6: it formatted schematic
+internal units through `pcbIUScale` (1e6 IU/mm) where the text report used
+`schIUScale` (1e4 IU/mm). `run_erc` reads that JSON, so a pin
+`get_schematic_pin_locations` puts at `(100.33, 104.14)` came back from
+`run_erc` at `(1.0033, 1.0414)` — a location that cannot be found on the sheet
+(#541). Upstream fixed it in `6d8e1fe` for KiCad 10.0.7
+([kicad#25582](https://gitlab.com/kicad/code/kicad/-/issues/25582)).
+
+`run_erc` now checks the `kicad_version` the report states — the binary that
+wrote those numbers — and says what it did in a new `coordinates` object:
+
+- `status: "corrected"` — an affected version wrote the report; every `x`/`y`
+  was multiplied by 100, and `scale_applied` says so. This is the change a
+  caller sees: coordinates from KiCad 10.0.6 and earlier are now 100× larger,
+  and match `get_schematic_pin_locations` for the same pin.
+- `status: "verbatim"` — KiCad 10.0.7 or newer wrote it; coordinates are
+  KiCad's own, untouched.
+- `status: "withheld"` — the version could not be placed on either side of the
+  fix (no `kicad_version`, an unrecognized one, or a development build, whose
+  version cannot date it against the fix). No `x`/`y` is reported at all;
+  KiCad's raw numbers ride along as `kicad_reported_x`/`kicad_reported_y` on
+  the violation and on each item, deliberately under a name that is not a
+  location. `coordinates.reason` says why.
+
+`run_erc`'s optional `output` file changes with it: it used to hold the
+filtered violation array alone, and now holds the whole response — the same
+JSON the tool returns, with `violations` under that key beside `coordinates`.
+That file is the copy handed to another tool or another person, so it must not
+carry a coordinate without the block saying what the coordinate is worth. A
+consumer of that file reads `<file>.violations` where it used to read the
+top-level array.
+
+One case the boundary cannot see: a KiCad built from the 10.0 branch between
+the 10.0.6 release and the 10.0.7 one carries the fix but still stamps its
+reports `10.0.6`, because `kicad_version` comes from `KICAD_SEMANTIC_VERSION`,
+which upstream leaves at the last released version until the release commit
+bumps it. Such a build reports correct coordinates and `run_erc` will multiply
+them by 100. Nothing in the report distinguishes it from the affected release.
+Released KiCad builds are unaffected, and only released builds are the
+supported contract: an in-between branch build is outside it (maintainer
+decision on #541). If you run a self-built 10.0-branch KiCad, check `coordinates.kicad_version` against your own build and treat a
+`"corrected"` status from it as the one case where the correction is wrong.
+
+`pcb drc` has its own report writer and never carried the defect, so
+`run_drc`, `get_drc_violations` and every DRC coordinate are unchanged.
+
+A caller that compensated for the scaling itself must stop: read
+`coordinates.status` instead, and multiply only when something else says to. A
+caller that reads `x`/`y` unconditionally must handle their absence when
+`status` is `withheld` — where it previously received a number that could be
+off by 100× with nothing saying so. KiCad scales the lengths quoted inside its
+own violation *text* the same way ("Horizontal Wire, length 0.1270 mm" for a
+12.70 mm wire); Konnect does not rewrite KiCad's prose, and
+`coordinates.reason` states that.
+
 ## Unreleased: configuration tools refuse a file they cannot use (minor release)
 
 `load_user_config`, `save_user_config`, `load_project_config`,

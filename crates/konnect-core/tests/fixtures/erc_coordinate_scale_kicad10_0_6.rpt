@@ -1,0 +1,48 @@
+ERC report (2026-09-21T23:51:57, Encoding UTF8)
+Report includes: Errors, Warnings, Exclusions
+
+***** Sheet /
+[label_dangling]: Label not connected
+    ; error
+    @(69.85 mm, 180.34 mm): Label 'STUB'
+[power_pin_not_driven]: Input Power pin not driven by any Output Power pins
+    ; error
+    @(73.66 mm, 100.33 mm): Symbol #PWR001 Pin 1 [Power input, Line]
+[unconnected_wire_endpoint]: Unconnected wire endpoint
+    ; warning
+    @(63.50 mm, 180.34 mm): Horizontal Wire, length 12.70 mm
+[isolated_pin_label]: Label connected to only one pin
+    ; warning
+    @(69.85 mm, 160.02 mm): Label 'MIXED'
+[isolated_pin_label]: Label connected to only one pin
+    ; warning
+    @(76.20 mm, 59.69 mm): Label 'LONE'
+[isolated_pin_label]: Label connected to only one pin
+    ; warning
+    @(76.20 mm, 160.02 mm): Global Label 'MIXED'
+[same_local_global_label]: Local and global labels have same name
+    ; warning
+    @(76.20 mm, 160.02 mm): Global Label 'MIXED'
+    @(69.85 mm, 160.02 mm): Label 'MIXED'
+[unconnected_wire_endpoint]: Unconnected wire endpoint
+    ; warning
+    @(63.50 mm, 180.34 mm): Horizontal Wire, length 12.70 mm
+[isolated_pin_label]: Label connected to only one pin
+    ; warning
+    @(95.25 mm, 59.69 mm): Label 'LONE'
+[unconnected_wire_endpoint]: Unconnected wire endpoint
+    ; warning
+    @(95.25 mm, 59.69 mm): Horizontal Wire, length 12.70 mm
+
+***** Sheet /Child/
+[power_pin_not_driven]: Input Power pin not driven by any Output Power pins
+    ; error
+    @(50.80 mm, 67.31 mm): Symbol #PWR001 Pin 1 [Power input, Line]
+
+ ** ERC messages: 11  Errors 3  Warnings 8
+
+ ** Ignored checks:
+    - Global label only appears once in the schematic
+    - Four connection points are joined together
+    - SPICE model issue
+    - Assigned footprint doesn't match footprint filters

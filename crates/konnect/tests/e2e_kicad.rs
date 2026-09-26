@@ -311,6 +311,36 @@ fn full_design_loop_with_real_kicad() {
             || erc.get("summary").is_some(),
         "unexpected ERC shape: {erc}"
     );
+    // Every part on this sheet sits at x >= 100 mm, y = 100 mm, so a violation
+    // on one of their pins cannot be at single-digit millimetres. That is what
+    // KiCad's ERC JSON writer reported up to 10.0.6 — the whole sheet at 1/100
+    // scale (#541, kicad#25582) — and this installation's version decides
+    // which side of it the response is on.
+    let coordinates = &erc["coordinates"];
+    let status = coordinates["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("ERC response must state what its coordinates are worth: {erc}"));
+    for violation in erc["violations"].as_array().into_iter().flatten() {
+        for item in violation["items"].as_array().into_iter().flatten() {
+            if status == "withheld" {
+                assert!(
+                    item["x"].is_null(),
+                    "an unclassifiable version must offer no location: {item}"
+                );
+                continue;
+            }
+            let Some(x) = item["x"].as_f64() else {
+                continue;
+            };
+            let y = item["y"].as_f64().expect("y rides with x");
+            assert!(
+                x > 10.0 && y > 10.0,
+                "ERC placed a violation off the sheet at ({x}, {y}) — \
+                 {status} against KiCad {:?}: {item}",
+                coordinates["kicad_version"]
+            );
+        }
+    }
 
     // eeschema's own netlist is the only proof that an oriented label still
     // binds its pin: rotating a label off 0° must not detach it.
