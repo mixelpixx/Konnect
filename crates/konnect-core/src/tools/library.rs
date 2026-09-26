@@ -151,7 +151,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_footprint_pad",
-            "Edit the size, shape, or position of a pad in an existing .kicad_mod footprint file.",
+            "Edit the size, shape, position, drill, or zone connection of a pad in an existing .kicad_mod footprint file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -168,7 +168,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["circle", "rect", "oval", "roundrect"],
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
-                    "drill": { "type": "number", "description": "New drill diameter in mm (optional)" }
+                    "drill": { "type": "number", "description": "New drill diameter in mm (optional)" },
+                    "zone_connect": {
+                        "type": "string",
+                        "enum": ["inherited", "solid", "thermal", "none"],
+                        "description": "How copper zones connect to this pad (optional). 'solid', 'thermal' and 'none' write the pad's own override; 'inherited' removes it so the pad follows its footprint and zone settings."
+                    }
                 },
                 "required": ["footprint_path", "pad_number"]
             }),
@@ -948,6 +953,28 @@ async fn handle_edit_footprint_pad(
             }
         },
     };
+    let zone_connect = match args.get("zone_connect") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_str() {
+            Some(name) => match PadZoneConnect::parse(name) {
+                Some(zone_connect) => Some(zone_connect),
+                None => {
+                    return Ok(invalid_library_argument(
+                        "zone_connect",
+                        format!(
+                            "unsupported zone connection '{name}'; expected inherited, solid, thermal, or none"
+                        ),
+                    ))
+                }
+            },
+            None => {
+                return Ok(invalid_library_argument(
+                    "zone_connect",
+                    "must be a string when supplied",
+                ))
+            }
+        },
+    };
 
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
@@ -968,6 +995,7 @@ async fn handle_edit_footprint_pad(
 
     let mut edits = Vec::new();
     let mut matched_count = 0usize;
+    let mut observed_zone_connects = Vec::new();
     for (start, end) in find_direct_child_blocks(&content, "footprint") {
         let block = &content[start..end];
         let Ok(node) = parse_sexp(block) else {
@@ -982,10 +1010,16 @@ async fn handle_edit_footprint_pad(
         }
 
         matched_count += 1;
-        let edited = match edit_footprint_pad_block(block, args, new_number, shape) {
+        let mut edited = match edit_footprint_pad_block(block, args, new_number, shape) {
             Ok(edited) => edited,
             Err(reason) => return Ok(invalid_library_argument("shape", reason)),
         };
+        if let Some(zone_connect) = zone_connect {
+            edited = set_pad_zone_connect(edited, zone_connect);
+            observed_zone_connects.push(
+                PadZoneConnect::of_pad(&edited).map_or("unrecognized", PadZoneConnect::as_str),
+            );
+        }
         edits.push(SexpEdit::replace(start, end, edited));
         if !match_all {
             break;
@@ -1002,16 +1036,169 @@ async fn handle_edit_footprint_pad(
     let new_content = apply_edits(content.clone(), edits);
     write_atomic_if_unchanged(&path, &content, &new_content)?;
 
+    let mut response = json!({
+        "success": true,
+        "pad": pad_number,
+        "shape": shape,
+        "matched_count": matched_count,
+        "updated_count": matched_count
+    });
+    // Read off the pads as written, not echoed from the request.
+    observed_zone_connects.dedup();
+    match observed_zone_connects.as_slice() {
+        [] => {}
+        [observed] => response["zone_connect"] = json!(observed),
+        disagreeing => response["zone_connect"] = json!(disagreeing),
+    }
+
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "pad": pad_number,
-            "shape": shape,
-            "matched_count": matched_count,
-            "updated_count": matched_count
-        }))
-        .unwrap(),
+        serde_json::to_string(&response).unwrap(),
     ))
+}
+
+/// A pad's `(zone_connect N)` override. The numbers are KiCad's
+/// `ZONE_CONNECTION` values; `Inherited` is written by omitting the token.
+/// KiCad's pad dialog offers these four and not `THT_THERMAL` (3), which is a
+/// zone setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PadZoneConnect {
+    Inherited,
+    None,
+    Thermal,
+    Solid,
+}
+
+impl PadZoneConnect {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "inherited" => Some(Self::Inherited),
+            "none" => Some(Self::None),
+            "thermal" => Some(Self::Thermal),
+            "solid" => Some(Self::Solid),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherited => "inherited",
+            Self::None => "none",
+            Self::Thermal => "thermal",
+            Self::Solid => "solid",
+        }
+    }
+
+    fn token(self) -> Option<u8> {
+        match self {
+            Self::Inherited => None,
+            Self::None => Some(0),
+            Self::Thermal => Some(1),
+            Self::Solid => Some(2),
+        }
+    }
+
+    /// The connection a pad block carries, or `None` for a value this enum
+    /// cannot name (such as KiCad's `3`).
+    fn of_pad(pad_block: &str) -> Option<Self> {
+        let children = pad_zone_connect_children(pad_block);
+        let Some(&(start, end)) = children.first() else {
+            return Some(Self::Inherited);
+        };
+        let node = parse_sexp(&pad_block[start..end]).ok()?;
+        match node.get(1).and_then(SexpNode::as_str)? {
+            "0" => Some(Self::None),
+            "1" => Some(Self::Thermal),
+            "2" => Some(Self::Solid),
+            _ => None,
+        }
+    }
+}
+
+/// Direct `(zone_connect …)` children of a pad block.
+fn pad_zone_connect_children(pad_block: &str) -> Vec<(usize, usize)> {
+    find_direct_child_blocks(pad_block, "pad")
+        .into_iter()
+        .filter(|&(start, end)| {
+            parse_sexp(&pad_block[start..end])
+                .is_ok_and(|child| child.head() == Some("zone_connect"))
+        })
+        .collect()
+}
+
+/// Whitespace immediately before `index`, so a child can be added or removed
+/// with the indentation and line endings its siblings already use.
+fn leading_whitespace_start(source: &str, index: usize) -> usize {
+    source[..index]
+        .trim_end_matches(|c: char| c.is_ascii_whitespace())
+        .len()
+}
+
+/// Children KiCad writes after `zone_connect` inside a pad. A new token goes
+/// before the first of these, which is where KiCad itself would write it.
+const PAD_CHILDREN_AFTER_ZONE_CONNECT: &[&str] = &[
+    "thermal_bridge_width",
+    "thermal_bridge_angle",
+    "thermal_gap",
+    "options",
+    "primitives",
+    "zone_layer_connections",
+    "padstack",
+    "teardrops",
+    "uuid",
+];
+
+fn set_pad_zone_connect(pad_block: String, zone_connect: PadZoneConnect) -> String {
+    let existing = pad_zone_connect_children(&pad_block);
+    let mut edits = Vec::new();
+    match (zone_connect.token(), existing.split_first()) {
+        (Some(token), Some((&(start, end), duplicates))) => {
+            edits.push(SexpEdit::replace(
+                start,
+                end,
+                format!("(zone_connect {token})"),
+            ));
+            for &(start, end) in duplicates {
+                edits.push(SexpEdit::delete(
+                    leading_whitespace_start(&pad_block, start),
+                    end,
+                ));
+            }
+        }
+        (Some(token), None) => {
+            let children = find_direct_child_blocks(&pad_block, "pad");
+            let before = children.iter().find(|&&(start, end)| {
+                parse_sexp(&pad_block[start..end]).is_ok_and(|child| {
+                    child
+                        .head()
+                        .is_some_and(|head| PAD_CHILDREN_AFTER_ZONE_CONNECT.contains(&head))
+                })
+            });
+            if let Some(&(start, _)) = before {
+                let separator = &pad_block[leading_whitespace_start(&pad_block, start)..start];
+                edits.push(SexpEdit::insert(
+                    start,
+                    format!("(zone_connect {token}){separator}"),
+                ));
+            } else if let Some(&(start, end)) = children.last() {
+                let separator = &pad_block[leading_whitespace_start(&pad_block, start)..start];
+                edits.push(SexpEdit::insert(
+                    end,
+                    format!("{separator}(zone_connect {token})"),
+                ));
+            } else if let Some(close) = pad_block.rfind(')') {
+                edits.push(SexpEdit::insert(close, format!(" (zone_connect {token})")));
+            }
+        }
+        (None, _) => {
+            for &(start, end) in &existing {
+                edits.push(SexpEdit::delete(
+                    leading_whitespace_start(&pad_block, start),
+                    end,
+                ));
+            }
+        }
+    }
+    apply_edits(pad_block, edits)
 }
 
 fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
@@ -5918,6 +6105,10 @@ mod tests {
             json!(["circle", "rect", "oval", "roundrect"])
         );
         assert_eq!(
+            properties["zone_connect"]["enum"],
+            json!(["inherited", "solid", "thermal", "none"])
+        );
+        assert_eq!(
             tool.input_schema["required"],
             json!(["footprint_path", "pad_number"])
         );
@@ -5973,6 +6164,147 @@ mod tests {
         assert!(result.is_error);
         let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(output["error"]["field"], "shape");
+    }
+
+    // KiCad 10.0.6 wrote every one of these; provenance in
+    // tests/fixtures/pad_zone_connect_kicad10.README.md.
+    const ZONE_CONNECT_SOLID: &str =
+        include_str!("../../tests/fixtures/pad_zone_connect_kicad10.kicad_mod");
+    const ZONE_CONNECT_THERMAL: &str =
+        include_str!("../../tests/fixtures/pad_zone_connect_thermal_kicad10.kicad_mod");
+    const ZONE_CONNECT_INHERITED: &str =
+        include_str!("../../tests/fixtures/pad_zone_connect_inherited_kicad10.kicad_mod");
+    const ZONE_CONNECT_FIRST_NONE: &str =
+        include_str!("../../tests/fixtures/pad_zone_connect_first_none_kicad10.kicad_mod");
+
+    fn footprint_pad_ranges(content: &str) -> Vec<(usize, usize)> {
+        find_direct_child_blocks(content, "footprint")
+            .into_iter()
+            .filter(|&(start, end)| parse_sexp(&content[start..end]).unwrap().head() == Some("pad"))
+            .collect()
+    }
+
+    /// `source` with each pad replaced by the pad KiCad wrote in `kicad`. KiCad
+    /// regenerates the mandatory fields' UUIDs on every save, so the rest of its
+    /// file cannot be compared; the rest of `source` must survive byte for byte.
+    fn with_kicad_pads(source: &str, kicad: &str) -> String {
+        let source_pads = footprint_pad_ranges(source);
+        let kicad_pads = footprint_pad_ranges(kicad);
+        assert_eq!(source_pads.len(), kicad_pads.len());
+        let edits = source_pads
+            .into_iter()
+            .zip(kicad_pads)
+            .map(|((start, end), (kicad_start, kicad_end))| {
+                SexpEdit::replace(start, end, &kicad[kicad_start..kicad_end])
+            })
+            .collect();
+        apply_edits(source.to_string(), edits)
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_writes_each_zone_connection_as_kicad_does() {
+        let cases = [
+            (
+                "replace solid with thermal",
+                ZONE_CONNECT_SOLID,
+                "thermal",
+                true,
+                ZONE_CONNECT_THERMAL,
+                3,
+            ),
+            (
+                "replace thermal with solid",
+                ZONE_CONNECT_THERMAL,
+                "solid",
+                true,
+                ZONE_CONNECT_SOLID,
+                3,
+            ),
+            (
+                "remove the override",
+                ZONE_CONNECT_SOLID,
+                "inherited",
+                true,
+                ZONE_CONNECT_INHERITED,
+                3,
+            ),
+            (
+                "add none to the first pad only",
+                ZONE_CONNECT_INHERITED,
+                "none",
+                false,
+                ZONE_CONNECT_FIRST_NONE,
+                1,
+            ),
+        ];
+        for (case, source, zone_connect, match_all, kicad, matched) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp
+                .path()
+                .join("MountingHole_3.2mm_M3_Pad_TopBottom.kicad_mod");
+            std::fs::write(&path, source).unwrap();
+
+            let result = handle_edit_footprint_pad(
+                &json!({
+                    "footprint_path": path,
+                    "pad_number": "1",
+                    "match_all": match_all,
+                    "zone_connect": zone_connect
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(!result.is_error, "{case}: {:?}", result.content);
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["updated_count"], matched, "{case}");
+            assert_eq!(output["zone_connect"], zone_connect, "{case}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                with_kicad_pads(source, kicad),
+                "{case}: pads must match KiCad's and nothing else may change"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_refuses_an_unsupported_zone_connect_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("MountingHole_3.2mm_M3_Pad_TopBottom.kicad_mod");
+        std::fs::write(&path, ZONE_CONNECT_SOLID).unwrap();
+
+        for zone_connect in [json!("thermal_pth"), json!(2)] {
+            let result = handle_edit_footprint_pad(
+                &json!({
+                    "footprint_path": path,
+                    "pad_number": "1",
+                    "zone_connect": zone_connect
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error, "{zone_connect} must be refused");
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["error"]["kind"], "invalid_argument");
+            assert_eq!(output["error"]["field"], "zone_connect");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), ZONE_CONNECT_SOLID);
+        }
+    }
+
+    #[test]
+    fn zone_connect_follows_the_indentation_of_a_single_line_pad() {
+        let pad = r#"(pad "1" smd rect (at 0 0) (size 2 1) (layers "F.Cu"))"#;
+        let solid = set_pad_zone_connect(pad.to_string(), PadZoneConnect::Solid);
+        assert_eq!(
+            solid,
+            r#"(pad "1" smd rect (at 0 0) (size 2 1) (layers "F.Cu") (zone_connect 2))"#
+        );
+        assert_eq!(set_pad_zone_connect(solid, PadZoneConnect::Inherited), pad);
     }
 
     #[test]

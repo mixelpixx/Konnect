@@ -357,6 +357,8 @@ set_footprint_metadata(
   implicitly adding `exclude_from_bom`.
 - Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to
   renumber one or every matching direct-child pad atomically.
+- Use `edit_footprint_pad` with `zone_connect` (`solid`, `thermal`, `none`) to
+  override how zones connect to one pad, or `inherited` to remove the override.
 
 ### Existing Footprint 3D Models
 

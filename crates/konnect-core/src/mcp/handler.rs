@@ -1905,6 +1905,44 @@ mod schema_validation_dispatch_tests {
     }
 
     #[tokio::test]
+    async fn a_pad_zone_connect_outside_the_enum_is_refused_without_changing_the_file() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let footprint = directory.path().join("MountingHole.kicad_mod");
+        let source = include_str!("../../tests/fixtures/pad_zone_connect_kicad10.kicad_mod");
+        std::fs::write(&footprint, source).unwrap();
+
+        assert_invalid_field(
+            &handler,
+            "edit_footprint_pad",
+            json!({
+                "footprint_path": footprint.display().to_string(),
+                "pad_number": "1",
+                "zone_connect": "thermal_pth"
+            }),
+            "zone_connect",
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&footprint).unwrap(), source);
+
+        let (result, _, _) = handler
+            .dispatch_tool(
+                "edit_footprint_pad",
+                &json!({
+                    "footprint_path": footprint.display().to_string(),
+                    "pad_number": "1",
+                    "match_all": true,
+                    "zone_connect": "thermal"
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let written = std::fs::read_to_string(&footprint).unwrap();
+        assert_eq!(written.matches("(zone_connect 1)").count(), 3);
+        assert!(!written.contains("(zone_connect 2)"));
+    }
+
+    #[tokio::test]
     async fn a_pad_typo_is_refused_without_creating_a_footprint() {
         let handler = handler().await;
         let directory = tempfile::tempdir().unwrap();
