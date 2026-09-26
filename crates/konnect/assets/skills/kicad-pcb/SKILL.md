@@ -161,9 +161,14 @@ after its own plan, so a change is judged before it is made:
    lists caps that were within their family limit of a connector carrying every
    one of their nets: that is cable filtering, so the decoupling rule was
    answered rather than skipped. They are not defects to "fix" by dragging them
-   toward an IC.
+   toward an IC. Outside-outline/connector-edge evidence only applies to a
+   provably axis-aligned rectangular outline (`outline_shape: "rectangular"`);
+   a concave, notched, rounded, rotated, or multi-boundary outline cannot
+   prove containment from a bbox, so the verdict is `outline_unproven`
+   instead — treat it like `outline_missing`, not like `pass`.
 2. `auto_place_from_schematic` — deterministic first placement by net
-   clusters; explicitly a starting point, not a final layout.
+   clusters; explicitly a starting point, not a final layout. Refuses
+   outright, regardless of `dry_run`, against an unproven outline.
 3. `refine_placement_force_directed` is deprecated. Its global-net spring
    model can pull a part toward every footprint sharing a board-wide rail, so
    it is not a recommended bulk-cleanup step. A dry-run exposes the
@@ -171,10 +176,36 @@ after its own plan, so a change is judged before it is made:
    the proposed moves for diagnosis; a blocked plan cannot apply. Do not treat
    those gates as evidence that the heuristic chose an electrically sensible
    placement. Apply also requires a positive `max_displacement_mm` safety
-   limit; omitting it leaves the diagnostic plan blocked.
+   limit; omitting it leaves the diagnostic plan blocked. Also refuses
+   outright, regardless of `dry_run`, against an unproven outline.
 4. For components `score_placement` flags, plan bounded explicit moves from
    schematic function instead. Use `move_component` / `rotate_component` on a
-   small batch, then re-run `score_placement` and DRC before continuing.
+   small batch, then re-run `score_placement` and DRC before continuing. This
+   is also the recovery path for `outline_unproven`/BLOCKED refusals: neither
+   `score_placement` nor the planners implement true polygon/arc/cutout
+   containment, so a non-rectangular board's real fit has to be validated by
+   KiCad DRC on the saved board, not claimed from a bbox.
+
+   Each explicit-move batch follows the same contract:
+   - **Preserve intentional placements.** Never move a footprint KiCad marks
+     locked, or one the user has called intentional (connectors, mounting
+     holes, mechanically fixed parts), even when `score_placement` flags it.
+     `get_component_list` does not report lock state, so an absent flag is
+     not evidence a part is free to move — ask when unsure. The planners hold
+     KiCad-locked footprints automatically; pass user-named ones in `locked`.
+   - **Read back the exact board after each batch.** Call
+     `get_component_list` for the same `board` and confirm every requested
+     reference landed at the requested position, rotation, and layer — and
+     nothing else moved — before planning the next batch. A mismatch or a
+     failed read stops the loop.
+   - **Disclose provenance.** When reporting results, state where each check
+     came from: `score_placement`'s `source` (`ipc` live board or
+     `saved_file`) and DRC's `source_evidence`. A saved-file answer excludes
+     unsaved editor state; say so rather than presenting it as the live board.
+   - **Report BLOCKED** when the current board state, true outline
+     containment, or another required fact cannot be established. A score,
+     a generated move list, or a plausible-looking layout is not
+     manufacturing acceptance.
 5. `place_decoupling_caps` — plans a row beside an IC from exact caller-given
    `capacitor_references` (never net-inferred); reports a blocked plan status
    naming why, and refuses to apply an out-of-bounds or non-improving plan.

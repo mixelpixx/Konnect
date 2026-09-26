@@ -353,6 +353,152 @@ pub fn lossless_zone_outlines(tree: &SexpNode) -> Scan<LosslessZoneOutline> {
     Scan { items, skipped }
 }
 
+/// The board outline's proven geometry class (#594).
+///
+/// A bounding box is not the outline: for any board whose Edge.Cuts shape is
+/// not a rectangle — concave, notched, rounded, or just rotated — a point
+/// can sit inside the bbox while outside the true board. Every containment
+/// claim that matters (does this footprint fit, is this plan in bounds) has
+/// to know which case it is in rather than silently trusting the bbox.
+///
+/// This type draws the line **without** implementing a polygon/arc/cutout
+/// containment engine: it classifies whether the parsed Edge.Cuts geometry
+/// is *provably* an axis-aligned rectangle (in which case bbox containment
+/// is exact, not an approximation) or merely *parses* into some other shape
+/// the bbox cannot prove anything about.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutlineShape {
+    /// No Edge.Cuts graphics, or any one of them malformed — the same
+    /// all-or-nothing rule [`board_outline_bbox`] always used.
+    Missing,
+    /// Provably an axis-aligned rectangle: a single `gr_rect`, a single
+    /// axis-aligned 4-vertex `gr_poly`, or exactly four `gr_line` segments
+    /// closing into an axis-aligned rectangle. Bbox containment against
+    /// this shape is exact containment, not an approximation.
+    Rectangular { bbox: (f64, f64, f64, f64) },
+    /// Edge.Cuts geometry that parses cleanly but is not provably
+    /// rectangular — any arc, circle, or curve; a rotated or non-4-vertex
+    /// `gr_poly`; more than one boundary element. The bbox is reported for
+    /// advisory display only; it is never a containment proof.
+    Unproven { bbox: (f64, f64, f64, f64) },
+}
+
+impl OutlineShape {
+    /// The advisory bbox, present for every class except `Missing`.
+    pub fn bbox(self) -> Option<(f64, f64, f64, f64)> {
+        match self {
+            OutlineShape::Missing => None,
+            OutlineShape::Rectangular { bbox } | OutlineShape::Unproven { bbox } => Some(bbox),
+        }
+    }
+}
+
+const EDGE_TAGS: [&str; 6] = [
+    "gr_line",
+    "gr_rect",
+    "gr_arc",
+    "gr_circle",
+    "gr_curve",
+    "gr_poly",
+];
+
+/// Classify the board outline's proven shape — see [`OutlineShape`].
+pub fn board_outline_shape(tree: &SexpNode) -> OutlineShape {
+    let mut acc: Option<(f64, f64, f64, f64)> = None;
+    let mut edges: Vec<(&str, &SexpNode)> = Vec::new();
+    for child in tree.children().unwrap_or(&[]) {
+        let Some(head) = child.head() else { continue };
+        if !EDGE_TAGS.contains(&head) || child.find_str("layer") != Some("Edge.Cuts") {
+            continue;
+        }
+        let Some(bb) = graphic_bbox(child, head) else {
+            return OutlineShape::Missing;
+        };
+        acc = Some(match acc {
+            None => bb,
+            Some((x0, y0, x1, y1)) => (x0.min(bb.0), y0.min(bb.1), x1.max(bb.2), y1.max(bb.3)),
+        });
+        edges.push((head, child));
+    }
+    let Some(bbox) = acc else {
+        return OutlineShape::Missing;
+    };
+    if is_axis_aligned_rectangle(&edges, bbox) {
+        OutlineShape::Rectangular { bbox }
+    } else {
+        OutlineShape::Unproven { bbox }
+    }
+}
+
+/// Whether `edges` (the full Edge.Cuts graphic set, in source order) reduces
+/// to exactly one axis-aligned rectangle: a single `gr_rect`; a single
+/// `gr_poly` whose deduplicated vertices are exactly the four bbox corners;
+/// or exactly four `gr_line` segments, each axis-aligned, whose endpoints
+/// are exactly the four bbox corners.
+fn is_axis_aligned_rectangle(edges: &[(&str, &SexpNode)], bbox: (f64, f64, f64, f64)) -> bool {
+    let (x0, y0, x1, y1) = bbox;
+    if x0 >= x1 || y0 >= y1 {
+        return false; // Degenerate (zero-area) bbox proves nothing.
+    }
+    let corners = [(x0, y0), (x0, y1), (x1, y0), (x1, y1)];
+    let is_corner = |p: (f64, f64)| corners.iter().any(|c| close(*c, p));
+
+    match edges {
+        [("gr_rect", _)] => true,
+        [("gr_poly", node)] => {
+            let Some(pts) = node.find("pts") else {
+                return false;
+            };
+            let mut verts: Vec<(f64, f64)> = Vec::new();
+            for xy in pts.find_all("xy") {
+                let (Some(x), Some(y)) = (xy.get_f64(1), xy.get_f64(2)) else {
+                    return false;
+                };
+                if verts.last() != Some(&(x, y)) {
+                    verts.push((x, y));
+                }
+            }
+            if verts.len() > 1 && verts.first() == verts.last() {
+                verts.pop();
+            }
+            verts.len() == 4
+                && verts.iter().all(|v| is_corner(*v))
+                && all_corners_covered(&verts, &corners)
+        }
+        [("gr_line", _), ("gr_line", _), ("gr_line", _), ("gr_line", _)] => {
+            let mut verts: Vec<(f64, f64)> = Vec::new();
+            for (_, node) in edges {
+                let (Some(s), Some(e)) = (point(node, "start"), point(node, "end")) else {
+                    return false;
+                };
+                let axis_aligned = close_scalar(s.0, e.0) || close_scalar(s.1, e.1);
+                if !axis_aligned || !is_corner(s) || !is_corner(e) {
+                    return false;
+                }
+                verts.push(s);
+                verts.push(e);
+            }
+            all_corners_covered(&verts, &corners)
+        }
+        _ => false,
+    }
+}
+
+/// Every bbox corner appears in `verts` (order and duplicate count aside) —
+/// rules out four collinear or repeated points passing the per-point corner
+/// check above.
+fn all_corners_covered(verts: &[(f64, f64)], corners: &[(f64, f64); 4]) -> bool {
+    corners.iter().all(|c| verts.iter().any(|v| close(*c, *v)))
+}
+
+fn close_scalar(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+fn close(a: (f64, f64), b: (f64, f64)) -> bool {
+    close_scalar(a.0, b.0) && close_scalar(a.1, b.1)
+}
+
 /// Bounding box `(min_x, min_y, max_x, max_y)` of the board outline: every
 /// `Edge.Cuts` graphic that is a direct child of `(kicad_pcb …)` — `gr_line`,
 /// `gr_rect`, `gr_arc`, `gr_circle`, `gr_curve`, `gr_poly`.
@@ -369,28 +515,12 @@ pub fn lossless_zone_outlines(tree: &SexpNode) -> Scan<LosslessZoneOutline> {
 /// of them is malformed**. A partial outline bbox looks exactly like a
 /// finished one and silently mis-sizes the board, so a single broken edge
 /// graphic invalidates the answer rather than shrinking it.
+///
+/// This bbox is **not** a containment proof for non-rectangular shapes — see
+/// [`board_outline_shape`] and [`OutlineShape`], which every placement
+/// containment check should use instead.
 pub fn board_outline_bbox(tree: &SexpNode) -> Option<(f64, f64, f64, f64)> {
-    const EDGE_TAGS: [&str; 6] = [
-        "gr_line",
-        "gr_rect",
-        "gr_arc",
-        "gr_circle",
-        "gr_curve",
-        "gr_poly",
-    ];
-    let mut acc: Option<(f64, f64, f64, f64)> = None;
-    for child in tree.children().unwrap_or(&[]) {
-        let Some(head) = child.head() else { continue };
-        if !EDGE_TAGS.contains(&head) || child.find_str("layer") != Some("Edge.Cuts") {
-            continue;
-        }
-        let bb = graphic_bbox(child, head)?;
-        acc = Some(match acc {
-            None => bb,
-            Some((x0, y0, x1, y1)) => (x0.min(bb.0), y0.min(bb.1), x1.max(bb.2), y1.max(bb.3)),
-        });
-    }
-    acc
+    board_outline_shape(tree).bbox()
 }
 
 /// Bbox of a single edge graphic; `None` when a load-bearing coordinate is
@@ -1475,6 +1605,170 @@ mod tests {
     fn outline_bbox_is_none_without_edge_cuts() {
         let tree = parse_sexp("(kicad_pcb\n\t(version 20260206)\n)").unwrap();
         assert_eq!(board_outline_bbox(&tree), None);
+    }
+
+    // ─── OutlineShape classification (#594) ────────────────────────────────
+
+    #[test]
+    fn outline_shape_single_gr_rect_is_rectangular() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_rect (start 0 0) (end 100 50) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Rectangular {
+                bbox: (0.0, 0.0, 100.0, 50.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_four_gr_lines_closing_a_rectangle_is_rectangular() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 173.355 90.17) (end 173.355 136.525) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 121.285 90.17) (end 121.285 136.525) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 173.355 90.17) (end 121.285 90.17) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 121.285 136.525) (end 173.355 136.525) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Rectangular {
+                bbox: (121.285, 90.17, 173.355, 136.525)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_axis_aligned_four_vertex_gr_poly_is_rectangular() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts (xy 0 0) (xy 100 0) (xy 100 50) (xy 0 50)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Rectangular {
+                bbox: (0.0, 0.0, 100.0, 50.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_rotated_rectangle_gr_poly_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts (xy 10 0) (xy 20 10) (xy 10 20) (xy 0 10)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven {
+                bbox: (0.0, 0.0, 20.0, 20.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_concave_gr_poly_is_unproven() {
+        // The real-KiCad concave L-shaped fixture from gr_poly_outline.kicad_pcb.
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts \
+                (xy 154.48 116.96) (xy 116.48 116.96) (xy 116.48 103.96) (xy 109.49 103.96) \
+                (xy 109.49 108.97) (xy 103.42 108.97) (xy 103.42 82.55) (xy 109.494528 82.55) \
+                (xy 109.494528 86.96) (xy 116.48 86.96) (xy 116.48 78.96) (xy 154.48 78.96) \
+             ) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_single_arc_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 0 0) (end 10 0) (layer \"Edge.Cuts\"))\n\
+             \t(gr_arc (start 0 0) (mid 5 -5) (end 10 0) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_single_circle_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_circle (center 50 50) (end 53 54) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_single_curve_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_curve (pts (xy 30 50) (xy 32 48) (xy 35 47) (xy 38 50)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_two_boundary_elements_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_rect (start 0 0) (end 50 50) (layer \"Edge.Cuts\"))\n\
+             \t(gr_rect (start 60 60) (end 100 100) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_malformed_is_missing() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 0 0) (end 10 0) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 0 0) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(board_outline_shape(&tree), OutlineShape::Missing);
+    }
+
+    #[test]
+    fn outline_shape_is_missing_without_edge_cuts() {
+        let tree = parse_sexp("(kicad_pcb\n\t(version 20260206)\n)").unwrap();
+        assert_eq!(board_outline_shape(&tree), OutlineShape::Missing);
     }
 
     // ─── Courtyards ──────────────────────────────────────────────────────

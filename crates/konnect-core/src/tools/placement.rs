@@ -13,6 +13,22 @@
 //! the response says `outline_missing` explicitly rather than skipping the
 //! check silently.
 //!
+//! # Outline shape (#594)
+//!
+//! Outside-outline and connector-edge containment is only evidence against a
+//! **provably rectangular** outline (a bbox-vs-bbox check is exact against a
+//! rectangle). Any other parsed Edge.Cuts geometry — concave, notched,
+//! rounded, rotated, or multi-boundary — cannot be proven "inside" from a
+//! bbox alone, so those checks are skipped as unproven rather than silently
+//! passed: the response carries `outline_shape` (`"rectangular"`,
+//! `"unproven"`, or `"missing"`) and `outline_unproven: bool`, and the
+//! verdict can reach `outline_unproven` the same way it reaches
+//! `outline_missing`. See [`konnect_sexp::board::OutlineShape`]. The
+//! `auto_place_from_schematic` and `refine_placement_force_directed`
+//! planners go further: they refuse to plan a mutation against an unproven
+//! outline at all, since a plan is an implicit containment claim, not just
+//! an assessment of one.
+//!
 //! # Weight table
 //!
 //! The soft-score weights (overlaps ×20 capped 40, outside ×20 capped 40,
@@ -29,8 +45,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolContext, ToolDef};
 use konnect_sexp::board::{
-    board_outline_bbox, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
-    PcbConnectivityIndex, Side,
+    board_outline_bbox, board_outline_shape, footprint_courtyards, footprints, CourtyardSource,
+    FootprintCourtyard, OutlineShape, PcbConnectivityIndex, Side,
 };
 use konnect_sexp::parser::SexpNode;
 use plan_status::PlanApplicability;
@@ -47,7 +63,11 @@ pub fn tools() -> Vec<ToolDef> {
          naming the components behind each one. Hard failures (courtyard overlaps, parts \
          outside the outline) decide the verdict regardless of the numeric score, and a \
          board without an Edge.Cuts outline can never pass — its verdict is \
-         'outline_missing'.",
+         'outline_missing'. Outside-outline and connector-edge evidence only applies against \
+         a provably axis-aligned rectangular outline; a concave, notched, rounded, rotated, \
+         or multi-boundary outline cannot prove containment from its bbox, so those checks \
+         are skipped and the verdict is 'outline_unproven' (see 'outline_shape' in the \
+         response) rather than a silent pass.",
             json!({
                 "type": "object",
                 "properties": {
@@ -114,6 +134,10 @@ pub fn tools() -> Vec<ToolDef> {
              lay clusters out as tight grids inside the board outline, courtyards \
              non-overlapping. Footprints locked in KiCad are never moved and act as obstacles; add more with 'locked'. A starting point for refinement, not a final layout — the \
              response says so, and carries the board's score before and after the plan. \
+             Refuses (regardless of dry_run) when the board outline is not provably an \
+             axis-aligned rectangle — a concave, notched, rounded, rotated, or multi-boundary \
+             outline cannot back a containment proof; validate the saved board with KiCad DRC \
+             and make small explicit single-part moves instead. \
              Dry-run by default.",
             json!({
                 "type": "object",
@@ -138,6 +162,9 @@ pub fn tools() -> Vec<ToolDef> {
              layout stops changing. A plan is blocked when it does not converge or improve, \
              has a hard failure or off-board target, exceeds max_displacement_mm, or has no \
              displacement limit. Blocked plans can be inspected in dry-run but cannot apply. \
+             Also refuses outright (regardless of dry_run) when the board outline is not \
+             provably an axis-aligned rectangle — validate the saved board with KiCad DRC and \
+             make small explicit single-part moves instead. \
              Locked references exert force but never move. Dry-run by default.",
             json!({
                 "type": "object",
@@ -235,7 +262,16 @@ async fn handle_score_placement(
     let tree = konnect_sexp::parse_sexp(&content)?;
 
     let scan = footprint_courtyards(&tree);
-    let outline = board_outline_bbox(&tree);
+    let outline_shape = board_outline_shape(&tree);
+    // Containment evidence is authoritative only against a proven-rectangular
+    // outline (#594): an `Unproven` shape (concave, notched, rounded,
+    // rotated, or multi-boundary) still surfaces its bbox for advisory
+    // display, but the outside-outline and connector-edge checks below only
+    // run as pass/fail evidence for `Rectangular`.
+    let outline = match outline_shape {
+        OutlineShape::Rectangular { bbox } => Some(bbox),
+        OutlineShape::Unproven { .. } | OutlineShape::Missing => None,
+    };
     let index = PcbConnectivityIndex::build(&tree);
     let values = footprint_values(&tree);
 
@@ -391,12 +427,15 @@ async fn handle_score_placement(
         }));
     }
 
-    // The verdict derives ONLY from hard failures and outline presence — the
-    // numeric score never decides it.
+    // The verdict derives ONLY from hard failures and outline shape — the
+    // numeric score never decides it. Precedence: hard failures →
+    // outline_missing → outline_unproven → pass.
     let verdict = if !hard_failures.is_empty() {
         "hard_fail"
-    } else if outline.is_none() {
+    } else if matches!(outline_shape, OutlineShape::Missing) {
         "outline_missing"
+    } else if matches!(outline_shape, OutlineShape::Unproven { .. }) {
+        "outline_unproven"
     } else {
         "pass"
     };
@@ -404,7 +443,13 @@ async fn handle_score_placement(
     Ok(CallToolResult::json(&json!({
         "verdict": verdict,
         "score": score,
-        "outline_missing": outline.is_none(),
+        "outline_missing": matches!(outline_shape, OutlineShape::Missing),
+        "outline_unproven": matches!(outline_shape, OutlineShape::Unproven { .. }),
+        "outline_shape": match outline_shape {
+            OutlineShape::Rectangular { .. } => "rectangular",
+            OutlineShape::Unproven { .. } => "unproven",
+            OutlineShape::Missing => "missing",
+        },
         "hard_failures": hard_failures,
         "deductions": deductions,
         "connector_edges": connector_edges,
@@ -439,6 +484,33 @@ async fn score_of_content(ctx: &ToolContext, content: &str) -> anyhow::Result<se
         anyhow::bail!("score returned non-text content");
     };
     Ok(serde_json::from_str(text)?)
+}
+
+/// Refuse to plan against an outline whose containment cannot be proven
+/// (#594): `Unproven` covers concave, notched, rounded, rotated, or
+/// multi-boundary Edge.Cuts geometry, where a bbox-only planner could place
+/// a part inside the bbox but outside the true board shape. Refuses
+/// regardless of `dry_run`/`apply` — a "preview" that claims containment it
+/// cannot prove is exactly the false-authority problem, not a safe subset of
+/// it. One shared helper so every placement planner agrees on the wording.
+fn outline_unproven_refusal(operation: &str, bbox: (f64, f64, f64, f64)) -> CallToolResult {
+    let (x0, y0, x1, y1) = bbox;
+    let reasons = vec![format!(
+        "the board outline is not provably an axis-aligned rectangle (advisory bbox \
+         ({x0}, {y0})..({x1}, {y1})) — automated layout cannot prove a planned position is \
+         inside a concave, notched, rounded, rotated, or multi-boundary board shape; use KiCad \
+         DRC to validate the saved board, and make small explicit single-part moves instead"
+    )];
+    CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: operation.into(),
+            reasons: reasons.clone(),
+        },
+        format!(
+            "{operation} refuses to plan against an unproven outline: {}",
+            reasons.join("; ")
+        ),
+    )
 }
 
 /// Apply Set placements to board content via the SAME transform the closed-
@@ -931,10 +1003,16 @@ async fn handle_auto_place(
     let tree = konnect_sexp::parse_sexp(&content)?;
     let scan = footprint_courtyards(&tree);
     let index = PcbConnectivityIndex::build(&tree);
-    let Some(outline) = board_outline_bbox(&tree) else {
-        return Ok(CallToolResult::error(
-            "auto placement needs a board outline; add Edge.Cuts first (set_board_size)",
-        ));
+    let outline = match board_outline_shape(&tree) {
+        OutlineShape::Rectangular { bbox } => bbox,
+        OutlineShape::Unproven { bbox } => {
+            return Ok(outline_unproven_refusal("auto_place_from_schematic", bbox));
+        }
+        OutlineShape::Missing => {
+            return Ok(CallToolResult::error(
+                "auto placement needs a board outline; add Edge.Cuts first (set_board_size)",
+            ));
+        }
     };
 
     // Union-find over references joined by shared nets.
@@ -1296,10 +1374,19 @@ async fn handle_force_directed(
     let tree = konnect_sexp::parse_sexp(&content)?;
     let scan = footprint_courtyards(&tree);
     let index = PcbConnectivityIndex::build(&tree);
-    let Some((ox0, oy0, ox1, oy1)) = board_outline_bbox(&tree) else {
-        return Ok(CallToolResult::error(
-            "force-directed refinement needs a board outline (Edge.Cuts)",
-        ));
+    let (ox0, oy0, ox1, oy1) = match board_outline_shape(&tree) {
+        OutlineShape::Rectangular { bbox } => bbox,
+        OutlineShape::Unproven { bbox } => {
+            return Ok(outline_unproven_refusal(
+                "refine_placement_force_directed",
+                bbox,
+            ));
+        }
+        OutlineShape::Missing => {
+            return Ok(CallToolResult::error(
+                "force-directed refinement needs a board outline (Edge.Cuts)",
+            ));
+        }
     };
     let (board_w, board_h) = (ox1 - ox0, oy1 - oy0);
 
@@ -2287,6 +2374,31 @@ mod tests {
         assert!(detail.contains("0.846"), "hand-computed area: {detail}");
     }
 
+    /// Regression for the rectangular fast path (#594): the fixture's
+    /// four-`gr_line` outline classifies as `Rectangular`, so moving C1's
+    /// root anchor from (20, 15) far outside the 60×45 outline must still
+    /// reach `outside_outline` as a hard failure — containment evidence for
+    /// a proven rectangle is unaffected by the new `Unproven` classification.
+    #[tokio::test]
+    async fn rectangular_outline_still_reaches_outside_outline_hard_fail() {
+        let fixture = std::fs::read_to_string(FIXTURE).unwrap();
+        let moved = fixture.replace("(at 20 15)", "(at 200 15)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outside.kicad_pcb");
+        std::fs::write(&path, moved).unwrap();
+
+        let response = score(&path).await;
+        assert_eq!(response["outline_shape"], "rectangular", "{response}");
+        assert_eq!(response["outline_unproven"], false, "{response}");
+        assert_eq!(response["verdict"], "hard_fail", "{response}");
+        let failures = response["hard_failures"].as_array().unwrap();
+        assert!(
+            failures.iter().any(|f| f["kind"] == "outside_outline"
+                && f["references"].as_array().unwrap().contains(&json!("C1"))),
+            "{response}"
+        );
+    }
+
     /// Synthetic variant derived from the KiCad-authored fixture: retagging
     /// the four Edge.Cuts lines removes the outline. The outside and
     /// connector-edge checks are blocked (not passed), the response says so,
@@ -2317,20 +2429,24 @@ mod tests {
     /// real project board into a fresh board and saved by pcbnew — not
     /// manufactured by string surgery. It has no footprints, so this exercises
     /// `score_placement`'s public path purely for outline recognition: the
-    /// board must not be treated as outline-missing, and its verdict must be
-    /// able to reach "pass" (blocked only by outline absence or hard
-    /// failures, of which an empty board has none).
+    /// board must not be treated as outline-missing (gr_poly recognition
+    /// from #593 stands), but its concave shape is not a provable rectangle,
+    /// so containment is unproven (#594) — it must never reach a silent
+    /// "pass".
     const GR_POLY_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../konnect-sexp/tests/fixtures/gr_poly_outline.kicad_pcb"
     );
 
     #[tokio::test]
-    async fn gr_poly_outline_is_recognized_through_the_public_scoring_path() {
+    async fn gr_poly_outline_is_recognized_but_unproven_through_the_public_scoring_path() {
         let response = score(std::path::Path::new(GR_POLY_FIXTURE)).await;
 
         assert_eq!(response["outline_missing"], false, "{response}");
-        assert_eq!(response["verdict"], "pass", "{response}");
+        assert_eq!(response["outline_unproven"], true, "{response}");
+        assert_eq!(response["outline_shape"], "unproven", "{response}");
+        assert_eq!(response["verdict"], "outline_unproven", "{response}");
+        assert_ne!(response["verdict"], "pass");
         assert_eq!(response["score"], 100);
         assert_eq!(response["footprints_scored"], 0);
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
@@ -2344,6 +2460,48 @@ mod tests {
             board_outline_bbox(&tree),
             Some((103.42, 78.96, 154.48, 116.96))
         );
+    }
+
+    /// Served `tools/call` coverage (not a direct handler call) for #594's
+    /// `outline_unproven` verdict, over the same real-KiCad concave `gr_poly`
+    /// fixture used above.
+    #[tokio::test]
+    async fn served_score_placement_reports_outline_unproven_for_a_non_rectangular_board() {
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 594,
+                "method": "tools/call",
+                "params": {
+                    "name": "score_placement",
+                    "arguments": { "board": GR_POLY_FIXTURE }
+                }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(response["isError"], json!(false), "{body}");
+        assert_eq!(body["outline_missing"], false, "{body}");
+        assert_eq!(body["outline_unproven"], true, "{body}");
+        assert_eq!(body["outline_shape"], "unproven", "{body}");
+        assert_eq!(body["verdict"], "outline_unproven", "{body}");
+        assert_ne!(body["verdict"], "pass");
     }
 
     /// Move ONE footprint's root anchor by string surgery on the
@@ -3419,6 +3577,211 @@ mod tests {
 
         assert!(!result.is_error, "{result:?}");
         assert_ne!(std::fs::read(&board).unwrap(), before);
+    }
+
+    /// #594: a non-rectangular outline cannot back a containment proof, so
+    /// `auto_place_from_schematic` must refuse to plan against it — a
+    /// BLOCKED refusal, not a plan — regardless of `dry_run`/`apply`.
+    #[tokio::test]
+    async fn auto_place_refuses_an_unproven_outline_dry_run() {
+        let before = std::fs::read(GR_POLY_FIXTURE).unwrap();
+        let result = handle_auto_place(
+            &json!({ "board": GR_POLY_FIXTURE, "dry_run": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("auto_place_from_schematic"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(GR_POLY_FIXTURE).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn auto_place_refuses_an_unproven_outline_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_auto_place(
+            &json!({ "board": board.to_string_lossy(), "dry_run": false }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("auto_place_from_schematic"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before, "must not mutate");
+    }
+
+    /// #594, mirroring `auto_place_refuses_an_unproven_outline_dry_run` for
+    /// `refine_placement_force_directed`.
+    #[tokio::test]
+    async fn force_directed_refuses_an_unproven_outline_dry_run() {
+        let before = std::fs::read(GR_POLY_FIXTURE).unwrap();
+        let result = handle_force_directed(
+            &json!({ "board": GR_POLY_FIXTURE, "dry_run": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("refine_placement_force_directed"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(GR_POLY_FIXTURE).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn force_directed_refuses_an_unproven_outline_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_force_directed(
+            &json!({ "board": board.to_string_lossy(), "dry_run": false }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result_text(&result).contains("refine_placement_force_directed"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before, "must not mutate");
+    }
+
+    /// Served `tools/call` coverage (not a direct handler call) for #594's
+    /// planner refusal: `auto_place_from_schematic` must refuse an unproven
+    /// outline through the real MCP dispatch layer, for both `dry_run` and
+    /// `apply`, and the apply attempt must leave the board byte-identical.
+    #[tokio::test]
+    async fn served_auto_place_refuses_an_unproven_outline_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "auto_place_from_schematic",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": dry_run }
+                }
+            })
+        };
+
+        for (id, dry_run) in [(5940, true), (5941, false)] {
+            let response = handler
+                .handle_message(call(id, dry_run))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+            assert_eq!(
+                response["isError"],
+                json!(true),
+                "dry_run={dry_run}: {body}"
+            );
+            assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+            assert_eq!(body["error"]["operation"], "auto_place_from_schematic");
+            assert_eq!(
+                std::fs::read(&board).unwrap(),
+                before,
+                "dry_run={dry_run}: an unproven-outline refusal must not write"
+            );
+        }
+    }
+
+    /// Served twin of `served_auto_place_refuses_an_unproven_outline_and_does_not_write`
+    /// for `refine_placement_force_directed`, the other planner that shares
+    /// the same `outline_unproven_refusal` helper.
+    #[tokio::test]
+    async fn served_force_directed_refuses_an_unproven_outline_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gr_poly.kicad_pcb");
+        std::fs::copy(GR_POLY_FIXTURE, &board).unwrap();
+        let before = std::fs::read(&board).unwrap();
+
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let call = |id, dry_run| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "refine_placement_force_directed",
+                    "arguments": { "board": board.to_string_lossy(), "dry_run": dry_run }
+                }
+            })
+        };
+
+        for (id, dry_run) in [(5942, true), (5943, false)] {
+            let response = handler
+                .handle_message(call(id, dry_run))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+
+            assert_eq!(
+                response["isError"],
+                json!(true),
+                "dry_run={dry_run}: {body}"
+            );
+            assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+            assert_eq!(
+                body["error"]["operation"],
+                "refine_placement_force_directed"
+            );
+            assert_eq!(
+                std::fs::read(&board).unwrap(),
+                before,
+                "dry_run={dry_run}: an unproven-outline refusal must not write"
+            );
+        }
     }
 
     #[tokio::test]

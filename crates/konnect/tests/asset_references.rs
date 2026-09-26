@@ -720,6 +720,13 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "sheet_instance_path",
         // Structured placement-score response field, not a callable tool.
         "interface_filter_caps",
+        // Structured outline-shape response fields (#594), not callable tools.
+        "outline_shape",
+        "outline_unproven",
+        "outline_missing",
+        // Placement/DRC provenance response values (#602), not callable tools.
+        "saved_file",
+        "source_evidence",
         // Shared placement-plan response fields, not callable tools.
         "plan_status",
         "blocking_reasons",
