@@ -2163,7 +2163,10 @@ async fn handle_add_power_symbol(
         return Ok(error.into_tool_result());
     }
 
-    let pwr_ref = format!("#PWR{:03}", next_pwr_number(&sch));
+    // Spelled by the rule `annotate_schematic` uses, which is eeschema's:
+    // `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second spelling of the
+    // same number beside every eeschema-numbered symbol (#583).
+    let pwr_ref = super::sch_annotate::format_designator("#PWR", next_pwr_number(&sch));
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
@@ -4047,7 +4050,7 @@ mod power_symbol_tests {
         let sym = sch
             .symbols
             .iter()
-            .find(|s| s.reference() == Some("#PWR001"))
+            .find(|s| s.reference() == Some("#PWR01"))
             .expect("power symbol instance");
         let ref_prop = sym
             .properties
@@ -4079,7 +4082,7 @@ mod power_symbol_tests {
             "Value must stay visible on power symbols: {val_sexp}"
         );
         assert!(
-            !after.contains("(property \"Reference\" \"#PWR001\")\n"),
+            !after.contains("(property \"Reference\" \"#PWR01\")\n"),
             "must not write a bare Reference with no (at)"
         );
     }
@@ -4111,7 +4114,7 @@ mod power_symbol_tests {
         let sym = sch
             .symbols
             .iter()
-            .find(|s| s.reference() == Some("#PWR001"))
+            .find(|s| s.reference() == Some("#PWR01"))
             .expect("power symbol instance");
         assert_eq!(
             sym.footprint(),
@@ -4166,7 +4169,7 @@ mod power_symbol_tests {
         let sym = sch
             .symbols
             .iter()
-            .find(|s| s.reference() == Some("#PWR001"))
+            .find(|s| s.reference() == Some("#PWR01"))
             .expect("power symbol instance");
         let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
         let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
@@ -4177,7 +4180,7 @@ mod power_symbol_tests {
     }
 
     /// Numbering by count re-issued a designator that was still on the sheet:
-    /// delete `#PWR002` of three and the next add produced a second `#PWR003`.
+    /// delete `#PWR02` of three and the next add produced a second `#PWR03`.
     #[tokio::test]
     async fn add_power_symbol_fills_a_freed_number_instead_of_duplicating() {
         let dir = tempfile::tempdir().unwrap();
@@ -4205,7 +4208,7 @@ mod power_symbol_tests {
         add(120.0).await;
 
         let mut sch = cse::Schematic::load(&path).unwrap();
-        sch.symbols.retain(|s| s.reference() != Some("#PWR002"));
+        sch.symbols.retain(|s| s.reference() != Some("#PWR02"));
         sch.overwrite().unwrap();
 
         add(130.0).await;
@@ -4215,9 +4218,211 @@ mod power_symbol_tests {
         refs.sort_unstable();
         assert_eq!(
             refs,
-            ["#PWR001", "#PWR002", "#PWR003"],
+            ["#PWR01", "#PWR02", "#PWR03"],
             "the freed number belongs to the new symbol, and nothing may repeat"
         );
+    }
+
+    /// KiCad's `ecc83-pp` demo as eeschema saved it. Its power symbols are
+    /// numbered `#PWR01`-`#PWR04`, `#PWR06`, `#PWR08` and `#PWR09`.
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    /// A copy of the ecc83 sheet that can take a `power:GND` without a KiCad
+    /// install. The sheet draws ground from its own `ecc83-pp:GND`, so that
+    /// eeschema-written definition is spliced in a second time under the name
+    /// `power:GND`. Every other byte of the copy is as eeschema wrote it.
+    fn ecc83_with_power_gnd(dir: &std::path::Path) -> std::path::PathBuf {
+        let opening = "(symbol \"ecc83-pp:GND\"";
+        let start = ECC83.find(opening).expect("the sheet's own GND definition");
+        let (_, end) = find_balanced_block(ECC83, start).expect("balanced block");
+        let renamed = ECC83[start..end].replacen("ecc83-pp:GND", "power:GND", 1);
+        let mut content = ECC83.to_string();
+        content.insert_str(start, &format!("{renamed}\n\t\t"));
+        let path = dir.join("ecc83-pp.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    async fn add_gnd(path: &std::path::Path, x: f64) -> serde_json::Value {
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": x,
+                "y": 25.4
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected a JSON text response, got {other:?}"),
+        }
+    }
+
+    /// Both places a designator lives in a schematic: the `Reference`
+    /// property and the `(reference …)` of each instance record.
+    fn designator_spellings(content: &str, designator: &str) -> (usize, usize) {
+        (
+            content
+                .matches(&format!("(property \"Reference\" \"{designator}\""))
+                .count(),
+            content
+                .matches(&format!("(reference \"{designator}\")"))
+                .count(),
+        )
+    }
+
+    /// A symbol added to a sheet eeschema numbered continues eeschema's
+    /// series in eeschema's spelling. The sheet has 1-4, 6, 8 and 9, so the
+    /// free numbers are 5, 7 and then 10: `{:03}` spelled those `#PWR005`,
+    /// `#PWR007` and `#PWR010` beside neighbours named `#PWR04` and `#PWR06`
+    /// (#583).
+    #[tokio::test]
+    async fn a_sheet_eeschema_numbered_is_continued_in_eeschemas_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ecc83_with_power_gnd(dir.path());
+
+        let mut reported = Vec::new();
+        for x in [25.4, 38.1, 50.8] {
+            let response = add_gnd(&path, x).await;
+            reported.push(response["reference"].as_str().unwrap().to_string());
+        }
+        assert_eq!(reported, ["#PWR05", "#PWR07", "#PWR010"]);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        for designator in &reported {
+            assert_eq!(
+                designator_spellings(&after, designator),
+                (1, 1),
+                "{designator} is written once as the property and once in the instance record"
+            );
+        }
+        for stale in ["#PWR005", "#PWR007"] {
+            assert_eq!(designator_spellings(&after, stale), (0, 0), "{stale}");
+        }
+        for untouched in [
+            "#PWR01", "#PWR02", "#PWR03", "#PWR04", "#PWR06", "#PWR08", "#PWR09",
+        ] {
+            assert_eq!(
+                designator_spellings(&after, untouched),
+                designator_spellings(ECC83, untouched),
+                "{untouched} is eeschema's and stays as eeschema wrote it"
+            );
+        }
+    }
+
+    /// #583 through the served boundary: `tools/call` on the eeschema-numbered
+    /// sheet reports eeschema's spelling, and the committed file carries the
+    /// designator the response reported, in both places it lives.
+    #[tokio::test]
+    async fn the_served_dispatch_reports_the_spelling_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ecc83_with_power_gnd(dir.path());
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 583,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_power_symbol",
+                    "arguments": {
+                        "schematic": path.display().to_string(),
+                        "power_net": "GND", "x": 25.4, "y": 25.4
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let placed: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(placed["reference"], "#PWR05", "{placed}");
+
+        let committed = cse::Schematic::load(&path).unwrap();
+        let symbol = committed
+            .symbols
+            .iter()
+            .find(|symbol| Some(symbol.uuid.as_str()) == placed["uuid"].as_str())
+            .expect("the placed symbol is in the committed file");
+        assert_eq!(symbol.reference(), placed["reference"].as_str());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(designator_spellings(&after, "#PWR05"), (1, 1));
+    }
+
+    /// A schematic holding one power symbol per designator, as text. Each
+    /// symbol records its instance under `project`, which the placement
+    /// preflight holds to the name of the file it is written to.
+    fn sheet_with_power_symbols(project: &str, designators: &[String]) -> String {
+        let mut sheet = String::from(
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n",
+        );
+        for (index, designator) in designators.iter().enumerate() {
+            sheet.push_str(&format!(
+                "  (symbol\n    (lib_id \"power:GND\")\n    (at {x} 50.8 0)\n    (unit 1)\n    (uuid \"00000000-0000-0000-0000-{index:012}\")\n    (property \"Reference\" \"{designator}\" (at {x} 57.15 0))\n    (property \"Value\" \"GND\" (at {x} 54.61 0))\n    (instances (project \"{project}\" (path \"/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\" (reference \"{designator}\") (unit 1))))\n  )\n",
+                x = 25.4 + 2.54 * index as f64,
+            ));
+        }
+        sheet.push_str(")\n");
+        sheet
+    }
+
+    /// Past ninety-nine the `0` stays: eeschema writes `#PWR0100`, where
+    /// `{:03}` wrote `#PWR100`.
+    #[tokio::test]
+    async fn the_hundredth_power_symbol_keeps_the_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hundred.kicad_sch");
+        let used: Vec<String> = (1..=99).map(|n| format!("#PWR0{n}")).collect();
+        std::fs::write(&path, sheet_with_power_symbols("hundred", &used)).unwrap();
+
+        let response = add_gnd(&path, 25.4).await;
+        assert_eq!(response["reference"], "#PWR0100");
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(
+            sch.symbols
+                .iter()
+                .any(|s| s.reference() == Some("#PWR0100")),
+            "the committed file carries eeschema's spelling"
+        );
+        assert!(
+            !sch.symbols.iter().any(|s| s.reference() == Some("#PWR100")),
+            "and not the old one"
+        );
+    }
+
+    /// A sheet that already holds Konnect's older `#PWR001` and `#PWR002`
+    /// counts them as 1 and 2, hands out 3 in the new spelling, and leaves
+    /// the older two alone: re-spelling what is already in a file belongs
+    /// to `annotate_schematic`, not to placing a symbol.
+    #[tokio::test]
+    async fn older_spellings_on_the_sheet_are_counted_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.kicad_sch");
+        let used = vec!["#PWR001".to_string(), "#PWR002".to_string()];
+        std::fs::write(&path, sheet_with_power_symbols("mixed", &used)).unwrap();
+
+        let response = add_gnd(&path, 25.4).await;
+        assert_eq!(response["reference"], "#PWR03");
+        let sch = cse::Schematic::load(&path).unwrap();
+        let mut refs: Vec<&str> = sch.symbols.iter().filter_map(|s| s.reference()).collect();
+        refs.sort_unstable();
+        assert_eq!(refs, ["#PWR001", "#PWR002", "#PWR03"]);
     }
 }
 
