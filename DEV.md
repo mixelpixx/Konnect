@@ -209,6 +209,13 @@ Konnect/
 - Multi-file schematic changes use project-local
   `.konnect-transaction-*.json` write-ahead journals. These journals contain
   complete before/after images and must be treated as sensitive project data.
+  On Unix a journal is created `0600` whatever the umask says; elsewhere it
+  inherits whatever the platform gives a new file, so keep the project
+  directory itself private there.
+- A newly created design file or exported artifact takes the mode any other
+  new file would get — `0666 & ~umask` on Unix. A replacement keeps the mode
+  the destination already had, so a project created by an earlier Konnect
+  stays at `0600` until its owner widens it with `chmod`.
 
 `konnect_schematic_editor::Schematic` deliberately distinguishes creation from
 replacement:
