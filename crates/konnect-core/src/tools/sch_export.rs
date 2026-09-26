@@ -145,12 +145,16 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "run_erc",
             "Run the Electrical Rules Check (ERC) on the schematic via kicad-cli \
-             and return a list of violations filtered by severity.",
+             and return a list of violations filtered by severity. Violation \
+             positions are millimetres on the sheet; the response's `coordinates` \
+             object says whether they were corrected for the KiCad versions that \
+             report them 100x too small, passed through, or withheld because the \
+             KiCad version could not be classified.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "output":    { "type": "string", "description": "Optional path to write this tool's filtered violation list as JSON (not KiCad's own ERC report)" },
+                    "output":    { "type": "string", "description": "Optional path to write this tool's response as JSON, violations and coordinate provenance together (not KiCad's own ERC report)" },
                     "severity":  {
                         "type": "string",
                         "description": "Minimum severity to report: 'error', 'warning', 'info'",
@@ -599,12 +603,99 @@ async fn handle_export_netlist_summary(
     })))
 }
 
-/// ERC positions ride on the entry itself as `x`/`y`, not as a nested object.
-fn flatten_pos(entry: &mut serde_json::Value, pos: Option<&cli::ReportPos>) {
+/// ERC positions ride on the entry itself as a pair of keys, not as a nested
+/// object. A location is `x`/`y`; the raw KiCad coordinate kept when the
+/// writing version could not be classified is deliberately not, because it is
+/// not a location and a caller reading only `x`/`y` must not pick it up.
+fn flatten_pos(
+    entry: &mut serde_json::Value,
+    pos: Option<&cli::ReportPos>,
+    (x_key, y_key): (&str, &str),
+) {
     if let Some(pos) = pos {
-        entry["x"] = json!(pos.x);
-        entry["y"] = json!(pos.y);
+        entry[x_key] = json!(pos.x);
+        entry[y_key] = json!(pos.y);
     }
+}
+
+const LOCATION_KEYS: (&str, &str) = ("x", "y");
+const KICAD_REPORTED_KEYS: (&str, &str) = ("kicad_reported_x", "kicad_reported_y");
+
+/// Shape an ERC run into the tool's response: the violations at or above
+/// `min_severity`, and what the coordinates on them are worth.
+fn erc_response(report: &cli::ErcReport, min_severity: &str) -> serde_json::Value {
+    let severity_rank = |s: &str| match s {
+        "error" => 2,
+        "warning" => 1,
+        _ => 0,
+    };
+    let min_rank = severity_rank(min_severity);
+
+    let filtered: Vec<serde_json::Value> = report
+        .violations
+        .iter()
+        .filter(|v| severity_rank(&v.severity) >= min_rank)
+        .map(|v| {
+            let items: Vec<serde_json::Value> = v
+                .items
+                .iter()
+                .map(|item| {
+                    let mut entry = json!({ "description": item.description });
+                    flatten_pos(&mut entry, item.pos.as_ref(), LOCATION_KEYS);
+                    flatten_pos(
+                        &mut entry,
+                        item.kicad_reported_pos.as_ref(),
+                        KICAD_REPORTED_KEYS,
+                    );
+                    if let Some(uuid) = &item.uuid {
+                        entry["uuid"] = json!(uuid);
+                    }
+                    entry
+                })
+                .collect();
+            let mut entry = json!({
+                "severity": v.severity,
+                "description": v.description,
+                // KiCad's stable key for the rule; `description` is prose.
+                "rule": v.rule,
+                // A pin conflict names two pins, and `description` above
+                // carries only the first.
+                "items": items,
+            });
+            if let Some(sheet) = &v.sheet {
+                entry["sheet"] = json!(sheet);
+            }
+            // The violation's own x/y predate `items` and stay the first
+            // item's — including when that item's coordinate was withheld.
+            if let Some(first) = v.items.first() {
+                flatten_pos(&mut entry, first.pos.as_ref(), LOCATION_KEYS);
+                flatten_pos(
+                    &mut entry,
+                    first.kicad_reported_pos.as_ref(),
+                    KICAD_REPORTED_KEYS,
+                );
+            }
+            entry
+        })
+        .collect();
+
+    let error_count = filtered.iter().filter(|v| v["severity"] == "error").count();
+    let warning_count = filtered
+        .iter()
+        .filter(|v| v["severity"] == "warning")
+        .count();
+
+    json!({
+        "total": filtered.len(),
+        "errors": error_count,
+        "warnings": warning_count,
+        // What the positions above are worth. KiCad's ERC JSON writer reported
+        // every coordinate at 1/100 of its true value up to 10.0.6 (#541,
+        // kicad#25582), so a caller cannot read x/y without knowing which side
+        // of that fix wrote the report.
+        "coordinates": report.coordinates,
+        "violations": filtered
+    })
 }
 
 async fn handle_run_erc(
@@ -642,68 +733,18 @@ async fn handle_run_erc(
         ));
     }
 
-    let violations = cli::run_erc(&ctx.config.kicad_cli, &sch_path).await?;
+    let report = cli::run_erc(&ctx.config.kicad_cli, &sch_path).await?;
+    let response = erc_response(&report, min_severity);
 
-    let severity_rank = |s: &str| match s {
-        "error" => 2,
-        "warning" => 1,
-        _ => 0,
-    };
-    let min_rank = severity_rank(min_severity);
-
-    let filtered: Vec<serde_json::Value> = violations
-        .iter()
-        .filter(|v| severity_rank(&v.severity) >= min_rank)
-        .map(|v| {
-            let items: Vec<serde_json::Value> = v
-                .items
-                .iter()
-                .map(|item| {
-                    let mut entry = json!({ "description": item.description });
-                    flatten_pos(&mut entry, item.pos.as_ref());
-                    if let Some(uuid) = &item.uuid {
-                        entry["uuid"] = json!(uuid);
-                    }
-                    entry
-                })
-                .collect();
-            let mut entry = json!({
-                "severity": v.severity,
-                "description": v.description,
-                // KiCad's stable key for the rule; `description` is prose.
-                "rule": v.rule,
-                // A pin conflict names two pins, and `description` above
-                // carries only the first.
-                "items": items,
-            });
-            if let Some(sheet) = &v.sheet {
-                entry["sheet"] = json!(sheet);
-            }
-            // The violation's own x/y predate `items` and stay the first
-            // item's.
-            flatten_pos(&mut entry, v.items.first().and_then(|i| i.pos.as_ref()));
-            entry
-        })
-        .collect();
-
-    // Optionally write the report to a file
+    // Optionally write the report to a file. The whole response goes in, not
+    // the violation array alone: the file is the copy that gets handed to
+    // another tool or another person, and a coordinate must not travel
+    // without the `coordinates` block saying what it is worth.
     if let Some(out_path) = args["output"].as_str() {
-        let report = serde_json::to_string_pretty(&filtered)?;
-        std::fs::write(out_path, report)?;
+        std::fs::write(out_path, serde_json::to_string_pretty(&response)?)?;
     }
 
-    let error_count = filtered.iter().filter(|v| v["severity"] == "error").count();
-    let warning_count = filtered
-        .iter()
-        .filter(|v| v["severity"] == "warning")
-        .count();
-
-    Ok(CallToolResult::json(&json!({
-        "total": filtered.len(),
-        "errors": error_count,
-        "warnings": warning_count,
-        "violations": filtered
-    })))
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_fix_connectivity(
@@ -1807,5 +1848,137 @@ mod tests {
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("conflict")
         );
+    }
+}
+
+#[cfg(test)]
+mod erc_response_tests {
+    use super::*;
+
+    const AFFECTED_REPORT: &str =
+        include_str!("../../tests/fixtures/erc_coordinate_scale_kicad10_0_6.json");
+
+    /// KiCad 10.0.6's own ERC JSON for the `single_pin_nets` hierarchy, with
+    /// the version it claims swapped so one fixture covers both sides of the
+    /// gate. See `tests/fixtures/erc_coordinate_scale.README.md`.
+    fn erc_report(kicad_version: Option<&str>) -> cli::ErcReport {
+        let mut raw: serde_json::Value = serde_json::from_str(AFFECTED_REPORT).unwrap();
+        match kicad_version {
+            Some(version) => raw["kicad_version"] = json!(version),
+            None => {
+                raw.as_object_mut().unwrap().remove("kicad_version");
+            }
+        }
+        cli::parse_erc_json(&raw)
+    }
+
+    /// A caller reading `x`/`y` gets a location it can find on the sheet, and
+    /// the response says on which side of kicad#25582 that number was made.
+    #[test]
+    fn the_response_states_what_its_coordinates_are_worth() {
+        let response = erc_response(&erc_report(Some("10.0.6")), "warning");
+
+        assert_eq!(response["coordinates"]["status"], "corrected");
+        assert_eq!(response["coordinates"]["kicad_version"], "10.0.6");
+        assert_eq!(response["coordinates"]["scale_applied"], 100.0);
+
+        let first = &response["violations"][0];
+        // KiCad's own text report of this run: `@(69.85 mm, 180.34 mm)`.
+        assert_eq!(first["x"], 69.85);
+        assert_eq!(first["y"], 180.34);
+        assert_eq!(first["items"][0]["x"], 69.85);
+        assert!(first["items"][0]["kicad_reported_x"].is_null());
+    }
+
+    /// Withholding has to be visible in the response, not just in the parse:
+    /// no `x`/`y` anywhere, and KiCad's own number under a name that cannot be
+    /// mistaken for a location.
+    #[test]
+    fn a_withheld_coordinate_leaves_no_location_in_the_response() {
+        let response = erc_response(&erc_report(None), "warning");
+
+        assert_eq!(response["coordinates"]["status"], "withheld");
+        assert!(response["coordinates"]["scale_applied"].is_null());
+        assert!(response["coordinates"]["kicad_version"].is_null());
+
+        for violation in response["violations"].as_array().unwrap() {
+            assert!(violation["x"].is_null() && violation["y"].is_null());
+            assert_eq!(
+                violation["kicad_reported_x"],
+                violation["items"][0]["kicad_reported_x"]
+            );
+            for item in violation["items"].as_array().unwrap() {
+                assert!(item["x"].is_null() && item["y"].is_null());
+                assert!(item["kicad_reported_x"].is_number());
+                assert!(item["kicad_reported_y"].is_number());
+            }
+        }
+        assert_eq!(
+            response["violations"][0]["items"][0]["kicad_reported_x"],
+            0.6985
+        );
+    }
+
+    /// The `output` file is the copy that leaves Konnect, so it carries the
+    /// same disclosure the response does. Writing the violation array alone
+    /// put corrected — or withheld — coordinates in a file with nothing
+    /// saying which.
+    #[tokio::test]
+    async fn the_output_file_carries_the_coordinate_provenance() {
+        let project = tempfile::TempDir::new().unwrap();
+        let control = tempfile::TempDir::new().unwrap();
+        let schematic = project.path().join("board.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        let written = project.path().join("violations.json");
+
+        // `sch erc --output <path>` puts the report path in $4; the fake CLI
+        // writes an affected-version report there and exits.
+        let report = r#"{"kicad_version":"10.0.6","sheets":[{"path":"/","violations":[{"description":"Pin not connected","items":[{"description":"Symbol R1 Pin 1","pos":{"x":1.0033,"y":1.0414}}],"severity":"error","type":"pin_not_connected"}]}]}"#;
+        let cli = crate::tools::cli::test_support::write_script(
+            control.path(),
+            "fake-kicad-cli",
+            &format!("#!/bin/sh\nprintf '%s' '{report}' > \"$4\"\nexit 0\n"),
+            &format!("@echo off\r\n> \"%~4\" echo {report}\r\nexit /b 0\r\n"),
+        );
+
+        let ctx = crate::tools::ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: cli.to_str().unwrap().to_string(),
+                ..Default::default()
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        handle_run_erc(
+            &json!({
+                "schematic": schematic.display().to_string(),
+                "output": written.display().to_string(),
+            }),
+            &ctx,
+        )
+        .await
+        .expect("the fake CLI reports one violation");
+
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+        assert_eq!(file["coordinates"]["status"], "corrected");
+        assert_eq!(file["coordinates"]["scale_applied"], 100.0);
+        assert_eq!(file["violations"][0]["x"], 100.33);
+        assert_eq!(file["violations"][0]["items"][0]["y"], 104.14);
+    }
+
+    /// The severity filter and the counts beside it are unchanged by any of
+    /// this. `kicad-cli` printed "Found 11 violations" for this run, and its
+    /// text report lists 3 errors and 8 warnings.
+    #[test]
+    fn the_counts_and_the_severity_filter_are_unchanged() {
+        let all = erc_response(&erc_report(Some("10.0.6")), "warning");
+        assert_eq!(all["total"], 11);
+        assert_eq!(all["errors"], 3);
+        assert_eq!(all["warnings"], 8);
+
+        let errors_only = erc_response(&erc_report(Some("10.0.6")), "error");
+        assert_eq!(errors_only["total"], 3);
+        assert_eq!(errors_only["warnings"], 0);
     }
 }

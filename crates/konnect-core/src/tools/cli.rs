@@ -52,6 +52,56 @@ pub struct ErcViolation {
     pub items: Vec<ReportItem>,
 }
 
+/// Everything `run_erc` answers with: the violations, and what was done to
+/// their coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErcReport {
+    pub violations: Vec<ErcViolation>,
+    pub coordinates: ErcCoordinates,
+}
+
+/// What happened to the coordinates in an ERC report, and why.
+///
+/// KiCad's ERC *JSON* writer divided every `pos` by 100, from the release that
+/// introduced it (8.0) through 10.0.6: it formatted schematic internal units
+/// through `pcbIUScale` (1e6 IU/mm) where the text report used `schIUScale`
+/// (1e4 IU/mm). Upstream fixed exactly that line in `6d8e1fe` for 10.0.7
+/// ([kicad#25582]). `pcb drc` has its own writer and never shared the fault,
+/// so the correction is scoped to this one reader (#541).
+///
+/// [kicad#25582]: https://gitlab.com/kicad/code/kicad/-/issues/25582
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErcCoordinates {
+    pub status: ErcCoordinateStatus,
+    /// The version that wrote this report, as the report itself states it.
+    /// That is the binary which produced these numbers, which is what the
+    /// classification needs — not whatever `kicad-cli --version` answers now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kicad_version: Option<String>,
+    /// What every coordinate was multiplied by. Only set for `corrected`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale_applied: Option<f64>,
+    pub reason: String,
+}
+
+/// Whether an ERC report's coordinates can be believed, after checking the
+/// version that wrote them against the scaling defect described on
+/// [`ErcCoordinates`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErcCoordinateStatus {
+    /// A version proven affected wrote the report; every coordinate was
+    /// multiplied back by 100.
+    Corrected,
+    /// A version with the upstream fix wrote it; the coordinates are KiCad's
+    /// own, untouched.
+    Verbatim,
+    /// The writing version could not be classified, so no coordinate is
+    /// reported as a location. KiCad's own numbers are kept in
+    /// [`ReportItem::kicad_reported_pos`], unscaled, for diagnosis.
+    Withheld,
+}
+
 /// One item involved in an ERC or DRC violation. Both reports use the same
 /// item shape, so both parsers decode it the same way.
 ///
@@ -67,6 +117,11 @@ pub struct ReportItem {
     /// shape both the ERC and DRC responses have always had.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
+    /// The position exactly as KiCad wrote it, kept only when the ERC report's
+    /// version could not be classified against the scaling defect and `pos`
+    /// was therefore withheld. Never set on the DRC path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kicad_reported_pos: Option<ReportPos>,
     /// Whether ownership was resolved, and if not, why. Absent when ownership
     /// enrichment did not run at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +197,31 @@ impl ReportItem {
                 self.ownership_status = Some(OwnershipStatus::NotFound);
                 self.owner = Some(None);
             }
+        }
+    }
+
+    /// Put an ERC coordinate back where it belongs, or withhold it, according
+    /// to what the report's version is worth. The DRC path never calls this.
+    ///
+    /// The correction is rounded to nanometre-scale precision because
+    /// `0.6985 × 100.0` is `69.85000000000001` in binary floating point, and a
+    /// coordinate that reads as 12 decimals of a millimetre invites a caller
+    /// to believe a precision KiCad never had: the schematic grid is 1e4 IU/mm.
+    fn apply_erc_coordinates(&mut self, coordinates: &ErcCoordinates) {
+        fn corrected(value: f64) -> f64 {
+            const ROUND_TO: f64 = 1e6;
+            (value * ERC_JSON_SCALE_CORRECTION * ROUND_TO).round() / ROUND_TO
+        }
+
+        match coordinates.status {
+            ErcCoordinateStatus::Verbatim => {}
+            ErcCoordinateStatus::Corrected => {
+                if let Some(pos) = self.pos.as_mut() {
+                    pos.x = corrected(pos.x);
+                    pos.y = corrected(pos.y);
+                }
+            }
+            ErcCoordinateStatus::Withheld => self.kicad_reported_pos = self.pos.take(),
         }
     }
 }
@@ -631,9 +711,24 @@ pub(crate) mod test_support {
 
 // ─── ERC ─────────────────────────────────────────────────────────────────────
 
+/// Ratio between KiCad's PCB and schematic internal-unit scales — 1e6 against
+/// 1e4 IU/mm — which is exactly what the defective ERC JSON writer divided
+/// every coordinate by.
+const ERC_JSON_SCALE_CORRECTION: f64 = 100.0;
+
+/// First KiCad release whose ERC JSON writer reports true coordinates.
+const ERC_JSON_SCALE_FIXED_IN: (u64, u64, u64) = (10, 0, 7);
+
+/// KiCad's development branches carry minor version 99 — 10.99.0 is the work
+/// toward 11.0. Only the branch whose major matches the fixed release is
+/// undatable: the fix reached master and the 10.0 branch on the same day, so a
+/// 10.99 nightly may sit on either side of it. Every other development branch
+/// is wholly before or wholly after, and its version orders like any other.
+const KICAD_DEVELOPMENT_MINOR: u64 = 99;
+
 /// Run ERC on a schematic and return parsed violations.
 /// KiCAD 10: `sch erc --output <path> --format json <input>`
-pub async fn run_erc(cli: &str, schematic: &Path) -> Result<Vec<ErcViolation>> {
+pub async fn run_erc(cli: &str, schematic: &Path) -> Result<ErcReport> {
     run_erc_with_temp_root(cli, schematic, None).await
 }
 
@@ -641,7 +736,7 @@ async fn run_erc_with_temp_root(
     cli: &str,
     schematic: &Path,
     temp_root: Option<&Path>,
-) -> Result<Vec<ErcViolation>> {
+) -> Result<ErcReport> {
     let report_dir = match temp_root {
         Some(root) => tempfile::Builder::new()
             .prefix("konnect-erc-")
@@ -661,6 +756,10 @@ async fn run_erc_with_temp_root(
                 .context("temporary ERC path is not UTF-8")?,
             "--format",
             "json",
+            // kicad-cli defaults to millimetres, but the response states the
+            // unit, so it is pinned here rather than inherited.
+            "--units",
+            "mm",
             schematic.to_str().context("schematic path is not UTF-8")?,
         ];
         run_cli(cli, &args, LONG_TIMEOUT).await?;
@@ -686,14 +785,101 @@ async fn run_erc_with_temp_root(
     }
 }
 
-fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
+/// Decide what the coordinates of a report written by `kicad_version` are
+/// worth. A version that cannot be placed on either side of the upstream fix
+/// yields `Withheld`: a coordinate that may be off by 100× cannot be told from
+/// a true one by the caller, so none is offered.
+fn classify_erc_coordinates(kicad_version: Option<&str>) -> ErcCoordinates {
+    let (fixed_major, fixed_minor, fixed_patch) = ERC_JSON_SCALE_FIXED_IN;
+    let fixed_in = format!("{fixed_major}.{fixed_minor}.{fixed_patch}");
+    // Every withheld reason ends the same way, because the caller's next move
+    // is the same whichever way the version defeated the check.
+    let withheld = |cause: String| ErcCoordinates {
+        status: ErcCoordinateStatus::Withheld,
+        kicad_version: kicad_version.map(String::from),
+        scale_applied: None,
+        reason: format!(
+            "{cause} Coordinates are in kicad_reported_x/kicad_reported_y, exactly as KiCad \
+             wrote them, and may be {ERC_JSON_SCALE_CORRECTION}× too small."
+        ),
+    };
+
+    let Some(version) = kicad_version else {
+        return withheld(format!(
+            "The ERC report names no kicad_version, so it cannot be placed against the \
+             coordinate scaling defect KiCad fixed in {fixed_in} (kicad#25582)."
+        ));
+    };
+    let Some((major, minor, patch)) = parse_kicad_version(version) else {
+        return withheld(format!(
+            "The ERC report's kicad_version '{version}' is not a major.minor.patch version, so \
+             it cannot be placed against the coordinate scaling defect KiCad fixed in \
+             {fixed_in} (kicad#25582)."
+        ));
+    };
+    if (major, minor) == (fixed_major, KICAD_DEVELOPMENT_MINOR) {
+        return withheld(format!(
+            "KiCad {version} is a development build of the branch the fix for the ERC coordinate \
+             scaling defect (kicad#25582) landed on mid-cycle, so the version cannot say whether \
+             this build predates it."
+        ));
+    }
+
+    let kicad_version = Some(version.to_string());
+    if (major, minor, patch) < ERC_JSON_SCALE_FIXED_IN {
+        ErcCoordinates {
+            status: ErcCoordinateStatus::Corrected,
+            kicad_version,
+            scale_applied: Some(ERC_JSON_SCALE_CORRECTION),
+            reason: format!(
+                "KiCad {version} writes every ERC JSON coordinate at 1/{ERC_JSON_SCALE_CORRECTION} \
+                 of its true value (kicad#25582, fixed in {fixed_in}); Konnect multiplied it \
+                 back. A length quoted inside KiCad's own violation text is scaled the same way \
+                 and is left as KiCad wrote it."
+            ),
+        }
+    } else {
+        ErcCoordinates {
+            status: ErcCoordinateStatus::Verbatim,
+            kicad_version,
+            scale_applied: None,
+            reason: format!(
+                "KiCad {version} carries the fix for the ERC JSON coordinate scaling defect \
+                 (kicad#25582, fixed in {fixed_in}), so its coordinates are passed through \
+                 unchanged."
+            ),
+        }
+    }
+}
+
+/// Read KiCad's `major.minor.patch` version, which is how both the ERC and DRC
+/// reports spell the version that wrote them. Anything else is no version:
+/// guessing at a shape KiCad does not write would be guessing at the fix
+/// boundary too.
+fn parse_kicad_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let mut next = || {
+        parts
+            .next()
+            .filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|part| part.parse::<u64>().ok())
+    };
+    let version = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(version)
+}
+
+pub(crate) fn parse_erc_json(raw: &serde_json::Value) -> ErcReport {
     // KiCAD's ERC report (https://schemas.kicad.org/erc.v1.json) nests
     // violations per sheet — { "sheets": [ { "path": …, "violations": […] } ] }
     // — with positions on the affected items. There is no top-level
     // "violations" key (that's the DRC report's shape), so reading one here
     // silently returned zero violations for every schematic.
+    let coordinates = classify_erc_coordinates(raw.get("kicad_version").and_then(|v| v.as_str()));
     let Some(sheets) = raw.get("sheets").and_then(|s| s.as_array()) else {
-        return Vec::new();
+        return ErcReport {
+            violations: Vec::new(),
+            coordinates,
+        };
     };
 
     let mut out = Vec::new();
@@ -706,7 +892,16 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
             let items: Vec<ReportItem> = v
                 .get("items")
                 .and_then(|i| i.as_array())
-                .map(|items| items.iter().map(parse_report_item).collect())
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            let mut item = parse_report_item(item);
+                            item.apply_erc_coordinates(&coordinates);
+                            item
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             let mut description = v["description"].as_str().unwrap_or("").to_string();
             // The per-item description names the offender ("Symbol R1 Pin 1…")
@@ -727,7 +922,10 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
             });
         }
     }
-    out
+    ErcReport {
+        violations: out,
+        coordinates,
+    }
 }
 
 /// Decode one item of an ERC or DRC violation — the two reports spell it the
@@ -737,6 +935,9 @@ fn parse_report_item(item: &serde_json::Value) -> ReportItem {
         description: item["description"].as_str().unwrap_or("").to_string(),
         pos: parse_item_pos(item),
         uuid: item["uuid"].as_str().map(String::from),
+        // Set on the ERC path only, by `apply_erc_coordinates`, and only when
+        // the report's version left `pos` unusable.
+        kicad_reported_pos: None,
         // Filled in on the DRC path by `enrich_drc_items`; ERC leaves them
         // unset and they serialise away.
         ownership_status: None,
@@ -1856,6 +2057,43 @@ mod drc_parse_tests {
             .all(|v| v.severity == "error"));
     }
 
+    /// The scoping control for #541: `pcb drc` has its own report writer and
+    /// never carried the ÷100 defect, so its coordinates must reach the caller
+    /// exactly as KiCad wrote them. This fixture is a real KiCad 10.0.0
+    /// report, a version the ERC correction *does* apply to, so a correction
+    /// that leaked out of the ERC reader would move these numbers.
+    #[test]
+    fn drc_coordinates_are_never_rescaled() {
+        let raw = real_report();
+        let report = parse_drc_report(&raw).unwrap();
+
+        let expected = |index: usize| {
+            let pos = &raw["violations"][index]["items"][0]["pos"];
+            (pos["x"].as_f64().unwrap(), pos["y"].as_f64().unwrap())
+        };
+        // Restated from the fixture, which is KiCad's own output: the board's
+        // first violation sits at these millimetres.
+        assert_eq!(expected(0), (121.285, 136.525));
+
+        for (index, violation) in report.violations.iter().enumerate() {
+            let pos = violation.pos.as_ref().expect("items[0].pos");
+            assert_eq!((pos.x, pos.y), expected(index));
+        }
+        for violation in report.all() {
+            for item in &violation.items {
+                let pos = item.pos.as_ref().expect("every item here has one");
+                assert!(
+                    pos.x > 1.0 && pos.y > 1.0,
+                    "a scaled coordinate would be two orders of magnitude smaller: {pos:?}"
+                );
+                assert!(
+                    item.kicad_reported_pos.is_none(),
+                    "withholding is an ERC-only state"
+                );
+            }
+        }
+    }
+
     /// KiCad reports a position per *involved item*, not one per violation.
     /// Reading a top-level `pos` — which the schema has never had — made every
     /// position `null`, and the rule key was dropped entirely, leaving the
@@ -2279,7 +2517,7 @@ mod erc_parse_tests {
         #[cfg(unix)]
         std::fs::set_permissions(project.path(), original_permissions).unwrap();
 
-        assert!(result.unwrap().is_empty());
+        assert!(result.unwrap().violations.is_empty());
         assert_eq!(std::fs::read(&legacy_report).unwrap(), b"user-owned report");
         let report_path = PathBuf::from(std::fs::read_to_string(observed).unwrap().trim());
         assert!(report_path.starts_with(scratch.path()));
@@ -2371,7 +2609,7 @@ mod erc_parse_tests {
 
     #[test]
     fn parses_violations_nested_under_sheets() {
-        let violations = parse_erc_json(&real_report());
+        let violations = parse_erc_json(&real_report()).violations;
         assert_eq!(
             violations.len(),
             3,
@@ -2385,7 +2623,9 @@ mod erc_parse_tests {
         );
         assert_eq!(violations[0].sheet.as_deref(), Some("/"));
         let pos = violations[0].items[0].pos.as_ref().expect("item position");
-        assert!((pos.x - 1.0033).abs() < 1e-9);
+        // 1.0033 in the report; the fixture was written by KiCad 10.0.3, which
+        // is inside the scaled range, so the sheet position is 100.33 mm.
+        assert!((pos.x - 100.33).abs() < 1e-9);
         assert_eq!(violations[1].severity, "warning");
     }
 
@@ -2395,12 +2635,12 @@ mod erc_parse_tests {
     /// caller back to `kicad-cli` by hand.
     #[test]
     fn every_item_of_a_violation_survives() {
-        let conflict = &parse_erc_json(&real_report())[2];
+        let conflict = &parse_erc_json(&real_report()).violations[2];
         assert_eq!(conflict.items.len(), 2);
         assert!(conflict.items[0].description.contains("#PWR031"));
         let explains = &conflict.items[1];
         assert!(explains.description.contains("U2 Pin 5"));
-        assert!((explains.pos.as_ref().expect("item position").y - 1.016).abs() < 1e-9);
+        assert!((explains.pos.as_ref().expect("item position").y - 101.6).abs() < 1e-9);
         assert_eq!(
             explains.uuid.as_deref(),
             Some("5b6a1f42-2c17-4f0b-9a6e-8c3f7d21e0a4")
@@ -2410,7 +2650,7 @@ mod erc_parse_tests {
     /// `type` is the addressable key; `description` beside it is prose.
     #[test]
     fn violations_carry_kicads_rule_key() {
-        let violations = parse_erc_json(&real_report());
+        let violations = parse_erc_json(&real_report()).violations;
         assert_eq!(violations[0].rule, "pin_not_connected");
         assert_eq!(violations[2].rule, "pin_to_pin");
     }
@@ -2419,7 +2659,7 @@ mod erc_parse_tests {
     /// second item must not change what it says.
     #[test]
     fn the_description_still_names_the_first_item_only() {
-        let conflict = &parse_erc_json(&real_report())[2];
+        let conflict = &parse_erc_json(&real_report()).violations[2];
         assert!(conflict.description.contains("#PWR031"));
         assert!(!conflict.description.contains("U2"));
     }
@@ -2429,6 +2669,7 @@ mod erc_parse_tests {
     #[test]
     fn an_item_without_a_position_is_still_reported() {
         let violations = parse_erc_json(&serde_json::json!({
+            "kicad_version": "10.0.6",
             "sheets": [{
                 "path": "/",
                 "violations": [{
@@ -2438,20 +2679,269 @@ mod erc_parse_tests {
                     "type": "label_dangling"
                 }]
             }]
-        }));
+        }))
+        .violations;
         assert_eq!(violations[0].items.len(), 1);
         assert!(violations[0].items[0].pos.is_none());
         assert!(violations[0].items[0].uuid.is_none());
         assert!(violations[0].description.contains("Label VIN"));
     }
 
+    /// KiCad 10.0.6's own ERC JSON for the committed `single_pin_nets`
+    /// hierarchy, and — the oracle — its own *text* report of the same run,
+    /// whose coordinates were never affected. Provenance and the item table
+    /// are in `erc_coordinate_scale.README.md`.
+    const AFFECTED_REPORT: &str =
+        include_str!("../../tests/fixtures/erc_coordinate_scale_kicad10_0_6.json");
+    const AFFECTED_TEXT_REPORT: &str =
+        include_str!("../../tests/fixtures/erc_coordinate_scale_kicad10_0_6.rpt");
+    /// A KiCad carrying the upstream fix writing the same hierarchy: its JSON
+    /// report, and that same run's text report. Captured from a build of the
+    /// 10.0 branch, which is where the fix lives until 10.0.7 ships — see the
+    /// README for the build and for why its version had to be stamped.
+    const FIXED_REPORT: &str =
+        include_str!("../../tests/fixtures/erc_coordinate_scale_kicad10_0_7.json");
+    const FIXED_TEXT_REPORT: &str =
+        include_str!("../../tests/fixtures/erc_coordinate_scale_kicad10_0_7.rpt");
+    /// The same branch build with upstream's version left as it is: it
+    /// carries the fix but stamps its report `10.0.6`.
+    const UNRELEASED_BRANCH_REPORT: &str =
+        include_str!("../../tests/fixtures/erc_coordinate_scale_kicad10_branch.json");
+
+    /// The release upstream fixed kicad#25582 in. Restated here as the promise
+    /// the tests hold Konnect to, deliberately not read from the constant the
+    /// implementation gates on.
+    const FIRST_FIXED_KICAD: &str = "10.0.7";
+
+    /// Every `@(x mm, y mm): description` line of a KiCad ERC text report, in
+    /// file order — which is the order the JSON report lists the same items
+    /// in. Deliberately parsed here rather than transcribed, so the
+    /// expectations stay KiCad's numbers.
+    fn text_report_items(report: &str) -> Vec<(f64, f64, String)> {
+        report
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("@(")?;
+                let (x, rest) = rest.split_once(" mm, ")?;
+                let (y, description) = rest.split_once(" mm): ")?;
+                Some((
+                    x.parse().ok()?,
+                    y.parse().ok()?,
+                    description.trim().to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    fn reported_items(violations: &[ErcViolation]) -> Vec<&ReportItem> {
+        violations.iter().flat_map(|v| v.items.iter()).collect()
+    }
+
+    /// The whole point of the correction: what `run_erc` reports has to be
+    /// findable on the sheet, which is what KiCad's own text report says it is.
+    #[test]
+    fn an_affected_reports_coordinates_are_put_back_where_kicad_says_they_are() {
+        let report = parse_erc_json(&serde_json::from_str(AFFECTED_REPORT).unwrap());
+        let oracle = text_report_items(AFFECTED_TEXT_REPORT);
+        assert_eq!(oracle.len(), 12, "the text report names 12 items");
+
+        assert_eq!(report.coordinates.status, ErcCoordinateStatus::Corrected);
+        assert_eq!(report.coordinates.kicad_version.as_deref(), Some("10.0.6"));
+        assert_eq!(report.coordinates.scale_applied, Some(100.0));
+        assert!(report.coordinates.reason.contains(FIRST_FIXED_KICAD));
+
+        let items = reported_items(&report.violations);
+        assert_eq!(items.len(), oracle.len());
+        for (item, (x, y, description)) in items.iter().zip(&oracle) {
+            let pos = item
+                .pos
+                .as_ref()
+                .expect("every item in this report has one");
+            assert!(
+                (pos.x - x).abs() < 1e-9 && (pos.y - y).abs() < 1e-9,
+                "{} reported at ({}, {}), text report says ({x}, {y})",
+                item.description,
+                pos.x,
+                pos.y
+            );
+            assert!(item.kicad_reported_pos.is_none(), "nothing was withheld");
+            // KiCad scales the measurement inside its own violation text the
+            // same way, and Konnect does not rewrite KiCad's prose — so the
+            // three wire items keep the description KiCad wrote.
+            if !description.contains("length") {
+                assert_eq!(&item.description, description);
+            }
+        }
+        assert_eq!(
+            reported_items(&report.violations)
+                .iter()
+                .filter(|item| item.description.contains("length 0.1270 mm"))
+                .count(),
+            3,
+            "the scaled-down lengths in KiCad's prose are left alone"
+        );
+    }
+
+    /// The fixture is only evidence while it still shows the defect: if a
+    /// later capture is dropped in unscaled, the test above would pass by
+    /// doing nothing.
+    #[test]
+    fn the_affected_fixture_still_carries_the_defect() {
+        let raw: serde_json::Value = serde_json::from_str(AFFECTED_REPORT).unwrap();
+        let first = &raw["sheets"][0]["violations"][0]["items"][0]["pos"];
+        assert_eq!(first["x"].as_f64(), Some(0.6985));
+        assert_eq!(first["y"].as_f64(), Some(1.8034));
+        let (x, y, _) = text_report_items(AFFECTED_TEXT_REPORT)[0].clone();
+        assert_eq!((x, y), (69.85, 180.34));
+    }
+
+    /// A fixed KiCad's numbers are already right; touching them would be the
+    /// same bug with the sign flipped.
+    #[test]
+    fn a_fixed_kicads_coordinates_are_passed_through_untouched() {
+        let raw: serde_json::Value = serde_json::from_str(FIXED_REPORT).unwrap();
+        let report = parse_erc_json(&raw);
+
+        assert_eq!(report.coordinates.status, ErcCoordinateStatus::Verbatim);
+        assert_eq!(
+            report.coordinates.kicad_version.as_deref(),
+            Some(FIRST_FIXED_KICAD)
+        );
+        assert_eq!(report.coordinates.scale_applied, None);
+
+        // Two oracles, neither of them this crate. The fixed JSON report has
+        // to agree with the text report of its own run — same binary, but a
+        // writer the fix did not touch — and with the 10.0.6 text report,
+        // written months earlier by a different binary. Nothing but the true
+        // geometry satisfies both.
+        let own_oracle = text_report_items(FIXED_TEXT_REPORT);
+        let affected_oracle = text_report_items(AFFECTED_TEXT_REPORT);
+        assert_eq!(
+            own_oracle, affected_oracle,
+            "the fix did not touch the text writer, so both releases report the same geometry"
+        );
+
+        let items = reported_items(&report.violations);
+        assert_eq!(items.len(), own_oracle.len());
+        for (item, (x, y, _)) in items.iter().zip(&own_oracle) {
+            let pos = item
+                .pos
+                .as_ref()
+                .expect("every item in this report has one");
+            assert!((pos.x - x).abs() < 1e-9 && (pos.y - y).abs() < 1e-9);
+            assert!(item.kicad_reported_pos.is_none());
+        }
+    }
+
+    /// Known limitation, outside the supported contract by maintainer decision
+    /// on #541: only released builds are covered. An unreleased 10.0-branch
+    /// build writes true coordinates but stamps them `10.0.6`, so they are
+    /// scaled like an affected release. Pinned so the limit cannot change
+    /// unnoticed in either direction.
+    #[test]
+    fn an_unreleased_branch_build_stamped_as_the_affected_release_is_scaled() {
+        let raw: serde_json::Value = serde_json::from_str(UNRELEASED_BRANCH_REPORT).unwrap();
+        assert_eq!(raw["kicad_version"], "10.0.6");
+        let report = parse_erc_json(&raw);
+        assert_eq!(report.coordinates.status, ErcCoordinateStatus::Corrected);
+        assert_eq!(report.coordinates.scale_applied, Some(100.0));
+
+        let oracle = text_report_items(AFFECTED_TEXT_REPORT);
+        let items = reported_items(&report.violations);
+        assert_eq!(items.len(), oracle.len());
+        for (item, (x, y, _)) in items.iter().zip(&oracle) {
+            let pos = item
+                .pos
+                .as_ref()
+                .expect("every item in this report has one");
+            assert!(
+                (pos.x - x * 100.0).abs() < 1e-6 && (pos.y - y * 100.0).abs() < 1e-6,
+                "{} reported at ({}, {}), expected 100x the true ({x}, {y})",
+                item.description,
+                pos.x,
+                pos.y
+            );
+        }
+    }
+
+    /// Three ways a version cannot be placed against the fix. None of them may
+    /// produce a location — a coordinate that might be 100× out cannot be told
+    /// from a true one by the caller — and all of them keep KiCad's own number.
+    #[test]
+    fn an_unclassifiable_version_withholds_the_location_and_keeps_kicads_number() {
+        let mut raw: serde_json::Value = serde_json::from_str(AFFECTED_REPORT).unwrap();
+        for version in [
+            serde_json::Value::Null,
+            // A development build of the branch the fix landed on mid-cycle:
+            // it reached master and 10.0 on the same day, so 10.99 alone
+            // cannot date the build.
+            serde_json::json!("10.99.0"),
+            serde_json::json!("10.0"),
+            serde_json::json!("10.0.6-rc1"),
+        ] {
+            match &version {
+                serde_json::Value::Null => {
+                    raw.as_object_mut().unwrap().remove("kicad_version");
+                }
+                version => raw["kicad_version"] = version.clone(),
+            }
+
+            let report = parse_erc_json(&raw);
+            assert_eq!(
+                report.coordinates.status,
+                ErcCoordinateStatus::Withheld,
+                "{version:?}"
+            );
+            assert_eq!(report.coordinates.scale_applied, None, "{version:?}");
+            assert!(
+                report.coordinates.reason.contains("kicad_reported_x"),
+                "the reason has to say where the number went: {}",
+                report.coordinates.reason
+            );
+
+            for item in reported_items(&report.violations) {
+                assert!(item.pos.is_none(), "{version:?}");
+            }
+            let first = reported_items(&report.violations)[0]
+                .kicad_reported_pos
+                .expect("KiCad's own number is kept for diagnosis");
+            assert_eq!((first.x, first.y), (0.6985, 1.8034), "{version:?}");
+        }
+    }
+
+    /// The boundary itself, stated as the release notes state it rather than
+    /// as the code spells it.
+    #[test]
+    fn the_correction_covers_every_release_before_the_upstream_fix() {
+        // 9.99 is the development branch that became 10.0, so it is wholly
+        // before the fix; 11.99 became 12.0 and is wholly after. Only 10.99,
+        // the branch the fix landed on, is undatable — see the test above.
+        for affected in ["8.0.0", "9.0.0", "9.99.0", "10.0.0", "10.0.5", "10.0.6"] {
+            assert_eq!(
+                classify_erc_coordinates(Some(affected)).status,
+                ErcCoordinateStatus::Corrected,
+                "{affected}"
+            );
+        }
+        for fixed in [FIRST_FIXED_KICAD, "10.0.8", "10.1.0", "11.0.0", "11.99.0"] {
+            assert_eq!(
+                classify_erc_coordinates(Some(fixed)).status,
+                ErcCoordinateStatus::Verbatim,
+                "{fixed}"
+            );
+        }
+    }
+
     #[test]
     fn empty_or_alien_reports_yield_no_violations() {
-        assert!(parse_erc_json(&serde_json::json!({})).is_empty());
-        assert!(parse_erc_json(&serde_json::json!({ "sheets": [] })).is_empty());
+        assert!(parse_erc_json(&serde_json::json!({})).violations.is_empty());
+        assert!(parse_erc_json(&serde_json::json!({ "sheets": [] }))
+            .violations
+            .is_empty());
         // DRC-shaped input (top-level violations) is not an ERC report.
         assert!(
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
+                .violations
                 .is_empty()
         );
     }
