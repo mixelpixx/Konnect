@@ -18,6 +18,62 @@ use std::path::{Path, PathBuf};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
+fn footprint_drill_schema() -> serde_json::Value {
+    json!({
+        "description": "Hole in pad-local millimetres: a circular diameter or an oval width/height. Pad rotation rotates the hole too.",
+        "oneOf": [
+            {"type": "number", "exclusiveMinimum": 0},
+            {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "shape": {"const": "oval"},
+                    "width": {"type": "number", "exclusiveMinimum": 0},
+                    "height": {"type": "number", "exclusiveMinimum": 0}
+                },
+                "required": ["shape", "width", "height"]
+            }
+        ]
+    })
+}
+
+fn footprint_drill_sexp(
+    value: &serde_json::Value,
+    pad_type: &str,
+    pad_width: f64,
+    pad_height: f64,
+) -> Result<String, String> {
+    if !matches!(pad_type, "thru_hole" | "np_thru_hole") {
+        return Err("drill requires a thru_hole or np_thru_hole pad".into());
+    }
+    let (width, height, oval) = if let Some(diameter) = value.as_f64() {
+        (diameter, diameter, false)
+    } else if let Some(object) = value.as_object() {
+        if object.len() != 3 || object.get("shape").and_then(|s| s.as_str()) != Some("oval") {
+            return Err("oval drill requires exactly shape, width, and height".into());
+        }
+        let width = value["width"]
+            .as_f64()
+            .ok_or("drill width must be a number")?;
+        let height = value["height"]
+            .as_f64()
+            .ok_or("drill height must be a number")?;
+        (width, height, true)
+    } else {
+        return Err("drill must be a positive diameter or an oval object".into());
+    };
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err("drill dimensions must be finite and positive".into());
+    }
+    if width > pad_width || height > pad_height {
+        return Err("drill dimensions must fit within the pad size".into());
+    }
+    Ok(if oval {
+        format!("(drill oval {width} {height})")
+    } else {
+        format!("(drill {width})")
+    })
+}
+
 /// The pin-item object schema (number/name/type/style/x/y/angle/length) shared
 /// by `pins`, `units[].pins`, and `power_pins` in the create_symbol schema
 /// below. `type_desc` parameterizes the one wording difference between call
@@ -109,7 +165,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "y": { "type": "number" },
                                 "width": { "type": "number" },
                                 "height": { "type": "number" },
-                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" },
+                                "drill": footprint_drill_schema(),
                                 "layers": {
                                     "type": "array",
                                     "items": { "type": "string" },
@@ -168,7 +224,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["circle", "rect", "oval", "roundrect"],
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
-                    "drill": { "type": "number", "description": "New drill diameter in mm (optional)" }
+                    "drill": footprint_drill_schema()
                 },
                 "required": ["footprint_path", "pad_number"]
             }),
@@ -803,8 +859,8 @@ async fn handle_create_footprint(
             String::new()
         };
 
-        let drill_sexp = if let Some(drill) = pad["drill"].as_f64() {
-            format!("(drill {})", drill)
+        let drill_sexp = if let Some(drill) = pad.get("drill") {
+            footprint_drill_sexp(drill, &pad_type, w, h).expect("validated drill")
         } else {
             String::new()
         };
@@ -888,6 +944,15 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
                     "missing or not a number",
                 ));
             }
+        }
+        if let Some(drill) = pad.get("drill") {
+            footprint_drill_sexp(
+                drill,
+                pad["type"].as_str().expect("validated"),
+                pad["width"].as_f64().expect("validated"),
+                pad["height"].as_f64().expect("validated"),
+            )
+            .map_err(|reason| invalid_library_argument(&format!("pads[{index}].drill"), reason))?;
         }
     }
     Ok(())
@@ -1190,16 +1255,32 @@ fn edit_footprint_pad_block(
             new_pad.replace_range(size_pos..size_end, &format!("(size {width} {height})"));
         }
     }
-    if let Some(drill) = args["drill"].as_f64() {
-        if let Some(drill_pos) = new_pad.find("(drill ") {
-            let drill_end = new_pad[drill_pos..]
-                .find(')')
-                .map(|i| drill_pos + i + 1)
-                .unwrap_or(new_pad.len());
-            new_pad.replace_range(drill_pos..drill_end, &format!("(drill {drill})"));
+    if let Some(drill) = args.get("drill") {
+        let node = parse_sexp(&new_pad).map_err(|e| e.to_string())?;
+        let pad_type = node.get(2).and_then(SexpNode::as_str).unwrap_or("");
+        let size = node.find("size").ok_or("pad size is missing")?;
+        let drill_sexp = footprint_drill_sexp(
+            drill,
+            pad_type,
+            size.get_f64(1).ok_or("pad width is missing")?,
+            size.get_f64(2).ok_or("pad height is missing")?,
+        )?;
+        let existing =
+            find_direct_child_blocks(&new_pad, "pad")
+                .into_iter()
+                .find(|(start, end)| {
+                    parse_sexp(&new_pad[*start..*end]).is_ok_and(|n| n.head() == Some("drill"))
+                });
+        if let Some((drill_pos, drill_end)) = existing {
+            let old_drill =
+                parse_sexp(&new_pad[drill_pos..drill_end]).map_err(|e| e.to_string())?;
+            if old_drill.find("offset").is_some() {
+                return Err("editing an offset drill is not supported".into());
+            }
+            new_pad.replace_range(drill_pos..drill_end, &drill_sexp);
         } else {
             let insert_at = new_pad.rfind(')').unwrap_or(new_pad.len());
-            new_pad.insert_str(insert_at, &format!(" (drill {drill})"));
+            new_pad.insert_str(insert_at, &format!(" {drill_sexp}"));
         }
     }
 
@@ -6282,6 +6363,188 @@ mod tests {
         assert!(s.contains("(model \"x.wrl\""));
         assert!(s.contains("(rotate (xyz 0 0 90)"));
         assert!(s.contains("(scale (xyz 1 1 1)"));
+    }
+
+    #[tokio::test]
+    async fn oval_drill_edit_preserves_kicad_authored_footprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Socket.kicad_mod");
+        let original = include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
+        std::fs::write(&path, original).unwrap();
+        let result = handle_edit_footprint_pad(
+            &json!({"footprint_path":path.to_string_lossy(), "pad_number":"2",
+                    "drill":{"shape":"oval","width":0.6,"height":1.6}}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replacen("(drill 1)", "(drill oval 0.6 1.6)", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn oval_drill_create_edit_readback_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SLOTS.kicad_mod");
+        let created = handle_create_footprint(
+            &json!({
+                "output": path.to_string_lossy(), "name": "SLOTS",
+                "pads": [
+                    {"number":"1", "type":"thru_hole", "shape":"oval", "x":0.0,"y":0.0,
+                     "width":1.0,"height":2.0,"rotation":90.0,
+                     "drill":{"shape":"oval","width":0.6,"height":1.6}},
+                    {"number":"2", "type":"thru_hole", "shape":"circle", "x":3.0,"y":0.0,
+                     "width":1.5,"height":1.5,"drill":0.8}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!created.is_error);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("(drill oval 0.6 1.6)"));
+        assert!(text.contains("(drill 0.8)"));
+        assert!(text.contains("(at 0 0 90)"));
+        assert!(text.contains("(layers \"*.Cu\" \"*.Mask\")"));
+
+        let edited = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path":path.to_string_lossy(),"pad_number":"2",
+                "height":2.0,"drill":{"shape":"oval","width":0.6,"height":1.6}
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!edited.is_error);
+        let info = handle_get_footprint_info(
+            &json!({
+                "footprint_path":path.to_string_lossy(),"include_pads":true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &info.content[0] else {
+            panic!("expected text");
+        };
+        let info: serde_json::Value = serde_json::from_str(text).unwrap();
+        for pad in info["pads"].as_array().unwrap() {
+            assert_eq!(pad["drill"]["shape"], "oval");
+            assert_eq!(pad["drill"]["size"], json!({"x":0.6,"y":1.6}));
+            assert_eq!(pad["pad_type"], "thru_hole");
+        }
+        let edited = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path":path.to_string_lossy(),"pad_number":"1","drill":0.5
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!edited.is_error);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("(at 0 0 90)"));
+        assert!(text.contains("(drill 0.5)"));
+        assert_eq!(text.matches("(drill oval 0.6 1.6)").count(), 1);
+        assert!(parse_sexp(&text).is_ok());
+    }
+
+    #[tokio::test]
+    async fn oval_drill_invalid_payloads_leave_files_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("INVALID.kicad_mod");
+        let initial = handle_create_footprint(
+            &json!({
+                "output":path.to_string_lossy(),"name":"INVALID",
+                "pads":[{"number":"1","type":"thru_hole","shape":"oval",
+                         "x":0.0,"y":0.0,"width":1.0,"height":2.0,"drill":0.6}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!initial.is_error);
+        let before = std::fs::read(&path).unwrap();
+        for drill in [
+            json!(0),
+            json!(-0.1),
+            json!(null),
+            json!("0.6"),
+            json!({"shape":"oval","width":0.6}),
+            json!({"shape":"circle","width":0.6,"height":1.6}),
+            json!({"shape":"oval","width":0.6,"height":2.1}),
+            json!({"shape":"oval","width":0.6,"height":1.6,"rotation":90}),
+        ] {
+            let result = handle_edit_footprint_pad(
+                &json!({
+                    "footprint_path":path.to_string_lossy(),"pad_number":"1","drill":drill
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "accepted invalid drill {drill}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let new_path = tmp.path().join("MUST_NOT_EXIST.kicad_mod");
+            let result = handle_create_footprint(
+                &json!({
+                    "output":new_path.to_string_lossy(),"name":"INVALID",
+                    "pads":[{"number":"1","type":"thru_hole","shape":"oval",
+                             "x":0.0,"y":0.0,"width":1.0,"height":2.0,"drill":drill}]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert!(!new_path.exists());
+        }
+        let result = handle_create_footprint(&json!({
+            "output":tmp.path().join("SMD.kicad_mod").to_string_lossy(),"name":"SMD",
+            "pads":[{"number":"1","type":"smd","shape":"rect","x":0.0,"y":0.0,
+                     "width":1.0,"height":2.0,"drill":{"shape":"oval","width":0.6,"height":1.6}}]
+        }), &test_ctx()).await.unwrap();
+        assert!(result.is_error);
+        assert!(!tmp.path().join("SMD.kicad_mod").exists());
+    }
+
+    #[test]
+    fn oval_drill_schema_accepts_legacy_and_slot_rejects_invalid() {
+        let schema = footprint_drill_schema();
+        let validator = jsonschema::draft202012::new(&schema).unwrap();
+        assert!(validator.is_valid(&json!(0.6)));
+        assert!(validator.is_valid(&json!({"shape":"oval","width":0.6,"height":1.6})));
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!({"shape":"oval","width":0.6}),
+            json!({"shape":"oval","width":0.6,"height":1.6,"offset":0.1}),
+        ] {
+            assert!(!validator.is_valid(&invalid));
+        }
+        let defs = tools();
+        let create = defs.iter().find(|t| t.name == "create_footprint").unwrap();
+        let edit = defs
+            .iter()
+            .find(|t| t.name == "edit_footprint_pad")
+            .unwrap();
+        assert_eq!(
+            create.input_schema["properties"]["pads"]["items"]["properties"]["drill"],
+            schema
+        );
+        assert_eq!(edit.input_schema["properties"]["drill"], schema);
+    }
+
+    #[test]
+    fn oval_drill_edit_refuses_existing_offset() {
+        let pad = "(pad \"1\" thru_hole oval (at 0 0) (size 1 2) (drill oval 0.6 1.6 (offset 0.1 0)) (layers \"*.Cu\" \"*.Mask\"))";
+        let result = edit_footprint_pad_block(pad, &json!({"drill":0.5}), None, None);
+        assert!(result.unwrap_err().contains("offset"));
     }
 
     #[tokio::test]
