@@ -906,10 +906,14 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     assert_eq!(kinds, expected, "{body}");
 
     for (root, dir) in searched[..3].iter().zip(&third_party) {
-        assert_eq!(root["path"], json!(dir), "{root}");
+        assert_eq!(root["location_path"], json!(dir), "{root}");
         assert_eq!(root["exists"], true, "{root}");
     }
-    let working = std::path::PathBuf::from(searched[3 + plugin_folders]["path"].as_str().unwrap());
+    let working = std::path::PathBuf::from(
+        searched[3 + plugin_folders]["location_path"]
+            .as_str()
+            .unwrap(),
+    );
     assert_eq!(working.file_name().unwrap(), "freerouting.jar");
     assert_eq!(
         working.parent().unwrap().canonicalize().unwrap(),
@@ -917,6 +921,6 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     );
     assert_eq!(searched[3 + plugin_folders]["exists"], false);
     let last = searched.last().unwrap();
-    assert_eq!(last["path"], json!(bin_s), "{last}");
+    assert_eq!(last["location_path"], json!(bin_s), "{last}");
     assert_eq!(last["max_depth"], 1, "{last}");
 }
