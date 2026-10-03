@@ -171,15 +171,17 @@ The one exception is a rail that must stay separate per instance of a repeated
 sheet — see below.
 
 ```
+add_power_symbol(schematic, power_net, reference, pin_number, rotation?)
 add_power_symbol(schematic, power_net, x, y, rotation?)
 ```
 
-- Takes coordinates, not a reference and pin number. Place it on the pin
-  endpoint (from `get_schematic_pin_locations`) — a power symbol carries its
-  pin at its own origin, so the two coinciding is the connection.
-- The position is snapped to the 1.27mm grid, like every other placer, and
-  the response reports where the symbol landed. Pin endpoints of placed
-  components are already on that grid, so a pin endpoint is kept as given.
+- Name the pin with `reference` + `pin_number`. The symbol lands on that pin's
+  endpoint and, without `rotation`, faces away from the body: GND below a
+  downward pin, turned sideways on a sideways pin. A missing pin, or a
+  reference two placed symbols share, is refused and nothing is written.
+- Or give `x` + `y`, never both forms. Coordinates snap to the 1.27mm grid,
+  like every other placer, and `rotation` defaults to 0. The response reports
+  where the symbol landed.
 - `power_net` is loaded as `power:<power_net>`, so it must name a symbol in
   KiCad's power library: `+3V3` and `+12V`, never `3V3` or `12V`. A miss is an
   error and nothing is placed.
