@@ -91,3 +91,21 @@ violations are the ones this sheet exists to have — `multiple_net_names` on th
 five two-name nets, `power_pin_not_driven` where no `PWR_FLAG` is placed, and
 `isolated_pin_label` on the labels of `/AAA` and the deliberately one-pin
 `/MIX`.
+
+## Label UUIDs
+
+`list_schematic_labels` must report the UUID Eeschema wrote for each of the 15
+labels. The table is read from the resaved file's text, not through Konnect:
+
+```text
+awk '/^\t\((label|global_label|hierarchical_label) /{k=$1; match($0,/"[^"]*"/); n=substr($0,RSTART,RLENGTH); want=1}
+     want && /\(uuid /{match($0,/"[^"]*"/); print k, n, substr($0,RSTART,RLENGTH); want=0}' two_name_nets.kicad_sch
+```
+
+| Kind | Labels |
+|---|---|
+| `label` | 12 — `AAA`, `ALT` ×2, `SDA` ×2, `SCL` ×2, `ZZZ` ×2, `PULLUP`, `MIX`, `VCC` |
+| `global_label` | 2 — `SYS`, `RETURN` |
+| `hierarchical_label` | 1 — `MIX_H` |
+
+The UUIDs themselves are restated as `KICAD_LABELS` in `sch_analysis.rs`.
