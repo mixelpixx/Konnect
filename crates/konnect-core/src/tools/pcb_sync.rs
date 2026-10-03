@@ -34,12 +34,23 @@ fn create_sync_items_in(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExportedDesign {
+    root_uuid: Option<String>,
     components: Vec<DesignComponent>,
     skipped: Vec<SkippedComponent>,
     /// Components the export names but carries no `(footprint …)` for: their
     /// `Footprint` property is empty. Nothing can be placed for them, so they
     /// are reported rather than planned — and never fatal (#507).
     unassigned: Vec<UnassignedComponent>,
+}
+
+impl ExportedDesign {
+    fn relative_symbol_path<'a>(&self, path: &'a str) -> &'a str {
+        self.root_uuid
+            .as_deref()
+            .and_then(|root| path.strip_prefix('/')?.strip_prefix(root))
+            .filter(|suffix| suffix.starts_with('/'))
+            .unwrap_or(path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +537,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             ));
         }
         if let Some(path) = footprint.symbol_path.as_deref() {
+            let path = design.relative_symbol_path(path);
             if board_by_path.insert(path, index).is_some() {
                 diagnostics.push(conflict(
                     "duplicate_board_identity",
@@ -546,7 +558,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     let mut skipped_paths = HashSet::new();
     for skipped in &design.skipped {
         if !skipped_references.insert(skipped.reference.as_str())
-            || !skipped_paths.insert(skipped.symbol_path.as_str())
+            || !skipped_paths.insert(design.relative_symbol_path(&skipped.symbol_path))
         {
             diagnostics.push(conflict(
                 "duplicate_skipped_identity",
@@ -560,7 +572,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         }
         counts.skipped_by_flag.planned += 1;
         let existing = board_by_path
-            .get(skipped.symbol_path.as_str())
+            .get(design.relative_symbol_path(&skipped.symbol_path))
             .copied()
             .or_else(|| board_by_reference.get(skipped.reference.as_str()).copied());
         if let Some(index) = existing {
@@ -584,7 +596,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
     for component in &design.unassigned {
         counts.unassigned_footprint.planned += 1;
         let existing = board_by_path
-            .get(component.symbol_path.as_str())
+            .get(design.relative_symbol_path(&component.symbol_path))
             .copied()
             .or_else(|| {
                 board_by_reference
@@ -621,7 +633,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             ));
             continue;
         }
-        if !design_paths.insert(component.symbol_path.as_str()) {
+        if !design_paths.insert(design.relative_symbol_path(&component.symbol_path)) {
             diagnostics.push(conflict(
                 "duplicate_schematic_identity",
                 format!(
@@ -634,7 +646,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         }
 
         let matched_index = board_by_path
-            .get(component.symbol_path.as_str())
+            .get(design.relative_symbol_path(&component.symbol_path))
             .copied()
             .or_else(|| {
                 board_by_reference
@@ -785,7 +797,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
 
         let needs_update = footprint.reference != component.reference
             || footprint.value != component.value
-            || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
+            || footprint.symbol_path.is_none()
             || footprint.dnp != component.dnp
             || changed_pads > 0;
         if needs_update {
@@ -793,7 +805,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 kiid: footprint.kiid.clone(),
                 reference: component.reference.clone(),
                 value: component.value.clone(),
-                symbol_path: component.symbol_path.clone(),
+                symbol_path: footprint
+                    .symbol_path
+                    .clone()
+                    .unwrap_or_else(|| component.symbol_path.clone()),
                 dnp: component.dnp,
                 pad_nets: component.pad_nets.clone(),
                 preserve: PreservedBoardState {
@@ -1107,6 +1122,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
     }
 
     Ok(ExportedDesign {
+        root_uuid: None,
         components,
         skipped: Vec::new(),
         unassigned,
@@ -1434,10 +1450,13 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
     }
 
     let mut flags = Vec::new();
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
         let source = std::fs::read_to_string(file)?;
         let tree = konnect_sexp::parse_sexp(&source)?;
         let root_uuid = tree.find_str("uuid").unwrap_or("");
+        if index == 0 {
+            design.root_uuid = (!root_uuid.is_empty()).then(|| root_uuid.to_string());
+        }
         for symbol in tree.find_all("symbol") {
             let Some(uuid) = symbol.find_str("uuid") else {
                 continue;
@@ -2748,9 +2767,266 @@ mod tests {
         }
     }
 
+    const IDENTITY_NETLIST: &str =
+        include_str!("../../tests/fixtures/pcb_sync_identity/pcb_sync_identity.net");
+    const IDENTITY_ROOT: &str = "957827ba-fa90-4f43-a1ca-8515c9493fca";
+    const IDENTITY_PATHS: [(&str, &str); 6] = [
+        ("R1", "/957827ba-fa90-4f43-a1ca-8515c9493fca/532603d2-c307-4e01-b7cf-8f2221eb0821"),
+        ("R2", "/957827ba-fa90-4f43-a1ca-8515c9493fca/47537793-77fc-4515-a1f3-73842dd961aa"),
+        ("R3", "/957827ba-fa90-4f43-a1ca-8515c9493fca/3ef98487-86ab-44cf-af6e-fa917bdf4435/0e85dbb4-febe-41ca-a977-693a2fa994d3"),
+        ("R4", "/957827ba-fa90-4f43-a1ca-8515c9493fca/8016b9b9-4f59-429c-9699-cef69c751594/0e85dbb4-febe-41ca-a977-693a2fa994d3"),
+        ("R5", "/957827ba-fa90-4f43-a1ca-8515c9493fca/3ef98487-86ab-44cf-af6e-fa917bdf4435/df3efa45-1c94-47f2-9bb9-b2df2c2ea502/c04a1d58-2fb5-4df8-bc91-3339cda3eec0"),
+        ("R6", "/957827ba-fa90-4f43-a1ca-8515c9493fca/8016b9b9-4f59-429c-9699-cef69c751594/df3efa45-1c94-47f2-9bb9-b2df2c2ea502/c04a1d58-2fb5-4df8-bc91-3339cda3eec0"),
+    ];
+
+    fn identity_design() -> ExportedDesign {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pcb_sync_identity/pcb_sync_identity.kicad_sch");
+        let files = saved_hierarchy_files(&root).unwrap();
+        assert_eq!(files.len(), 3);
+        let mut design = parse_exported_netlist(IDENTITY_NETLIST).unwrap();
+        apply_saved_symbol_flags(&files, &mut design).unwrap();
+        assert_eq!(design.components.len(), 5);
+        assert_eq!(design.unassigned.len(), 1);
+        design
+    }
+
+    fn identity_board(design: &ExportedDesign, rooted: bool) -> BoardState {
+        board_with(
+            design
+                .components
+                .iter()
+                .map(|component| {
+                    let path = IDENTITY_PATHS
+                        .iter()
+                        .find(|(reference, _)| *reference == component.reference)
+                        .unwrap()
+                        .1;
+                    let path = if rooted {
+                        path
+                    } else {
+                        path.strip_prefix(&format!("/{IDENTITY_ROOT}")).unwrap()
+                    };
+                    let mut footprint = board_resistor(&component.reference, Some(path));
+                    footprint.value = component.value.clone();
+                    footprint.pad_nets = component.pad_nets.clone();
+                    footprint
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn root_and_reused_nested_instances_accept_both_path_representations() {
+        let design = identity_design();
+        for rooted in [false, true] {
+            let board = identity_board(&design, rooted);
+            let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+            assert_eq!(
+                plan.status,
+                PlanStatus::Noop,
+                "{rooted}: {:?}",
+                plan.diagnostics
+            );
+            assert!(plan.changes.is_empty());
+            assert_eq!(plan.counts.board_only_preserved.planned, 0);
+        }
+    }
+
+    #[test]
+    fn rooted_identity_renames_preserve_the_existing_path_and_pose() {
+        let design = identity_design();
+        let mut board = identity_board(&design, true);
+        for footprint in &mut board.footprints {
+            footprint.reference = format!("OLD_{}", footprint.reference);
+            footprint.rotation = 90.0;
+            footprint.locked = true;
+        }
+        let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.counts.added.planned, 0);
+        assert_eq!(plan.counts.updated.planned, 5);
+        for change in plan.changes {
+            let PlannedChange::Update {
+                kiid,
+                symbol_path,
+                preserve,
+                ..
+            } = change
+            else {
+                panic!("an existing instance must not be added again");
+            };
+            let original = board.footprints.iter().find(|f| f.kiid == kiid).unwrap();
+            assert_eq!(Some(&symbol_path), original.symbol_path.as_ref());
+            assert_eq!(preserve.position, original.position);
+            assert_eq!(preserve.rotation, original.rotation);
+            assert_eq!(preserve.layer, original.layer);
+            assert_eq!(preserve.locked, original.locked);
+        }
+    }
+
+    #[test]
+    fn root_aliases_do_not_adopt_a_different_root_sheet_or_symbol() {
+        let design = identity_design();
+        for (reference, path) in [
+            (
+                "R1",
+                IDENTITY_PATHS[0]
+                    .1
+                    .replace(IDENTITY_ROOT, "11111111-1111-4111-8111-111111111111"),
+            ),
+            (
+                "R1",
+                IDENTITY_PATHS[0]
+                    .1
+                    .replace(IDENTITY_ROOT, &format!("{IDENTITY_ROOT}0")),
+            ),
+            (
+                "R1",
+                IDENTITY_PATHS[0].1.replace(
+                    "532603d2-c307-4e01-b7cf-8f2221eb0821",
+                    "22222222-2222-4222-8222-222222222222",
+                ),
+            ),
+            (
+                "R4",
+                IDENTITY_PATHS[3].1.replace(
+                    "8016b9b9-4f59-429c-9699-cef69c751594",
+                    "33333333-3333-4333-8333-333333333333",
+                ),
+            ),
+        ] {
+            let mut board = identity_board(&design, true);
+            board
+                .footprints
+                .iter_mut()
+                .find(|f| f.reference == reference)
+                .unwrap()
+                .symbol_path = Some(path);
+            let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+            assert_eq!(plan.status, PlanStatus::Conflict);
+            assert!(plan.changes.is_empty());
+            assert!(plan
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "reference_identity_conflict"
+                    && d.reference.as_deref() == Some(reference)));
+        }
+    }
+
+    #[test]
+    fn duplicate_rooted_and_relative_identities_refuse_the_entire_plan() {
+        let design = identity_design();
+        let mut board = identity_board(&design, true);
+        let mut duplicate = identity_board(&design, false).footprints.remove(0);
+        duplicate.reference = "R99".to_string();
+        duplicate.kiid = "other-kiid".to_string();
+        board.footprints.push(duplicate);
+        let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "duplicate_board_identity"));
+    }
+
+    #[test]
+    fn unassigned_rooted_identity_is_kept_after_a_reference_change() {
+        let design = identity_design();
+        let mut board = identity_board(&design, true);
+        board
+            .footprints
+            .push(board_resistor("OLD_R2", Some(IDENTITY_PATHS[1].1)));
+        let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+        assert_eq!(plan.status, PlanStatus::Noop, "{:?}", plan.diagnostics);
+        assert_eq!(plan.unassigned[0].board_state, UnassignedBoardState::Kept);
+        assert_eq!(plan.counts.board_only_preserved.planned, 0);
+    }
+
+    #[test]
+    fn new_instances_keep_the_native_netlist_path() {
+        let design = identity_design();
+        let plan = plan_sync(IDENTITY_NETLIST, &design, &board_with(Vec::new()));
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.added.planned, 5);
+        for change in plan.changes {
+            let PlannedChange::Add {
+                reference,
+                symbol_path,
+                ..
+            } = change
+            else {
+                panic!("an empty board needs additions");
+            };
+            let expected = IDENTITY_PATHS
+                .iter()
+                .find(|(r, _)| *r == reference)
+                .unwrap()
+                .1;
+            assert_eq!(
+                symbol_path,
+                expected.strip_prefix(&format!("/{IDENTITY_ROOT}")).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn root_normalization_requires_an_exact_leading_path_segment() {
+        let design = identity_design();
+        for path in [
+            format!("/{IDENTITY_ROOT}0/symbol"),
+            format!("{IDENTITY_ROOT}/symbol"),
+            format!("/other/{IDENTITY_ROOT}/symbol"),
+            format!("/{IDENTITY_ROOT}"),
+            "/".to_string(),
+        ] {
+            assert_eq!(design.relative_symbol_path(&path), path);
+        }
+        assert_eq!(
+            design.relative_symbol_path(IDENTITY_PATHS[0].1),
+            "/532603d2-c307-4e01-b7cf-8f2221eb0821"
+        );
+    }
+
+    #[test]
+    fn rooted_aliases_require_the_requested_schematic_root() {
+        let mut design = identity_design();
+        let board = identity_board(&design, true);
+        design.root_uuid = None;
+        let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.diagnostics.len(), 5);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .all(|d| d.code == "reference_identity_conflict"));
+    }
+
+    #[test]
+    fn excluded_rooted_identity_refuses_an_existing_relative_footprint() {
+        let mut design = identity_design();
+        let mut board = identity_board(&design, false);
+        let component = design.components.remove(0);
+        design.skipped.push(SkippedComponent {
+            reference: component.reference,
+            symbol_path: IDENTITY_PATHS[0].1.to_string(),
+        });
+        board.footprints[0].reference = "OLD_R1".to_string();
+        let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "on_board_exclusion_conflict"));
+    }
+
     #[test]
     fn planner_matches_identity_preserves_pose_and_stages_new_parts_deterministically() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![
                 resistor("R2", "/sheet/existing"),
                 resistor("R3", "/sheet/new"),
@@ -3189,6 +3465,7 @@ mod tests {
     #[test]
     fn removing_a_pad_from_a_routed_net_conflicts_the_whole_plan() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![DesignComponent {
                 pad_nets: BTreeMap::new(),
                 ..resistor("R1", "/sheet/existing")
@@ -3234,6 +3511,7 @@ mod tests {
     #[test]
     fn already_synchronized_design_is_noop() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3252,6 +3530,7 @@ mod tests {
     #[test]
     fn footprint_swap_conflicts_but_an_unrouted_net_change_is_planned() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3277,6 +3556,7 @@ mod tests {
     #[test]
     fn on_board_no_skips_absent_but_conflicts_when_present() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: Vec::new(),
             skipped: vec![SkippedComponent {
                 reference: "R1".to_string(),
@@ -3303,6 +3583,7 @@ mod tests {
     #[test]
     fn reference_only_possible_rename_is_a_conflict() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R2", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3346,6 +3627,7 @@ mod tests {
     #[test]
     fn plan_revision_changes_when_reviewed_board_bounds_change() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/new")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3586,6 +3868,7 @@ mod tests {
             board_footprint_from_instance(&board_only_instance("fiducial-kiid", "FID1")).unwrap(),
         ]);
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3642,6 +3925,7 @@ mod tests {
     #[test]
     fn issue_452_an_unlinked_footprint_the_schematic_names_is_adopted_not_refused() {
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3683,6 +3967,7 @@ mod tests {
         // The board carries a footprint with no schematic identity whose
         // library id and value match a component the schematic has just gained.
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R5", "/sheet/new")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3720,6 +4005,7 @@ mod tests {
             board_footprint_from_instance(&ref_star_instance("second-kiid")).unwrap(),
         ]);
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3758,6 +4044,7 @@ mod tests {
             board_footprint_from_instance(&ref_star_instance("second-kiid")).unwrap(),
         ]);
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3798,6 +4085,7 @@ mod tests {
             board_footprint_from_instance(&unlinked_instance("second-kiid", "R1")).unwrap(),
         ]);
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3835,6 +4123,7 @@ mod tests {
             board_footprint_from_instance(&unlinked_instance("second-kiid", "R9")).unwrap(),
         ]);
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: vec![SkippedComponent {
                 reference: "R9".to_string(),
@@ -3877,6 +4166,7 @@ mod tests {
             board_footprint_from_instance(&ref_star_instance("loose-kiid")).unwrap(),
         ]);
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -4454,6 +4744,7 @@ mod tests {
             .pad_nets
             .insert("3".to_string(), "SENSE".to_string());
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![component],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -4547,20 +4838,83 @@ mod tests {
         schematic: PathBuf,
         board: PathBuf,
         exported: PathBuf,
+        mutations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl ServedSync {
         async fn new() -> Self {
+            Self::with_identity_board(None).await
+        }
+
+        async fn with_identity_board(board_state: Option<BoardState>) -> Self {
             use crate::tools::cli::test_support::write_script;
             use konnect_ipc::gen::kiapi;
 
             let (temp, board) = project_with_stock_footprints();
-            let schematic = temp.path().join("carrier.kicad_sch");
-            std::fs::write(
-                &schematic,
-                include_bytes!("../../tests/fixtures/structural_scans_kicad10.kicad_sch"),
-            )
-            .unwrap();
+            let schematic = if board_state.is_some() {
+                for (name, source) in [
+                    (
+                        "pcb_sync_identity.kicad_sch",
+                        include_str!(
+                            "../../tests/fixtures/pcb_sync_identity/pcb_sync_identity.kicad_sch"
+                        ),
+                    ),
+                    (
+                        "channel.kicad_sch",
+                        include_str!("../../tests/fixtures/pcb_sync_identity/channel.kicad_sch"),
+                    ),
+                    (
+                        "leaf.kicad_sch",
+                        include_str!("../../tests/fixtures/pcb_sync_identity/leaf.kicad_sch"),
+                    ),
+                ] {
+                    std::fs::write(temp.path().join(name), source).unwrap();
+                }
+                temp.path().join("pcb_sync_identity.kicad_sch")
+            } else {
+                let schematic = temp.path().join("carrier.kicad_sch");
+                std::fs::write(
+                    &schematic,
+                    include_bytes!("../../tests/fixtures/structural_scans_kicad10.kicad_sch"),
+                )
+                .unwrap();
+                schematic
+            };
+            let items = board_state
+                .into_iter()
+                .flat_map(|board| board.footprints)
+                .map(|footprint| {
+                    let mut instance = kiapi::board::types::FootprintInstance::decode(
+                        &include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin")[..],
+                    )
+                    .unwrap();
+                    instance.id = Some(kiapi::common::types::Kiid {
+                        value: footprint.kiid,
+                    });
+                    let (library, entry) = footprint.footprint_id.split_once(':').unwrap();
+                    instance.definition.as_mut().unwrap().id =
+                        Some(kiapi::common::types::LibraryIdentifier {
+                            library_nickname: library.to_string(),
+                            entry_name: entry.to_string(),
+                        });
+                    apply_footprint_fields(
+                        &mut instance,
+                        &footprint.reference,
+                        &footprint.value,
+                        footprint.symbol_path.as_deref().unwrap(),
+                        footprint.dnp,
+                        &footprint.pad_nets,
+                        &BTreeMap::new(),
+                    )
+                    .unwrap();
+                    konnect_ipc::builders::pack_any(
+                        &instance,
+                        "kiapi.board.types.FootprintInstance",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mutations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recorded_mutations = mutations.clone();
             let exported = temp.path().join("carrier.net");
             let unix_source = exported.to_string_lossy().replace('\'', "'\\''");
             let windows_source = exported.to_string_lossy();
@@ -4574,14 +4928,37 @@ mod tests {
                     "@echo off\r\n:loop\r\nif \"%~1\"==\"\" exit /b 2\r\nif \"%~1\"==\"--output\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\ncopy /Y \"{windows_source}\" \"%~1\" >nul\r\nexit /b %ERRORLEVEL%\r\n"
                 ),
             );
-            let kicad =
-                crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, |command| {
+            let kicad = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
+                &board,
+                move |command| {
+                    if [
+                        "BeginCommit",
+                        "CreateItems",
+                        "UpdateItems",
+                        "DeleteItems",
+                        "SaveDocument",
+                    ]
+                    .iter()
+                    .any(|name| command.type_url.ends_with(name))
+                    {
+                        recorded_mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     if command.type_url.ends_with("GetItems") {
+                        let request =
+                            kiapi::common::commands::GetItems::decode(command.value.as_slice())
+                                .unwrap();
+                        let footprints = request.types.contains(
+                            &(kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32),
+                        );
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::GetItemsResponse {
                                 header: None,
                                 status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                                items: Vec::new(),
+                                items: if footprints {
+                                    items.clone()
+                                } else {
+                                    Vec::new()
+                                },
                             },
                             "kiapi.common.commands.GetItemsResponse",
                         ));
@@ -4605,7 +4982,8 @@ mod tests {
                         ));
                     }
                     None
-                });
+                },
+            );
             let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
                 kicad_cli: cli.to_string_lossy().to_string(),
                 kicad_binary: String::new(),
@@ -4624,6 +5002,7 @@ mod tests {
                 schematic,
                 board,
                 exported,
+                mutations,
             }
         }
 
@@ -4634,7 +5013,23 @@ mod tests {
 
         /// As [`Self::dry_run`], with the result's `isError` beside the body.
         async fn dry_run_result(&self, netlist: &str) -> (bool, serde_json::Value) {
+            self.sync_result(netlist, None).await
+        }
+
+        async fn sync_result(
+            &self,
+            netlist: &str,
+            revision: Option<&str>,
+        ) -> (bool, serde_json::Value) {
             std::fs::write(&self.exported, netlist).unwrap();
+            let mut arguments = serde_json::json!({
+                "schematic": self.schematic.to_string_lossy(),
+                "board": self.board.to_string_lossy()
+            });
+            if let Some(revision) = revision {
+                arguments["dry_run"] = serde_json::json!(false);
+                arguments["expected_plan_revision"] = serde_json::json!(revision);
+            }
             let response = self
                 .handler
                 .handle_message(serde_json::json!({
@@ -4643,10 +5038,7 @@ mod tests {
                     "method": "tools/call",
                     "params": {
                         "name": "update_pcb_from_schematic",
-                        "arguments": {
-                            "schematic": self.schematic.to_string_lossy(),
-                            "board": self.board.to_string_lossy()
-                        }
+                        "arguments": arguments
                     }
                 }))
                 .await
@@ -4657,6 +5049,55 @@ mod tests {
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap(),
             )
         }
+    }
+
+    #[tokio::test]
+    async fn rooted_identity_matching_and_ambiguity_are_served_without_writes() {
+        let design = identity_design();
+        let mut board = identity_board(&design, true);
+        let served = ServedSync::with_identity_board(Some(board.clone())).await;
+        let (is_error, body) = served.dry_run_result(IDENTITY_NETLIST).await;
+        assert!(!is_error, "{body}");
+        assert_eq!(body["status"], "noop", "{body}");
+        assert_eq!(body["coverage"]["conflicts"]["planned"], 0);
+        let (_, applied) = served
+            .sync_result(
+                IDENTITY_NETLIST,
+                Some(body["plan_revision"].as_str().unwrap()),
+            )
+            .await;
+        assert_eq!(applied["status"], "noop", "{applied}");
+        assert_eq!(
+            served.mutations.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let mut duplicate = identity_board(&design, false).footprints.remove(0);
+        duplicate.reference = "R99".to_string();
+        duplicate.kiid = "other-kiid".to_string();
+        board.footprints.push(duplicate);
+        let refused = ServedSync::with_identity_board(Some(board)).await;
+        let (_, body) = refused.dry_run_result(IDENTITY_NETLIST).await;
+        assert_eq!(body["status"], "conflict", "{body}");
+        assert!(body["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "duplicate_board_identity"));
+        assert_eq!(body["coverage"]["footprints_updated"]["planned"], 0);
+        assert_eq!(body["coverage"]["footprints_added"]["planned"], 0);
+        let (_, applied) = refused
+            .sync_result(
+                IDENTITY_NETLIST,
+                Some(body["plan_revision"].as_str().unwrap()),
+            )
+            .await;
+        assert_eq!(applied["status"], "conflict", "{applied}");
+        assert!(applied["changes"].as_array().unwrap().is_empty());
+        assert_eq!(
+            refused.mutations.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     /// #657 through the served boundary. The run that found it needed two
