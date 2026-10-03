@@ -139,7 +139,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "jar_path": { "type": "string", "description": "Path to freerouting.jar (optional, uses config default)" }
+                    "jar_path": { "type": "string", "description": freerouting_jar_path_description() }
                 },
                 "required": []
             }),
@@ -153,7 +153,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
                     "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
-                    "jar_path": { "type": "string", "description": "Optional Freerouting JAR path; otherwise uses installation discovery" },
+                    "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "optimizer_enabled": { "type": "boolean" },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
@@ -1450,72 +1450,203 @@ fn find_freerouting_jar_below(root: &Path, remaining_depth: usize) -> Option<Pat
         })
 }
 
-fn freerouting_search_roots() -> Vec<(PathBuf, usize)> {
-    let mut roots = Vec::new();
+/// Where Freerouting discovery looks when the caller passes no `jar_path`, in
+/// the order it looks. The `jar_path` descriptions and the `searched` evidence
+/// are both built from this table, so what the schema says and what the
+/// search does cannot drift apart. There is no configuration setting: the
+/// schema once said "uses config default" for one that never existed (#787).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FreeroutingLocation {
+    KicadThirdPartyVariable,
+    KicadPluginFolder,
+    WorkingDirectory,
+    SystemDirectory,
+    PathDirectory,
+}
 
-    for variable in ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"] {
-        if let Some(path) = std::env::var_os(variable) {
-            roots.push((PathBuf::from(path), 5));
+impl FreeroutingLocation {
+    /// Every location, in search order.
+    const ALL: [Self; 5] = [
+        Self::KicadThirdPartyVariable,
+        Self::KicadPluginFolder,
+        Self::WorkingDirectory,
+        Self::SystemDirectory,
+        Self::PathDirectory,
+    ];
+
+    fn kind(self) -> &'static str {
+        match self {
+            Self::KicadThirdPartyVariable => "kicad_3rd_party_variable",
+            Self::KicadPluginFolder => "kicad_plugin_folder",
+            Self::WorkingDirectory => "working_directory",
+            Self::SystemDirectory => "system_directory",
+            Self::PathDirectory => "path_directory",
         }
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    fn description(self) -> &'static str {
+        match self {
+            Self::KicadThirdPartyVariable => {
+                "the KICAD10_3RD_PARTY, KICAD9_3RD_PARTY and KICAD8_3RD_PARTY directories"
+            }
+            Self::KicadPluginFolder => {
+                "the KiCad 10, 9 and 8 plugin folders under the home directory \
+                 (Documents/KiCad/<version>/3rdparty/plugins and \
+                 .local/share/kicad/<version>/3rdparty/plugins)"
+            }
+            Self::WorkingDirectory => "freerouting.jar in the server's working directory",
+            Self::SystemDirectory => "/usr/local/lib/freerouting and /opt/freerouting",
+            Self::PathDirectory => "every directory on PATH",
+        }
+    }
+}
+
+fn freerouting_jar_path_description() -> String {
+    let locations = FreeroutingLocation::ALL
+        .iter()
+        .map(|location| location.description())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Path to a Freerouting JAR (optional). When omitted, Konnect searches, in order: \
+         {locations}. There is no configuration setting for it."
+    )
+}
+
+/// One place discovery looked, and how many directory levels below it.
+#[derive(Debug, Clone, PartialEq)]
+struct FreeroutingSearchRoot {
+    location: FreeroutingLocation,
+    path: PathBuf,
+    depth: usize,
+}
+
+impl FreeroutingSearchRoot {
+    fn evidence(&self) -> serde_json::Value {
+        json!({
+            "kind": self.location.kind(),
+            "path": self.path,
+            "max_depth": self.depth,
+            "exists": self.path.exists(),
+        })
+    }
+}
+
+fn freerouting_search_roots() -> Vec<FreeroutingSearchRoot> {
+    freerouting_search_roots_from(
+        |name| std::env::var_os(name),
+        &std::env::current_dir().unwrap_or_default(),
+    )
+}
+
+/// The search roots for a given environment, so a test can supply one without
+/// touching the process's own.
+fn freerouting_search_roots_from(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    working_directory: &Path,
+) -> Vec<FreeroutingSearchRoot> {
+    let mut roots: Vec<FreeroutingSearchRoot> = Vec::new();
+    // `HOME` and `USERPROFILE` are often the same directory (Git Bash on
+    // Windows sets both), and searching a root twice only repeats it in the
+    // evidence.
+    let mut push = |location, path: PathBuf, depth| {
+        if !roots.iter().any(|root| root.path == path) {
+            roots.push(FreeroutingSearchRoot {
+                location,
+                path,
+                depth,
+            })
+        }
+    };
+
+    for variable in ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"] {
+        if let Some(path) = var(variable) {
+            push(
+                FreeroutingLocation::KicadThirdPartyVariable,
+                PathBuf::from(path),
+                5,
+            );
+        }
+    }
+
+    let plugins =
+        |base: PathBuf, version: &str| base.join(version).join("3rdparty").join("plugins");
+    if let Some(home) = var("HOME").map(PathBuf::from) {
         for version in ["10.0", "9.0", "8.0"] {
-            roots.push((
-                home.join("Documents")
-                    .join("KiCad")
-                    .join(version)
-                    .join("3rdparty")
-                    .join("plugins"),
+            let documents = home.join("Documents").join("KiCad");
+            let share = home.join(".local").join("share").join("kicad");
+            push(
+                FreeroutingLocation::KicadPluginFolder,
+                plugins(documents, version),
                 5,
-            ));
-            roots.push((
-                home.join(".local")
-                    .join("share")
-                    .join("kicad")
-                    .join(version)
-                    .join("3rdparty")
-                    .join("plugins"),
+            );
+            push(
+                FreeroutingLocation::KicadPluginFolder,
+                plugins(share, version),
                 5,
-            ));
+            );
         }
     }
 
     #[cfg(target_os = "windows")]
-    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+    if let Some(profile) = var("USERPROFILE").map(PathBuf::from) {
         for version in ["10.0", "9.0", "8.0"] {
-            roots.push((
-                profile
-                    .join("Documents")
-                    .join("KiCad")
-                    .join(version)
-                    .join("3rdparty")
-                    .join("plugins"),
+            push(
+                FreeroutingLocation::KicadPluginFolder,
+                plugins(profile.join("Documents").join("KiCad"), version),
                 5,
-            ));
+            );
         }
     }
 
-    roots.extend([
-        (PathBuf::from("freerouting.jar"), 0),
-        (PathBuf::from("/usr/local/lib/freerouting"), 3),
-        (PathBuf::from("/opt/freerouting"), 3),
-    ]);
-    if let Some(path) = std::env::var_os("PATH") {
-        roots.extend(std::env::split_paths(&path).map(|directory| (directory, 1)));
+    push(
+        FreeroutingLocation::WorkingDirectory,
+        working_directory.join("freerouting.jar"),
+        0,
+    );
+    for directory in ["/usr/local/lib/freerouting", "/opt/freerouting"] {
+        push(
+            FreeroutingLocation::SystemDirectory,
+            PathBuf::from(directory),
+            3,
+        );
+    }
+    if let Some(path) = var("PATH") {
+        for directory in std::env::split_paths(&path) {
+            push(FreeroutingLocation::PathDirectory, directory, 1);
+        }
     }
     roots
 }
 
-fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
+/// What looking for the Freerouting JAR found.
+#[derive(Debug, PartialEq)]
+enum FreeroutingJar {
+    Found(PathBuf),
+    /// The caller passed `jar_path`, and it is not a file.
+    SuppliedPathIsNotAFile(PathBuf),
+    /// Discovery searched every root and found no JAR.
+    NotFound(Vec<FreeroutingSearchRoot>),
+}
+
+fn find_freerouting_jar(args: &serde_json::Value) -> FreeroutingJar {
     if let Some(path) = args["jar_path"].as_str() {
         let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
+        return if path.is_file() {
+            FreeroutingJar::Found(path)
+        } else {
+            FreeroutingJar::SuppliedPathIsNotAFile(path)
+        };
     }
 
-    freerouting_search_roots()
-        .into_iter()
-        .find_map(|(root, depth)| find_freerouting_jar_below(&root, depth))
+    let roots = freerouting_search_roots();
+    match roots
+        .iter()
+        .find_map(|root| find_freerouting_jar_below(&root.path, root.depth))
+    {
+        Some(jar) => FreeroutingJar::Found(jar),
+        None => FreeroutingJar::NotFound(roots),
+    }
 }
 
 fn command_output(output: &std::process::Output) -> String {
@@ -1738,20 +1869,26 @@ async fn handle_check_freerouting(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let jar = find_freerouting_jar(args);
-
-    match jar {
-        None => Ok(CallToolResult::text(
-            serde_json::to_string(&json!({
-                "available": false,
-                "engine_found": false,
-                "native_mcp_available": false,
-                "bridge_available": false,
-                "note": "freerouting.jar not found. Download from https://github.com/freerouting/freerouting/releases"
-            }))
-            .unwrap(),
-        )),
-        Some(jar_path) => {
+    match find_freerouting_jar(args) {
+        FreeroutingJar::SuppliedPathIsNotAFile(path) => Ok(CallToolResult::json(&json!({
+            "available": false,
+            "engine_found": false,
+            "native_mcp_available": false,
+            "bridge_available": false,
+            "checked_path": path,
+            "note": format!("jar_path is not a file: {}", path.display())
+        }))),
+        FreeroutingJar::NotFound(roots) => Ok(CallToolResult::json(&json!({
+            "available": false,
+            "engine_found": false,
+            "native_mcp_available": false,
+            "bridge_available": false,
+            "searched_locations": roots.iter().map(FreeroutingSearchRoot::evidence).collect::<Vec<_>>(),
+            "note": "No Freerouting JAR was found in any searched location. Install Freerouting \
+                     (KiCad's Plugin and Content Manager, or \
+                     https://github.com/freerouting/freerouting/releases), or pass jar_path."
+        }))),
+        FreeroutingJar::Found(jar_path) => {
             let mut java_command = tokio::process::Command::new("java");
             java_command.arg("-version");
             let java = match run_java_command(&mut java_command).await {
@@ -1815,10 +1952,23 @@ async fn handle_route_specctra_dsn(
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
     let ses_output = get_path(args, "ses_output_path")?;
-    let Some(jar) = find_freerouting_jar(args) else {
-        return Ok(CallToolResult::error(
-            "Freerouting JAR not found; install Freerouting or pass jar_path",
-        ));
+    let jar = match find_freerouting_jar(args) {
+        FreeroutingJar::Found(jar) => jar,
+        FreeroutingJar::SuppliedPathIsNotAFile(path) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound {
+                    path: path.display().to_string(),
+                },
+                format!("jar_path is not a file: {}", path.display()),
+            ));
+        }
+        FreeroutingJar::NotFound(roots) => {
+            return Ok(CallToolResult::error(format!(
+                "Freerouting JAR not found in {} searched locations; install Freerouting or \
+                 pass jar_path. check_freerouting lists every location searched.",
+                roots.len()
+            )));
+        }
     };
     let max_passes = args["max_passes"]
         .as_u64()
@@ -1911,7 +2061,10 @@ mod freerouting_tests {
     async fn explicit_missing_jar_reports_each_readiness_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.jar");
-        assert_eq!(find_freerouting_jar(&json!({ "jar_path": missing })), None);
+        assert_eq!(
+            find_freerouting_jar(&json!({ "jar_path": missing })),
+            FreeroutingJar::SuppliedPathIsNotAFile(missing.clone())
+        );
 
         let result = handle_check_freerouting(&json!({ "jar_path": missing }), &test_ctx())
             .await
@@ -1921,6 +2074,200 @@ mod freerouting_tests {
         assert_eq!(body["engine_found"], false);
         assert_eq!(body["native_mcp_available"], false);
         assert_eq!(body["bridge_available"], false);
+        // The caller's path is what was checked; discovery never ran, so
+        // there is no search to report and no download advice to give.
+        assert_eq!(body["checked_path"], json!(missing));
+        assert_eq!(
+            body["note"],
+            json!(format!("jar_path is not a file: {}", missing.display()))
+        );
+        assert!(body.get("searched_locations").is_none(), "{body}");
+    }
+
+    /// A full environment, so every location the search can visit is present.
+    fn every_location_environment(root: &Path) -> HashMap<&'static str, std::ffi::OsString> {
+        let path = std::env::join_paths([root.join("bin-a"), root.join("bin-b")]).unwrap();
+        HashMap::from([
+            ("KICAD10_3RD_PARTY", root.join("k10").into_os_string()),
+            ("KICAD9_3RD_PARTY", root.join("k9").into_os_string()),
+            ("KICAD8_3RD_PARTY", root.join("k8").into_os_string()),
+            ("HOME", root.join("home").into_os_string()),
+            ("USERPROFILE", root.join("profile").into_os_string()),
+            ("PATH", path),
+        ])
+    }
+
+    /// #787: the `jar_path` description is the documentation of the search.
+    /// The search visits locations in the order the description lists them,
+    /// visits every location it lists, and the description promises no
+    /// configuration setting.
+    #[test]
+    fn the_search_visits_the_documented_locations_in_the_documented_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = every_location_environment(temp.path());
+        let roots =
+            freerouting_search_roots_from(|name| env.get(name).cloned(), &temp.path().join("cwd"));
+
+        let visited: Vec<FreeroutingLocation> = roots.iter().map(|root| root.location).collect();
+        assert!(
+            visited.windows(2).all(|pair| pair[0] <= pair[1]),
+            "search order differs from the documented order: {visited:?}"
+        );
+        let mut distinct = visited.clone();
+        distinct.dedup();
+        assert_eq!(distinct, FreeroutingLocation::ALL);
+
+        let description = freerouting_jar_path_description();
+        let positions: Vec<usize> = FreeroutingLocation::ALL
+            .iter()
+            .map(|location| {
+                description
+                    .find(location.description())
+                    .unwrap_or_else(|| panic!("{location:?} is not documented: {description}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{description}"
+        );
+        assert!(!description.contains("config default"), "{description}");
+        assert!(description.contains("There is no configuration setting"));
+
+        // The working-directory root is absolute, so `searched` names the
+        // file that was actually checked.
+        assert!(roots.contains(&FreeroutingSearchRoot {
+            location: FreeroutingLocation::WorkingDirectory,
+            path: temp.path().join("cwd").join("freerouting.jar"),
+            depth: 0,
+        }));
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|root| root.location == FreeroutingLocation::PathDirectory)
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>(),
+            [temp.path().join("bin-a"), temp.path().join("bin-b")]
+        );
+    }
+
+    /// A directory reached twice is searched, and reported, once, under the
+    /// location that reached it first.
+    #[test]
+    fn a_root_reached_twice_is_searched_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared").into_os_string();
+        let path = std::env::join_paths([
+            temp.path().join("bin"),
+            temp.path().join("bin"),
+            PathBuf::from(&shared),
+        ])
+        .unwrap();
+        let env = HashMap::from([
+            ("KICAD10_3RD_PARTY", shared.clone()),
+            ("KICAD9_3RD_PARTY", shared.clone()),
+            ("PATH", path),
+        ]);
+        let roots = freerouting_search_roots_from(|name| env.get(name).cloned(), temp.path());
+
+        let mut paths: Vec<&PathBuf> = roots.iter().map(|root| &root.path).collect();
+        let total = paths.len();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), total, "{roots:?}");
+        assert_eq!(
+            roots
+                .iter()
+                .find(|root| root.path.as_os_str() == shared)
+                .map(|root| root.location),
+            Some(FreeroutingLocation::KicadThirdPartyVariable)
+        );
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|root| root.location == FreeroutingLocation::PathDirectory)
+                .count(),
+            1
+        );
+    }
+
+    /// Both tools that take `jar_path` describe it the same way, through the
+    /// served `tools/list`.
+    #[tokio::test]
+    async fn served_jar_path_descriptions_state_the_search() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .await
+            .expect("tools/list receives a response");
+        let tools = response.result.expect("result")["tools"].clone();
+        for name in ["check_freerouting", "route_specctra_dsn"] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not listed"));
+            assert_eq!(
+                tool["inputSchema"]["properties"]["jar_path"]["description"],
+                json!(freerouting_jar_path_description()),
+                "{name}"
+            );
+        }
+    }
+
+    /// `route_specctra_dsn` names the missing file instead of telling a caller
+    /// who passed `jar_path` to pass `jar_path`.
+    #[tokio::test]
+    async fn served_route_refuses_a_jar_path_that_is_not_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.jar");
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "route_specctra_dsn",
+                    "arguments": {
+                        "dsn_path": temp.path().join("board.dsn").display().to_string(),
+                        "ses_output_path": temp.path().join("board.ses").display().to_string(),
+                        "jar_path": missing.display().to_string()
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["error"]["path"], json!(missing.display().to_string()));
+        assert_eq!(
+            body["message"],
+            json!(format!("jar_path is not a file: {}", missing.display()))
+        );
     }
 
     #[test]

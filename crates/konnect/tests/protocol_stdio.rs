@@ -851,3 +851,72 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
         ]
     );
 }
+
+/// #787 over real stdio: with nothing to find, `check_freerouting` reports
+/// every location it searched, in the documented order, from the server's own
+/// environment. The environment is redirected so a Freerouting installed on
+/// the machine running the test cannot be found.
+#[test]
+fn check_freerouting_reports_every_location_it_searched_over_stdio() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let third_party: Vec<String> = ["3rd-10", "3rd-9", "3rd-8"]
+        .iter()
+        .map(|name| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.display().to_string()
+        })
+        .collect();
+    let (bin_s, home_s) = (bin.display().to_string(), tmp.path().display().to_string());
+    let mut p = McpProcess::spawn_with_env(
+        Some(tmp.path()),
+        true,
+        &[
+            ("PATH", bin_s.as_str()),
+            ("USERPROFILE", home_s.as_str()),
+            ("KICAD10_3RD_PARTY", third_party[0].as_str()),
+            ("KICAD9_3RD_PARTY", third_party[1].as_str()),
+            ("KICAD8_3RD_PARTY", third_party[2].as_str()),
+        ],
+    );
+    McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "integration"})));
+
+    let result = p.call_tool("check_freerouting", json!({}));
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["engine_found"], false, "{body}");
+    assert_eq!(body["available"], false, "{body}");
+
+    let searched = body["searched_locations"]
+        .as_array()
+        .expect("searched_locations is reported");
+    let kinds: Vec<&str> = searched
+        .iter()
+        .map(|root| root["kind"].as_str().unwrap())
+        .collect();
+    // `HOME` and `USERPROFILE` name the same directory here, so on Windows the
+    // `Documents` plugin folders are reached twice and searched once.
+    let plugin_folders = 6;
+    let mut expected = vec!["kicad_3rd_party_variable"; 3];
+    expected.extend(vec!["kicad_plugin_folder"; plugin_folders]);
+    expected.extend(["working_directory", "system_directory", "system_directory"]);
+    expected.push("path_directory");
+    assert_eq!(kinds, expected, "{body}");
+
+    for (root, dir) in searched[..3].iter().zip(&third_party) {
+        assert_eq!(root["path"], json!(dir), "{root}");
+        assert_eq!(root["exists"], true, "{root}");
+    }
+    let working = std::path::PathBuf::from(searched[3 + plugin_folders]["path"].as_str().unwrap());
+    assert_eq!(working.file_name().unwrap(), "freerouting.jar");
+    assert_eq!(
+        working.parent().unwrap().canonicalize().unwrap(),
+        tmp.path().canonicalize().unwrap()
+    );
+    assert_eq!(searched[3 + plugin_folders]["exists"], false);
+    let last = searched.last().unwrap();
+    assert_eq!(last["path"], json!(bin_s), "{last}");
+    assert_eq!(last["max_depth"], 1, "{last}");
+}

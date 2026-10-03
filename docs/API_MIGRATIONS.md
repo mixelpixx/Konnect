@@ -3,6 +3,27 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `check_freerouting` reports where it searched (minor release)
+
+The `jar_path` argument of `check_freerouting` and `route_specctra_dsn` was
+described as "uses config default", but no Freerouting setting exists. Both
+descriptions now list where discovery looks, in order: the
+`KICAD10_3RD_PARTY`, `KICAD9_3RD_PARTY` and `KICAD8_3RD_PARTY` directories;
+the KiCad 10, 9 and 8 plugin folders under the home directory;
+`freerouting.jar` in the server's working directory; `/usr/local/lib/freerouting`
+and `/opt/freerouting`; then every directory on `PATH`. The search itself is
+unchanged.
+
+When nothing is found, `check_freerouting` adds `searched_locations`: one
+entry per location visited, with `kind`, `path`, `max_depth` and `exists`,
+read from the server's own environment. A location reached twice, such as the
+`Documents` plugin folders when `HOME` and `USERPROFILE` are the same
+directory, is searched once. When `jar_path` is passed and is not a file, it
+reports `checked_path` and says so instead of giving download advice.
+`route_specctra_dsn` now refuses such a `jar_path` with `file_not_found` naming
+the path, where it used to answer "install Freerouting or pass jar_path"
+(#787).
+
 ## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
 
 A hook's `matcher` is built from the tool registry, so it changes when a board
