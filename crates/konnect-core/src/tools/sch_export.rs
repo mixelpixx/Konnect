@@ -8,7 +8,7 @@ use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext, ToolDef};
 use konnect_sexp::{
-    geometry::{point_on_segment, points_coincident},
+    geometry::{point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
@@ -858,7 +858,9 @@ async fn handle_fix_connectivity(
                         WireEndpoint::End
                     },
                     from: (px, py),
-                    to: (tx, ty),
+                    // A pin endpoint is an f64 sum: 101.6 - 3.81 is
+                    // 97.78999999999999. Plan the point KiCad writes (#766).
+                    to: (round6(tx), round6(ty)),
                 });
             }
         }
@@ -1434,6 +1436,42 @@ mod connectivity_edit_tests {
             panic!("expected text response");
         };
         serde_json::from_str(text).unwrap()
+    }
+
+    /// R1's pin 1 sits at `101.6 - 3.81` = `97.78999999999999`, and R2's
+    /// rotated pin 2 at `120.65 + 3.81` = `124.46000000000001`. Each wire must
+    /// land on the point as KiCad writes it, `97.79` and `124.46`, in the file
+    /// and in the response read back from it (#766).
+    #[tokio::test]
+    async fn a_snap_onto_a_pin_writes_the_coordinates_kicad_writes() {
+        let (result, file) = run_fix(include_str!(
+            "../../tests/fixtures/written_coordinates_kicad10.kicad_sch"
+        ))
+        .await;
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            after.contains("(xy 139.7 88.9) (xy 139.7 97.79)"),
+            "{after}"
+        );
+        assert!(
+            after.contains("(xy 132.08 96.52) (xy 124.46 96.52)"),
+            "{after}"
+        );
+        let body = response(&result);
+        assert_eq!(body["fixes_found"], 2, "{body}");
+        let to: Vec<String> = body["fixes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fix| fix["to"].to_string())
+            .collect();
+        assert_eq!(
+            to,
+            [r#"{"x":139.7,"y":97.79}"#, r#"{"x":124.46,"y":96.52}"#],
+            "{body}"
+        );
     }
 
     #[tokio::test]

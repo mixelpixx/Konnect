@@ -1426,9 +1426,8 @@ pub(crate) fn reconcile_junctions_at(
     );
     let mut to_add: Vec<(f64, f64)> = to_add
         .into_iter()
-        // Pin endpoints come out of arithmetic (136.19 + 3.81 = 139.70000000000002)
-        // and `format_junction` interpolates the f64 verbatim, so round to the
-        // 6 decimals KiCAD writes rather than leaking float noise into the file.
+        // Pin endpoints come out of arithmetic (136.19 + 3.81 = 139.70000000000002).
+        // Round before deduplicating, so two noisy copies of one point add one dot.
         .map(|(x, y)| (round6(x), round6(y)))
         .collect();
     to_add.sort_by(|a, b| a.partial_cmp(b).expect("rounded coordinates are finite"));
@@ -2056,7 +2055,12 @@ async fn handle_move_labels_by_offset(
         edits.push(SexpEdit::replace(
             at_val,
             at_close,
-            format!("{} {} {}", label.x + dx, label.y + dy, rotation),
+            // Rounded: 167.64 - 5.08 is 162.55999999999997 in f64 (#766).
+            format!(
+                "{} {} {rotation}",
+                round6(label.x + dx),
+                round6(label.y + dy)
+            ),
         ));
     }
 
@@ -2850,6 +2854,46 @@ mod unit_aware_wiring_tests {
         )
         .unwrap();
         (dir, path)
+    }
+
+    /// `connect_pins` routes between two pin endpoints that are `f64` sums,
+    /// `101.6 - 3.81` and `120.65 + 3.81`, through the raw wire and junction
+    /// formatters. The file must carry them as KiCad writes them (#766).
+    #[tokio::test]
+    async fn connect_pins_writes_the_coordinates_kicad_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written_coordinates_kicad10.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/written_coordinates_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        let result = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "R1", "pin1": "1",
+                "ref2": "R2", "pin2": "2"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(xy 139.7 97.79) (xy 124.46 97.79)"),
+            "{after}"
+        );
+        assert!(
+            after.contains("(xy 124.46 97.79) (xy 124.46 96.52)"),
+            "{after}"
+        );
+        // The new wire starts mid-span on the wire from label A, so a dot
+        // is added there too.
+        assert!(after.contains("(at 139.7 97.79)"), "{after}");
+        assert!(!after.contains("97.78999"), "{after}");
+        assert!(!after.contains("124.46000"), "{after}");
     }
 
     #[tokio::test]
@@ -3770,6 +3814,30 @@ mod label_tests {
             after.contains("(at 202.54 98.73 0)"),
             "second label moved: {after}"
         );
+    }
+
+    /// `167.64 - 5.08` is `162.55999999999997` in `f64`. KiCad writes the
+    /// label at `(at 142.24 162.56 0)` when it resaves the moved sheet, which
+    /// is what the file must already say (#766).
+    #[tokio::test]
+    async fn move_labels_by_offset_writes_the_coordinates_kicad_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written_coordinates_kicad10.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/written_coordinates_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        let result = handle_move_labels_by_offset(
+            &json!({ "schematic": path.display().to_string(), "net": "SIG", "dx": 2.54, "dy": -5.08 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 142.24 162.56 0)"), "{after}");
     }
 
     #[tokio::test]
