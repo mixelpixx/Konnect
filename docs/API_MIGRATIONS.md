@@ -3,6 +3,15 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `list_schematic_labels` reports each label's `uuid` (patch release)
+
+Each entry in `list_schematic_labels`' `labels` array gains a `uuid` field
+holding the UUID KiCad wrote for that label, for net, global and hierarchical
+labels alike. Pass these to `batch_delete` to remove many labels in one call,
+as `list_schematic_wires`' UUIDs already allow for wires. The existing fields,
+including the `NetLabel`/`GlobalLabel`/`HierarchicalLabel` `type` values, are
+unchanged (#746).
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the

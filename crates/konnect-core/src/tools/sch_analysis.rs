@@ -42,8 +42,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "list_schematic_labels",
-            "List all label instances (net_label, global_label, hierarchical_label) \
-             with their positions, net names, and types.",
+            "List all net, global, and hierarchical labels with their positions, \
+             net names, types (NetLabel, GlobalLabel, HierarchicalLabel), and UUIDs \
+             (usable with batch_delete).",
             json!({ "type": "object",
                 "properties": { "schematic": { "type": "string" } },
                 "required": ["schematic"] }),
@@ -245,15 +246,16 @@ async fn handle_list_labels(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let sch = cse::Schematic::load(&sch_path)?;
+    let entry = |kind: &str, text: &str, at: &cse::At, uuid: &str| json!({ "net": text, "type": kind, "x": at.x, "y": at.y, "rotation": at.rotation.unwrap_or(0.0), "uuid": uuid });
     let mut items: Vec<serde_json::Value> = Vec::new();
     for l in sch.labels.iter() {
-        items.push(json!({ "net": l.text, "type": "NetLabel", "x": l.at.x, "y": l.at.y, "rotation": l.at.rotation.unwrap_or(0.0) }));
+        items.push(entry("NetLabel", &l.text, &l.at, &l.uuid));
     }
     for g in sch.global_labels.iter() {
-        items.push(json!({ "net": g.text, "type": "GlobalLabel", "x": g.at.x, "y": g.at.y, "rotation": g.at.rotation.unwrap_or(0.0) }));
+        items.push(entry("GlobalLabel", &g.text, &g.at, &g.uuid));
     }
     for h in sch.hierarchical_labels.iter() {
-        items.push(json!({ "net": h.text, "type": "HierarchicalLabel", "x": h.at.x, "y": h.at.y, "rotation": h.at.rotation.unwrap_or(0.0) }));
+        items.push(entry("HierarchicalLabel", &h.text, &h.at, &h.uuid));
     }
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "labels": items }),
@@ -1383,14 +1385,27 @@ mod tool_call_support {
     pub(super) async fn call_result(
         sch: &str,
         tool: &str,
-        mut args: serde_json::Value,
+        args: serde_json::Value,
     ) -> CallToolResult {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
         f.write_all(sch.as_bytes()).unwrap();
         f.flush().unwrap();
+        call_result_at(f.path(), tool, args).await
+    }
 
-        args["schematic"] = json!(f.path().to_str().unwrap());
-        let def = tools().into_iter().find(|t| t.name == tool).unwrap();
+    /// The same against an existing file, so one test can chain calls on it.
+    /// `sch_batch` is searched too, for its writers.
+    pub(super) async fn call_result_at(
+        path: &std::path::Path,
+        tool: &str,
+        mut args: serde_json::Value,
+    ) -> CallToolResult {
+        args["schematic"] = json!(path.to_str().unwrap());
+        let def = tools()
+            .into_iter()
+            .chain(crate::tools::sch_batch::tools())
+            .find(|t| t.name == tool)
+            .unwrap();
         let ctx = ToolContext::new(
             ServerConfig::default(),
             Arc::new(crate::router::ToolRouter::new()),
@@ -1400,8 +1415,20 @@ mod tool_call_support {
 
     /// The body of a call that must have succeeded.
     pub(super) async fn call(sch: &str, tool: &str, args: serde_json::Value) -> serde_json::Value {
-        let result = call_result(sch, tool, args).await;
-        assert!(!result.is_error, "{tool} failed");
+        body(tool, call_result(sch, tool, args).await)
+    }
+
+    /// The body of a call on an existing file that must have succeeded.
+    pub(super) async fn call_at(
+        path: &std::path::Path,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        body(tool, call_result_at(path, tool, args).await)
+    }
+
+    fn body(tool: &str, result: CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{tool} failed: {:?}", result.content);
         let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
             panic!("expected text content");
         };
@@ -1834,7 +1861,7 @@ mod multi_unit_tool_tests {
 /// `two_name_nets.README.md`; every expectation below is that table.
 #[cfg(test)]
 mod two_name_net_tests {
-    use super::tool_call_support::call;
+    use super::tool_call_support::{call, call_at};
     use super::*;
 
     const SCH: &str = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
@@ -1931,6 +1958,92 @@ mod two_name_net_tests {
             .map(|component| component["reference"].as_str().unwrap())
             .collect();
         assert_eq!(components, ["TP9"], "{items}");
+    }
+
+    /// The 15 labels as Eeschema serialized them, read from the fixture text
+    /// (see the README), not from this crate's parser.
+    const KICAD_LABELS: [(&str, &str, &str); 15] = [
+        ("NetLabel", "AAA", "06aae51d-ad92-45a3-ab6b-a2934ec12f2a"),
+        ("NetLabel", "ALT", "15de34f4-cedd-40a3-9159-f3eff2ac13bb"),
+        ("NetLabel", "SDA", "35064194-a7cb-4fcc-b60a-539f8e03bbbc"),
+        ("NetLabel", "SCL", "3893093c-b550-492c-80fd-10739f176fb5"),
+        ("NetLabel", "ZZZ", "5990e890-7fcd-4caf-ac60-269b1b5f7d3e"),
+        ("NetLabel", "ALT", "849c7341-fc4a-4c95-a59f-68f8994893f5"),
+        ("NetLabel", "SDA", "8a222e21-42d9-4588-bafd-c4947977eed0"),
+        ("NetLabel", "PULLUP", "9724b793-eefa-47df-a8b9-9c0dc04b968f"),
+        ("NetLabel", "MIX", "a102cfc5-873d-4e3d-b1ba-a697aa9366ca"),
+        ("NetLabel", "VCC", "ab408dff-d6ba-43fb-abfa-bfff6771323d"),
+        ("NetLabel", "ZZZ", "b6d04cca-e63c-4dab-aa7b-48bc7b576c07"),
+        ("NetLabel", "SCL", "f7a3ae8e-998e-4051-990b-eda340b2e7de"),
+        ("GlobalLabel", "SYS", "821185fe-9fdd-4020-a37c-7b17c7a5d1ef"),
+        (
+            "GlobalLabel",
+            "RETURN",
+            "c8e4d402-48cc-4823-9cc2-f7275f5e2973",
+        ),
+        (
+            "HierarchicalLabel",
+            "MIX_H",
+            "f9df2d51-8230-4a59-b15b-468f176904ac",
+        ),
+    ];
+
+    fn label_rows(body: &serde_json::Value) -> Vec<(&str, &str, &str)> {
+        let mut rows: Vec<_> = body["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                let field = |k: &str| l[k].as_str().unwrap_or_default();
+                (field("type"), field("net"), field("uuid"))
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Each label carries the UUID KiCad gave it, for all three label kinds.
+    #[tokio::test]
+    async fn listed_labels_carry_kicads_uuids() {
+        let body = call(SCH, "list_schematic_labels", json!({})).await;
+
+        let mut expected = KICAD_LABELS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(label_rows(&body), expected, "{body}");
+    }
+
+    /// The listed UUIDs are what `batch_delete` takes: one call removes every
+    /// label and nothing else.
+    #[tokio::test]
+    async fn listed_label_uuids_feed_batch_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_name_nets.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+
+        let listed = call_at(&path, "list_schematic_labels", json!({})).await;
+        let uuids: Vec<&str> = label_rows(&listed).into_iter().map(|(_, _, u)| u).collect();
+        let wires_before = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
+
+        let deleted = call_at(&path, "batch_delete", json!({ "uuids": uuids })).await;
+        let mut deleted_uuids: Vec<&str> = deleted["deleted_item_uuids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u.as_str().unwrap())
+            .collect();
+        deleted_uuids.sort_unstable();
+        let mut requested = uuids.clone();
+        requested.sort_unstable();
+        assert_eq!(deleted_uuids, requested, "{deleted}");
+        assert_eq!(deleted["deleted_components"], json!([]), "{deleted}");
+        assert_eq!(deleted["removed_no_connects_count"], 0, "{deleted}");
+        assert_eq!(deleted["junctions_pruned_count"], 0, "{deleted}");
+        assert_eq!(deleted["errors"], json!([]), "{deleted}");
+
+        let after = call_at(&path, "list_schematic_labels", json!({})).await;
+        assert_eq!(after["count"], 0, "{after}");
+        let wires_after = call_at(&path, "list_schematic_wires", json!({})).await["count"].clone();
+        assert_eq!(wires_after, wires_before);
     }
 }
 
