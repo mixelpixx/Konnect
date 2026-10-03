@@ -17,7 +17,7 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, lcsc_packages, require_str, ToolContext, ToolDef};
 use konnect_sexp::{
     command::{commit_command, prepare_command, ItemId, SchematicCommand},
     parse_sexp,
@@ -84,13 +84,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "suggest_jlcpcb_alternatives",
-            "Suggest JLCPCB-stocked alternative parts for a given component value and footprint.",
+            "Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint uses. The footprint is mapped to LCSC's package names, the value must match as a whole value, and parts below a stock floor are excluded. Results rank Basic, then Preferred, then Extended parts, then known price and stock; the response states the package names matched, the ranking, and what was excluded.",
             json!({
                 "type": "object",
                 "properties": {
-                    "value": { "type": "string", "description": "Component value (e.g. '100nF')" },
-                    "footprint": { "type": "string", "description": "KiCAD footprint identifier" },
-                    "max_price_usd": { "type": "number", "description": "Maximum unit price in USD (optional)" },
+                    "value": { "type": "string", "description": "Component value or part number, matched case-insensitively as a whole value (no digit or '.' directly before or after) against the part description and manufacturer part number, e.g. '100nF', '10k', 'AMS1117-3.3'. Unit spellings are not converted: '100nF' does not find '0.1uF'" },
+                    "footprint": { "type": "string", "description": "KiCad footprint ID such as 'Capacitor_SMD:C_0402_1005Metric', or LCSC's own package name without a library prefix, such as '0402' or 'LQFP-48(7x7)'. A library footprint with no known LCSC package is refused" },
+                    "max_price_usd": { "type": "number", "description": "Keep only parts whose known unit price is at or below this, in USD (optional). Parts with an unknown price are excluded when it is set" },
+                    "min_stock": { "type": "integer", "minimum": 0, "description": "Exclude parts with fewer units in stock. Raise it to the build quantity", "default": 100 },
+                    "prefer_basic": { "type": "boolean", "description": "Rank JLCPCB Basic parts first, then Preferred, then Extended, before price. Extended parts add a setup fee per unique part", "default": true },
                     "limit": { "type": "integer", "description": "Maximum number of suggestions", "default": 5 }
                 },
                 "required": ["value", "footprint"]
@@ -737,18 +739,214 @@ async fn handle_get_jlcpcb_part(
     }
 }
 
+/// JLCPCB library types in order of preference. Basic parts carry no setup
+/// fee, Preferred parts none for economic assembly, and every unique Extended
+/// part adds one.
+const LIBRARY_TYPE_ORDER: [&str; 3] = ["Basic", "Preferred", "Extended"];
+
+const SUGGEST_DEFAULT_MIN_STOCK: u64 = 100;
+
+/// A part that matched both the value and the package, with the columns the
+/// stock floor, price limit and ranking read.
+#[derive(Debug, Clone)]
+struct AlternativeCandidate {
+    part: serde_json::Value,
+    lcsc: String,
+    library_type: String,
+    price: f64,
+    stock: i64,
+}
+
+impl AlternativeCandidate {
+    /// The import stores a price the feed did not give as 0 (#582), and no
+    /// part is free, so 0 or less means the price is unknown.
+    fn price_known(&self) -> bool {
+        self.price > 0.0
+    }
+
+    fn library_rank(&self) -> usize {
+        LIBRARY_TYPE_ORDER
+            .iter()
+            .position(|kind| *kind == self.library_type)
+            .unwrap_or(LIBRARY_TYPE_ORDER.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AlternativePolicy {
+    min_stock: u64,
+    prefer_basic: bool,
+    max_price: Option<f64>,
+    limit: usize,
+}
+
+impl AlternativePolicy {
+    fn criteria(&self) -> Vec<&'static str> {
+        let mut criteria = Vec::new();
+        if self.prefer_basic {
+            criteria.push("library_type: Basic, Preferred, Extended");
+        }
+        criteria.extend([
+            "known price before unknown price",
+            "price ascending",
+            "stock descending",
+            "LCSC number",
+        ]);
+        criteria
+    }
+}
+
+/// What filtering removed and what was returned, so an empty or short result
+/// says why.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AlternativeCounts {
+    matched: usize,
+    below_min_stock: usize,
+    unknown_price: usize,
+    above_max_price: usize,
+    returned: usize,
+}
+
+/// Apply the stock floor and price limit, then rank. Ranking by price alone
+/// put Extended parts with a dozen units in stock, and parts whose price was
+/// unknown, ahead of the Basic part with millions (#785).
+fn rank_alternatives(
+    candidates: Vec<AlternativeCandidate>,
+    policy: &AlternativePolicy,
+) -> (Vec<AlternativeCandidate>, AlternativeCounts) {
+    let mut counts = AlternativeCounts {
+        matched: candidates.len(),
+        ..AlternativeCounts::default()
+    };
+    let min_stock = i64::try_from(policy.min_stock).unwrap_or(i64::MAX);
+    let mut kept: Vec<AlternativeCandidate> = Vec::new();
+    for candidate in candidates {
+        if candidate.stock < min_stock {
+            counts.below_min_stock += 1;
+        } else if let Some(max_price) = policy.max_price {
+            if !candidate.price_known() {
+                counts.unknown_price += 1;
+            } else if candidate.price > max_price {
+                counts.above_max_price += 1;
+            } else {
+                kept.push(candidate);
+            }
+        } else {
+            kept.push(candidate);
+        }
+    }
+
+    let tier = |candidate: &AlternativeCandidate| {
+        if policy.prefer_basic {
+            candidate.library_rank()
+        } else {
+            0
+        }
+    };
+    kept.sort_by(|a, b| {
+        tier(a)
+            .cmp(&tier(b))
+            .then(b.price_known().cmp(&a.price_known()))
+            .then(a.price.total_cmp(&b.price))
+            .then(b.stock.cmp(&a.stock))
+            .then(a.lcsc.cmp(&b.lcsc))
+    });
+    kept.truncate(policy.limit);
+    counts.returned = kept.len();
+    (kept, counts)
+}
+
+/// Read every part in one of `packages` whose description or part number
+/// contains `value` as a whole value. SQL narrows by substring; the
+/// whole-value test, which SQLite's LIKE cannot express, runs here.
+fn query_alternative_candidates(
+    db_path: &Path,
+    value: &str,
+    packages: &[String],
+) -> anyhow::Result<Vec<AlternativeCandidate>> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let placeholders = (1..=packages.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let like = packages.len() + 1;
+    let sql = format!(
+        "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
+         FROM components WHERE Package COLLATE NOCASE IN ({placeholders}) \
+         AND (Description LIKE ?{like} ESCAPE '\\' OR MFR_Part LIKE ?{like} ESCAPE '\\')"
+    );
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut params: Vec<String> = packages.to_vec();
+    params.push(format!("%{escaped}%"));
+
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let mpn: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let description: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            Ok((
+                mpn,
+                description,
+                AlternativeCandidate {
+                    part: row_to_part_json(row)?,
+                    lcsc: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    library_type: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    price: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                    stock: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(mpn, description, _)| {
+            lcsc_packages::contains_whole_value(description, value)
+                || lcsc_packages::contains_whole_value(mpn, value)
+        })
+        .map(|(_, _, candidate)| candidate)
+        .collect())
+}
+
 async fn handle_suggest_alternatives(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     // Arguments before environment — see `handle_search_jlcpcb_parts`.
     let value = match require_str(args, "value") {
-        Ok(v) => v.to_string(),
+        Ok(v) => v.trim().to_string(),
         Err(e) => return Ok(e),
     };
     let footprint = match require_str(args, "footprint") {
-        Ok(v) => v.to_string(),
+        Ok(v) => v.trim().to_string(),
         Err(e) => return Ok(e),
+    };
+    if value.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "value".into(),
+                reason: "empty".into(),
+            },
+            "value is empty; give the component value or part number to match",
+        ));
+    }
+    // The package used to be the footprint ID's last `_` segment, which for
+    // every standard KiCad footprint (`C_0402_1005Metric` → `1005Metric`) is
+    // a name LCSC never uses, so the search silently matched nothing (#785).
+    let Some(package_match) = lcsc_packages::lcsc_packages(&footprint) else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "footprint".into(),
+                reason: "no known LCSC package for this footprint".into(),
+            },
+            format!(
+                "No LCSC package name is known for footprint '{footprint}'. Pass LCSC's own \
+                 package name without a library prefix instead, for example '0402', 'SOT-23' \
+                 or 'LQFP-48(7x7)'."
+            ),
+        ));
     };
 
     let db_path = resolve_db_path(args, ctx);
@@ -757,18 +955,14 @@ async fn handle_suggest_alternatives(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
         ));
     }
-    let max_price = args["max_price_usd"].as_f64();
-    let limit = args["limit"].as_u64().unwrap_or(5) as usize;
-
-    // Extract package from footprint (e.g. "Resistor_SMD:R_0402" → "0402")
-    let package_hint = footprint
-        .split(':')
-        .next_back()
-        .unwrap_or("")
-        .split('_')
-        .next_back()
-        .unwrap_or("")
-        .to_string();
+    let policy = AlternativePolicy {
+        min_stock: args["min_stock"]
+            .as_u64()
+            .unwrap_or(SUGGEST_DEFAULT_MIN_STOCK),
+        prefer_basic: args["prefer_basic"].as_bool().unwrap_or(true),
+        max_price: args["max_price_usd"].as_f64(),
+        limit: args["limit"].as_u64().unwrap_or(5) as usize,
+    };
 
     let key = cache_key(
         "suggest_jlcpcb_alternatives",
@@ -776,8 +970,10 @@ async fn handle_suggest_alternatives(
         &[
             &value,
             &footprint,
-            &max_price.map(|v| v.to_string()).unwrap_or_default(),
-            &limit.to_string(),
+            &policy.max_price.map(|v| v.to_string()).unwrap_or_default(),
+            &policy.limit.to_string(),
+            &policy.min_stock.to_string(),
+            &policy.prefer_basic.to_string(),
         ],
     );
     if let Some(cached) = ctx.jlcpcb_cache.get(&key) {
@@ -786,33 +982,41 @@ async fn handle_suggest_alternatives(
         return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
     }
 
-    let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let like_val = format!("%{}%", value);
-        let like_pkg = format!("%{}%", package_hint);
-
-        let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
-             FROM components WHERE Description LIKE ?1 AND Package LIKE ?2 AND Stock > 0"
-        );
-        if let Some(max_p) = max_price {
-            sql.push_str(&format!(" AND Price <= {}", max_p));
-        }
-        sql.push_str(&format!(" ORDER BY Price ASC LIMIT {}", limit));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params![like_val, like_pkg], row_to_part_json)?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
+    let packages = package_match.packages.clone();
+    let query_value = value.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        query_alternative_candidates(&db_path, &query_value, &packages)
     })
     .await??;
+    let (alternatives, counts) = rank_alternatives(candidates, &policy);
 
     let body = json!({
-        "value": args["value"].as_str().unwrap_or(""),
-        "footprint": args["footprint"].as_str().unwrap_or(""),
-        "alternatives": results
+        "value": value,
+        "footprint": footprint,
+        "package_match": {
+            "rule": package_match.rule.name(),
+            "lcsc_packages": package_match.packages,
+            "note": "Matched by LCSC's package name, which does not record pitch or exposed-pad size; check the land pattern against the datasheet."
+        },
+        "value_match": {
+            "columns": ["Description", "MFR_Part"],
+            "rule": "whole_value",
+            "note": "Case-insensitive, with no digit or '.' directly before or after the value. Unit spellings are not converted: '100nF' does not find '0.1uF'."
+        },
+        "ranking": {
+            "criteria": policy.criteria(),
+            "prefer_basic": policy.prefer_basic,
+            "min_stock": policy.min_stock,
+            "max_price_usd": policy.max_price
+        },
+        "count": counts.returned,
+        "matched_count": counts.matched,
+        "exclusions": {
+            "below_min_stock_count": counts.below_min_stock,
+            "unknown_price_count": counts.unknown_price,
+            "above_max_price_count": counts.above_max_price
+        },
+        "alternatives": alternatives.into_iter().map(|candidate| candidate.part).collect::<Vec<_>>()
     });
     ctx.jlcpcb_cache.put(key, body.clone());
 
@@ -2655,5 +2859,313 @@ mod jlcpcb_cache_tests {
         assert_eq!(body["datasheet_url"], serde_json::Value::Null);
         let note = body["note"].as_str().unwrap();
         assert!(note.contains("local catalog"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod suggest_alternatives_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// Real rows of the Konnect-built catalogue (`components` table), copied
+    /// verbatim from a `download_jlcpcb_database` run on 2026-10-03. The
+    /// README beside it records the source and how the rows were chosen.
+    const FIXTURE: &str = include_str!("../../tests/fixtures/jlcpcb/suggest_alternatives.tsv");
+
+    fn fixture_db() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jlcpcb.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // The table `build_konnect_jlcpcb_database` creates.
+        conn.execute_batch(
+            "CREATE TABLE components (
+                 LCSC TEXT NOT NULL PRIMARY KEY, MFR_Part TEXT NOT NULL,
+                 Package TEXT NOT NULL, Manufacturer TEXT NOT NULL,
+                 Library_Type TEXT NOT NULL, Description TEXT NOT NULL,
+                 Datasheet TEXT NOT NULL, Price REAL NOT NULL,
+                 Stock INTEGER NOT NULL, Category TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let mut lines = FIXTURE.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "LCSC\tMFR_Part\tPackage\tManufacturer\tLibrary_Type\tDescription\tDatasheet\tPrice\tStock\tCategory"
+        );
+        for line in lines.filter(|line| !line.is_empty()) {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 10, "{line}");
+            conn.execute(
+                "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    f[0],
+                    f[1],
+                    f[2],
+                    f[3],
+                    f[4],
+                    f[5],
+                    f[6],
+                    f[7].parse::<f64>().unwrap(),
+                    f[8].parse::<i64>().unwrap(),
+                    f[9]
+                ],
+            )
+            .unwrap();
+        }
+        (dir, path)
+    }
+
+    async fn served(db: &Path, arguments: serde_json::Value) -> (bool, serde_json::Value) {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: Some(db.to_path_buf()),
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "suggest_jlcpcb_alternatives", "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("result");
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (result["isError"] == json!(true), body)
+    }
+
+    fn lcsc(body: &serde_json::Value) -> Vec<&str> {
+        body["alternatives"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no alternatives: {body}"))
+            .iter()
+            .map(|part| part["lcsc"].as_str().unwrap())
+            .collect()
+    }
+
+    /// #785: real KiCad 10 footprint IDs reach real parts, the value matches
+    /// as a whole value, and the Basic part with millions in stock comes
+    /// first. On `main` every one of these returned `[]`.
+    #[tokio::test]
+    async fn standard_kicad_footprints_find_the_value_with_the_basic_part_first() {
+        let (_dir, db) = fixture_db();
+        for (value, footprint, expected) in [
+            (
+                "100nF",
+                "Capacitor_SMD:C_0402_1005Metric",
+                vec!["C1525", "C307331", "C285038", "C359190", "C285045"],
+            ),
+            (
+                "10k",
+                "Resistor_SMD:R_0402_1005Metric",
+                vec!["C25744", "C22356213", "C174175"],
+            ),
+            (
+                "20pF",
+                "Capacitor_SMD:C_0402_1005Metric",
+                vec!["C1554", "C107000"],
+            ),
+            (
+                "AMS1117-3.3",
+                "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+                vec!["C6186", "C2992570"],
+            ),
+            (
+                "STM32F411CEU6",
+                "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm_EP5.6x5.6mm",
+                vec!["C60420"],
+            ),
+            (
+                "LM358",
+                "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+                vec!["C7950", "C5252902", "C5423"],
+            ),
+        ] {
+            let (is_error, body) =
+                served(&db, json!({ "value": value, "footprint": footprint })).await;
+            assert!(!is_error, "{value} / {footprint}: {body}");
+            assert_eq!(lcsc(&body), expected, "{value} / {footprint}: {body}");
+            assert_eq!(body["count"], expected.len(), "{body}");
+        }
+    }
+
+    /// The evidence for the first case: which packages were searched, how
+    /// the value was matched, the ranking, and what the stock floor removed
+    /// (four parts with 8 to 19 in stock, which used to lead the list).
+    #[tokio::test]
+    async fn the_response_states_the_package_match_ranking_and_exclusions() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({ "value": "100nF", "footprint": "Capacitor_SMD:C_0402_1005Metric" }),
+        )
+        .await;
+        assert_eq!(body["package_match"]["rule"], "chip_imperial");
+        assert_eq!(body["package_match"]["lcsc_packages"], json!(["0402"]));
+        assert_eq!(
+            body["value_match"]["columns"],
+            json!(["Description", "MFR_Part"])
+        );
+        assert_eq!(
+            body["ranking"]["criteria"],
+            json!([
+                "library_type: Basic, Preferred, Extended",
+                "known price before unknown price",
+                "price ascending",
+                "stock descending",
+                "LCSC number"
+            ])
+        );
+        assert_eq!(body["ranking"]["min_stock"], 100);
+        assert_eq!(body["ranking"]["prefer_basic"], true);
+        assert_eq!(body["count"], 5);
+        assert_eq!(body["matched_count"], 9);
+        assert_eq!(
+            body["exclusions"],
+            json!({
+                "below_min_stock_count": 4,
+                "unknown_price_count": 0,
+                "above_max_price_count": 0
+            })
+        );
+    }
+
+    /// `10k` used to match `110kΩ` and `510kΩ`, and `0402` used to match the
+    /// `0402x4` resistor arrays. Neither is counted as a match now.
+    #[tokio::test]
+    async fn neighbouring_values_and_array_packages_are_not_matches() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({
+                "value": "10k",
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "min_stock": 0,
+                "limit": 50
+            }),
+        )
+        .await;
+        assert_eq!(lcsc(&body), ["C25744", "C22356213", "C174175"], "{body}");
+        assert_eq!(body["matched_count"], 3, "{body}");
+        for part in body["alternatives"].as_array().unwrap() {
+            assert_eq!(part["package"], "0402", "{part}");
+            assert!(
+                part["description"].as_str().unwrap().contains(" 10kΩ "),
+                "{part}"
+            );
+        }
+    }
+
+    /// Preferred parts rank between Basic and Extended; turning the
+    /// preference off ranks by price.
+    #[tokio::test]
+    async fn library_type_ranks_before_price_unless_turned_off() {
+        let (_dir, db) = fixture_db();
+        let args = |prefer_basic: bool| {
+            json!({
+                "value": "510k",
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "prefer_basic": prefer_basic
+            })
+        };
+        let (_, preferred) = served(&db, args(true)).await;
+        assert_eq!(lcsc(&preferred), ["C11616", "C25564"], "{preferred}");
+        // C170418 has 6 in stock and an unknown price; the floor removes it.
+        assert_eq!(preferred["exclusions"]["below_min_stock_count"], 1);
+
+        let (_, by_price) = served(&db, args(false)).await;
+        assert_eq!(lcsc(&by_price), ["C25564", "C11616"], "{by_price}");
+        assert_eq!(by_price["ranking"]["prefer_basic"], false);
+        assert_eq!(
+            by_price["ranking"]["criteria"][0],
+            "known price before unknown price"
+        );
+    }
+
+    /// #582's stored zero is an unknown price: it sorts after every known
+    /// price, and a price limit excludes it rather than admitting it as free.
+    #[tokio::test]
+    async fn an_unknown_price_never_sorts_as_the_cheapest() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({ "value": "1.5M", "footprint": "Resistor_SMD:R_0402_1005Metric" }),
+        )
+        .await;
+        assert_eq!(lcsc(&body), ["C22369344", "C138034", "C11812"], "{body}");
+
+        let (_, limited) = served(
+            &db,
+            json!({
+                "value": "1.5M",
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "max_price_usd": 0.0015
+            }),
+        )
+        .await;
+        assert_eq!(lcsc(&limited), ["C22369344"], "{limited}");
+        assert_eq!(limited["exclusions"]["unknown_price_count"], 1, "{limited}");
+        assert_eq!(
+            limited["exclusions"]["above_max_price_count"], 1,
+            "{limited}"
+        );
+    }
+
+    /// With both overrides relaxed, the old cheapest-first order comes back,
+    /// so a caller who wants it can still have it.
+    #[tokio::test]
+    async fn the_stock_floor_and_preference_are_overridable() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({
+                "value": "100nF",
+                "footprint": "0402",
+                "min_stock": 0,
+                "prefer_basic": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            lcsc(&body),
+            ["C285038", "C2932181", "C2838746", "C3152530", "C18255880"],
+            "{body}"
+        );
+        assert_eq!(body["package_match"]["rule"], "lcsc_name");
+        assert_eq!(body["exclusions"]["below_min_stock_count"], 0);
+    }
+
+    /// A library footprint the table does not cover is refused, naming the
+    /// argument, instead of returning an empty list that reads as "no
+    /// alternatives exist".
+    #[tokio::test]
+    async fn an_unmapped_footprint_and_an_empty_value_are_refused() {
+        let (_dir, db) = fixture_db();
+        let (is_error, body) = served(
+            &db,
+            json!({
+                "value": "100nF",
+                "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "footprint");
+
+        let (is_error, body) = served(
+            &db,
+            json!({ "value": "  ", "footprint": "Capacitor_SMD:C_0402_1005Metric" }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["field"], "value");
     }
 }

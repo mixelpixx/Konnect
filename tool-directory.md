@@ -377,7 +377,7 @@ and Windows servers do not.
 | `download_jlcpcb_database` | Download or update the local JLCPCB parts database cache (SQLite). |
 | `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. The query is split on whitespace; a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive, `%` and `_` literal). |
 | `get_jlcpcb_part` | Retrieve full details for a single JLCPCB part by LCSC part number. |
-| `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked alternatives for a given component value and footprint. |
+| `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint maps to. Excludes parts below a stock floor and ranks Basic, then Preferred, then Extended parts, then known price and stock; the response states the LCSC package names matched, the ranking and what was excluded. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
