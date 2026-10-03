@@ -809,6 +809,20 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
         "KiCad measured nothing: {live}"
     );
     assert_eq!(saved["skipped_item_count"], 0, "{saved}");
+    // KiCad 10 will not list tables or generators. The live answer names both
+    // with KiCad's own refusal instead of reading as complete (#688).
+    let unavailable = live["unavailable_item_classes"]
+        .as_array()
+        .expect("the live answer names what KiCad would not list");
+    for class in ["tables", "generators"] {
+        let named = unavailable
+            .iter()
+            .find(|entry| entry["class"] == class)
+            .unwrap_or_else(|| panic!("{class} is not named: {live}"));
+        assert_eq!(named["reason"], "refused", "{live}");
+        assert_eq!(named["kiapi_status"], "AS_BAD_REQUEST", "{live}");
+    }
+    assert_eq!(saved["unavailable_item_classes"], json!([]), "{saved}");
 
     let coordinate = |body: &Value, key: &str| body[key].as_f64().unwrap();
     let tolerance = 1e-4;

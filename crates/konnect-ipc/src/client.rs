@@ -717,6 +717,13 @@ impl PingOutcome {
     }
 }
 
+/// What `GetItems` said about one class of board items.
+enum Listed {
+    Items(Vec<prost_types::Any>),
+    /// KiCad declined to list the class at all.
+    Refused(UnavailableReason),
+}
+
 /// Typed KiCad response status for a request that completed a round trip.
 ///
 /// Keeping the numeric status in the error chain lets capability discovery
@@ -4238,10 +4245,16 @@ impl KiCadIpcClient {
     /// empty list returns no boxes on every board (measured on KiCad 10.0.5),
     /// which is how this read used to report an empty board for all of them.
     /// So each class of board item is listed with `GetItems`, one class per
-    /// request so that a class KiCad refuses fails the read by name instead of
-    /// vanishing from it, and every KIID is measured in one `BBM_ITEM_ONLY`
-    /// request through [`Self::get_item_boxes_in`], which requires exactly one
-    /// box back for each.
+    /// request, and every KIID is measured in one `BBM_ITEM_ONLY` request
+    /// through [`Self::get_item_boxes_in`], which requires exactly one box
+    /// back for each.
+    ///
+    /// A class KiCad declines to list (`AS_BAD_REQUEST`) is named in
+    /// `unavailable` with KiCad's answer instead of vanishing from the read.
+    /// KiCad 10.0.5 declines tables and generators. Both are asked for on every
+    /// read: the bundled protocol has no message for either, so a KiCad that
+    /// does list them is reported too, with how many it listed. Any other
+    /// failure still fails the read.
     ///
     /// `BBM_ITEM_ONLY` leaves a footprint's text out of its box: board extents
     /// mean board geometry, and footprint text can sit tens of millimetres off
@@ -4304,14 +4317,31 @@ impl KiCadIpcClient {
             ),
         ];
 
+        // Classes the bundled protocol has no item message for. A table's or a
+        // generator's own box can reach past anything listed above: on the
+        // Jetson demo, 164 of 167 tuning patterns extend up to 3.99 mm beyond
+        // their member tracks.
+        const UNREADABLE: [(Kind, &str); 2] = [
+            (Kind::KotPcbTable, "tables"),
+            (Kind::KotPcbGenerator, "generators"),
+        ];
+
         let mut ids = Vec::new();
         let mut seen = BTreeSet::new();
         let mut measured = std::collections::BTreeMap::new();
         let mut shared_kiid_count = 0;
+        let mut unavailable = Vec::new();
         for (kind, message, key) in CLASSES {
-            let items = self
-                .get_items_of_types_in(document.clone(), &[kind])
-                .with_context(|| format!("KiCad did not list the board's {key}"))?;
+            let items = match self.list_class_in(document.clone(), kind, key)? {
+                Listed::Items(items) => items,
+                Listed::Refused(reason) => {
+                    unavailable.push(IpcUnavailableItemClass {
+                        class: key.to_string(),
+                        reason,
+                    });
+                    continue;
+                }
+            };
             for item in &items {
                 anyhow::ensure!(
                     crate::builders::any_is(item, message),
@@ -4342,6 +4372,19 @@ impl KiCadIpcClient {
             if !items.is_empty() {
                 measured.insert(key.to_string(), items.len());
             }
+        }
+        for (kind, key) in UNREADABLE {
+            let reason = match self.list_class_in(document.clone(), kind, key)? {
+                Listed::Refused(reason) => reason,
+                Listed::Items(items) if items.is_empty() => continue,
+                Listed::Items(items) => UnavailableReason::Undecodable {
+                    listed_count: items.len(),
+                },
+            };
+            unavailable.push(IpcUnavailableItemClass {
+                class: key.to_string(),
+                reason,
+            });
         }
 
         let boxes = self.get_item_boxes_in(document, &ids)?;
@@ -4380,7 +4423,32 @@ impl KiCadIpcClient {
             extents,
             measured,
             shared_kiid_count,
+            unavailable,
         })
+    }
+
+    /// List one class for [`Self::get_board_bounds_in`], separating KiCad's
+    /// refusal of the class from a failure of the read.
+    fn list_class_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        kind: kiapi::common::types::KiCadObjectType,
+        key: &str,
+    ) -> Result<Listed> {
+        match self.get_items_of_types_in(document, &[kind]) {
+            Ok(items) => Ok(Listed::Items(items)),
+            Err(error) => match ApiStatusError::from_error(&error) {
+                Some(status)
+                    if status.code == kiapi::common::ApiStatusCode::AsBadRequest as i32 =>
+                {
+                    Ok(Listed::Refused(UnavailableReason::Refused {
+                        status: status.code_name.clone(),
+                        message: status.message.clone(),
+                    }))
+                }
+                _ => Err(error.context(format!("KiCad did not list the board's {key}"))),
+            },
+        }
     }
 
     /// Get enabled layers.
