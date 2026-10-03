@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `add_power_symbol` accepts a pin (minor release)
+
+`add_power_symbol` takes `reference` + `pin_number` as an alternative to
+`x` + `y`, like `connect_to_net` (#727). The symbol is placed on the pin's
+endpoint, unsnapped, so an off-grid pin is still reached. When `rotation` is
+omitted it is derived from the pin, so the symbol faces away from the
+component body; an explicit `rotation` still wins.
+
+`x` and `y` are no longer listed as required in the schema, and the advertised
+`rotation` default of `0` is gone because it now applies only to coordinates.
+A coordinate call behaves exactly as before. A call must give one selector:
+mixing the two, or giving half of one, is `invalid_argument` naming the field.
+A reference or pin that is not on the sheet is `stale_target`, and a pin that
+more than one placed symbol carries is `ambiguous_target` with the candidates.
+None of these refusals writes.
+
+No tool, argument, or response field was renamed or removed.
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the

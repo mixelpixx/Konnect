@@ -406,7 +406,7 @@ pub fn field_anchors(schematic: &Schematic, lib_id: &str) -> FieldAnchors {
 }
 
 /// The `lib_symbols` entry `schematic` carries for `lib_id`.
-fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a SexpNode> {
+pub fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a SexpNode> {
     schematic
         .raw_other
         .iter()

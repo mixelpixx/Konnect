@@ -944,6 +944,14 @@ pub fn pin_outward_direction(pin: &LibPin, t: PinTransform) -> f64 {
     crate::geometry::transform_direction(pin.rotation + 180.0, t)
 }
 
+/// The rotation that turns an unmirrored symbol so this pin's body side faces
+/// `direction` (0/90/180/270): a power symbol on a pin pointing away from its
+/// component then points away too. The inverse of [`pin_outward_direction`]
+/// for the body side, which is the pin's own angle.
+pub fn rotation_facing(pin: &LibPin, direction: f64) -> f64 {
+    (direction - pin.rotation).rem_euclid(360.0)
+}
+
 /// The rotation a label at this pin's endpoint needs so its text reads away
 /// from the symbol body instead of across it. Pairs with [`label_justify`].
 ///
@@ -1783,5 +1791,37 @@ mod pin_label_rotation_tests {
         assert_eq!(horizontal_label_rotation(90.0), 0.0);
         assert_eq!(horizontal_label_rotation(270.0), 0.0);
         assert_eq!(horizontal_label_rotation(-180.0), 180.0);
+    }
+
+    /// Checked against [`crate::geometry::transform_direction`], which owns
+    /// the rotation convention: at the returned rotation, the pin's own angle
+    /// (its body side) lands on the requested direction.
+    #[test]
+    fn rotation_facing_turns_the_body_side_onto_the_direction() {
+        for angle in [0.0, 90.0, 180.0, 270.0] {
+            let pin = LibPin {
+                number: "1".into(),
+                name: String::new(),
+                electrical_type: "power_in".into(),
+                local_x: 0.0,
+                local_y: 0.0,
+                rotation: angle,
+                length: 0.0,
+            };
+            for direction in [0.0, 90.0, 180.0, 270.0] {
+                let t = PinTransform {
+                    comp_x: 0.0,
+                    comp_y: 0.0,
+                    rotation_deg: rotation_facing(&pin, direction),
+                    mirror_x: false,
+                    mirror_y: false,
+                };
+                assert_eq!(
+                    crate::geometry::transform_direction(angle, t),
+                    direction,
+                    "pin angle {angle}"
+                );
+            }
+        }
     }
 }
