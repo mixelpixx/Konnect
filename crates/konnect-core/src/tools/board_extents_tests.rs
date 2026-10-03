@@ -13,9 +13,7 @@
 use crate::mcp::handler::McpHandler;
 use crate::mcp::protocol::CallToolResult;
 use crate::test_support::MockIpcServer;
-use crate::tools::pcb_board::board_mock::{
-    board_document, kicad_bounding_boxes, listed_item, spawn_kicad_holding_board,
-};
+use crate::tools::pcb_board::board_mock::{board_document, kicad_bounding_boxes, listed_item};
 use crate::tools::ServerConfig;
 use konnect_ipc::gen::kiapi;
 use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as Kind;
@@ -55,29 +53,62 @@ fn fixture_board(dir: &Path) -> PathBuf {
     board
 }
 
-/// A KiCad holding `open` with `items` on it, `(class, KIID, box)`.
-fn spawn_kicad_with_items(open: &Path, items: Vec<LiveItem>) -> MockIpcServer {
-    spawn_kicad_holding_board(open, move |command| {
-        if command.type_url.ends_with("GetItems") {
-            let request = kiapi::common::commands::GetItems::decode(command.value.as_slice())
-                .expect("a GetItems request");
-            let listed_items = items
-                .iter()
-                .filter(|(kind, _, _)| request.types.contains(&(*kind as i32)))
-                .map(|(kind, kiid, _)| listed_item(*kind, kiid))
-                .collect();
-            return Some(konnect_ipc::builders::pack_any(
-                &kiapi::common::commands::GetItemsResponse {
-                    header: None,
-                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                    items: listed_items,
+/// What KiCad 10.0.5 answers `GetItems` with for a class it will not list on a
+/// board, measured on 2026-10-03 for tables, table cells, generators, fields and
+/// markers alike.
+const KICAD_REFUSAL: &str = "none of the requested types are valid for a Board object";
+
+/// How the double answers a `GetItems` request for one class.
+#[derive(Clone, Copy, PartialEq)]
+enum ClassAnswer {
+    /// `AS_BAD_REQUEST`, as KiCad 10.0.5 answers for tables and generators.
+    Refuse,
+    /// A failure that is not a refusal of the class.
+    Fail,
+    /// `count` items of a type the bundled protocol has no message for.
+    ListUnknown(usize),
+}
+
+/// The classes KiCad 10.0.5 refuses to list that a bounds read asks for.
+fn kicad_10_answers() -> Vec<(Kind, ClassAnswer)> {
+    vec![
+        (Kind::KotPcbTable, ClassAnswer::Refuse),
+        (Kind::KotPcbGenerator, ClassAnswer::Refuse),
+    ]
+}
+
+/// A KiCad holding `open` with `items` on it, `(class, KIID, box)`, answering
+/// the classes in `answers` as given and every other class by listing `items`.
+fn spawn_kicad(
+    open: &Path,
+    items: Vec<LiveItem>,
+    answers: Vec<(Kind, ClassAnswer)>,
+) -> MockIpcServer {
+    let documents = vec![board_document(&open.to_string_lossy())];
+    MockIpcServer::spawn("extents-kicad", move |request| {
+        let command = request.message.expect("a command");
+        let reply = |status: kiapi::common::ApiStatusCode, error: &str, message| {
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: status as i32,
+                    error_message: error.to_string(),
+                }),
+                header: None,
+                message,
+            }
+        };
+        let ok = |message| reply(kiapi::common::ApiStatusCode::AsOk, "", Some(message));
+        if command.type_url.ends_with("GetOpenDocuments") {
+            return ok(konnect_ipc::builders::pack_any(
+                &kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: documents.clone(),
                 },
-                "kiapi.common.commands.GetItemsResponse",
+                "kiapi.common.commands.GetOpenDocumentsResponse",
             ));
         }
         if command.type_url.ends_with("GetBoundingBox") {
             let items = items.clone();
-            return Some(kicad_bounding_boxes(command, move |kiid| {
+            return ok(kicad_bounding_boxes(&command, move |kiid| {
                 items
                     .iter()
                     .find(|(_, id, _)| *id == kiid)
@@ -85,53 +116,62 @@ fn spawn_kicad_with_items(open: &Path, items: Vec<LiveItem>) -> MockIpcServer {
                     .unwrap_or_else(|| panic!("asked to measure an unknown KIID {kiid}"))
             }));
         }
-        None
-    })
-}
-
-/// A KiCad holding `open` that refuses to list `refused`, the way it refuses a
-/// type it does not serve: `AS_BAD_REQUEST` on the `GetItems` round trip.
-fn spawn_kicad_refusing_to_list(open: &Path, refused: Kind) -> MockIpcServer {
-    let documents = vec![board_document(&open.to_string_lossy())];
-    MockIpcServer::spawn("extents-refusing-class", move |request| {
-        let command = request.message.expect("a command");
-        let ok = |message| kiapi::common::ApiResponse {
-            status: Some(kiapi::common::ApiResponseStatus {
-                status: kiapi::common::ApiStatusCode::AsOk as i32,
-                error_message: String::new(),
-            }),
-            header: None,
-            message,
-        };
-        if command.type_url.ends_with("GetOpenDocuments") {
-            return ok(Some(konnect_ipc::builders::pack_any(
-                &kiapi::common::commands::GetOpenDocumentsResponse {
-                    documents: documents.clone(),
-                },
-                "kiapi.common.commands.GetOpenDocumentsResponse",
-            )));
-        }
         let asked = kiapi::common::commands::GetItems::decode(command.value.as_slice())
-            .expect("only GetItems follows the binding");
-        if asked.types.contains(&(refused as i32)) {
-            return kiapi::common::ApiResponse {
-                status: Some(kiapi::common::ApiResponseStatus {
-                    status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
-                    error_message: "none of the requested types are valid for a Board object"
-                        .to_string(),
-                }),
-                header: None,
-                message: None,
-            };
-        }
-        ok(Some(konnect_ipc::builders::pack_any(
+            .expect("only GetItems and GetBoundingBox follow the binding");
+        let answer = answers
+            .iter()
+            .find(|(kind, _)| asked.types.contains(&(*kind as i32)))
+            .map(|(_, answer)| *answer);
+        let listed: Vec<prost_types::Any> = match answer {
+            Some(ClassAnswer::Refuse) => {
+                return reply(
+                    kiapi::common::ApiStatusCode::AsBadRequest,
+                    KICAD_REFUSAL,
+                    None,
+                )
+            }
+            Some(ClassAnswer::Fail) => {
+                return reply(
+                    kiapi::common::ApiStatusCode::AsUnhandled,
+                    "no handler",
+                    None,
+                )
+            }
+            Some(ClassAnswer::ListUnknown(count)) => (0..count)
+                .map(|i| prost_types::Any {
+                    type_url: "type.googleapis.com/kiapi.board.types.Table".to_string(),
+                    value: format!("table {i}").into_bytes(),
+                })
+                .collect(),
+            None => items
+                .iter()
+                .filter(|(kind, _, _)| asked.types.contains(&(*kind as i32)))
+                .map(|(kind, kiid, _)| listed_item(*kind, kiid))
+                .collect(),
+        };
+        ok(konnect_ipc::builders::pack_any(
             &kiapi::common::commands::GetItemsResponse {
                 header: None,
                 status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                items: Vec::new(),
+                items: listed,
             },
             "kiapi.common.commands.GetItemsResponse",
-        )))
+        ))
+    })
+}
+
+/// The KiCad 10.0.5 double: `items` listed, tables and generators refused.
+fn spawn_kicad_with_items(open: &Path, items: Vec<LiveItem>) -> MockIpcServer {
+    spawn_kicad(open, items, kicad_10_answers())
+}
+
+/// KiCad's refusal of `class`, as the response reports it.
+fn refused(class: &str) -> Value {
+    json!({
+        "class": class,
+        "reason": "refused",
+        "kiapi_status": "AS_BAD_REQUEST",
+        "message": KICAD_REFUSAL,
     })
 }
 
@@ -234,6 +274,10 @@ async fn the_live_answer_measures_every_item_kicad_lists() {
         json!({ "footprints": 1, "shapes": 1, "tracks": 1 })
     );
     assert_eq!(body["unmeasured_item_counts"], json!({}));
+    assert_eq!(
+        body["unavailable_item_classes"],
+        json!([refused("tables"), refused("generators")])
+    );
     assert_eq!(body["shared_kiid_count"], json!(0));
     assert_eq!(body["source"], json!("ipc"));
     assert_eq!(body["sources"], json!({ "bounds": "ipc" }));
@@ -253,6 +297,7 @@ async fn the_saved_answer_is_kicads_extent_of_the_file() {
         json!({ "footprints": 15, "shapes": 4, "tracks": 59, "zones": 1 })
     );
     assert_eq!(body["unmeasured_item_counts"], json!({}));
+    assert_eq!(body["unavailable_item_classes"], json!([]));
     assert_eq!(body["skipped_item_count"], json!(0));
     assert_eq!(body["source"], json!("file"));
     assert_eq!(body["sources"], json!({ "bounds": "saved_board" }));
@@ -275,14 +320,70 @@ async fn without_kicad_the_file_answers_and_says_why() {
     );
 }
 
-/// KiCad holds the board and refuses to list a class of its items. The read
-/// fails by name rather than answering from the file, which may be older than
-/// the editor; the old read discarded this failure and answered from the file.
+/// KiCad 10.0.5 will not list tables or generators. A bounds read used to skip
+/// both without a word, which read as complete bounds (#688). Each is now named
+/// with KiCad's own answer, beside the extent of everything KiCad did list.
 #[tokio::test]
-async fn a_class_kicad_refuses_to_list_fails_the_read_by_name() {
+async fn the_classes_kicad_will_not_list_are_named_with_its_answer() {
+    let scene = Scene::holding(LIVE_ITEMS.to_vec()).await;
+    let body = scene.body(Some("live")).await;
+    assert_close(extent(&body), (190.0, 140.0, 230.0, 170.0));
+    assert_eq!(
+        body["unavailable_item_classes"],
+        json!([refused("tables"), refused("generators")])
+    );
+}
+
+/// A class Konnect does measure, refused the same way, is named the same way
+/// instead of failing a read whose other classes KiCad did answer.
+#[tokio::test]
+async fn a_measured_class_kicad_refuses_is_named_not_dropped() {
+    let mut answers = kicad_10_answers();
+    answers.push((Kind::KotPcbDimension, ClassAnswer::Refuse));
     let scene =
-        Scene::build(|board| Some(spawn_kicad_refusing_to_list(board, Kind::KotPcbDimension)))
-            .await;
+        Scene::build(move |board| Some(spawn_kicad(board, LIVE_ITEMS.to_vec(), answers))).await;
+    let body = scene.body(None).await;
+    assert_close(extent(&body), (190.0, 140.0, 230.0, 170.0));
+    assert_eq!(
+        body["unavailable_item_classes"],
+        json!([
+            refused("dimensions"),
+            refused("tables"),
+            refused("generators")
+        ])
+    );
+    assert_eq!(body["sources"], json!({ "bounds": "ipc" }));
+}
+
+/// A KiCad that does list tables lists a type the bundled protocol cannot read,
+/// so their KIIDs cannot be measured. They are counted rather than dropped.
+#[tokio::test]
+async fn tables_a_kicad_lists_are_counted_when_they_cannot_be_measured() {
+    let answers = vec![
+        (Kind::KotPcbTable, ClassAnswer::ListUnknown(2)),
+        (Kind::KotPcbGenerator, ClassAnswer::Refuse),
+    ];
+    let scene =
+        Scene::build(move |board| Some(spawn_kicad(board, LIVE_ITEMS.to_vec(), answers))).await;
+    let body = scene.body(None).await;
+    assert_eq!(
+        body["unavailable_item_classes"],
+        json!([
+            { "class": "tables", "reason": "undecodable", "listed_count": 2 },
+            refused("generators")
+        ])
+    );
+    assert_eq!(body["item_count"], json!(3));
+}
+
+/// Any failure other than KiCad declining a class still fails the read by
+/// name, rather than answering from a file that may be older than the editor.
+#[tokio::test]
+async fn a_failure_that_is_not_a_refusal_still_fails_the_read_by_name() {
+    let mut answers = kicad_10_answers();
+    answers.push((Kind::KotPcbDimension, ClassAnswer::Fail));
+    let scene =
+        Scene::build(move |board| Some(spawn_kicad(board, LIVE_ITEMS.to_vec(), answers))).await;
     let result = scene.call(None).await;
     assert!(result.is_error, "{}", body_text(&result));
     let text = body_text(&result);

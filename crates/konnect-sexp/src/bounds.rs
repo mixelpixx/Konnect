@@ -13,11 +13,15 @@
 //!   width, by half the width again (`PCB_TRACK::GetBoundingBox`).
 //! - **Vias:** the centre inflated by half the largest diameter on any layer.
 //! - **Graphic shapes:** the geometry's box inflated by half the stroke width.
+//! - **Text boxes:** the same, on the box's corners, as `start`/`end` or as the
+//!   four `pts` KiCad writes for a turned one. The stroke counts with or
+//!   without a drawn border, and text that overflows the box does not.
 //! - **Zones:** the outline, arcs included. Fill is not part of the box.
 //! - **Footprints** (`FOOTPRINT::GetBoundingBox` without text): the anchor
 //!   inflated by 0.25 mm, merged with every pad, zone and point, and with every
-//!   graphic except those on `Cmts.User`, `Dwgs.User`, `Eco1.User`, `Eco2.User`
-//!   or a private layer. Text, fields and dimensions are left out.
+//!   graphic and text box except those on `Cmts.User`, `Dwgs.User`,
+//!   `Eco1.User`, `Eco2.User` or a private layer. Text, fields and dimensions
+//!   are left out.
 //!
 //! What a saved file cannot be measured against without KiCad's own font and
 //! layout code — text, dimensions, and the classes no KiCad sample exercises —
@@ -39,6 +43,7 @@ pub enum ItemClass {
     Arc,
     Via,
     Zone,
+    TextBox,
 }
 
 impl ItemClass {
@@ -51,6 +56,7 @@ impl ItemClass {
             ItemClass::Arc => "arcs",
             ItemClass::Via => "vias",
             ItemClass::Zone => "zones",
+            ItemClass::TextBox => "text_boxes",
         }
     }
 }
@@ -96,9 +102,8 @@ impl BoardItemBounds {
 
 /// Board-level items whose extent needs KiCad's own font or layout code, or
 /// that no KiCad sample exercises, by the name a response reports them under.
-const NOT_MEASURED: [(&str, &str); 7] = [
+const NOT_MEASURED: [(&str, &str); 6] = [
     ("gr_text", "text"),
-    ("gr_text_box", "text_boxes"),
     ("dimension", "dimensions"),
     ("barcode", "barcodes"),
     ("image", "reference_images"),
@@ -120,6 +125,7 @@ pub fn board_item_bounds(tree: &SexpNode) -> BoardItemBounds {
             "arc" => Some((ItemClass::Arc, arc_track_bbox(child))),
             "via" => Some((ItemClass::Via, via_bbox(child))),
             "zone" => Some((ItemClass::Zone, zone_bbox(child))),
+            "gr_text_box" => Some((ItemClass::TextBox, shape_bbox(child, None))),
             _ => None,
         };
         match measured {
@@ -167,8 +173,8 @@ fn via_bbox(node: &SexpNode) -> Option<Bbox> {
     let mut diameter = finite(node.find_f64("size")?)?;
     if let Some(stack) = node.find("padstack") {
         for layer in stack.find_all("layer") {
-            if let Some(size) = layer.find_f64("size") {
-                diameter = diameter.max(finite(size)?);
+            if let Some(size) = layer.find("size") {
+                diameter = diameter.max(finite(size.get_f64(1)?)?);
             }
         }
     }
@@ -213,6 +219,14 @@ fn shape_bbox(node: &SexpNode, to_board: Option<&dyn Fn(f64, f64) -> (f64, f64)>
             place(point(node, "end")?),
         ),
         "poly" | "curve" => pts_bbox(node.find("pts")?, to_board)?,
+        "text_box" => match node.find("pts") {
+            Some(pts) => pts_bbox(pts, to_board)?,
+            None => {
+                let (x1, y1) = point(node, "start")?;
+                let (x2, y2) = point(node, "end")?;
+                hull([(x1, y1), (x2, y1), (x2, y2), (x1, y2)].map(place))
+            }
+        },
         _ => return None,
     };
     // KiCad writes a hairline as a tiny negative width; its integer half is 0.
@@ -297,7 +311,8 @@ fn footprint_bbox(fp: &SexpNode, out: &mut BoardItemBounds) -> Option<Bbox> {
     for child in fp.children().unwrap_or(&[]) {
         let Some(head) = child.head() else { continue };
         let bb = match head {
-            "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" | "fp_curve" => {
+            "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" | "fp_curve"
+            | "fp_text_box" => {
                 geometry = true;
                 let layer = child.find_str("layer");
                 if layer.is_some_and(|l| ANNOTATION_LAYERS.contains(&l) || private.contains(&l)) {
@@ -324,13 +339,11 @@ fn footprint_bbox(fp: &SexpNode, out: &mut BoardItemBounds) -> Option<Bbox> {
             // reading them as footprint-local moves seven footprints by metres.
             "point" => {
                 let (x, y) = point(child, "at")?;
-                let size = child.find_f64("size").map_or(Some(1.0), finite)?;
+                let size = match child.find("size") {
+                    None => 1.0,
+                    Some(size) => finite(size.get_f64(1)?)?,
+                };
                 inflate((x, y, x, y), size / 2.0)
-            }
-            "fp_text_box" => {
-                geometry = true;
-                *out.not_measured.entry("footprint_text_boxes").or_insert(0) += 1;
-                continue;
             }
             // Drawings KiCad leaves out of the box, but whose presence still
             // keeps it from falling back to measuring the footprint's text.

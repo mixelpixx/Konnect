@@ -63,6 +63,7 @@ fn golden_class(class: ItemClass) -> &'static str {
         ItemClass::Arc => "arc",
         ItemClass::Via => "via",
         ItemClass::Zone => "zone",
+        ItemClass::TextBox => "textbox",
     }
 }
 
@@ -178,6 +179,19 @@ fn zone_outline_arcs_reach_their_extremes() {
     );
 }
 
+/// Board text boxes and footprint text boxes, saved by KiCad 10.0.5 (#688):
+/// borders of 0.2 and 1.5 mm, a hidden 1 mm border, no border, a box turned 30°
+/// that KiCad writes as four corners, and text overflowing a small box. In
+/// footprints, a text box on `F.Fab` turned 30°, one on `Dwgs.User`, and the
+/// stock `Raytac_MDBT42Q` with its two on `Dwgs.User` and two keep-out zones.
+#[test]
+fn text_boxes_agree_with_kicad_item_by_item() {
+    agrees_with_kicad(
+        "board_bounds/bounds_text_boxes.kicad_pcb",
+        "bounds_text_boxes",
+    );
+}
+
 /// Every pad, including pic_programmer's two custom-shape solder jumpers and the
 /// placement fixture's BGA, lands where KiCad put it.
 #[test]
@@ -193,6 +207,10 @@ fn every_pad_agrees_with_kicad() {
         (
             "board_bounds/bounds_annotation_layers.kicad_pcb",
             "bounds_annotation_layers",
+        ),
+        (
+            "board_bounds/bounds_text_boxes.kicad_pcb",
+            "bounds_text_boxes",
         ),
     ] {
         let kicad: HashMap<String, Bbox> = golden(name)
@@ -235,6 +253,16 @@ fn malformed_optional_geometry_is_skipped_instead_of_defaulted() {
         r#"(footprint "F" (at 10 20) (uuid "fp")
              (pad "1" smd roundrect (at 0 0) (size 1 1) (layers "F.Cu")
                (roundrect_rratio nope)))"#,
+        // A malformed present point size must not become the default 1 mm.
+        r#"(footprint "F" (at 10 20) (uuid "fp")
+             (point (at 12 22) (size nope) (layer "F.Cu")))"#,
+        // A malformed per-layer via size must not leave the base diameter.
+        r#"(via (at 5 5) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu")
+             (padstack (mode front_inner_back) (layer "Inner" (size nope)))
+             (uuid "v"))"#,
+        // A text box without its second corner has no box.
+        r#"(gr_text_box "t" (start 1 1) (layer "F.SilkS") (uuid "tb")
+             (stroke (width 0.1) (type solid)))"#,
     ] {
         let tree = parse_sexp(&format!("(kicad_pcb {malformed})")).unwrap();
         let bounds = board_item_bounds(&tree);
@@ -252,4 +280,18 @@ fn malformed_optional_geometry_is_skipped_instead_of_defaulted() {
     let bounds = board_item_bounds(&tree);
     assert_eq!(bounds.items.len(), 1);
     assert_eq!(bounds.skipped, 0);
+
+    // An omitted point size is KiCad's 1 mm, and a via layer without a size
+    // keeps the via's own diameter.
+    let tree = parse_sexp(
+        r#"(kicad_pcb
+             (footprint "F" (at 10 20) (uuid "fp") (point (at 40 50) (layer "F.Cu")))
+             (via (at 5 5) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu")
+               (padstack (mode front_inner_back) (layer "Inner")) (uuid "v")))"#,
+    )
+    .unwrap();
+    let bounds = board_item_bounds(&tree);
+    assert_eq!(bounds.skipped, 0);
+    let boxes: Vec<Bbox> = bounds.items.iter().map(|item| item.bbox).collect();
+    assert_eq!(boxes, [(9.75, 19.75, 40.5, 50.5), (4.7, 4.7, 5.3, 5.3)]);
 }
