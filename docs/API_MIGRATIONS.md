@@ -20,6 +20,38 @@ can be older than what KiCad holds. Close the board in KiCad, or make the
 change there, and retry. A KiCad that holds a different board, or none, does
 not affect these tools. Response shapes are unchanged (#791).
 
+## Unreleased: `get_board_extents` names what KiCad will not list, and measures text boxes (minor release)
+
+KiCad 10 will not list tables or generators through `GetItems`; it answers
+`AS_BAD_REQUEST`. The live read used to skip both without a word, so an answer
+read as complete bounds when it was not. It now asks for both on every read and
+adds `unavailable_item_classes`, one entry per class it could not measure:
+
+- `{"class": "tables", "reason": "refused", "kiapi_status": "AS_BAD_REQUEST",
+  "message": "…"}` carries KiCad's own answer;
+- `{"class": …, "reason": "undecodable", "listed_count": n}` is for a KiCad that
+  does list a class the bundled protocol has no message for, so the items
+  cannot be measured.
+
+A class that Konnect does measure, if KiCad refuses it the same way, is now
+named there too, and the rest of the read still answers. It used to fail the
+whole read. Any other failure still fails the read. A saved-file answer
+carries `unavailable_item_classes: []`, since it lists every item and names
+what it cannot measure in `unmeasured_item_counts`.
+
+The saved file now measures text boxes, as KiCad does: their corners, or the
+four `pts` KiCad writes for a turned box, plus half the stroke width whether or
+not the border is drawn. Text overflowing the box does not count. Board text
+boxes move from `unmeasured_item_counts` to `measured_item_counts`
+(`text_boxes`). Footprint text boxes count toward their footprint's box, except
+on `Cmts.User`, `Dwgs.User`, `Eco1.User`, `Eco2.User` or a private layer, and
+`footprint_text_boxes` is gone from `unmeasured_item_counts`. A saved-file
+extent can therefore grow where a board has text boxes.
+
+A footprint point or a via layer whose `size` is present but unreadable is now
+skipped and counted in `skipped_item_count`. The point used to take the 1 mm
+default, and the via used to keep its base diameter (#688).
+
 ## Unreleased: grid-snapped coordinates are written as KiCad writes them (patch release)
 
 A point snapped to the 1.27 mm grid is now rounded to the six decimals KiCad
@@ -88,6 +120,23 @@ footprints 5 mm to the right of it. It used to stage them beside the page origin
 (0, 0), because it read KiCad's empty answer as an empty board. Staged positions,
 and therefore `plan_revision`, differ from plans computed before this change.
 Apply already requires a fresh dry run.
+
+`update_pcb_from_schematic` stages the footprints it adds beside the same live
+measurement, and now says what that measurement covered. Its dry-run and apply
+responses gain `staging`:
+
+- `basis` is one of:
+  - `complete_geometry`: every class was listed and measured;
+  - `partial_geometry`: staged beside what KiCad measured, without the classes
+    listed below (on KiCad 10.0.5, every board's tables and generators);
+  - `empty_board`: every class was listed and none held an item;
+  - `no_measured_geometry`: nothing was measured, but some classes could not
+    be listed, so the board is not known to be empty. Staging starts at the
+    origin.
+- `unavailable_item_classes` uses the same shape as `get_board_extents`.
+
+`staging` is `null` when the sync was refused before it read the board. It
+never refuses a sync: staging is a starting position.
 
 ## Unreleased: `check_freerouting` reports where it searched (minor release)
 

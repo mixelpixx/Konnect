@@ -190,7 +190,10 @@ pub fn tools() -> Vec<ToolDef> {
              A symbol with no footprint assigned is reported under `unassigned_footprints` \
              and the sync proceeds for every other component. A library footprint that \
              cannot be placed, or a connected pad its footprint does not have, makes the dry \
-             run a conflict whose diagnostics name the footprint and every part that needs it.",
+             run a conflict whose diagnostics name the footprint and every part that needs it. \
+             Added footprints are staged beside the board as KiCad measured it; `staging` \
+             names the item classes KiCad would not list, so a partial or unmeasured board \
+             is never reported as complete or empty.",
             json!({
                 "type": "object",
                 "properties": {

@@ -1098,7 +1098,10 @@ pub fn tools() -> Vec<ToolDef> {
              text), graphics, tracks, vias and zones, plus board text and dimensions \
              when KiCad measures them. Reads the board KiCad holds open where it can, \
              so unsaved edits count; 'board_source' selects that. An answer from the \
-             saved file names, in 'unmeasured_item_counts', what it could not measure.",
+             saved file names, in 'unmeasured_item_counts', what it could not measure. \
+             A live answer names, in 'unavailable_item_classes', each item class KiCad \
+             would not list, with KiCad's answer: KiCad 10 lists neither tables nor \
+             generators.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1649,6 +1652,11 @@ async fn handle_get_board_extents(
             item_count,
             measured: json!(live.measured),
             unmeasured: json!({}),
+            unavailable: live
+                .unavailable
+                .iter()
+                .map(unavailable_item_class)
+                .collect(),
             skipped: 0,
             shared_kiids: live.shared_kiid_count,
         },
@@ -1663,8 +1671,31 @@ struct BoardExtentsCounts {
     item_count: usize,
     measured: serde_json::Value,
     unmeasured: serde_json::Value,
+    /// Classes a live read could not list; a saved read lists every item and
+    /// names what it cannot measure in `unmeasured` instead.
+    unavailable: Vec<serde_json::Value>,
     skipped: usize,
     shared_kiids: usize,
+}
+
+/// One class a live read could not measure, with the evidence for it: KiCad's
+/// own refusal, or how many items it listed that this protocol cannot read.
+pub(crate) fn unavailable_item_class(
+    class: &konnect_ipc::IpcUnavailableItemClass,
+) -> serde_json::Value {
+    match &class.reason {
+        konnect_ipc::UnavailableReason::Refused { status, message } => json!({
+            "class": class.class,
+            "reason": "refused",
+            "kiapi_status": status,
+            "message": message,
+        }),
+        konnect_ipc::UnavailableReason::Undecodable { listed_count } => json!({
+            "class": class.class,
+            "reason": "undecodable",
+            "listed_count": listed_count,
+        }),
+    }
 }
 
 /// One response shape for both sources. `bounds` is `None` only when nothing
@@ -1689,6 +1720,7 @@ fn board_extents_body(
         "item_count": counts.item_count,
         "measured_item_counts": counts.measured,
         "unmeasured_item_counts": counts.unmeasured,
+        "unavailable_item_classes": counts.unavailable,
         "skipped_item_count": counts.skipped,
         "shared_kiid_count": counts.shared_kiids,
         "source": legacy_source,
@@ -1722,6 +1754,7 @@ fn saved_board_extents(
             item_count: bounds.items.len(),
             measured: json!(bounds.measured()),
             unmeasured: json!(bounds.not_measured),
+            unavailable: Vec::new(),
             skipped: bounds.skipped,
             shared_kiids: 0,
         },
@@ -2818,6 +2851,63 @@ pub(crate) mod board_mock {
         respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
     ) -> MockIpcServer {
         spawn_kicad_holding_boards(&[board], respond)
+    }
+
+    /// What KiCad 10.0.5 answers `GetItems` with for a class it will not list
+    /// on a board (tables and generators among them), measured 2026-10-03.
+    pub const KICAD_CLASS_REFUSAL: &str =
+        "none of the requested types are valid for a Board object";
+
+    /// As [`spawn_kicad_holding_board`], refusing `GetItems` for each class in
+    /// `refused` with `AS_BAD_REQUEST` and [`KICAD_CLASS_REFUSAL`], as KiCad
+    /// 10.0.5 refuses tables and generators.
+    pub fn spawn_kicad_holding_board_refusing(
+        board: &std::path::Path,
+        refused: Vec<kiapi::common::types::KiCadObjectType>,
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> MockIpcServer {
+        use prost::Message;
+        let documents = vec![board_document(&board.to_string_lossy())];
+        MockIpcServer::spawn("board-refusing-classes", move |request| {
+            let command = request.message.expect("a command");
+            let reply = |status: kiapi::common::ApiStatusCode, error: &str, message| {
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: status as i32,
+                        error_message: error.to_string(),
+                    }),
+                    header: None,
+                    message,
+                }
+            };
+            if command.type_url.ends_with("GetOpenDocuments") {
+                return reply(
+                    kiapi::common::ApiStatusCode::AsOk,
+                    "",
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: documents.clone(),
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                );
+            }
+            if command.type_url.ends_with("GetItems") {
+                let asked = kiapi::common::commands::GetItems::decode(command.value.as_slice())
+                    .expect("GetItems request");
+                if refused
+                    .iter()
+                    .any(|kind| asked.types.contains(&(*kind as i32)))
+                {
+                    return reply(
+                        kiapi::common::ApiStatusCode::AsBadRequest,
+                        KICAD_CLASS_REFUSAL,
+                        None,
+                    );
+                }
+            }
+            reply(kiapi::common::ApiStatusCode::AsOk, "", respond(&command))
+        })
     }
 
     /// As [`spawn_kicad_holding_board`], for the two answers that are not
