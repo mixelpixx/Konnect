@@ -66,7 +66,8 @@ pub(crate) fn description_and_keywords(
 ///
 /// The vector values go into the `*_nm` fields unconverted, because that is
 /// how KiCad's own serializer packs a 3D model's millimetre offset, scale and
-/// degrees.
+/// degrees. An absent opacity is KiCad's default, fully opaque; a present one
+/// that is not a number is refused rather than read as that default.
 pub(crate) fn models(root: &SexpNode) -> Result<Vec<kiapi::board::types::Footprint3DModel>> {
     root.find_all("model")
         .into_iter()
@@ -125,7 +126,12 @@ pub(crate) fn models(root: &SexpNode) -> Result<Vec<kiapi::board::types::Footpri
                 rotation: Some(vector("rotate", [0.0, 0.0, 0.0])?),
                 offset: Some(vector("offset", [0.0, 0.0, 0.0])?),
                 visible: !hidden,
-                opacity: model.find_f64("opacity").unwrap_or(1.0),
+                opacity: match model.find("opacity") {
+                    None => 1.0,
+                    Some(opacity) => opacity
+                        .get_f64(1)
+                        .context("3D model opacity is not a number")?,
+                },
             })
         })
         .collect()
@@ -215,6 +221,26 @@ mod tests {
             "{} is hidden in the library",
             models[0].filename
         );
+    }
+
+    /// Opacity defaults only when the library leaves it out. A value that is
+    /// there and readable is kept; one that is there and unreadable refuses the
+    /// model, where it used to become full opacity without a word.
+    #[test]
+    fn opacity_defaults_only_when_absent() {
+        let with = |opacity: &str| {
+            root(&format!(
+                "(footprint \"X\" (model \"m.step\" (offset (xyz 0 0 0)) {opacity}))"
+            ))
+        };
+        assert_eq!(models(&with("")).unwrap()[0].opacity, 1.0);
+        assert_eq!(models(&with("(opacity 0.4)")).unwrap()[0].opacity, 0.4);
+        let refusal = models(&with("(opacity dim)")).unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains("3D model opacity is not a number"),
+            "{refusal:#}"
+        );
+        assert!(models(&with("(opacity)")).is_err());
     }
 
     #[test]

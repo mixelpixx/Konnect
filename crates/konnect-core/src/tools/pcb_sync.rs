@@ -1312,50 +1312,75 @@ fn apply_footprint_fields(
     Ok(())
 }
 
-/// How many pads and how many drawn items a footprint carries, its mounting
-/// style, and the 3D model files it names.
+/// How many pads and how many drawn items a footprint carries, its instance
+/// attributes, and the 3D model files it names.
 ///
 /// The two counts are the numbers #244 got wrong in opposite directions: every
 /// graphic became a pad, so pads went up by exactly the number of drawings, and
-/// drawings went to zero. The mounting style and models are what #789's sync
-/// used to leave off.
+/// drawings went to zero. The attributes and models are what #789's sync used
+/// to leave off.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct FootprintShape {
     pads: usize,
     drawings: usize,
-    mounting_style: MountingStyle,
+    attributes: AttributeSet,
     /// Sorted, so the comparison does not depend on the order KiCad lists them.
     model_files: Vec<String>,
 }
 
-/// A footprint's mounting style as KiCad reports it. KiCad answers
-/// `FMS_UNSPECIFIED` for a footprint with neither `smd` nor `through_hole`,
-/// and a message that leaves the field unset means the same thing, so the two
-/// compare equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum MountingStyle {
-    Smd,
-    ThroughHole,
-    #[default]
-    Unspecified,
-}
+/// Every instance attribute KiCad reports for a footprint, named by the
+/// `(attr …)` token a footprint file uses for it. The set includes DNP as it
+/// was finally sent, after the schematic overrode the library.
+///
+/// A message with no attributes, or with every flag clear and no mounting
+/// style, is the same empty set: KiCad reports both as an unspecified part.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AttributeSet(BTreeSet<&'static str>);
 
-impl MountingStyle {
+impl AttributeSet {
     fn of(attributes: Option<&konnect_ipc::gen::kiapi::board::types::FootprintAttributes>) -> Self {
         use konnect_ipc::gen::kiapi::board::types::FootprintMountingStyle;
-        match attributes.map(|attributes| attributes.mounting_style()) {
-            Some(FootprintMountingStyle::FmsSmd) => Self::Smd,
-            Some(FootprintMountingStyle::FmsThroughHole) => Self::ThroughHole,
-            _ => Self::Unspecified,
+        let mut names = BTreeSet::new();
+        if let Some(attributes) = attributes {
+            match attributes.mounting_style() {
+                FootprintMountingStyle::FmsSmd => {
+                    names.insert("smd");
+                }
+                FootprintMountingStyle::FmsThroughHole => {
+                    names.insert("through_hole");
+                }
+                _ => {}
+            }
+            for (set, name) in [
+                (attributes.not_in_schematic, "board_only"),
+                (
+                    attributes.exclude_from_position_files,
+                    "exclude_from_pos_files",
+                ),
+                (
+                    attributes.exclude_from_bill_of_materials,
+                    "exclude_from_bom",
+                ),
+                (
+                    attributes.exempt_from_courtyard_requirement,
+                    "allow_missing_courtyard",
+                ),
+                (attributes.do_not_populate, "dnp"),
+                (
+                    attributes.allow_soldermask_bridges,
+                    "allow_soldermask_bridges",
+                ),
+            ] {
+                if set {
+                    names.insert(name);
+                }
+            }
         }
+        Self(names)
     }
 
-    fn name(self) -> &'static str {
-        match self {
-            Self::Smd => "smd",
-            Self::ThroughHole => "through_hole",
-            Self::Unspecified => "unspecified",
-        }
+    fn listed(&self) -> String {
+        self.0.iter().copied().collect::<Vec<_>>().join(", ")
     }
 }
 
@@ -1381,7 +1406,7 @@ fn footprint_shapes<'a>(
             continue;
         }
         let mut shape = FootprintShape {
-            mounting_style: MountingStyle::of(footprint.attributes.as_ref()),
+            attributes: AttributeSet::of(footprint.attributes.as_ref()),
             ..Default::default()
         };
         for child in &definition.items {
@@ -1461,11 +1486,11 @@ fn verify_board_matches_what_was_sent(
         } else if (got.pads, got.drawings) != (want.pads, want.drawings) {
             suspicious.push(detail);
         }
-        if got.mounting_style != want.mounting_style {
+        if got.attributes != want.attributes {
             suspicious.push(format!(
-                "{reference}: sent mounting style {}, board now has {}",
-                want.mounting_style.name(),
-                got.mounting_style.name()
+                "{reference}: sent attributes [{}], board now has [{}]",
+                want.attributes.listed(),
+                got.attributes.listed()
             ));
         }
         if got.model_files != want.model_files {
@@ -4751,6 +4776,9 @@ mod tests {
         /// What was sent without the instance attributes and 3D models: the
         /// board the sync built before #789.
         WithoutLibraryData,
+        /// What was sent with its mounting style and models, but DNP cleared:
+        /// one flag lost while everything the old check looked at survives.
+        WithoutDnp,
     }
 
     impl ServedSync {
@@ -5072,7 +5100,33 @@ mod tests {
                 }
                 konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
             }
+            Readback::WithoutDnp => {
+                let mut footprint =
+                    konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .expect("a footprint");
+                if let Some(attributes) = footprint.attributes.as_mut() {
+                    attributes.do_not_populate = false;
+                }
+                konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+            }
         }
+    }
+
+    /// `netlist` with `reference` marked DNP the way `kicad-cli` exports it.
+    fn with_dnp(netlist: &str, reference: &str) -> String {
+        // Anchored on the component entry: the net nodes name the reference too.
+        let anchor = format!("(comp\n      (ref \"{reference}\")");
+        assert_eq!(
+            netlist.matches(&anchor).count(),
+            1,
+            "{reference} is exported once"
+        );
+        netlist.replace(
+            &anchor,
+            &format!("{anchor}\n      (property (name \"dnp\"))"),
+        )
     }
 
     /// #688 through the served boundary: a part the board lacks is staged
@@ -5406,7 +5460,7 @@ mod tests {
             .collect();
         assert_eq!(messages.len(), 2, "{applied:#}");
         assert!(
-            messages[0].contains("C1: sent mounting style smd, board now has unspecified"),
+            messages[0].contains("C1: sent attributes [smd], board now has []"),
             "{}",
             messages[0]
         );
@@ -5417,6 +5471,57 @@ mod tests {
             "{}",
             messages[1]
         );
+    }
+
+    /// One attribute lost while the mounting style and the models survive,
+    /// which a check on those two alone passes. The flag is DNP as the
+    /// schematic set it, the final value sent, not the library's: the 0603's
+    /// library footprint is not DNP.
+    #[tokio::test]
+    async fn the_readback_names_a_single_attribute_the_board_did_not_keep() {
+        let served = ServedSync::reading_back(Readback::WithoutDnp).await;
+        let applied = served
+            .apply(&with_dnp(
+                &exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]),
+                "C1",
+            ))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(
+            applied["diagnostics"].as_array().unwrap().len(),
+            1,
+            "{applied:#}"
+        );
+        assert_eq!(applied["diagnostics"][0]["code"], "board_readback_differs");
+        let message = applied["diagnostics"][0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("C1: sent attributes [dnp, smd], board now has [smd]"),
+            "{message}"
+        );
+        assert!(
+            served.sent_footprints()[0]
+                .attributes
+                .as_ref()
+                .unwrap()
+                .do_not_populate
+        );
+    }
+
+    /// The control for the test above: the same DNP part on a board that kept
+    /// everything is reported as nothing at all.
+    #[tokio::test]
+    async fn a_board_that_kept_every_attribute_reports_nothing() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let applied = served
+            .apply(&with_dnp(
+                &exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]),
+                "C1",
+            ))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
     }
 
     /// The schematic decides DNP, over whatever the library footprint says,

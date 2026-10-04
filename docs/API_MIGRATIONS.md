@@ -70,13 +70,19 @@ A footprint the sync adds now carries all of these from its library. DNP still
 comes from the schematic, overriding a library `dnp`, as in KiCad's own Update
 PCB from Schematic.
 
-The post-apply readback also checks each footprint's mounting style and 3D model
-files against what was sent. A difference is reported in `diagnostics` as
-`board_readback_differs`, the same way a changed drawing count is reported.
+The post-apply readback also checks each footprint's instance attributes and 3D
+model files against what was sent. The attributes are the mounting style,
+`board_only`, `exclude_from_pos_files`, `exclude_from_bom`,
+`allow_missing_courtyard`, `allow_soldermask_bridges` and `dnp` (DNP as finally
+sent, after the schematic's override). A difference is reported in `diagnostics`
+as `board_readback_differs`, the same way a changed drawing count is reported.
 
 `update_footprints_from_library` uses the same readers, so it now accepts a 3D
 model hidden with KiCad 10's `(hide yes)`. 16 models in KiCad 10.0.5's own
 library are written that way, and the refresh used to refuse those footprints.
+Both tools now refuse a model whose `(opacity …)` is present but not a number,
+where it used to be read as fully opaque. An absent opacity still defaults to
+fully opaque.
 
 Library properties (Datasheet, Description and custom fields) and each field's
 layer and visibility are not part of this change (#789).
