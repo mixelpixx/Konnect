@@ -259,21 +259,36 @@ fn ensure_kicad_design_document_is_closed_with(
 /// lock means for their operation. Other file types return `None` so a caller
 /// cannot accidentally treat an unrelated tilde file as editor state.
 pub fn kicad_editor_lock_path(path: &Path) -> Option<PathBuf> {
+    kicad_sibling_lock_path(path, &["kicad_sch", "kicad_pcb"])
+}
+
+/// KiCad's sibling lock path for a project file: `~<filename>.lck` in the same
+/// directory. pcbnew, Eeschema and the project manager each create it for the
+/// project they hold (measured on KiCad 10.0.5, #804).
+///
+/// Kept apart from [`kicad_editor_lock_path`], which every design-document
+/// write consults: a project lock refuses only the tools that write the
+/// project file. Other file types return `None`.
+pub fn kicad_project_lock_path(path: &Path) -> Option<PathBuf> {
+    kicad_sibling_lock_path(path, &["kicad_pro"])
+}
+
+fn kicad_sibling_lock_path(path: &Path, extensions: &[&str]) -> Option<PathBuf> {
     let resolved = path.canonicalize().unwrap_or_else(|_| {
         path.parent()
             .and_then(|parent| parent.canonicalize().ok())
             .and_then(|parent| path.file_name().map(|name| parent.join(name)))
             .unwrap_or_else(|| path.to_path_buf())
     });
-    let is_design_document =
-        resolved
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("kicad_sch")
-                    || extension.eq_ignore_ascii_case("kicad_pcb")
-            });
-    if !is_design_document {
+    let accepted = resolved
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            extensions
+                .iter()
+                .any(|accepted| extension.eq_ignore_ascii_case(accepted))
+        });
+    if !accepted {
         return None;
     }
     let mut name = OsString::from("~");
@@ -1424,6 +1439,22 @@ mod atomic_write_tests {
         );
         assert_eq!(
             kicad_editor_lock_path(Path::new("project/design.kicad_pro")),
+            None
+        );
+    }
+
+    #[test]
+    fn kicad_project_lock_path_is_exact_for_projects_only() {
+        assert_eq!(
+            kicad_project_lock_path(Path::new("project/design.kicad_pro")),
+            Some(PathBuf::from("project/~design.kicad_pro.lck"))
+        );
+        assert_eq!(
+            kicad_project_lock_path(Path::new("project/design.kicad_pcb")),
+            None
+        );
+        assert_eq!(
+            kicad_project_lock_path(Path::new("project/design.kicad_sch")),
             None
         );
     }

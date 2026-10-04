@@ -49,8 +49,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "set_design_rules",
             "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
-             project file. Refuses while KiCad holds the board open, because KiCad's next save \
-             rewrites the project file from its own copy.",
+             project file. Refuses while KiCad holds the board or the project (its \
+             ~<project>.kicad_pro.lck), because pcbnew and Eeschema rewrite the project file \
+             from their own copy when they save.",
             json!({
                 "type": "object",
                 "properties": {
@@ -84,7 +85,10 @@ pub fn tools() -> Vec<ToolDef> {
              and W/Shift+W while routing; they are not DRC limits and do not change \
              netclasses. A leading 0 mm track and 0/0 via is always kept as the \
              'use netclass' sentinel. Pass only the lists you want to replace. KiCad \
-             reads the change on next project open. The board file is not modified.",
+             reads the change on next project open. The board file is not modified. \
+             Refuses while KiCad holds the board or the project (its \
+             ~<project>.kicad_pro.lck), because pcbnew and Eeschema rewrite the project \
+             file from their own copy when they save.",
             json!({
                 "type": "object",
                 "properties": {
@@ -437,6 +441,12 @@ async fn handle_set_design_rules(
         return Ok(refusal);
     }
     let project_path = sibling_project_path(&board);
+    // Eeschema rewrites the project file on save too, and holds no board (#804).
+    if let Some(refusal) =
+        crate::tools::pcb_board::refuse_if_project_locked_by_kicad(&project_path, "design rule")
+    {
+        return Ok(refusal);
+    }
     let project_content = tokio::fs::read_to_string(&project_path).await?;
     let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
 
@@ -677,6 +687,12 @@ async fn handle_set_predefined_sizes(
     )
     .await?
     {
+        return Ok(refusal);
+    }
+    if let Some(refusal) = crate::tools::pcb_board::refuse_if_project_locked_by_kicad(
+        &sibling_project_path(&board),
+        "Pre-defined Sizes list",
+    ) {
         return Ok(refusal);
     }
 

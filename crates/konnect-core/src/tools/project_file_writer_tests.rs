@@ -1,10 +1,17 @@
-//! The three `.kicad_pro` writers while KiCad holds the board (#791).
+//! The `.kicad_pro` writers while KiCad holds the board (#791) or the
+//! project (#804).
 //!
 //! Saving the board in KiCad rewrites the project file from KiCad's own copy.
 //! So `set_design_rules`, `create_netclass` and `assign_net_to_class` must not
 //! write while KiCad holds the board: the write would be reported and then
 //! reverted. Measured on KiCad 10.0.5 before the fix: all three reported
 //! success, and `run_drc` with `sync_live_board` then put every value back.
+//!
+//! Eeschema rewrites the project file on save as well, and holds no board, so
+//! the writers also refuse while a KiCad program holds the project lock,
+//! `~<project>.kicad_pro.lck`. Measured on KiCad 10.0.5: pcbnew, Eeschema and
+//! the project manager each create it, and an Eeschema save reverted all three
+//! #791 writers' values.
 //!
 //! Driven through served `tools/call`, so dispatch, schema and handler are all
 //! under test. The project is the KiCad-written placement fixture
@@ -91,6 +98,8 @@ fn arguments_for(tool: &str) -> Value {
         "set_design_rules" => json!({ "min_trace_width": 0.35 }),
         "create_netclass" => json!({ "name": "Power", "trace_width": 0.5 }),
         "assign_net_to_class" => json!({ "net_name": "VCC", "netclass": "Default" }),
+        // The fixture's palette is empty, so any list is a change.
+        "set_predefined_sizes" => json!({ "track_widths": [0.3] }),
         other => panic!("no arguments for {other}"),
     }
 }
@@ -178,5 +187,106 @@ async fn each_writer_still_writes_while_kicad_holds_a_different_board() {
             ),
             _ => unreachable!(),
         }
+    }
+}
+
+/// Every tool that writes the board's project file.
+const PROJECT_FILE_WRITERS: [&str; 4] = [
+    "set_design_rules",
+    "set_predefined_sizes",
+    "create_netclass",
+    "assign_net_to_class",
+];
+
+/// KiCad's project lock, where pcbnew, Eeschema and the project manager each
+/// create it. Its contents name a host and user; only its presence is read.
+fn lock_project(project: &Project) -> PathBuf {
+    let lock = project
+        .project_file
+        .with_file_name("~placement_fixture.kicad_pro.lck");
+    std::fs::write(&lock, r#"{"hostname":"HOST","username":"user"}"#).unwrap();
+    lock
+}
+
+fn body_of(result: &CallToolResult) -> Value {
+    serde_json::from_str(text_of(result)).expect("a structured refusal")
+}
+
+/// No KiCad answers over IPC, as when only Eeschema or the project manager is
+/// running, but a KiCad program holds the project: the tool refuses, names
+/// the lock, and the project file does not change by a byte.
+async fn assert_refused_while_kicad_holds_the_project(tool: &str) {
+    let project = project();
+    let lock = lock_project(&project);
+    let before = std::fs::read(&project.project_file).unwrap();
+    let handler = handler_talking_to("").await;
+
+    let result = call(&handler, tool, &project.board, &arguments_for(tool)).await;
+
+    assert!(result.is_error, "{tool}: {}", text_of(&result));
+    let body = body_of(&result);
+    assert_eq!(
+        body["error"]["kind"], "unsafe_file_fallback",
+        "{tool}: {body}"
+    );
+    assert_eq!(
+        body["error"]["reason"], "kicad_project_lock_present",
+        "{tool}: {body}"
+    );
+    assert_eq!(
+        body["error"]["path"],
+        project.project_file.display().to_string(),
+        "{tool}: {body}"
+    );
+    let message = body["message"].as_str().unwrap();
+    let lock_name = lock.file_name().unwrap().to_string_lossy();
+    assert!(
+        message.contains(lock_name.as_ref()),
+        "{tool} must name the lock: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&project.project_file).unwrap(),
+        before,
+        "{tool} wrote the project file while KiCad held the project"
+    );
+}
+
+#[tokio::test]
+async fn set_design_rules_refuses_while_kicad_holds_the_project() {
+    assert_refused_while_kicad_holds_the_project("set_design_rules").await;
+}
+
+#[tokio::test]
+async fn set_predefined_sizes_refuses_while_kicad_holds_the_project() {
+    assert_refused_while_kicad_holds_the_project("set_predefined_sizes").await;
+}
+
+#[tokio::test]
+async fn create_netclass_refuses_while_kicad_holds_the_project() {
+    assert_refused_while_kicad_holds_the_project("create_netclass").await;
+}
+
+#[tokio::test]
+async fn assign_net_to_class_refuses_while_kicad_holds_the_project() {
+    assert_refused_while_kicad_holds_the_project("assign_net_to_class").await;
+}
+
+/// The control: the same project with no lock and no KiCad is written by
+/// every one of the four.
+#[tokio::test]
+async fn each_writer_writes_when_no_kicad_program_holds_the_project() {
+    for tool in PROJECT_FILE_WRITERS {
+        let project = project();
+        let before = std::fs::read(&project.project_file).unwrap();
+        let handler = handler_talking_to("").await;
+
+        let result = call(&handler, tool, &project.board, &arguments_for(tool)).await;
+
+        assert!(!result.is_error, "{tool}: {}", text_of(&result));
+        assert_ne!(
+            std::fs::read(&project.project_file).unwrap(),
+            before,
+            "{tool} did not write"
+        );
     }
 }
