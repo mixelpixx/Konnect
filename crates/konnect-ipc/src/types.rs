@@ -622,6 +622,29 @@ pub struct IpcBoardBounds {
     /// Items KiCad listed under a KIID it had already listed. Each KIID is
     /// measured once, so these have no box of their own.
     pub shared_kiid_count: usize,
+    /// Board item classes whose items are not in `extents`, because KiCad
+    /// would not list them or listed them in a form this protocol cannot read.
+    pub unavailable: Vec<IpcUnavailableItemClass>,
+}
+
+/// A class of board items a live bounds read could not measure, and why. A
+/// class is named here rather than left out, so an answer never reads as
+/// complete when it is not (#688).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcUnavailableItemClass {
+    /// The class, by the name a response reports it under (`tables`).
+    pub class: String,
+    pub reason: UnavailableReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// KiCad declined to list the class. KiCad 10.0.5 answers `GetItems` for
+    /// tables and generators with `AS_BAD_REQUEST`.
+    Refused { status: String, message: String },
+    /// KiCad listed items of a class the bundled protocol has no message for,
+    /// so their KIIDs cannot be read to measure them.
+    Undecodable { listed_count: usize },
 }
 
 /// Footprint-local placement of the Reference and Value text fields, read

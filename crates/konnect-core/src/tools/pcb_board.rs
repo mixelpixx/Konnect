@@ -1098,7 +1098,10 @@ pub fn tools() -> Vec<ToolDef> {
              text), graphics, tracks, vias and zones, plus board text and dimensions \
              when KiCad measures them. Reads the board KiCad holds open where it can, \
              so unsaved edits count; 'board_source' selects that. An answer from the \
-             saved file names, in 'unmeasured_item_counts', what it could not measure.",
+             saved file names, in 'unmeasured_item_counts', what it could not measure. \
+             A live answer names, in 'unavailable_item_classes', each item class KiCad \
+             would not list, with KiCad's answer: KiCad 10 lists neither tables nor \
+             generators.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1649,6 +1652,11 @@ async fn handle_get_board_extents(
             item_count,
             measured: json!(live.measured),
             unmeasured: json!({}),
+            unavailable: live
+                .unavailable
+                .iter()
+                .map(unavailable_item_class)
+                .collect(),
             skipped: 0,
             shared_kiids: live.shared_kiid_count,
         },
@@ -1663,8 +1671,29 @@ struct BoardExtentsCounts {
     item_count: usize,
     measured: serde_json::Value,
     unmeasured: serde_json::Value,
+    /// Classes a live read could not list; a saved read lists every item and
+    /// names what it cannot measure in `unmeasured` instead.
+    unavailable: Vec<serde_json::Value>,
     skipped: usize,
     shared_kiids: usize,
+}
+
+/// One class a live read could not measure, with the evidence for it: KiCad's
+/// own refusal, or how many items it listed that this protocol cannot read.
+fn unavailable_item_class(class: &konnect_ipc::IpcUnavailableItemClass) -> serde_json::Value {
+    match &class.reason {
+        konnect_ipc::UnavailableReason::Refused { status, message } => json!({
+            "class": class.class,
+            "reason": "refused",
+            "kiapi_status": status,
+            "message": message,
+        }),
+        konnect_ipc::UnavailableReason::Undecodable { listed_count } => json!({
+            "class": class.class,
+            "reason": "undecodable",
+            "listed_count": listed_count,
+        }),
+    }
 }
 
 /// One response shape for both sources. `bounds` is `None` only when nothing
@@ -1689,6 +1718,7 @@ fn board_extents_body(
         "item_count": counts.item_count,
         "measured_item_counts": counts.measured,
         "unmeasured_item_counts": counts.unmeasured,
+        "unavailable_item_classes": counts.unavailable,
         "skipped_item_count": counts.skipped,
         "shared_kiid_count": counts.shared_kiids,
         "source": legacy_source,
@@ -1722,6 +1752,7 @@ fn saved_board_extents(
             item_count: bounds.items.len(),
             measured: json!(bounds.measured()),
             unmeasured: json!(bounds.not_measured),
+            unavailable: Vec::new(),
             skipped: bounds.skipped,
             shared_kiids: 0,
         },
