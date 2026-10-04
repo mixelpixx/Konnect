@@ -227,6 +227,12 @@ struct PreparedFootprint {
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     fields: konnect_ipc::IpcFieldPlacement,
+    /// The library's `(attr …)`: mounting style and exclusion flags.
+    attributes: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
+    /// The library's description and keywords, which KiCad keeps on the
+    /// footprint definition.
+    description_and_keywords: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
+    models: Vec<konnect_ipc::gen::kiapi::board::types::Footprint3DModel>,
     width: f64,
     height: f64,
 }
@@ -1243,15 +1249,51 @@ fn apply_footprint_fields(
     Ok(())
 }
 
-/// How many pads and how many drawn items a footprint carries.
+/// How many pads and how many drawn items a footprint carries, its mounting
+/// style, and the 3D model files it names.
 ///
-/// The two numbers #244 got wrong in opposite directions: every graphic became
-/// a pad, so pads went up by exactly the number of drawings, and drawings went
-/// to zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The two counts are the numbers #244 got wrong in opposite directions: every
+/// graphic became a pad, so pads went up by exactly the number of drawings, and
+/// drawings went to zero. The mounting style and models are what #789's sync
+/// used to leave off.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct FootprintShape {
     pads: usize,
     drawings: usize,
+    mounting_style: MountingStyle,
+    /// Sorted, so the comparison does not depend on the order KiCad lists them.
+    model_files: Vec<String>,
+}
+
+/// A footprint's mounting style as KiCad reports it. KiCad answers
+/// `FMS_UNSPECIFIED` for a footprint with neither `smd` nor `through_hole`,
+/// and a message that leaves the field unset means the same thing, so the two
+/// compare equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MountingStyle {
+    Smd,
+    ThroughHole,
+    #[default]
+    Unspecified,
+}
+
+impl MountingStyle {
+    fn of(attributes: Option<&konnect_ipc::gen::kiapi::board::types::FootprintAttributes>) -> Self {
+        use konnect_ipc::gen::kiapi::board::types::FootprintMountingStyle;
+        match attributes.map(|attributes| attributes.mounting_style()) {
+            Some(FootprintMountingStyle::FmsSmd) => Self::Smd,
+            Some(FootprintMountingStyle::FmsThroughHole) => Self::ThroughHole,
+            _ => Self::Unspecified,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Smd => "smd",
+            Self::ThroughHole => "through_hole",
+            Self::Unspecified => "unspecified",
+        }
+    }
 }
 
 /// Tally the pads and drawings of each footprint in a set of packed items,
@@ -1275,16 +1317,27 @@ fn footprint_shapes<'a>(
         if reference.is_empty() {
             continue;
         }
-        let mut shape = FootprintShape::default();
+        let mut shape = FootprintShape {
+            mounting_style: MountingStyle::of(footprint.attributes.as_ref()),
+            ..Default::default()
+        };
         for child in &definition.items {
             match konnect_ipc::builders::any_type_name(child) {
                 "kiapi.board.types.Pad" => shape.pads += 1,
                 "kiapi.board.types.BoardGraphicShape" | "kiapi.board.types.BoardText" => {
                     shape.drawings += 1
                 }
+                "kiapi.board.types.Footprint3DModel" => {
+                    if let Ok(model) =
+                        kiapi::board::types::Footprint3DModel::decode(child.value.as_slice())
+                    {
+                        shape.model_files.push(model.filename);
+                    }
+                }
                 _ => {}
             }
         }
+        shape.model_files.sort();
         out.insert(reference, shape);
     }
     out
@@ -1342,8 +1395,22 @@ fn verify_board_matches_what_was_sent(
         );
         if got.pads > want.pads {
             corrupted.push(detail);
-        } else if got != want {
+        } else if (got.pads, got.drawings) != (want.pads, want.drawings) {
             suspicious.push(detail);
+        }
+        if got.mounting_style != want.mounting_style {
+            suspicious.push(format!(
+                "{reference}: sent mounting style {}, board now has {}",
+                want.mounting_style.name(),
+                got.mounting_style.name()
+            ));
+        }
+        if got.model_files != want.model_files {
+            suspicious.push(format!(
+                "{reference}: sent 3D models [{}], board now has [{}]",
+                want.model_files.join(", "),
+                got.model_files.join(", ")
+            ));
         }
     }
     if !corrupted.is_empty() {
@@ -1825,20 +1892,65 @@ fn prepare_footprint(
             format!("failed to read {}: {error}", path.display()),
         )
     })?;
+    prepare_footprint_source(&source)
+}
+
+/// [`prepare_footprint`] after the file is read: everything the typed
+/// placement path sends, from the library footprint's text.
+fn prepare_footprint_source(
+    source: &str,
+) -> std::result::Result<PreparedFootprint, (&'static str, String)> {
     let unsupported =
         |error: anyhow::Error| ("unsupported_library_footprint", format!("{error:#}"));
-    let pads = super::pcb_components::extract_pad_definitions(&source).map_err(unsupported)?;
+    let pads = super::pcb_components::extract_pad_definitions(source).map_err(unsupported)?;
     let graphics =
-        super::pcb_components::extract_graphic_definitions(&source).map_err(unsupported)?;
-    let fields = super::pcb_components::extract_field_placement(&source);
+        super::pcb_components::extract_graphic_definitions(source).map_err(unsupported)?;
+    let fields = super::pcb_components::extract_field_placement(source);
+    // Read with the same readers `update_footprints_from_library` uses, so a
+    // footprint the sync places carries what a refresh would give it (#789).
+    let root = konnect_sexp::parse_sexp(source)
+        .context("invalid footprint S-expression")
+        .map_err(unsupported)?;
+    let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
+    let description_and_keywords = super::library_footprint::description_and_keywords(&root);
+    let models = super::library_footprint::models(&root).map_err(unsupported)?;
     let (width, height) = footprint_dimensions(&pads, &graphics);
     Ok(PreparedFootprint {
         pads,
         graphics,
         fields,
+        attributes,
+        description_and_keywords,
+        models,
         width,
         height,
     })
+}
+
+/// Give a footprint built from pads, drawings and fields the rest of what its
+/// library carries: the instance attributes, the definition's description and
+/// keywords, and its 3D models. Without them a synced SMD part had no `smd`
+/// attribute, so KiCad treated it as unspecified, and `export_3d`'s default
+/// left every one of them out of the STEP (#789).
+///
+/// Runs before [`apply_footprint_fields`], which sets DNP from the schematic,
+/// so the schematic overrides a library `dnp` as KiCad's own update does.
+fn apply_library_data(
+    footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+    part: &PreparedFootprint,
+) -> Result<()> {
+    footprint.attributes = Some(part.attributes.clone());
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("built footprint has no definition")?;
+    definition.attributes = Some(part.description_and_keywords.clone());
+    definition.items.extend(
+        part.models.iter().map(|model| {
+            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }),
+    );
+    Ok(())
 }
 
 /// Prepare every footprint the plan adds. One that cannot be prepared does
@@ -2016,56 +2128,70 @@ fn restage_additions(
     }
 }
 
+/// One footprint the plan adds, as `CreateItems` receives it: built from the
+/// library's pads, drawings and fields, given the rest of the library's data,
+/// then the schematic's reference, value, symbol path, DNP and pad nets.
+fn build_added_footprint(
+    change: &PlannedChange,
+    part: &PreparedFootprint,
+    net_codes: &BTreeMap<String, i32>,
+) -> Result<prost_types::Any> {
+    let PlannedChange::Add {
+        reference,
+        value,
+        footprint_id,
+        symbol_path,
+        dnp,
+        pad_nets,
+        position,
+    } = change
+    else {
+        bail!("only a planned addition builds a new footprint");
+    };
+    let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
+        footprint_id,
+        reference,
+        value,
+        &part.pads,
+        &part.graphics,
+        &part.fields,
+        position.x,
+        position.y,
+        0.0,
+        "F.Cu",
+    )?;
+    let mut footprint =
+        konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+    apply_library_data(&mut footprint, part)?;
+    apply_footprint_fields(
+        &mut footprint,
+        reference,
+        value,
+        symbol_path,
+        *dnp,
+        pad_nets,
+        net_codes,
+    )?;
+    Ok(konnect_ipc::builders::pack_any(
+        &footprint,
+        "kiapi.board.types.FootprintInstance",
+    ))
+}
+
 fn build_mutation_items(
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     snapshot: &LiveSnapshot,
 ) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>)> {
-    use konnect_ipc::gen::kiapi;
-
     let mut creates = Vec::new();
     let mut updates = Vec::new();
     for change in &plan.changes {
         match change {
-            PlannedChange::Add {
-                reference,
-                value,
-                footprint_id,
-                symbol_path,
-                dnp,
-                pad_nets,
-                position,
-            } => {
+            PlannedChange::Add { footprint_id, .. } => {
                 let part = prepared
                     .get(footprint_id)
                     .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
-                let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
-                    footprint_id,
-                    reference,
-                    value,
-                    &part.pads,
-                    &part.graphics,
-                    &part.fields,
-                    position.x,
-                    position.y,
-                    0.0,
-                    "F.Cu",
-                )?;
-                let mut footprint =
-                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
-                apply_footprint_fields(
-                    &mut footprint,
-                    reference,
-                    value,
-                    symbol_path,
-                    *dnp,
-                    pad_nets,
-                    &snapshot.net_codes,
-                )?;
-                creates.push(konnect_ipc::builders::pack_any(
-                    &footprint,
-                    "kiapi.board.types.FootprintInstance",
-                ));
+                creates.push(build_added_footprint(change, part, &snapshot.net_codes)?);
             }
             PlannedChange::Update { kiid, .. } => {
                 let item = snapshot
@@ -3039,7 +3165,8 @@ mod tests {
             expected["U4"],
             FootprintShape {
                 pads: 1,
-                drawings: 6
+                drawings: 6,
+                ..Default::default()
             }
         );
 
@@ -3064,7 +3191,8 @@ mod tests {
             actual["U4"],
             FootprintShape {
                 pads: 6,
-                drawings: 1
+                drawings: 1,
+                ..Default::default()
             }
         );
         assert_ne!(actual["U4"], expected["U4"]);
@@ -4536,7 +4664,9 @@ mod tests {
 
     /// Everything a served dry run needs without KiCad: a stand-in
     /// `kicad-cli` that hands back `netlist`, and a protobuf mock holding the
-    /// project's board open with nothing on it.
+    /// project's board open with nothing on it. It can also apply: the mock
+    /// keeps what `CreateItems` sent and lists it back as the board's
+    /// footprints, shaped by `readback`.
     struct ServedSync {
         _temp: tempfile::TempDir,
         _kicad: crate::test_support::MockIpcServer,
@@ -4544,6 +4674,17 @@ mod tests {
         schematic: PathBuf,
         board: PathBuf,
         exported: PathBuf,
+        created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+    }
+
+    /// What the mock's board holds after `CreateItems`.
+    #[derive(Clone, Copy)]
+    enum Readback {
+        /// Exactly what was sent, as a KiCad that kept everything does.
+        AsSent,
+        /// What was sent without the instance attributes and 3D models: the
+        /// board the sync built before #789.
+        WithoutLibraryData,
     }
 
     impl ServedSync {
@@ -4554,8 +4695,21 @@ mod tests {
         /// As [`Self::new`], with KiCad also holding one board graphic whose
         /// box is `outline`, `(x, y, width, height)` in mm.
         async fn holding_outline(outline: Option<(f64, f64, f64, f64)>) -> Self {
+            Self::build(outline, Readback::AsSent).await
+        }
+
+        /// As [`Self::new`], with the board read back as `readback` says.
+        async fn reading_back(readback: Readback) -> Self {
+            Self::build(None, readback).await
+        }
+
+        async fn build(outline: Option<(f64, f64, f64, f64)>, readback: Readback) -> Self {
             use crate::tools::cli::test_support::write_script;
             use konnect_ipc::gen::kiapi;
+
+            let created =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::<prost_types::Any>::new()));
+            let board_items = created.clone();
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -4585,6 +4739,8 @@ mod tests {
                             kiapi::common::commands::GetItems::decode(command.value.as_slice())
                                 .expect("GetItems request");
                         let shapes = kiapi::common::types::KiCadObjectType::KotPcbShape as i32;
+                        let footprints =
+                            kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32;
                         let items = match outline {
                             Some(_) if request.types.contains(&shapes) => {
                                 vec![crate::tools::pcb_board::board_mock::listed_item(
@@ -4592,6 +4748,12 @@ mod tests {
                                     "outline",
                                 )]
                             }
+                            _ if request.types.contains(&footprints) => board_items
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .map(|item| read_back(item, readback))
+                                .collect(),
                             _ => Vec::new(),
                         };
                         return Some(konnect_ipc::builders::pack_any(
@@ -4618,6 +4780,92 @@ mod tests {
                             },
                         ));
                     }
+                    if command.type_url.ends_with("SaveDocumentToString") {
+                        // The apply's pre-commit snapshot: the board as KiCad
+                        // holds it, which here is the saved file.
+                        let request = kiapi::common::commands::SaveDocumentToString::decode(
+                            command.value.as_slice(),
+                        )
+                        .expect("SaveDocumentToString request");
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::SavedDocumentResponse {
+                                document: request.document,
+                                contents: String::from_utf8_lossy(include_bytes!(
+                                    "../../tests/fixtures/specctra_two_resistors.kicad_pcb"
+                                ))
+                                .into_owned(),
+                            },
+                            "kiapi.common.commands.SavedDocumentResponse",
+                        ));
+                    }
+                    if command.type_url.ends_with("BeginCommit") {
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::BeginCommitResponse {
+                                id: Some(kiapi::common::types::Kiid {
+                                    value: "served-sync-commit".into(),
+                                }),
+                            },
+                            "kiapi.common.commands.BeginCommitResponse",
+                        ));
+                    }
+                    if command.type_url.ends_with("CreateItems") {
+                        let request =
+                            kiapi::common::commands::CreateItems::decode(command.value.as_slice())
+                                .expect("CreateItems request");
+                        board_items
+                            .lock()
+                            .unwrap()
+                            .extend(request.items.iter().cloned());
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::CreateItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                created_items: request
+                                    .items
+                                    .into_iter()
+                                    .map(|item| kiapi::common::commands::ItemCreationResult {
+                                        status: Some(kiapi::common::commands::ItemStatus {
+                                            code: kiapi::common::commands::ItemStatusCode::IscOk
+                                                as i32,
+                                            error_message: String::new(),
+                                        }),
+                                        item: Some(item),
+                                    })
+                                    .collect(),
+                            },
+                            "kiapi.common.commands.CreateItemsResponse",
+                        ));
+                    }
+                    if command.type_url.ends_with("UpdateItems") {
+                        let request =
+                            kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
+                                .expect("UpdateItems request");
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::UpdateItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                updated_items: request
+                                    .items
+                                    .into_iter()
+                                    .map(|item| kiapi::common::commands::ItemUpdateResult {
+                                        status: Some(kiapi::common::commands::ItemStatus {
+                                            code: kiapi::common::commands::ItemStatusCode::IscOk
+                                                as i32,
+                                            error_message: String::new(),
+                                        }),
+                                        item: Some(item),
+                                    })
+                                    .collect(),
+                            },
+                            "kiapi.common.commands.UpdateItemsResponse",
+                        ));
+                    }
+                    if command.type_url.ends_with("EndCommit") {
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::EndCommitResponse {},
+                            "kiapi.common.commands.EndCommitResponse",
+                        ));
+                    }
                     None
                 },
             );
@@ -4639,7 +4887,59 @@ mod tests {
                 schematic,
                 board,
                 exported,
+                created,
             }
+        }
+
+        /// One `tools/call`, with the result's `isError` beside the body.
+        async fn call(&self, arguments: serde_json::Value) -> (bool, serde_json::Value) {
+            let response = self
+                .handler
+                .handle_message(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 789,
+                    "method": "tools/call",
+                    "params": { "name": "update_pcb_from_schematic", "arguments": arguments }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("successful JSON-RPC response");
+            (
+                result["isError"] == serde_json::json!(true),
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            )
+        }
+
+        /// A dry run and then the apply of its plan, both through
+        /// `tools/call`. Returns the apply's body.
+        async fn apply(&self, netlist: &str) -> serde_json::Value {
+            let plan = self.dry_run(netlist).await;
+            assert_eq!(plan["status"], "ready", "{plan:#}");
+            let (is_error, applied) = self
+                .call(serde_json::json!({
+                    "schematic": self.schematic.to_string_lossy(),
+                    "board": self.board.to_string_lossy(),
+                    "dry_run": false,
+                    "expected_plan_revision": plan["plan_revision"],
+                }))
+                .await;
+            assert!(!is_error, "{applied:#}");
+            applied
+        }
+
+        /// The footprints `CreateItems` received.
+        fn sent_footprints(&self) -> Vec<konnect_ipc::gen::kiapi::board::types::FootprintInstance> {
+            self.created
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .expect("a footprint")
+                })
+                .collect()
         }
 
         /// A dry run through `tools/call`, for a schematic exporting `netlist`.
@@ -4671,6 +4971,27 @@ mod tests {
                 result["isError"] == serde_json::json!(true),
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap(),
             )
+        }
+    }
+
+    /// A created item as the mock's board lists it back.
+    fn read_back(item: &prost_types::Any, readback: Readback) -> prost_types::Any {
+        match readback {
+            Readback::AsSent => item.clone(),
+            Readback::WithoutLibraryData => {
+                let mut footprint =
+                    konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .expect("a footprint");
+                footprint.attributes = None;
+                if let Some(definition) = footprint.definition.as_mut() {
+                    definition.items.retain(|child| {
+                        !konnect_ipc::builders::any_is(child, "kiapi.board.types.Footprint3DModel")
+                    });
+                }
+                konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+            }
         }
     }
 
@@ -4828,6 +5149,151 @@ mod tests {
         assert_eq!(
             keys(&refused["diagnostics"][0]),
             keys(&planned["diagnostics"][0])
+        );
+    }
+
+    /// #789 through the served boundary. A stock 0603 capacitor the board
+    /// lacks is added, and what `CreateItems` receives carries the library's
+    /// `(attr smd)`, its description and tags, and its 3D model. Before, the
+    /// footprint went out with none of them, so KiCad treated the part as
+    /// unspecified and `export_3d`'s default left it out of the STEP.
+    #[tokio::test]
+    async fn an_added_footprint_carries_its_library_attributes_text_and_model() {
+        use konnect_ipc::gen::kiapi;
+
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let applied = served
+            .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        let sent = served.sent_footprints();
+        assert_eq!(sent.len(), 1);
+        let footprint = &sent[0];
+        assert_eq!(
+            footprint.attributes.as_ref().map(|a| a.mounting_style()),
+            Some(kiapi::board::types::FootprintMountingStyle::FmsSmd)
+        );
+        let definition = footprint.definition.as_ref().unwrap();
+        let text = definition.attributes.as_ref().unwrap();
+        assert!(
+            text.description
+                .starts_with("Capacitor SMD 0603 (1608 Metric)"),
+            "{}",
+            text.description
+        );
+        assert_eq!(text.keywords, "capacitor");
+        let models: Vec<_> = definition
+            .items
+            .iter()
+            .filter(|child| {
+                konnect_ipc::builders::any_is(child, "kiapi.board.types.Footprint3DModel")
+            })
+            .map(|child| {
+                kiapi::board::types::Footprint3DModel::decode(child.value.as_slice()).unwrap()
+            })
+            .collect();
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].filename,
+            "${KICAD10_3DMODEL_DIR}/Capacitor_SMD.3dshapes/C_0603_1608Metric.step"
+        );
+        assert!(models[0].visible);
+    }
+
+    /// The readback holds the board to the mounting style and model files
+    /// that were sent. A board that kept neither, which is what the sync used
+    /// to build, is reported. It is not refused: the commit has already been
+    /// applied, and the footprint is otherwise the one that was planned.
+    #[tokio::test]
+    async fn the_readback_names_library_data_the_board_did_not_keep() {
+        let served = ServedSync::reading_back(Readback::WithoutLibraryData).await;
+        let applied = served
+            .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let messages: Vec<&str> = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == "board_readback_differs")
+            .map(|diagnostic| diagnostic["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(messages.len(), 2, "{applied:#}");
+        assert!(
+            messages[0].contains("C1: sent mounting style smd, board now has unspecified"),
+            "{}",
+            messages[0]
+        );
+        assert!(
+            messages[1].contains(
+                "C1: sent 3D models [${KICAD10_3DMODEL_DIR}/Capacitor_SMD.3dshapes/C_0603_1608Metric.step], board now has []"
+            ),
+            "{}",
+            messages[1]
+        );
+    }
+
+    /// The schematic decides DNP, over whatever the library footprint says,
+    /// as KiCad's own Update PCB from Schematic does. The library data is
+    /// applied first and the schematic's fields second, so the order is what
+    /// this pins: both directions, on the KiCad-written 0603.
+    #[test]
+    fn the_schematic_decides_dnp_over_the_library() {
+        use konnect_ipc::gen::kiapi;
+
+        let mut part = prepare_footprint_source(include_str!(
+            "../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"
+        ))
+        .unwrap();
+        let addition = |dnp: bool| PlannedChange::Add {
+            reference: "C1".into(),
+            value: "100n".into(),
+            footprint_id: STOCK_0603.into(),
+            symbol_path: "/c1-uuid".into(),
+            dnp,
+            pad_nets: BTreeMap::new(),
+            position: Point { x: 10.0, y: 10.0 },
+        };
+        let built_dnp = |part: &PreparedFootprint, dnp: bool| {
+            let item = build_added_footprint(&addition(dnp), part, &BTreeMap::new()).unwrap();
+            let footprint =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let attributes = footprint.attributes.unwrap();
+            assert_eq!(
+                attributes.mounting_style(),
+                kiapi::board::types::FootprintMountingStyle::FmsSmd,
+                "the library's attributes are still applied"
+            );
+            attributes.do_not_populate
+        };
+
+        // The stock 0603 is not DNP in the library; the schematic says it is.
+        assert!(!part.attributes.do_not_populate);
+        assert!(built_dnp(&part, true));
+
+        // A library footprint marked DNP; the schematic says it is fitted.
+        part.attributes.do_not_populate = true;
+        assert!(!built_dnp(&part, false));
+    }
+
+    /// A model the shared reader refuses refuses the footprint, under the code
+    /// the sync already uses for a footprint it cannot place, rather than
+    /// placing it without the model.
+    #[test]
+    fn a_library_model_the_reader_refuses_refuses_the_footprint() {
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod")
+            .replacen("(offset", "(origin", 1);
+
+        let refusal = prepare_footprint_source(&source).unwrap_err();
+
+        assert_eq!(refusal.0, "unsupported_library_footprint");
+        assert!(
+            refusal.1.contains("3D model clause 'origin'"),
+            "{}",
+            refusal.1
         );
     }
 }

@@ -19,6 +19,7 @@ mod footprint_models;
 pub mod integration;
 mod jlcpcb_midpoints;
 pub mod library;
+mod library_footprint;
 pub(crate) mod live_board;
 pub mod manufacturing;
 pub(crate) mod navigation_target;

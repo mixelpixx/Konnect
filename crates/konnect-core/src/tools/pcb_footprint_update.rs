@@ -746,18 +746,14 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
-    let models = parse_models(&root)?;
-    let attributes = parse_attributes(&root)?;
+    let models = super::library_footprint::models(&root)?;
+    let attributes = super::library_footprint::attributes(&root)?;
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
             entry_name: entry_name.to_string(),
         }),
-        attributes: Some(kiapi::board::types::FootprintAttributes {
-            description: root.find_str("descr").unwrap_or_default().to_string(),
-            keywords: root.find_str("tags").unwrap_or_default().to_string(),
-            ..Default::default()
-        }),
+        attributes: Some(super::library_footprint::description_and_keywords(&root)),
         ..Default::default()
     };
 
@@ -1454,98 +1450,6 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn parse_attributes(
-    root: &konnect_sexp::SexpNode,
-) -> Result<kiapi::board::types::FootprintAttributes> {
-    use kiapi::board::types::FootprintMountingStyle;
-
-    let mut attributes = kiapi::board::types::FootprintAttributes::default();
-    let Some(attr) = root.find("attr") else {
-        return Ok(attributes);
-    };
-    for value in attr.children().unwrap_or_default().iter().skip(1) {
-        match value
-            .as_str()
-            .context("footprint attr contains a non-atom")?
-        {
-            "smd" => attributes.mounting_style = FootprintMountingStyle::FmsSmd as i32,
-            "through_hole" => {
-                attributes.mounting_style = FootprintMountingStyle::FmsThroughHole as i32
-            }
-            "board_only" => attributes.not_in_schematic = true,
-            "exclude_from_pos_files" => attributes.exclude_from_position_files = true,
-            "exclude_from_bom" => attributes.exclude_from_bill_of_materials = true,
-            "allow_missing_courtyard" => attributes.exempt_from_courtyard_requirement = true,
-            "dnp" => attributes.do_not_populate = true,
-            "allow_soldermask_bridges" => attributes.allow_soldermask_bridges = true,
-            unsupported => bail!(
-                "footprint attribute '{unsupported}' is not supported by typed library refresh"
-            ),
-        }
-    }
-    Ok(attributes)
-}
-
-fn parse_models(
-    root: &konnect_sexp::SexpNode,
-) -> Result<Vec<kiapi::board::types::Footprint3DModel>> {
-    root.find_all("model")
-        .into_iter()
-        .map(|model| {
-            for child in model.children().unwrap_or_default().iter().skip(2) {
-                let Some(tag) = child.head() else {
-                    if child.as_str() == Some("hide") {
-                        continue;
-                    }
-                    bail!("3D model contains an unsupported atom");
-                };
-                if !matches!(tag, "offset" | "scale" | "rotate" | "opacity") {
-                    bail!("3D model clause '{tag}' is not supported");
-                }
-            }
-            let vector = |tag: &str, default: [f64; 3]| -> Result<kiapi::common::types::Vector3D> {
-                let Some(wrapper) = model.find(tag) else {
-                    return Ok(kiapi::common::types::Vector3D {
-                        x_nm: default[0],
-                        y_nm: default[1],
-                        z_nm: default[2],
-                    });
-                };
-                let xyz = wrapper
-                    .find("xyz")
-                    .with_context(|| format!("3D model {tag} is missing xyz"))?;
-                Ok(kiapi::common::types::Vector3D {
-                    x_nm: xyz
-                        .get_f64(1)
-                        .with_context(|| format!("3D model {tag}.x is invalid"))?,
-                    y_nm: xyz
-                        .get_f64(2)
-                        .with_context(|| format!("3D model {tag}.y is invalid"))?,
-                    z_nm: xyz
-                        .get_f64(3)
-                        .with_context(|| format!("3D model {tag}.z is invalid"))?,
-                })
-            };
-            Ok(kiapi::board::types::Footprint3DModel {
-                filename: model
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .context("3D model is missing its filename")?
-                    .to_string(),
-                scale: Some(vector("scale", [1.0, 1.0, 1.0])?),
-                rotation: Some(vector("rotate", [0.0, 0.0, 0.0])?),
-                offset: Some(vector("offset", [0.0, 0.0, 0.0])?),
-                visible: !model
-                    .children()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|child| child.as_str() == Some("hide")),
-                opacity: model.find_f64("opacity").unwrap_or(1.0),
-            })
-        })
-        .collect()
 }
 
 fn build_updated_instance(
