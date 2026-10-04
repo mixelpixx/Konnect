@@ -19,6 +19,39 @@ for wiring. Custom `graphics` still require explicit coordinates and glyphs
 that fit retain their established layout. Tool schemas and response shapes are
 unchanged; this does not infer electrical pin roles or redesign a supplied layout.
 
+## Unreleased: `copy_routing_pattern` copies routing from boards KiCad saved (patch release)
+
+`copy_routing_pattern` matched `(segment` and `(via` as two-space-indented
+text, which KiCad 10 never writes, so it copied nothing from a board KiCad had
+saved and reported `copied: 0`. It now reads top-level `segment`, `arc` and
+`via` items from the parsed board (#802).
+
+- **Selection:** an item is copied when every point that places it (a
+  segment's `start`/`end`, an arc's `start`/`mid`/`end`, a via's `at`) is
+  inside the source region, edges included. Vias used to be skipped even on
+  the old layout, because the filter read a `(start …)` they do not have.
+- **Crossing items:** an item with only some points inside is not copied. It
+  is listed in the new `excluded_crossing` array as `{kind, uuid}`.
+- **Copies** keep every attribute (layer, net, width, size, drill, layers,
+  `locked`, …), get a fresh `uuid` (or `tstamp`, on boards from KiCad 7 and
+  earlier), and have each coordinate rounded to the six decimals KiCad writes.
+- **Refusals, with the board untouched:**
+  - KiCad holds the board, or a KiCad lock file sits beside it.
+  - `invalid_argument`: `src_x2 < src_x1` or `src_y2 < src_y1`; a destination
+    equal to the source anchor (field `dest_x`), which would stack every copy
+    on its original; a `net_map` value that is not a string, or names a net
+    no item on the board carries (field `net_map.<name>`); `net_map` on a
+    board that references nets by number, as KiCad 9 boards do (field
+    `net_map`).
+  - A routing item anywhere on the board without readable points or an
+    identity, since whether it is in the region cannot be known.
+  - `conflict`: the board changed after it was read. This is new: the file
+    used to be replaced without that check.
+- **Response:** `copied` is counted in the board text the write verified on
+  disk. New keys are `copied_by_kind` (`segment`, `arc`, `via`), `uuids` (the
+  copies) and `excluded_crossing`. A successful write adds the `warning` the
+  other file-only board edits carry. `dx`/`dy` are rounded the same way.
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the

@@ -9,6 +9,8 @@ mod board_source_contract_tests;
 mod board_stackup;
 pub mod cli;
 pub mod config;
+#[cfg(test)]
+mod copy_routing_pattern_tests;
 pub(crate) mod cross_probe;
 pub mod design_review;
 pub(crate) mod drc;
