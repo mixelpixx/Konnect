@@ -16,7 +16,7 @@ use konnect_sexp::{
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_sheet_pins,
         extract_symbol_instances, extract_wires, find_lib_symbol, read_schematic,
-        symbol_bounds_for_instance, Label, LabelKind, LibPin, SymbolBounds, Wire,
+        symbol_geometry_for_instance, Label, LabelKind, LibPin, SymbolBounds, Wire,
     },
 };
 use serde_json::json;
@@ -187,9 +187,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_schematic_overlaps",
-            "Find overlapping symbols from their transformed drawing/pin bounds (excluding \
-             free text), plus conflicting labels at the same location. Reports any symbol whose \
-             embedded geometry could not be resolved and used the origin fallback instead.",
+            "Find overlapping symbols from their transformed drawings and pins (excluding free \
+             text): shared body area, a pin running into another symbol's body, or pins \
+             meeting anywhere but tip to tip. Pin-tip contact and touching edges are not \
+             reported. Also finds \
+             conflicting labels at the same location, and reports any symbol whose embedded \
+             geometry could not be resolved and used the origin fallback instead.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -952,15 +955,17 @@ async fn handle_check_overlaps(
         .map(|node| node.find_all("symbol"))
         .unwrap_or_default();
 
-    // Compare the actual selected-unit graphic/pin envelopes. Distinct origins
+    // Compare the actual selected-unit drawings and pins. Distinct origins
     // can still place two large symbols on top of each other; the old origin
     // comparison missed that normal collision shape entirely.
     let placements = instances
         .iter()
         .map(|instance| {
-            let bounds = find_lib_symbol(&lib_symbols, instance)
-                .and_then(|symbol| symbol_bounds_for_instance(symbol, instance));
-            (instance, bounds)
+            let placed = find_lib_symbol(&lib_symbols, instance).and_then(|symbol| {
+                let geometry = symbol_geometry_for_instance(symbol, instance)?;
+                Some((geometry.envelope()?, geometry))
+            });
+            (instance, placed)
         })
         .collect::<Vec<_>>();
     let mut comp_overlaps: Vec<serde_json::Value> = Vec::new();
@@ -972,14 +977,14 @@ async fn handle_check_overlaps(
             "y_max": bounds.max_y
         })
     };
-    for (index, (a, a_bounds)) in placements.iter().enumerate() {
-        for (b, b_bounds) in &placements[index + 1..] {
-            match (a_bounds, b_bounds) {
-                (Some(a_bounds), Some(b_bounds)) => {
-                    let (overlap_x, overlap_y) = a_bounds.overlap_depth(*b_bounds);
-                    // Edge/pin contact is a normal connection. Positive area
-                    // on both axes means the placed symbol envelopes collide.
-                    if overlap_x > 1e-9 && overlap_y > 1e-9 {
+    for (index, (a, a_placed)) in placements.iter().enumerate() {
+        for (b, b_placed) in &placements[index + 1..] {
+            match (a_placed, b_placed) {
+                (Some((a_bounds, a_geometry)), Some((b_bounds, b_geometry))) => {
+                    // Pin-tip contact is a normal connection, so the drawings
+                    // and pins are compared, not their envelopes.
+                    if !a_bounds.separated(*b_bounds) && a_geometry.collides(b_geometry) {
+                        let (overlap_x, overlap_y) = a_bounds.overlap_depth(*b_bounds);
                         comp_overlaps.push(json!({
                             "type": "component_overlap",
                             "a": a.reference,
@@ -1030,7 +1035,7 @@ async fn handle_check_overlaps(
     all.extend(label_overlaps);
     let bounds_unresolved = placements
         .iter()
-        .filter(|(_, bounds)| bounds.is_none())
+        .filter(|(_, placed)| placed.is_none())
         .map(|(instance, _)| instance.reference.as_str())
         .collect::<Vec<_>>();
     Ok(CallToolResult::json(&json!({
@@ -1145,6 +1150,68 @@ mod placement_overlap_tests {
         let result = overlaps(&schematic(&[("R1", 100.0, 50.0), ("R2", 102.032, 50.0)])).await;
 
         assert_eq!(result["overlap_count"], 0, "{result}");
+    }
+
+    /// #745 through the served dispatch, on KiCad's own serialization. The
+    /// three pin-tip contacts (R10 and U1 VOUT under `+3V3`, R11 over `GND`)
+    /// are connections in KiCad's netlist. R12/R13 share body area, `#PWR03`
+    /// covers R14's pin, and `#PWR05` sits partway along U1 VIN, which KiCad
+    /// leaves unconnected.
+    #[tokio::test]
+    async fn the_served_dispatch_passes_pin_tip_contact_and_reports_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("symbol_pin_contact_kicad10.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/symbol_pin_contact_kicad10.kicad_sch"),
+        )
+        .unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 745,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_schematic_overlaps",
+                    "arguments": { "schematic": path.display().to_string() }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(body["bounds_resolved"], 11, "{body}");
+        let mut pairs = body["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|overlap| {
+                assert_eq!(overlap["detection"], "symbol_geometry");
+                let mut pair = [
+                    overlap["a"].as_str().unwrap(),
+                    overlap["b"].as_str().unwrap(),
+                ];
+                pair.sort_unstable();
+                pair
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            [["#PWR03", "R14"], ["#PWR05", "U1"], ["R12", "R13"]],
+            "{body}"
+        );
+        assert_eq!(body["overlap_count"], 3);
     }
 
     #[tokio::test]

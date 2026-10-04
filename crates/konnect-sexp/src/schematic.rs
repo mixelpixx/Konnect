@@ -2,7 +2,7 @@
 //!
 //! Provides typed query functions used by the tool implementations.
 
-use crate::geometry::{transform_pin, PinTransform};
+use crate::geometry::{points_coincident, transform_pin, PinTransform};
 use crate::parser::{parse_sexp, SexpNode};
 use crate::writer::read_consistent;
 use crate::SexpError;
@@ -315,11 +315,15 @@ impl SymbolInstance {
     }
 }
 
+/// Distance below which two schematic coordinates are the same point.
+const GEOMETRY_EPSILON: f64 = 1e-9;
+
 /// Axis-aligned schematic-space bounds of a placed symbol's non-text drawings
 /// and pins. Property fields and free library text are deliberately excluded:
 /// their font layout is a separate concern, while callers use these bounds for
-/// component placement and body-collision checks. Explicit `text_box` geometry
-/// is included because KiCad gives it exact corners.
+/// component placement. Collision checks use [`SymbolGeometry`] instead, since
+/// this envelope covers pin tips that only make contact (#745). Explicit
+/// `text_box` geometry is included because KiCad gives it exact corners.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SymbolBounds {
     pub min_x: f64,
@@ -329,6 +333,12 @@ pub struct SymbolBounds {
 }
 
 impl SymbolBounds {
+    fn spanning((x1, y1): (f64, f64), (x2, y2): (f64, f64)) -> Self {
+        let mut bounds = Self::point(x1, y1);
+        bounds.include(x2, y2);
+        bounds
+    }
+
     fn point(x: f64, y: f64) -> Self {
         Self {
             min_x: x,
@@ -354,6 +364,33 @@ impl SymbolBounds {
 
     pub fn height(self) -> f64 {
         self.max_y - self.min_y
+    }
+
+    /// Whether the relative interiors meet. A box flat on an axis is a line
+    /// there, so a line counts only where it passes strictly inside the other
+    /// box, or along a coincident line, never where it merely touches an edge.
+    fn interiors_intersect(self, other: Self) -> bool {
+        let axis = |a_min: f64, a_max: f64, b_min: f64, b_max: f64| {
+            let a_flat = a_max - a_min <= GEOMETRY_EPSILON;
+            let b_flat = b_max - b_min <= GEOMETRY_EPSILON;
+            let inside = |c: f64, min: f64, max: f64| {
+                min + GEOMETRY_EPSILON < c && c < max - GEOMETRY_EPSILON
+            };
+            match (a_flat, b_flat) {
+                (true, true) => (a_min - b_min).abs() <= GEOMETRY_EPSILON,
+                (true, false) => inside(a_min, b_min, b_max),
+                (false, true) => inside(b_min, a_min, a_max),
+                (false, false) => a_max.min(b_max) - a_min.max(b_min) > GEOMETRY_EPSILON,
+            }
+        };
+        axis(self.min_x, self.max_x, other.min_x, other.max_x)
+            && axis(self.min_y, self.max_y, other.min_y, other.max_y)
+    }
+
+    /// Whether the boxes are apart, with not even an edge or corner shared.
+    pub fn separated(self, other: Self) -> bool {
+        let (x, y) = self.overlap_depth(other);
+        x < -GEOMETRY_EPSILON || y < -GEOMETRY_EPSILON
     }
 
     /// Intersection depth on each axis. Touching edges return zero; separated
@@ -449,7 +486,8 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
     }
 }
 
-fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
+fn collect_direct_symbol_geometry(node: &SexpNode, geometry: &mut SymbolGeometry) {
+    let bounds = &mut geometry.body;
     for rectangle in node
         .find_all("rectangle")
         .into_iter()
@@ -493,42 +531,66 @@ fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBou
         let Some(pin) = parse_lib_pin(pin) else {
             continue;
         };
-        include_point(bounds, pin.local_x, pin.local_y);
         let angle = pin.rotation.to_radians();
-        include_point(
-            bounds,
-            pin.local_x + pin.length * angle.cos(),
-            pin.local_y + pin.length * angle.sin(),
-        );
+        geometry.pins.push(PinSegment {
+            tip: (pin.local_x, pin.local_y),
+            root: (
+                pin.local_x + pin.length * angle.cos(),
+                pin.local_y + pin.length * angle.sin(),
+            ),
+        });
     }
 }
 
-fn collect_symbol_geometry_recursive(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
-    collect_direct_symbol_geometry(node, bounds);
+fn collect_symbol_geometry_recursive(node: &SexpNode, geometry: &mut SymbolGeometry) {
+    collect_direct_symbol_geometry(node, geometry);
     for child in node.find_all("symbol") {
-        collect_symbol_geometry_recursive(child, bounds);
+        collect_symbol_geometry_recursive(child, geometry);
     }
 }
 
-/// Bounds of the selected unit in library-local, Y-up coordinates.
+/// Geometry of the selected unit in library-local, Y-up coordinates.
 ///
 /// KiCad stores common graphics in `Name_0_M` and unit-specific graphics and
 /// pins in `Name_N_M`. The selection mirrors [`extract_lib_pins_for_unit`]:
 /// common nodes, the requested unit, and un-suffixed nested nodes participate;
 /// other units do not.
-pub fn symbol_local_bounds_for_unit(sym_node: &SexpNode, unit: u32) -> Option<SymbolBounds> {
-    let mut bounds = None;
-    collect_direct_symbol_geometry(sym_node, &mut bounds);
+fn local_geometry_for_unit(sym_node: &SexpNode, unit: u32) -> SymbolGeometry {
+    let mut geometry = SymbolGeometry::default();
+    collect_direct_symbol_geometry(sym_node, &mut geometry);
     for child in sym_node.find_all("symbol") {
         let child_unit = child
             .get(1)
             .and_then(|node| node.as_str())
             .and_then(parse_subsymbol_unit);
         if !matches!(child_unit, Some(child_unit) if child_unit != 0 && child_unit != unit) {
-            collect_symbol_geometry_recursive(child, &mut bounds);
+            collect_symbol_geometry_recursive(child, &mut geometry);
         }
     }
-    bounds
+    geometry
+}
+
+/// Bounds of the selected unit's drawings and pins in library-local, Y-up
+/// coordinates.
+pub fn symbol_local_bounds_for_unit(sym_node: &SexpNode, unit: u32) -> Option<SymbolBounds> {
+    local_geometry_for_unit(sym_node, unit).envelope()
+}
+
+/// Transform library-local bounds into schematic coordinates for one placed
+/// instance, including rotation and mirroring.
+fn place_bounds(local: SymbolBounds, transform: PinTransform) -> SymbolBounds {
+    let place = |x, y| transform_pin(x, y, transform);
+    let mut placed = SymbolBounds::spanning(
+        place(local.min_x, local.min_y),
+        place(local.max_x, local.max_y),
+    );
+    for (x, y) in [
+        place(local.min_x, local.max_y),
+        place(local.max_x, local.min_y),
+    ] {
+        placed.include(x, y);
+    }
+    placed
 }
 
 /// Transform a selected library unit's bounds into schematic coordinates for
@@ -537,19 +599,115 @@ pub fn symbol_bounds_for_instance(
     sym_node: &SexpNode,
     instance: &SymbolInstance,
 ) -> Option<SymbolBounds> {
-    let local = symbol_local_bounds_for_unit(sym_node, instance.unit)?;
-    let transform = instance.pin_transform();
-    let mut placed = None;
-    for (x, y) in [
-        (local.min_x, local.min_y),
-        (local.min_x, local.max_y),
-        (local.max_x, local.min_y),
-        (local.max_x, local.max_y),
-    ] {
-        let (x, y) = transform_pin(x, y, transform);
-        include_point(&mut placed, x, y);
+    symbol_geometry_for_instance(sym_node, instance)?.envelope()
+}
+
+/// A pin from its tip, the connection point, to its root at the body.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PinSegment {
+    pub tip: (f64, f64),
+    pub root: (f64, f64),
+}
+
+impl PinSegment {
+    fn bounds(self) -> SymbolBounds {
+        SymbolBounds::spanning(self.tip, self.root)
     }
-    placed
+
+    fn is_point(self) -> bool {
+        points_coincident(
+            self.tip.0,
+            self.tip.1,
+            self.root.0,
+            self.root.1,
+            GEOMETRY_EPSILON,
+        )
+    }
+
+    /// Whether two cardinal pins share more than their tips. KiCad connects
+    /// pins only tip to tip, so a tip on another pin's length is a collision.
+    fn collides(self, other: Self) -> bool {
+        let (a, b) = (self.bounds(), other.bounds());
+        if a.separated(b) {
+            return false;
+        }
+        let (x, y) = a.overlap_depth(b);
+        if x > GEOMETRY_EPSILON || y > GEOMETRY_EPSILON {
+            return true;
+        }
+        // Two cardinal segments that meet without sharing any length meet at
+        // a single point, the corner both boxes share.
+        let (at_x, at_y) = (a.min_x.max(b.min_x), a.min_y.max(b.min_y));
+        let is_tip = |(x, y): (f64, f64)| points_coincident(at_x, at_y, x, y, GEOMETRY_EPSILON);
+        !(is_tip(self.tip) && is_tip(other.tip))
+    }
+}
+
+/// A symbol's drawings and pins, kept apart so that two symbols meeting at a
+/// pin tip read as contact rather than collision (#745).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SymbolGeometry {
+    /// Envelope of the drawings, without the pins.
+    pub body: Option<SymbolBounds>,
+    pub pins: Vec<PinSegment>,
+}
+
+impl SymbolGeometry {
+    /// Envelope of the drawings and pins together.
+    pub fn envelope(&self) -> Option<SymbolBounds> {
+        let mut bounds = self.body;
+        for pin in &self.pins {
+            include_point(&mut bounds, pin.tip.0, pin.tip.1);
+            include_point(&mut bounds, pin.root.0, pin.root.1);
+        }
+        bounds
+    }
+
+    /// Whether the two symbols share more than edge or pin-tip contact: a
+    /// body over a body, a pin running into a body, or two pins crossing or
+    /// lying along each other. Callers comparing many symbols should first
+    /// skip pairs whose envelopes are [`SymbolBounds::separated`].
+    pub fn collides(&self, other: &Self) -> bool {
+        // A pin's tip, its connection point, is exempt, so only a pin's length
+        // can run into another symbol's body, and a zero-length pin cannot.
+        let body_hits = |body: Option<SymbolBounds>, pins: &[PinSegment]| {
+            body.is_some_and(|body| {
+                pins.iter()
+                    .any(|pin| !pin.is_point() && body.interiors_intersect(pin.bounds()))
+            })
+        };
+        matches!((self.body, other.body), (Some(a), Some(b)) if a.interiors_intersect(b))
+            || body_hits(self.body, &other.pins)
+            || body_hits(other.body, &self.pins)
+            || self
+                .pins
+                .iter()
+                .any(|a| other.pins.iter().any(|b| a.collides(*b)))
+    }
+}
+
+/// Place a selected library unit's drawings and pins for one instance.
+pub fn symbol_geometry_for_instance(
+    sym_node: &SexpNode,
+    instance: &SymbolInstance,
+) -> Option<SymbolGeometry> {
+    let local = local_geometry_for_unit(sym_node, instance.unit);
+    if local.body.is_none() && local.pins.is_empty() {
+        return None;
+    }
+    let transform = instance.pin_transform();
+    let place = |(x, y)| transform_pin(x, y, transform);
+    Some(SymbolGeometry {
+        body: local.body.map(|body| place_bounds(body, transform)),
+        pins: local
+            .pins
+            .into_iter()
+            .map(|pin| PinSegment {
+                tip: place(pin.tip),
+                root: place(pin.root),
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -635,6 +793,97 @@ mod symbol_bounds_tests {
         assert_close(horizontal.max_x, 103.81);
         assert_close(horizontal.min_y, 48.984);
         assert_close(horizontal.max_y, 51.016);
+    }
+
+    fn boxed(x1: f64, y1: f64, x2: f64, y2: f64) -> SymbolBounds {
+        SymbolBounds::spanning((x1, y1), (x2, y2))
+    }
+
+    fn pin(tip: (f64, f64), root: (f64, f64)) -> PinSegment {
+        PinSegment { tip, root }
+    }
+
+    fn geometry(body: Option<SymbolBounds>, pins: &[PinSegment]) -> SymbolGeometry {
+        SymbolGeometry {
+            body,
+            pins: pins.to_vec(),
+        }
+    }
+
+    /// `power:+3V3` with its zero-length pin at `at`, as KiCad 10 draws it.
+    fn power(at: (f64, f64)) -> SymbolGeometry {
+        geometry(
+            Some(boxed(at.0 - 0.762, at.1 - 2.54, at.0 + 0.762, at.1)),
+            &[pin(at, at)],
+        )
+    }
+
+    /// #745: a horizontal resistor whose pin tip carries a `+3V3` symbol.
+    /// Their envelopes share area; their drawings meet at one point.
+    /// R10 from the filed case: horizontal, pin 1's tip at (273.05, 91.44).
+    fn placed_resistor() -> SymbolGeometry {
+        let symbol = parse_sexp(DEVICE_R).unwrap();
+        let mut resistor = resistor_instance(270.0);
+        (resistor.x, resistor.y) = (269.24, 91.44);
+        symbol_geometry_for_instance(&symbol, &resistor).unwrap()
+    }
+
+    #[test]
+    fn a_power_symbol_at_a_pin_tip_is_contact() {
+        let placed = placed_resistor();
+        let power = power((273.05, 91.44));
+
+        let (x, y) = placed
+            .envelope()
+            .unwrap()
+            .overlap_depth(power.body.unwrap());
+        assert!(x > 0.0 && y > 0.0, "the envelopes alone would collide");
+        assert!(!placed.collides(&power));
+        assert!(!power.collides(&placed));
+    }
+
+    /// The same `+3V3` partway along the pin: KiCad does not connect it.
+    #[test]
+    fn a_power_symbol_partway_along_a_pin_collides() {
+        assert!(placed_resistor().collides(&power((272.415, 91.44))));
+    }
+
+    #[test]
+    fn a_pin_running_into_a_body_collides() {
+        let body = geometry(Some(boxed(0.0, 0.0, 2.0, 2.0)), &[]);
+        let into = geometry(None, &[pin((1.0, 3.0), (1.0, 1.0))]);
+        let along_edge = geometry(None, &[pin((0.0, 3.0), (0.0, 1.0))]);
+        assert!(body.collides(&into));
+        assert!(!body.collides(&along_edge));
+    }
+
+    #[test]
+    fn pins_touch_only_tip_to_tip() {
+        let horizontal = geometry(None, &[pin((4.0, 0.0), (0.0, 0.0))]);
+        for (case, other, expected) in [
+            ("crossing", pin((2.0, -1.0), (2.0, 1.0)), true),
+            ("lying along", pin((6.0, 0.0), (3.0, 0.0)), true),
+            ("tip on its length", pin((2.0, 0.0), (2.0, 3.0)), true),
+            ("tip on its root", pin((0.0, 0.0), (0.0, 3.0)), true),
+            ("root on its tip", pin((6.0, 0.0), (4.0, 0.0)), true),
+            ("tip to tip", pin((4.0, 0.0), (6.0, 0.0)), false),
+            ("tip to tip at a corner", pin((4.0, 0.0), (4.0, 3.0)), false),
+            ("parallel", pin((4.0, 1.0), (0.0, 1.0)), false),
+        ] {
+            let other = geometry(None, &[other]);
+            assert_eq!(horizontal.collides(&other), expected, "{case}");
+            assert_eq!(other.collides(&horizontal), expected, "{case}, reversed");
+        }
+    }
+
+    #[test]
+    fn zero_length_pins_on_one_point_are_contact() {
+        let up = power((5.0, 5.0));
+        let mut down = power((5.0, 5.0));
+        down.body = Some(boxed(4.238, 5.0, 5.762, 7.54));
+        assert!(!up.collides(&down));
+        let body = geometry(Some(boxed(0.0, 0.0, 10.0, 10.0)), &[]);
+        assert!(!body.collides(&geometry(None, &[pin((5.0, 5.0), (5.0, 5.0))])));
     }
 
     #[test]
