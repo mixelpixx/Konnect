@@ -212,11 +212,67 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    /// What the live board's measured extent was, set from the snapshot the
+    /// plan was made against, so the dry run and the apply report the same.
+    /// Not part of the plan's identity: `sync_response` reports it.
+    #[serde(skip)]
+    staging: Option<StagingEvidence>,
+}
+
+/// What added footprints were staged beside (#688).
+///
+/// Additions go to the right of the board's measured extent. KiCad 10.0.5
+/// will not list tables or generators, so a live board is never measured
+/// whole: the evidence says which classes were left out, and tells a board
+/// with no items apart from one whose items could not be measured. Neither
+/// refuses the sync; staging is a starting position the caller can move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagingEvidence {
+    /// KiCad measured at least one item.
+    measured: bool,
+    unavailable: Vec<konnect_ipc::IpcUnavailableItemClass>,
+}
+
+impl StagingEvidence {
+    fn of(bounds: &konnect_ipc::IpcBoardBounds) -> Self {
+        Self {
+            measured: bounds.extents.is_some(),
+            unavailable: bounds.unavailable.clone(),
+        }
+    }
+
+    /// What the staged positions were computed from.
+    fn basis(&self) -> &'static str {
+        match (self.measured, self.unavailable.is_empty()) {
+            // Every class listed and measured.
+            (true, true) => "complete_geometry",
+            // Beside the items KiCad measured; the listed classes are not in it.
+            (true, false) => "partial_geometry",
+            // Every class listed, and none held an item.
+            (false, true) => "empty_board",
+            // Nothing measured, but some classes could not be listed, so the
+            // board is not known to be empty. Staged from the origin.
+            (false, false) => "no_measured_geometry",
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "basis": self.basis(),
+            "unavailable_item_classes": self
+                .unavailable
+                .iter()
+                .map(super::pcb_board::unavailable_item_class)
+                .collect::<Vec<_>>(),
+        })
+    }
 }
 
 #[derive(Debug)]
 struct LiveSnapshot {
     state: BoardState,
+    /// What `state.bounds` was measured from.
+    staging: StagingEvidence,
     items: BTreeMap<String, prost_types::Any>,
     net_codes: BTreeMap<String, i32>,
     document: konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
@@ -315,6 +371,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
             let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            plan.staging = Some(snapshot.staging.clone());
             let (prepared, unprepared) = prepare_additions(&library_board, &plan);
             // Everything that would fail the apply is found here, so `ready`
             // means ready: each footprint that cannot be prepared, named with
@@ -446,6 +503,10 @@ fn sync_response(
         // collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
         // `coverage` entry beside it is a count category and stays singular.
         "unassigned_footprints": plan.unassigned,
+        // What added footprints were staged beside: the live board as KiCad
+        // measured it, with the classes it would not list (#688). Null only
+        // when the plan never reached the board.
+        "staging": plan.staging.as_ref().map(StagingEvidence::json),
         "undo": if applied { Some("Ctrl-Z reverses the whole schematic-to-PCB update.") } else { None }
     });
     CallToolResult::json(&value)
@@ -831,6 +892,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         changes,
         diagnostics,
         unassigned,
+        // Set by the handler from the snapshot this plan was made against.
+        staging: None,
     }
 }
 
@@ -1609,15 +1672,16 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             *routed_nets.entry(net.clone()).or_insert(0) += 1;
         }
     }
-    // Every item KiCad holds, measured as KiCad measures it (#688). Only a
-    // board with no items at all has no extent, and stages from the origin.
-    let extents = client
-        .get_board_bounds_in(document.clone())?
-        .extents
-        .unwrap_or(konnect_ipc::IpcBoardExtents {
-            min: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
-            max: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
-        });
+    // Every item KiCad holds, measured as KiCad measures it (#688). A board
+    // with nothing measured stages from the origin. The classes KiCad would
+    // not list are kept, so the response can say the extent is partial, and
+    // that a board with nothing measured is not known to be empty.
+    let bounds = client.get_board_bounds_in(document.clone())?;
+    let staging = StagingEvidence::of(&bounds);
+    let extents = bounds.extents.unwrap_or(konnect_ipc::IpcBoardExtents {
+        min: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
+        max: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
+    });
     Ok(LiveSnapshot {
         state: BoardState {
             footprints,
@@ -1629,6 +1693,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
                 max_y: extents.max.y,
             },
         },
+        staging,
         items,
         net_codes,
         document,
@@ -4312,6 +4377,7 @@ mod tests {
             changes,
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
+            staging: None,
         }
     }
 
@@ -4554,6 +4620,15 @@ mod tests {
         /// As [`Self::new`], with KiCad also holding one board graphic whose
         /// box is `outline`, `(x, y, width, height)` in mm.
         async fn holding_outline(outline: Option<(f64, f64, f64, f64)>) -> Self {
+            Self::refusing(outline, Vec::new()).await
+        }
+
+        /// As [`Self::holding_outline`], with KiCad refusing to list each class
+        /// in `refused`, as KiCad 10.0.5 refuses tables and generators.
+        async fn refusing(
+            outline: Option<(f64, f64, f64, f64)>,
+            refused: Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType>,
+        ) -> Self {
             use crate::tools::cli::test_support::write_script;
             use konnect_ipc::gen::kiapi;
 
@@ -4577,8 +4652,9 @@ mod tests {
                     "@echo off\r\n:loop\r\nif \"%~1\"==\"\" exit /b 2\r\nif \"%~1\"==\"--output\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\ncopy /Y \"{windows_source}\" \"%~1\" >nul\r\nexit /b %ERRORLEVEL%\r\n"
                 ),
             );
-            let kicad = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
+            let kicad = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board_refusing(
                 &board,
+                refused,
                 move |command| {
                     if command.type_url.ends_with("GetItems") {
                         let request =
@@ -4699,6 +4775,109 @@ mod tests {
         assert!(x > 155.0 && x < 165.0, "staged at x = {x}: {plan:#}");
         // Stacked down from the board's top edge (80 mm), not from y = 0.
         assert!(y > 80.0 && y < 90.0, "staged at y = {y}: {plan:#}");
+    }
+
+    /// The classes KiCad 10.0.5 refuses to list on every board.
+    fn kicad_10_refusals() -> Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType> {
+        use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as Kind;
+        vec![Kind::KotPcbTable, Kind::KotPcbGenerator]
+    }
+
+    /// One refused class, as `staging.unavailable_item_classes` reports it.
+    fn refused_class(class: &str) -> serde_json::Value {
+        serde_json::json!({
+            "class": class,
+            "reason": "refused",
+            "kiapi_status": "AS_BAD_REQUEST",
+            "message": crate::tools::pcb_board::board_mock::KICAD_CLASS_REFUSAL,
+        })
+    }
+
+    /// #688's disclosure in its sync consumer. On a board KiCad 10.0.5 holds,
+    /// additions are staged beside what KiCad measured, and the dry run says
+    /// that is not the whole board: tables and generators were not listed.
+    #[tokio::test]
+    async fn staging_names_the_classes_kicad_would_not_list() {
+        let served =
+            ServedSync::refusing(Some((100.0, 80.0, 50.0, 40.0)), kicad_10_refusals()).await;
+
+        let plan = served
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(
+            plan["staging"],
+            serde_json::json!({
+                "basis": "partial_geometry",
+                "unavailable_item_classes": [refused_class("tables"), refused_class("generators")],
+            }),
+            "{plan:#}"
+        );
+        // Still staged beside the measured outline.
+        let x = plan["changes"][0]["position"]["x"].as_f64().unwrap();
+        assert!(x > 155.0 && x < 165.0, "staged at x = {x}: {plan:#}");
+    }
+
+    /// A board where KiCad measured nothing but would not list some classes is
+    /// not called empty: it may hold tables or generators. Staging still starts
+    /// at the origin, and the response says why.
+    #[tokio::test]
+    async fn a_board_with_nothing_measured_is_not_reported_empty() {
+        let served = ServedSync::refusing(None, kicad_10_refusals()).await;
+
+        let plan = served
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["staging"]["basis"], "no_measured_geometry", "{plan:#}");
+        assert_eq!(
+            plan["staging"]["unavailable_item_classes"],
+            serde_json::json!([refused_class("tables"), refused_class("generators")])
+        );
+        let x = plan["changes"][0]["position"]["x"].as_f64().unwrap();
+        assert!(
+            x > 5.0 && x < 15.0,
+            "staged from the origin, x = {x}: {plan:#}"
+        );
+    }
+
+    /// The controls: a KiCad that lists every class reports a board it measured
+    /// as complete, and one holding nothing as empty, with no classes named.
+    #[tokio::test]
+    async fn a_board_whose_every_class_was_listed_is_complete_or_empty() {
+        let measured = ServedSync::holding_outline(Some((100.0, 80.0, 50.0, 40.0))).await;
+        let plan = measured
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert_eq!(
+            plan["staging"],
+            serde_json::json!({ "basis": "complete_geometry", "unavailable_item_classes": [] }),
+            "{plan:#}"
+        );
+
+        let empty = ServedSync::new().await;
+        let plan = empty
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert_eq!(
+            plan["staging"],
+            serde_json::json!({ "basis": "empty_board", "unavailable_item_classes": [] }),
+            "{plan:#}"
+        );
+    }
+
+    /// A refusal before the board was read has no staging to report, and
+    /// says so with `null` rather than a basis it never measured.
+    #[test]
+    fn a_plan_that_never_reached_the_board_reports_no_staging() {
+        let plan = plan_adding(Vec::new());
+        let body = match &sync_response(&plan, "conflict", 1, false).content[0] {
+            ToolContent::Text { text } => serde_json::from_str::<serde_json::Value>(text).unwrap(),
+            _ => panic!("sync response was not JSON text"),
+        };
+        assert_eq!(body["staging"], serde_json::Value::Null);
     }
 
     /// #657 through the served boundary. The run that found it needed two

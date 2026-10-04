@@ -1680,7 +1680,9 @@ struct BoardExtentsCounts {
 
 /// One class a live read could not measure, with the evidence for it: KiCad's
 /// own refusal, or how many items it listed that this protocol cannot read.
-fn unavailable_item_class(class: &konnect_ipc::IpcUnavailableItemClass) -> serde_json::Value {
+pub(crate) fn unavailable_item_class(
+    class: &konnect_ipc::IpcUnavailableItemClass,
+) -> serde_json::Value {
     match &class.reason {
         konnect_ipc::UnavailableReason::Refused { status, message } => json!({
             "class": class.class,
@@ -2849,6 +2851,63 @@ pub(crate) mod board_mock {
         respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
     ) -> MockIpcServer {
         spawn_kicad_holding_boards(&[board], respond)
+    }
+
+    /// What KiCad 10.0.5 answers `GetItems` with for a class it will not list
+    /// on a board (tables and generators among them), measured 2026-10-03.
+    pub const KICAD_CLASS_REFUSAL: &str =
+        "none of the requested types are valid for a Board object";
+
+    /// As [`spawn_kicad_holding_board`], refusing `GetItems` for each class in
+    /// `refused` with `AS_BAD_REQUEST` and [`KICAD_CLASS_REFUSAL`], as KiCad
+    /// 10.0.5 refuses tables and generators.
+    pub fn spawn_kicad_holding_board_refusing(
+        board: &std::path::Path,
+        refused: Vec<kiapi::common::types::KiCadObjectType>,
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> MockIpcServer {
+        use prost::Message;
+        let documents = vec![board_document(&board.to_string_lossy())];
+        MockIpcServer::spawn("board-refusing-classes", move |request| {
+            let command = request.message.expect("a command");
+            let reply = |status: kiapi::common::ApiStatusCode, error: &str, message| {
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: status as i32,
+                        error_message: error.to_string(),
+                    }),
+                    header: None,
+                    message,
+                }
+            };
+            if command.type_url.ends_with("GetOpenDocuments") {
+                return reply(
+                    kiapi::common::ApiStatusCode::AsOk,
+                    "",
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: documents.clone(),
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                );
+            }
+            if command.type_url.ends_with("GetItems") {
+                let asked = kiapi::common::commands::GetItems::decode(command.value.as_slice())
+                    .expect("GetItems request");
+                if refused
+                    .iter()
+                    .any(|kind| asked.types.contains(&(*kind as i32)))
+                {
+                    return reply(
+                        kiapi::common::ApiStatusCode::AsBadRequest,
+                        KICAD_CLASS_REFUSAL,
+                        None,
+                    );
+                }
+            }
+            reply(kiapi::common::ApiStatusCode::AsOk, "", respond(&command))
+        })
     }
 
     /// As [`spawn_kicad_holding_board`], for the two answers that are not

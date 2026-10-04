@@ -121,6 +121,23 @@ footprints 5 mm to the right of it. It used to stage them beside the page origin
 and therefore `plan_revision`, differ from plans computed before this change.
 Apply already requires a fresh dry run.
 
+`update_pcb_from_schematic` stages the footprints it adds beside the same live
+measurement, and now says what that measurement covered. Its dry-run and apply
+responses gain `staging`:
+
+- `basis` is one of:
+  - `complete_geometry`: every class was listed and measured;
+  - `partial_geometry`: staged beside what KiCad measured, without the classes
+    listed below (on KiCad 10.0.5, every board's tables and generators);
+  - `empty_board`: every class was listed and none held an item;
+  - `no_measured_geometry`: nothing was measured, but some classes could not
+    be listed, so the board is not known to be empty. Staging starts at the
+    origin.
+- `unavailable_item_classes` uses the same shape as `get_board_extents`.
+
+`staging` is `null` when the sync was refused before it read the board. It
+never refuses a sync: staging is a starting position.
+
 ## Unreleased: `check_freerouting` reports where it searched (minor release)
 
 The `jar_path` argument of `check_freerouting` and `route_specctra_dsn` was
