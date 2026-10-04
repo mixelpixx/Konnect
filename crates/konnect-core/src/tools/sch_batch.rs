@@ -28,8 +28,9 @@ use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_annotate::opt_string;
 use super::sch_components::{
-    commit_component_deletion, indexed_uuid_items, place_one_component, placed_component_readback,
-    plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
+    commit_component_deletion, dnp_property_refusal, indexed_uuid_items, is_dnp_property,
+    place_one_component, placed_component_readback, plan_component_and_item_deletions,
+    set_dnp_attribute, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
     add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
@@ -199,9 +200,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_edit_schematic_components",
-            "Apply field updates (Value, Footprint, custom properties) to multiple components \
-             in a single atomic file write. Missing custom properties are created on every \
-             placed unit only when create_missing is true.",
+            "Apply field updates (Value, Footprint, custom properties) and KiCad's native \
+             do-not-populate (DNP) attribute to multiple components in a single atomic file \
+             write. Missing custom properties are created on every placed unit only when \
+             create_missing is true.",
             json!({
                 "type": "object",
                 "properties": {
@@ -213,13 +215,17 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "edits": {
                         "type": "array",
-                        "description": "List of {reference, value?, footprint?, fields?} edit objects",
+                        "description": "List of {reference, value?, footprint?, dnp?, fields?} edit objects",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
+                                "dnp": {
+                                    "type": "boolean",
+                                    "description": "Set KiCad's native do-not-populate attribute, (dnp yes|no), on every placed unit of this component. A property named DNP is refused in 'fields'."
+                                },
                                 "fields": {
                                     "type": "object",
                                     "additionalProperties": { "type": "string" },
@@ -1159,13 +1165,30 @@ async fn handle_batch_edit(
         Some(_) => return Ok(invalid_arg("create_missing", "must be a boolean")),
     };
 
+    // A property named DNP anywhere refuses the whole batch before anything
+    // is read for writing; no other entry is applied.
+    for (index, edit_spec) in edits_arr.iter().enumerate() {
+        if let Some(name) = edit_spec["fields"]
+            .as_object()
+            .and_then(|fields| fields.keys().find(|name| is_dnp_property(name)))
+        {
+            return Ok(invalid_arg(
+                &format!("edits[{index}].fields"),
+                &dnp_property_refusal(name),
+            ));
+        }
+    }
+
     let expected = read_consistent(&sch_path)?;
     let mut content = expected.clone();
     let mut changed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut seen_assignments = HashSet::new();
+    let mut dnp_references = HashSet::new();
     let mut updated_unit_copies = 0;
     let mut created_unit_copies = 0;
+    // (index into `changed`, reference, requested state) for the readback.
+    let mut dnp_writes: Vec<(usize, String, bool)> = Vec::new();
 
     for edit_spec in &edits_arr {
         let reference = match edit_spec["reference"].as_str() {
@@ -1266,7 +1289,39 @@ async fn handle_batch_edit(
             }));
         }
 
+        let requested_dnp = match edit_spec.get("dnp") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(dnp)) => Some(*dnp),
+            Some(_) => {
+                errors.push(format!("'dnp' for '{reference}' must be a boolean"));
+                None
+            }
+        };
+        let mut applied_dnp = None;
+        if let Some(dnp) = requested_dnp {
+            if !dnp_references.insert(reference.to_string()) {
+                errors.push(format!("Duplicate assignment for 'dnp' on '{reference}'"));
+            } else {
+                match set_dnp_attribute(&content, reference, dnp) {
+                    Ok((next, units)) => {
+                        content = next;
+                        applied_dnp = Some(dnp);
+                        let state = if dnp { "yes" } else { "no" };
+                        component_changes.push(if units > 1 {
+                            format!("dnp → {state} ({units} units)")
+                        } else {
+                            format!("dnp → {state}")
+                        });
+                    }
+                    Err(error) => errors.push(format!("dnp on '{reference}': {error}")),
+                }
+            }
+        }
+
         if !component_changes.is_empty() {
+            if let Some(dnp) = applied_dnp {
+                dnp_writes.push((changed.len(), reference.to_string(), dnp));
+            }
             changed.push(json!({
                 "reference": reference,
                 "changes": component_changes,
@@ -1277,7 +1332,56 @@ async fn handle_batch_edit(
         }
     }
 
+    #[cfg(test)]
+    let content = apply_batch_write_fault(content);
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+
+    // The DNP state reported is the one the saved file holds, read back from
+    // it, not the one requested.
+    if !dnp_writes.is_empty() {
+        // An uncertain outcome still names what the write carried, so the
+        // caller can inspect those entries rather than re-derive them.
+        let carried = changed
+            .iter()
+            .map(|entry| {
+                let changes = entry["changes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} ({changes})", entry["reference"].as_str().unwrap_or("?"))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let uncertain = |why: String| {
+            crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "batch_edit_schematic_components",
+                format!("{why}. Entries in the write: {carried}"),
+            )
+        };
+        let committed = match cse::Schematic::load(&sch_path) {
+            Ok(committed) => committed,
+            Err(error) => {
+                return Ok(uncertain(format!(
+                    "The written schematic could not be loaded: {error}"
+                )))
+            }
+        };
+        for (index, reference, requested) in dnp_writes {
+            match observed_dnp(&committed, &reference) {
+                Ok(observed) if observed == requested => changed[index]["dnp"] = json!(observed),
+                Ok(observed) => {
+                    return Ok(uncertain(format!(
+                        "'{reference}' reads back with dnp {observed}, not {requested}"
+                    )))
+                }
+                Err(why) => return Ok(uncertain(why)),
+            }
+        }
+    }
 
     Ok(CallToolResult::json(&json!({
         "updated_count": changed.len(),
@@ -1286,6 +1390,45 @@ async fn handle_batch_edit(
         "updated": changed,
         "errors": errors
     })))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot corruption of the text the batch is about to write, so a
+    /// test can reach the readback's refusal of a write that did not land.
+    pub(crate) static BATCH_WRITE_FAULT: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn apply_batch_write_fault(content: String) -> String {
+    BATCH_WRITE_FAULT.with(|fault| match fault.borrow_mut().take() {
+        Some((from, to)) => {
+            assert!(content.contains(&from), "batch fault anchor absent: {from}");
+            content.replacen(&from, &to, 1)
+        }
+        None => content,
+    })
+}
+
+/// The one native DNP state every placed unit of `reference` holds in
+/// `committed`. Units that disagree have no one state, and KiCad's exports
+/// disagree about them too: its BOM marks the part DNP while a BOM with DNP
+/// exclusion still lists it as fitted.
+pub(crate) fn observed_dnp(committed: &cse::Schematic, reference: &str) -> Result<bool, String> {
+    let states = committed
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.reference() == Some(reference))
+        .map(|symbol| symbol.dnp)
+        .collect::<BTreeSet<_>>();
+    match states.len() {
+        1 => Ok(*states.first().expect("one state")),
+        0 => Err(format!(
+            "'{reference}' has no placed unit in the written file"
+        )),
+        _ => Err(format!("the placed units of '{reference}' disagree on dnp")),
+    }
 }
 
 async fn handle_batch_delete_components(

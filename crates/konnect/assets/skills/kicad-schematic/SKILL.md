@@ -226,6 +226,14 @@ dedicated arguments or workflows for built-in fields. Inspect each result's
 “updated_units” and “created_units” counts, because a partially populated
 multi-unit component can report both.
 
+To mark parts do-not-populate, give an edit `dnp: true` (or `false` to fit it
+again). That sets KiCad's native attribute on every placed unit, which is what
+KiCad's plot marks and what a BOM export with DNP exclusion reads. Never write
+a field named `DNP`: KiCad does not treat it as DNP (it can even fill the
+BOM's DNP column for a fitted part), and the tools refuse the whole request.
+Confirm the result from the reported `dnp`, or from `get_schematic_component`
+/ `list_schematic_components`, which read it back from the file.
+
 ### When to Use Batch vs Individual
 
 - 1-2 components: individual calls

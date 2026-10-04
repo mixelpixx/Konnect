@@ -2913,6 +2913,7 @@ mod component_properties_dispatch_tests {
             "rotation": 0.0,
             "mirror_x": false,
             "mirror_y": false,
+            "dnp": false,
             "properties": {
                 "Reference": "R1",
                 "Value": "10k",
@@ -2950,6 +2951,7 @@ mod component_properties_dispatch_tests {
             "rotation": 0.0,
             "mirror_x": false,
             "mirror_y": false,
+            "dnp": false,
             "uuid": R1_UUID
         }]);
         assert_eq!(r1, expected);
@@ -2988,6 +2990,118 @@ mod component_properties_dispatch_tests {
                 }
                 other => panic!("unexpected reference {other:?}: {listed}"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_dnp_dispatch_tests {
+    //! KiCad's native DNP attribute across the served `tools/call` path (#415).
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/dnp_kicad10.kicad_sch");
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, tool: &str, arguments: Value) -> Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 415,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        response.result.expect("successful JSON-RPC response")
+    }
+
+    fn body(result: &Value) -> Value {
+        assert_ne!(result["isError"], json!(true), "{result}");
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dnp_is_written_and_read_back_through_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnp.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        let schematic = path.display().to_string();
+
+        let edited = body(
+            &call(
+                &handler,
+                "edit_schematic_component",
+                json!({ "schematic": schematic, "reference": "U1", "dnp": true }),
+            )
+            .await,
+        );
+        assert_eq!(edited["dnp"], true, "{edited}");
+        let got = body(
+            &call(
+                &handler,
+                "get_schematic_component",
+                json!({ "schematic": schematic, "reference": "U1" }),
+            )
+            .await,
+        );
+        assert_eq!(got["dnp"], true, "{got}");
+        assert_eq!(
+            got["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|unit| unit["dnp"].clone())
+                .collect::<Vec<_>>(),
+            [json!(true), json!(true), json!(true)],
+            "{got}"
+        );
+
+        let batch = body(
+            &call(
+                &handler,
+                "batch_edit_schematic_components",
+                json!({ "schematic": schematic, "edits": [{ "reference": "U1", "dnp": false }] }),
+            )
+            .await,
+        );
+        assert_eq!(batch["updated"][0]["dnp"], false, "{batch}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+
+    #[tokio::test]
+    async fn a_non_boolean_dnp_and_a_dnp_property_are_refused_through_the_served_dispatch() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dnp.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        let schematic = path.display().to_string();
+
+        for arguments in [
+            json!({ "schematic": schematic, "reference": "R1", "dnp": "yes" }),
+            json!({ "schematic": schematic, "reference": "R1", "fields": { "DNP": "yes" } }),
+        ] {
+            let result = call(&handler, "edit_schematic_component", arguments.clone()).await;
+            assert_eq!(result["isError"], true, "{arguments}: {result}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                SHEET,
+                "{arguments}"
+            );
         }
     }
 }
