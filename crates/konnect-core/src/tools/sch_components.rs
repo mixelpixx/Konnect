@@ -185,6 +185,38 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_rotate_schematic_component(args, ctx).await }
         ),
         tool!(
+            "mirror_schematic_component",
+            "Set or clear the mirror of a placed component, in eeschema's own vocabulary: \
+             'x' negates screen-Y, 'y' negates screen-X, 'none' clears it. Each unit is \
+             reflected about its own origin, after its rotation. Without 'unit', every \
+             placed unit takes the requested mirror; with 'unit', only that unit changes, \
+             so one gate of a package can be reflected while its siblings and its power \
+             unit are left as they are. Reference and Value text reflect with the body. \
+             The orientation is stored in the rotation and mirror pair eeschema writes for \
+             it, so a reflection can change the stored rotation without turning the body \
+             (180° with 'x' is stored as 0° with 'y'). A later rotate_schematic_component \
+             works from the stored angle, so read it from mirrored_units rather than \
+             assuming the one you set. mirrored_units reports each selected unit as \
+             written, with changed=false for one already as requested, and the file is \
+             not rewritten when nothing changes. Does NOT adjust connected \
+             wires. Junction dots are \
+             re-judged where the pins moved, reported as junctions_pruned_count and \
+             junctions_added_count. A no-connect flag travels with the pin it protects, \
+             reported as no_connects_moved; the change is refused before writing when \
+             that pin cannot be followed one-to-one.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "reference": { "type": "string" },
+                    "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "The mirror each selected unit ends up with. Absolute, not a toggle: asking for the state a unit already has leaves it unchanged. 'x' and 'y' are exclusive, as in eeschema; reflecting about both axes is rotation 180." },
+                    "unit": { "type": "integer", "minimum": 1, "description": "Optional unit number. Only that placed unit is changed, and it must be placed on this sheet. When omitted, every placed unit of the component is changed." }
+                },
+                "required": ["schematic", "reference", "mirror"]
+            }),
+            |args, ctx| async move { handle_mirror_schematic_component(args, ctx).await }
+        ),
+        tool!(
             "move_connected",
             "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
             // No parameters: the handler refuses unconditionally, and the
@@ -3222,6 +3254,155 @@ async fn handle_rotate_schematic_component(
         "rotated": observed["reference"],
         "rotation": observed["rotation"],
         "rotated_units": observed["unit_count"],
+        "placements": observed["units"],
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers
+    });
+    copy_component_observation(&mut result, &observed);
+    Ok(CallToolResult::json(&result))
+}
+
+async fn handle_mirror_schematic_component(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(r) => r.to_string(),
+        Err(e) => return Ok(e),
+    };
+    // Required here, unlike at placement: an omitted axis would otherwise
+    // read as "none" and clear a mirror the caller never mentioned.
+    if let Err(error) = require_str(args, "mirror") {
+        return Ok(error);
+    }
+    let mirror = match mirror_arg(args, "mirror") {
+        Ok(mirror) => mirror,
+        Err(error) => return Ok(error),
+    };
+    // Unit 0 needs no check of its own: no unit 0 is ever placed, so it is
+    // refused below with the units that are.
+    let only_unit = match opt_u32(args, "unit") {
+        Ok(unit) => unit,
+        Err(error) => return Ok(error),
+    };
+
+    let before_source = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
+    let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
+    };
+    // KiCad stores the mirror per placed unit, so the selection is by unit
+    // number. Every unit left out keeps the mirror the file already gives it,
+    // and the readback below holds it to that bound state.
+    let selected = target
+        .units
+        .iter()
+        .filter(|unit| only_unit.is_none_or(|wanted| unit.unit == wanted))
+        .map(|unit| unit.uuid.clone())
+        .collect::<BTreeSet<_>>();
+    if selected.is_empty() {
+        let placed = target
+            .units
+            .iter()
+            .map(|unit| unit.unit)
+            .collect::<BTreeSet<_>>();
+        return Ok(crate::tools::invalid_arg(
+            "unit",
+            &format!(
+                "'{reference}' has no placed unit {} on this sheet (placed: {})",
+                only_unit.unwrap_or_default(),
+                placed
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    // The intent is bound apart from the writer: the requested reflection on
+    // each unit's own turn, in the pair eeschema writes for it. A unit whose
+    // bound pair is unchanged is already as requested.
+    let mut changed = BTreeSet::new();
+    for unit in target
+        .units
+        .iter_mut()
+        .filter(|unit| selected.contains(&unit.uuid))
+    {
+        let (rotation, mirror) = cse::kicad_orientation(unit.rotation, mirror);
+        if (rotation, mirror) != (unit.rotation, unit.mirror.as_deref()) {
+            changed.insert(unit.uuid.clone());
+        }
+        unit.rotation = rotation;
+        unit.mirror = mirror.map(str::to_owned);
+    }
+    // Nothing to change leaves the file alone, timestamp included. Judged on
+    // the bound pairs, not the bytes: re-serializing an untouched sheet still
+    // re-wraps its `(pts …)` lists (#210).
+    let (added, pruned, moved_markers) = if changed.is_empty() {
+        (0, 0, Vec::new())
+    } else {
+        for symbol in sch
+            .symbols
+            .iter_mut()
+            .filter(|symbol| changed.contains(&symbol.uuid))
+        {
+            // Reflects the field text with the body (#613), then stores the
+            // orientation as eeschema would, so its next save changes nothing.
+            symbol.set_mirror(mirror);
+            symbol.normalize_orientation();
+        }
+        // A reflection relocates pin endpoints exactly as a turn does, so the
+        // markers on those pins travel with them here too (#626).
+        let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+            Ok(carried) => carried,
+            Err(error) => return Ok(error),
+        };
+        let candidate = sch.to_source();
+        let (candidate, added, pruned) =
+            reconcile_junctions_for_placement(&before_source, candidate);
+        write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+        let moved_markers =
+            match observed_no_connect_moves(&sch_path, "mirror_schematic_component", &carried)? {
+                Ok(moved) => moved,
+                Err(error) => return Ok(error),
+            };
+        (added, pruned, moved_markers)
+    };
+    let observed = match load_component_mutation_readback(&sch_path, &target)? {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
+    // Each selected unit as the committed file has it. The readback has just
+    // held every unit to its bound pair, so `changed` is a fact about the
+    // file, not an echo of the request. The top-level fields copied below
+    // describe the lowest-numbered unit, as in every component tool, which is
+    // not necessarily one that was selected.
+    let mirrored_units = observed["units"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|unit| {
+            let uuid = unit["uuid"].as_str()?;
+            selected.contains(uuid).then(|| {
+                json!({
+                    "unit": unit["unit"],
+                    "uuid": uuid,
+                    "rotation": unit["rotation"],
+                    "mirror_x": unit["mirror_x"],
+                    "mirror_y": unit["mirror_y"],
+                    "changed": changed.contains(uuid)
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({
+        "mirrored": observed["reference"],
+        "mirrored_units": mirrored_units,
+        "changed_unit_count": changed.len(),
         "placements": observed["units"],
         "junctions_added_count": added,
         "junctions_pruned_count": pruned,
@@ -6373,7 +6554,7 @@ mod no_connect_carry_tests {
     }
 
     /// Where the file now has the marker with this UUID.
-    fn marker_at(content: &str, uuid: &str) -> (f64, f64) {
+    pub(super) fn marker_at(content: &str, uuid: &str) -> (f64, f64) {
         let tree = parse_sexp(content).expect("the written sheet parses");
         tree.find_all("no_connect")
             .into_iter()
@@ -9345,5 +9526,475 @@ mod rotate_junction_reconciliation_tests {
 
         assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+}
+
+#[cfg(test)]
+mod mirror_component_tests {
+    use super::rotate_field_text_tests::{field_positions, to_nanometres};
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    /// KiCad-saved twins (#613): each symbol, and the same symbol placed with
+    /// the target reflection 25.4mm below it.
+    const SHEET: &str = include_str!("../../tests/fixtures/mirror_fields_kicad10.kicad_sch");
+    const TWIN_OFFSET_MM: f64 = 25.4;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn sheet(source: &str, name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(name);
+        std::fs::write(&path, source).unwrap();
+        (directory, path)
+    }
+
+    /// A real eeschema save placing U1 as all three units of the dual triode
+    /// `ECC83`: two triodes and the heater, none of them mirrored.
+    fn ecc83() -> (tempfile::TempDir, std::path::PathBuf) {
+        sheet(
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+            "ecc83.kicad_sch",
+        )
+    }
+
+    async fn mirror(args: serde_json::Value) -> CallToolResult {
+        handle_mirror_schematic_component(&args, &context())
+            .await
+            .unwrap()
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "mirror unexpectedly failed: {result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Each placed unit's mirror token, by unit number, read from the file.
+    fn mirrors(path: &std::path::Path, reference: &str) -> Vec<(u32, Option<String>)> {
+        let schematic = cse::Schematic::load(path).unwrap();
+        let mut placed = schematic
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some(reference))
+            .map(|symbol| (symbol.unit, symbol.mirror.clone()))
+            .collect::<Vec<_>>();
+        placed.sort();
+        placed
+    }
+
+    /// Every pin endpoint of `reference`, in nanometres, lifted by `lift_mm`.
+    fn pins(path: &std::path::Path, reference: &str, lift_mm: f64) -> Vec<(String, i64, i64)> {
+        let (_, tree) = read_schematic(path).unwrap();
+        let located = pin_locations_for_reference(&tree, reference).unwrap();
+        let mut pins = located["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pin| {
+                (
+                    pin["number"].as_str().unwrap().to_owned(),
+                    (pin["x"].as_f64().unwrap() * 1_000_000.0).round() as i64,
+                    ((pin["y"].as_f64().unwrap() - lift_mm) * 1_000_000.0).round() as i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        pins.sort();
+        pins
+    }
+
+    /// Reflecting a placed symbol through the tool must leave it exactly as
+    /// placing it reflected does: KiCad's own save of the twin is the answer.
+    /// The cases cover both axes, a turned body (rotate first, mirror
+    /// second), swapping one axis for the other, and clearing.
+    #[tokio::test]
+    async fn a_reflected_symbol_lands_on_its_twin() {
+        for (reference, axis, twin) in [
+            ("D1", "x", "D2"),
+            ("U1", "y", "U2"),
+            ("U3", "x", "U4"),
+            ("U5", "y", "U6"),
+            ("U7", "none", "U8"),
+        ] {
+            let (_directory, path) = sheet(SHEET, "mirror.kicad_sch");
+            let (_original, original) = sheet(SHEET, "original.kicad_sch");
+            let response = body(
+                &mirror(json!({ "schematic": path, "reference": reference, "mirror": axis })).await,
+            );
+            assert_eq!(response["changed_unit_count"], 1, "{reference}: {response}");
+            let (was_x, was_y) = match mirrors(&original, twin)[0].1.as_deref() {
+                Some("x") => (true, false),
+                Some("y") => (false, true),
+                _ => (false, false),
+            };
+            assert_eq!(
+                (
+                    &response["mirrored_units"][0]["mirror_x"],
+                    &response["mirrored_units"][0]["mirror_y"]
+                ),
+                (&json!(was_x), &json!(was_y)),
+                "{reference}: {response}"
+            );
+
+            let committed = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                mirrors(&path, reference)[0].1,
+                mirrors(&original, twin)[0].1,
+                "{reference} must carry {twin}'s mirror token"
+            );
+            let lifted =
+                field_positions(SHEET, twin).map(|(x, y, angle)| (x, y - TWIN_OFFSET_MM, angle));
+            assert_eq!(
+                to_nanometres(field_positions(&committed, reference)),
+                to_nanometres(lifted),
+                "{reference}'s Reference and Value must land on {twin}'s"
+            );
+            assert_eq!(
+                pins(&path, reference, 0.0),
+                pins(&original, twin, TWIN_OFFSET_MM),
+                "{reference}'s pins must land on {twin}'s"
+            );
+        }
+    }
+
+    /// One gate of a package reflected alone: the other triode and the
+    /// heater keep the state the file gave them.
+    #[tokio::test]
+    async fn a_unit_is_reflected_alone() {
+        let (_directory, path) = ecc83();
+        assert_eq!(
+            mirrors(&path, "U1"),
+            vec![(1, None), (2, None), (3, None)],
+            "fixture premise"
+        );
+        let response = body(
+            &mirror(json!({ "schematic": path, "reference": "U1", "mirror": "y", "unit": 2 }))
+                .await,
+        );
+        assert_eq!(response["changed_unit_count"], 1, "{response}");
+        let reported = &response["mirrored_units"];
+        assert_eq!(reported.as_array().unwrap().len(), 1, "{response}");
+        assert_eq!(reported[0]["unit"], 2, "{response}");
+        assert_eq!(reported[0]["mirror_y"], true, "{response}");
+        assert_eq!(reported[0]["mirror_x"], false, "{response}");
+        assert_eq!(reported[0]["changed"], true, "{response}");
+        assert_eq!(
+            mirrors(&path, "U1"),
+            vec![(1, None), (2, Some("y".to_owned())), (3, None)]
+        );
+    }
+
+    /// Clearing one unit leaves a sibling that is still reflected alone.
+    #[tokio::test]
+    async fn clearing_a_unit_leaves_its_sibling_reflected() {
+        let (_directory, path) = ecc83();
+        body(&mirror(json!({ "schematic": path, "reference": "U1", "mirror": "x" })).await);
+        body(
+            &mirror(json!({ "schematic": path, "reference": "U1", "mirror": "none", "unit": 1 }))
+                .await,
+        );
+        assert_eq!(
+            mirrors(&path, "U1"),
+            vec![
+                (1, None),
+                (2, Some("x".to_owned())),
+                (3, Some("x".to_owned()))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_unit_every_placed_unit_is_reflected() {
+        let (_directory, path) = ecc83();
+        let response =
+            body(&mirror(json!({ "schematic": path, "reference": "U1", "mirror": "x" })).await);
+        assert_eq!(response["changed_unit_count"], 3, "{response}");
+        let mut numbers = response["mirrored_units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|unit| unit["unit"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [1, 2, 3], "{response}");
+        assert!(mirrors(&path, "U1")
+            .iter()
+            .all(|(_, mirror)| mirror.as_deref() == Some("x")));
+    }
+
+    /// Each refusal names its reason and writes nothing. An omitted axis is
+    /// refused rather than read as "none", which would clear a mirror the
+    /// caller never mentioned.
+    #[tokio::test]
+    async fn refusals_write_nothing() {
+        for (args, reason) in [
+            (
+                json!({ "reference": "U1", "unit": 4, "mirror": "x" }),
+                "no placed unit 4 on this sheet (placed: 1, 2, 3)",
+            ),
+            (
+                json!({ "reference": "U1", "unit": 0, "mirror": "x" }),
+                "no placed unit 0 on this sheet (placed: 1, 2, 3)",
+            ),
+            (
+                json!({ "reference": "U1" }),
+                "Argument 'mirror' is invalid: missing or not a string",
+            ),
+            (json!({ "reference": "U1", "mirror": "X" }), r#"got "X""#),
+            (json!({ "reference": "U1", "mirror": "xy" }), r#"got "xy""#),
+            (json!({ "reference": "U9", "mirror": "x" }), "U9"),
+        ] {
+            let (_directory, path) = ecc83();
+            let before = std::fs::read_to_string(&path).unwrap();
+            let mut args = args;
+            args["schematic"] = json!(path);
+            let result = mirror(args.clone()).await;
+            assert!(result.is_error, "{args} must be refused");
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text result");
+            };
+            // Structured refusals carry their reason in `message`.
+            let message = serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|body| body["message"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| text.clone());
+            assert!(message.contains(reason), "{args}: {message}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "{args}");
+        }
+    }
+
+    /// `(mirror x)` on an upright resistor swaps its pin ends, so the
+    /// no-connect on pin 2's top end must follow the pin to the bottom.
+    #[tokio::test]
+    async fn a_reflection_carries_the_marker_with_its_pin() {
+        const R2_MARKER: &str = "1a251b9a-30be-43fa-bf5f-04706ed82788";
+        let (_directory, path) = sheet(
+            include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch"),
+            "carry.kicad_sch",
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            super::no_connect_carry_tests::marker_at(&before, R2_MARKER),
+            (158.75, 156.21),
+            "fixture premise"
+        );
+        let response =
+            body(&mirror(json!({ "schematic": path, "reference": "R2", "mirror": "x" })).await);
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        assert_eq!(
+            response["no_connects_moved"][0]["uuid"], R2_MARKER,
+            "{response}"
+        );
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            super::no_connect_carry_tests::marker_at(&committed, R2_MARKER),
+            (158.75, 163.83)
+        );
+    }
+
+    /// A reflection on a turned body is stored in the pair eeschema writes
+    /// for it, and the re-expression moves nothing: the fields and pins are
+    /// where the requested reflection, applied without it, puts them.
+    #[tokio::test]
+    async fn the_orientation_is_stored_as_eeschema_writes_it() {
+        for rotation in [0.0, 90.0, 180.0, 270.0] {
+            for axis in ["x", "y"] {
+                let (_directory, path) = sheet(SHEET, "turned.kicad_sch");
+                body(
+                    &handle_rotate_schematic_component(
+                        &json!({ "schematic": path, "reference": "U1", "rotation": rotation }),
+                        &context(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                // The expectation: the same reflection, left as requested.
+                let turned = std::fs::read_to_string(&path).unwrap();
+                let mut unnormalized =
+                    cse::Schematic::from_source(&path, turned.clone()).expect("sheet parses");
+                unnormalized
+                    .symbols
+                    .iter_mut()
+                    .find(|symbol| symbol.reference() == Some("U1"))
+                    .unwrap()
+                    .set_mirror(Some(axis));
+                let (_expected_dir, expected) =
+                    sheet(&unnormalized.to_source(), "expected.kicad_sch");
+
+                let response = body(
+                    &mirror(json!({ "schematic": path, "reference": "U1", "mirror": axis })).await,
+                );
+                let (want_rotation, want_mirror) = cse::kicad_orientation(rotation, Some(axis));
+                let reported = &response["mirrored_units"][0];
+                assert_eq!(
+                    reported["rotation"], want_rotation,
+                    "{rotation}° {axis}: {response}"
+                );
+                assert_eq!(
+                    mirrors(&path, "U1")[0].1.as_deref(),
+                    want_mirror,
+                    "{rotation}° {axis}"
+                );
+                let committed = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    committed.contains(&format!("(at 139.7 50.8 {want_rotation})")),
+                    "{rotation}° {axis}: the stored turn must be {want_rotation}"
+                );
+                assert_eq!(
+                    to_nanometres(field_positions(&committed, "U1")),
+                    to_nanometres(field_positions(&unnormalized.to_source(), "U1")),
+                    "{rotation}° {axis}: fields must not move"
+                );
+                assert_eq!(
+                    pins(&path, "U1", 0.0),
+                    pins(&expected, "U1", 0.0),
+                    "{rotation}° {axis}: pins must not move"
+                );
+            }
+        }
+    }
+
+    /// Asking for the state a unit already has changes nothing and says so:
+    /// the file is not rewritten, not even its timestamp.
+    #[tokio::test]
+    async fn a_unit_already_as_requested_is_left_alone() {
+        let (_directory, path) = sheet(SHEET, "again.kicad_sch");
+        assert_eq!(
+            mirrors(&path, "D2")[0].1.as_deref(),
+            Some("x"),
+            "fixture premise"
+        );
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let response =
+            body(&mirror(json!({ "schematic": path, "reference": "D2", "mirror": "x" })).await);
+        assert_eq!(response["changed_unit_count"], 0, "{response}");
+        assert_eq!(
+            response["mirrored_units"][0]["changed"], false,
+            "{response}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    /// A reflected pin that lands mid-span on a wire gets its dot, as one
+    /// moved or turned onto the wire does. KiCad's own netlist puts U1 pin 3
+    /// on `/NETM` with the dot and leaves it unconnected without it (see the
+    /// fixture's README).
+    #[tokio::test]
+    async fn a_pin_reflected_onto_a_wire_gains_a_junction() {
+        let (_directory, path) = sheet(
+            include_str!("../../tests/fixtures/mirror_junctions_kicad10.kicad_sch"),
+            "junction.kicad_sch",
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !super::component_delete_connectivity_tests::has_junction(&before, 147.32, 50.8),
+            "fixture premise"
+        );
+        let response =
+            body(&mirror(json!({ "schematic": path, "reference": "U1", "mirror": "y" })).await);
+        assert_eq!(response["junctions_added_count"], 1, "{response}");
+        assert_eq!(response["junctions_pruned_count"], 0, "{response}");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            super::component_delete_connectivity_tests::has_junction(&committed, 147.32, 50.8),
+            "pin 3 must carry a dot where it lands on the NETM wire"
+        );
+    }
+
+    /// The ECC83 sheet with two states KiCad itself never writes: the heater
+    /// (unit 3) turned 180° with `(mirror x)`, and unit 1 carrying a literal
+    /// `(mirror none)`, as an older writer could leave them.
+    fn ecc83_with_odd_orientations() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (directory, path) = ecc83();
+        let mut schematic = cse::Schematic::load(&path).unwrap();
+        for symbol in schematic
+            .symbols
+            .iter_mut()
+            .filter(|symbol| symbol.reference() == Some("U1"))
+        {
+            match symbol.unit {
+                1 => symbol.mirror = Some("none".to_owned()),
+                3 => {
+                    symbol.at.rotation = Some(180.0);
+                    symbol.mirror = Some("x".to_owned());
+                }
+                _ => {}
+            }
+        }
+        std::fs::write(&path, schematic.to_source()).unwrap();
+        (directory, path)
+    }
+
+    /// Only the selected unit is normalised. A sibling left out keeps the
+    /// pair it has, even one eeschema would rewrite: the caller did not ask
+    /// for it to change.
+    #[tokio::test]
+    async fn a_unit_left_out_keeps_its_pair_even_a_non_canonical_one() {
+        let (_directory, path) = ecc83_with_odd_orientations();
+        body(
+            &mirror(json!({ "schematic": path, "reference": "U1", "mirror": "y", "unit": 2 }))
+                .await,
+        );
+        assert_eq!(
+            mirrors(&path, "U1"),
+            vec![
+                (1, Some("none".to_owned())),
+                (2, Some("y".to_owned())),
+                (3, Some("x".to_owned()))
+            ]
+        );
+        let schematic = cse::Schematic::load(&path).unwrap();
+        let heater = schematic
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some("U1") && symbol.unit == 3)
+            .unwrap();
+        assert_eq!(heater.at.rotation, Some(180.0));
+    }
+
+    /// A literal `(mirror none)` is the same drawing as no token, but not the
+    /// same file. Clearing it is a change: the token goes, and the response
+    /// says so.
+    #[tokio::test]
+    async fn clearing_a_literal_none_token_is_reported_as_a_change() {
+        let (_directory, path) = ecc83_with_odd_orientations();
+        let response = body(
+            &mirror(json!({ "schematic": path, "reference": "U1", "mirror": "none", "unit": 1 }))
+                .await,
+        );
+        assert_eq!(response["changed_unit_count"], 1, "{response}");
+        assert_eq!(response["mirrored_units"][0]["changed"], true, "{response}");
+        assert_eq!(mirrors(&path, "U1")[0], (1, None));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("(mirror none)"));
+    }
+
+    #[test]
+    fn the_tool_is_registered_in_sch_components() {
+        assert!(tools()
+            .iter()
+            .any(|tool| tool.name == "mirror_schematic_component"));
     }
 }

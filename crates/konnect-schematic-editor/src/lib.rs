@@ -11,7 +11,7 @@ pub use schematic::label::{
 };
 pub use schematic::misc::{Junction, NoConnect, Text};
 pub use schematic::sheet::{Sheet, SheetCollection, SheetInstance, SheetPin};
-pub use schematic::symbol::{Symbol, SymbolCollection};
+pub use schematic::symbol::{kicad_orientation, Symbol, SymbolCollection};
 pub use schematic::wire::{Wire, WireCollection};
 pub use schematic::{LocatedElement, Schematic};
 pub use types::{At, ChangeSet, Property};

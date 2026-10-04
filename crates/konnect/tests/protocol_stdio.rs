@@ -380,8 +380,8 @@ fn load_toolset_batch_form_loads_all_and_notifies_once() {
         .expect("expected a tools/call result")["result"]
         .clone();
     let body = McpProcess::tool_body(&r);
-    // sch_components (18) + sch_wiring (20).
-    assert_eq!(body["tools_added"].as_u64(), Some(38));
+    // sch_components (19) + sch_wiring (20).
+    assert_eq!(body["tools_added"].as_u64(), Some(39));
     // tools items are {name, description} objects, matching the legacy
     // single-name result shape -- not bare name strings.
     let tools = body["tools"].as_array().expect("tools array");
