@@ -52,6 +52,35 @@ A footprint point or a via layer whose `size` is present but unreadable is now
 skipped and counted in `skipped_item_count`. The point used to take the 1 mm
 default, and the via used to keep its base diameter (#688).
 
+## Unreleased: `update_pcb_from_schematic` places footprints with their library data (patch release)
+
+Footprints that `update_pcb_from_schematic` added used to reach the board with
+only their pads, drawings and Reference/Value fields. Everything else the library
+footprint carries was left at its default:
+
+- the mounting style (`smd`, `through_hole`) and exclusion flags from `(attr …)`;
+- the description and keywords;
+- every 3D model.
+
+As a result, KiCad treated each synced part as unspecified. `export_3d` with its
+default arguments left all of them out of the STEP, and KiCad's DRC flagged each
+one as `lib_footprint_mismatch`.
+
+A footprint the sync adds now carries all of these from its library. DNP still
+comes from the schematic, overriding a library `dnp`, as in KiCad's own Update
+PCB from Schematic.
+
+The post-apply readback also checks each footprint's mounting style and 3D model
+files against what was sent. A difference is reported in `diagnostics` as
+`board_readback_differs`, the same way a changed drawing count is reported.
+
+`update_footprints_from_library` uses the same readers, so it now accepts a 3D
+model hidden with KiCad 10's `(hide yes)`. 16 models in KiCad 10.0.5's own
+library are written that way, and the refresh used to refuse those footprints.
+
+Library properties (Datasheet, Description and custom fields) and each field's
+layer and visibility are not part of this change (#789).
+
 ## Unreleased: grid-snapped coordinates are written as KiCad writes them (patch release)
 
 A point snapped to the 1.27 mm grid is now rounded to the six decimals KiCad
