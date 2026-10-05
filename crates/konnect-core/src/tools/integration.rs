@@ -193,6 +193,101 @@ fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
     default_jlcpcb_db_path()
 }
 
+#[cfg(test)]
+mod configured_db_path_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn blank_database_configuration_uses_the_default_through_served_tools() {
+        const CHILD: &str = "KONNECT_TEST_JLCPCB_PATH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate platform path environment from other tests and user caches.
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::integration::configured_db_path_tests::blank_database_configuration_uses_the_default_through_served_tools",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("APPDATA", dir.path())
+                .env("HOME", dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let default = default_jlcpcb_db_path();
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        let configured = default.with_file_name(" configured.db");
+        let override_path = default.with_file_name("override.db");
+        for path in [&default, &configured, &override_path] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE components (LCSC TEXT, MFR_Part TEXT, Package TEXT, Manufacturer TEXT, Library_Type TEXT, Description TEXT, Datasheet TEXT, Price REAL, Stock INTEGER, Category TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO components VALUES ('C678', ?1, '0603', 'Test', 'Basic', 'path probe', '', 0.1, 10, 'Test')", [path.to_str().unwrap()]).unwrap();
+        }
+        for (setting, expected) in [
+            (None, default.clone()),
+            (Some(PathBuf::new()), default.clone()),
+            (Some(PathBuf::from(" \t\n ")), default.clone()),
+            (Some(configured.clone()), configured.clone()),
+        ] {
+            let config = ServerConfig {
+                jlcpcb_db_path: setting.clone(),
+                eager_toolsets: true,
+                ..Default::default()
+            };
+            let direct = ToolContext::new(
+                config.clone(),
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            );
+            assert_eq!(resolve_db_path(&json!({}), &direct), expected);
+            let handler = McpHandler::new(config).await.unwrap();
+            for selected in [&expected, &override_path] {
+                for (name, mut arguments) in [
+                    ("download_jlcpcb_database", json!({})),
+                    ("search_jlcpcb_parts", json!({"query": "path probe"})),
+                ] {
+                    if selected == &override_path {
+                        if name == "search_jlcpcb_parts" {
+                            continue;
+                        }
+                        arguments["output_path"] = json!(override_path);
+                    }
+                    let response = handler
+                        .handle_message(json!({
+                            "jsonrpc": "2.0", "id": 678, "method": "tools/call",
+                            "params": {"name": name, "arguments": arguments}
+                        }))
+                        .await
+                        .unwrap()
+                        .result
+                        .unwrap();
+                    assert_ne!(response["isError"], true, "{name}: {response}");
+                    let body: serde_json::Value =
+                        serde_json::from_str(response["content"][0]["text"].as_str().unwrap())
+                            .unwrap();
+                    if name == "download_jlcpcb_database" {
+                        assert_eq!(body["status"], "already_exists");
+                        assert_eq!(body["path"], json!(selected));
+                    } else {
+                        assert_eq!(body["results"][0]["mpn"], json!(selected));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ─── Retry/backoff for external HTTP calls ────────────────────────────────────
 //
 // JLCPCB database download and LCSC datasheet lookups are the only genuinely

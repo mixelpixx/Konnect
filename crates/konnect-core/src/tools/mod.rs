@@ -276,7 +276,7 @@ impl ToolContext {
     /// tests and by callers that don't need persistent call logs.
     pub fn new(config: ServerConfig, router: Arc<ToolRouter>) -> Self {
         ToolContext {
-            config,
+            config: config.normalized(),
             router,
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
@@ -294,7 +294,7 @@ impl ToolContext {
         observer: crate::observability::CallObserver,
     ) -> Self {
         ToolContext {
-            config,
+            config: config.normalized(),
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
@@ -379,6 +379,21 @@ pub struct ServerConfig {
     /// Pre-load every toolset at startup so the first `tools/list` is
     /// complete. Off by default (see `konnect::Config::eager_toolsets`).
     pub eager_toolsets: bool,
+}
+
+impl ServerConfig {
+    /// A blank database setting means "use the platform default", including
+    /// settings saved by the plugin. Preserve nonblank paths byte-for-byte.
+    fn normalized(mut self) -> Self {
+        if self
+            .jlcpcb_db_path
+            .as_ref()
+            .is_some_and(|path| path.to_str().is_some_and(|value| value.trim().is_empty()))
+        {
+            self.jlcpcb_db_path = None;
+        }
+        self
+    }
 }
 
 /// Serialises tests that set `KICAD*_DIR`. Those are process-wide and read at
