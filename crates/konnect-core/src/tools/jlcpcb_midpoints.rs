@@ -36,7 +36,7 @@ pub(super) fn capture(
         if fp
             .attributes
             .as_ref()
-            .is_some_and(|attrs| attrs.do_not_populate)
+            .is_some_and(|attrs| attrs.do_not_populate || attrs.exclude_from_position_files)
         {
             continue;
         }
@@ -232,6 +232,35 @@ mod tests {
                         .retain(|item| !item.type_url.ends_with("kiapi.board.types.Pad"));
                     items.items[0].value = fp.encode_to_vec();
                 }
+                if matches!(
+                    mode,
+                    "excluded-with-pads" | "excluded-no-pads" | "dnp" | "duplicate" | "bom-only"
+                ) {
+                    // Change only attributes/reference on native-captured items;
+                    // leave the pad geometry and UUID oracle untouched.
+                    let first = kiapi::board::types::FootprintInstance::decode(
+                        items.items[0].value.as_slice(),
+                    )
+                    .unwrap();
+                    for item in &mut items.items[1..3] {
+                        let mut fp =
+                            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                                .unwrap();
+                        fp.reference_field = first.reference_field.clone();
+                        let attrs = fp.attributes.get_or_insert_default();
+                        attrs.exclude_from_position_files = mode.starts_with("excluded-");
+                        attrs.do_not_populate = mode == "dnp";
+                        attrs.exclude_from_bill_of_materials = mode == "bom-only";
+                        if mode == "excluded-no-pads" {
+                            fp.definition
+                                .as_mut()
+                                .unwrap()
+                                .items
+                                .retain(|item| !item.type_url.ends_with("kiapi.board.types.Pad"));
+                        }
+                        item.value = fp.encode_to_vec();
+                    }
+                }
                 pack_any(&items, "kiapi.common.commands.GetItemsResponse")
             } else if command.type_url.ends_with("GetBoundingBox") {
                 let requested =
@@ -268,6 +297,41 @@ mod tests {
                 ..Default::default()
             }
         })
+    }
+
+    #[test]
+    fn position_exclusions_precede_duplicate_detection_and_geometry() {
+        let board = std::path::Path::new("midpoints.kicad_pcb");
+        let document =
+            super::super::pcb_board::board_mock::board_document(&board.to_string_lossy());
+        for mode in ["excluded-with-pads", "excluded-no-pads", "dnp"] {
+            let mock = fixture_server(board, mode);
+            let snapshot = capture(&KiCadIpcClient::new(mock.address()), document.clone()).unwrap();
+            assert_eq!(snapshot.midpoints.len(), 9, "{mode}");
+            // Two excluded items share the exported first item's reference.
+            // They must neither refuse the export nor replace its geometry.
+            let point = &snapshot.midpoints["JF0"];
+            assert_eq!((point.midpoint_x_mm, point.midpoint_y_mm), (20.0, 21.27));
+            let positions =
+                "Ref,Val,Package,PosX,PosY,Rot,Side\nJF0,X,JST,20.000000,-20.000000,0,top\n";
+            let (converted, evidence) = convert_positions(positions, &snapshot.midpoints).unwrap();
+            assert!(converted.contains("20.000000,-21.270000"), "{mode}");
+            assert_eq!(evidence.len(), 1, "{mode}");
+            assert_eq!(
+                snapshot.contents,
+                include_str!("../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb")
+            );
+        }
+        for mode in ["duplicate", "bom-only"] {
+            let mock = fixture_server(board, mode);
+            let error = capture(&KiCadIpcClient::new(mock.address()), document.clone())
+                .err()
+                .expect("position-included duplicates must still refuse");
+            assert!(
+                error.to_string().contains("duplicate footprint designator"),
+                "{mode}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -315,7 +379,7 @@ mod tests {
     async fn served_jlcpcb_refuses_closed_drifting_or_missing_geometry_without_output() {
         use crate::mcp::handler::McpHandler;
         use crate::tools::ServerConfig;
-        for mode in ["closed", "drift", "missing-box"] {
+        for mode in ["closed", "drift", "missing-box", "duplicate", "bom-only"] {
             let dir = tempfile::tempdir().unwrap();
             let board = dir.path().join("midpoints.kicad_pcb");
             let before = include_str!("../../tests/fixtures/jlcpcb_midpoints/midpoints.kicad_pcb");

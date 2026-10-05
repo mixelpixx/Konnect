@@ -51,6 +51,13 @@ rotated local bounding box. A footprint with no pads uses its observed anchor
 and reports `no_pads_observed_anchor`. Missing geometry or a board change during
 the reads refuses export before output creation; no anchor fallback is guessed.
 
+Footprints excluded from position files (`exclude_from_pos_files`) and DNP
+footprints are skipped during midpoint collection, matching the CPL export's
+selection. Excluded artwork may share placeholder references such as `REF**`
+without blocking assembly export, whether or not it has pads. Duplicate
+references on position-included, populated footprints still refuse export;
+excluding a footprint from the BOM alone does not exclude it from the CPL.
+
 Gerbers, drills, enabled-layer selection, and CPL positions use the same captured
 live board snapshot, including unsaved board edits. The original board is not
 saved or modified. Project settings and the schematic BOM still come from their

@@ -43,3 +43,11 @@ the official installed footprint given by `KONNECT_MIDPOINT_LIBRARY`. Setting
 generator. Setting
 `KONNECT_MIDPOINT_CAPTURE_DIR` during acceptance records the native artifacts;
 ordinary CI never regenerates the oracle.
+
+The position-exclusion regression replays these native messages with targeted
+in-memory changes to two footprints' attributes and reference fields. Both share
+the first included footprint's reference. Variants cover excluded footprints
+with/without pads, DNP, actual exported duplicates, and BOM-only exclusion. The
+captured geometry is unchanged; these variants are controlled test mutations,
+not additional live KiCad captures. The included footprint must retain its
+original observed midpoint and convert its position row successfully.
