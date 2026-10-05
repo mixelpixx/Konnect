@@ -1578,6 +1578,78 @@ mod rotate_junction_dispatch_tests {
 }
 
 #[cfg(test)]
+mod mirror_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// `mirror_schematic_component`'s `unit` selector passes the compiled
+    /// argument gate, and `mirrored_units` and `changed_unit_count` are
+    /// public response fields: prove both across the served `tools/call`
+    /// boundary, with the reflection actually written to the file.
+    #[tokio::test]
+    async fn one_unit_is_reflected_across_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("ecc83.kicad_sch");
+        std::fs::write(
+            &schematic,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "mirror_schematic_component",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "reference": "U1",
+                        "mirror": "y",
+                        "unit": 2
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool returns JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["changed_unit_count"], 1, "{body}");
+        assert_eq!(body["mirrored_units"][0]["unit"], 2, "{body}");
+        assert_eq!(body["mirrored_units"][0]["mirror_y"], true, "{body}");
+        let committed = konnect_schematic_editor::Schematic::load(&schematic).unwrap();
+        let mut placed = committed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some("U1"))
+            .map(|symbol| (symbol.unit, symbol.mirror.clone()))
+            .collect::<Vec<_>>();
+        placed.sort();
+        assert_eq!(
+            placed,
+            [(1, None), (2, Some("y".to_owned())), (3, None)],
+            "only unit 2 is reflected"
+        );
+    }
+}
+
+#[cfg(test)]
 mod ipc_failure_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;

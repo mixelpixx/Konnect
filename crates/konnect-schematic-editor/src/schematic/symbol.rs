@@ -473,6 +473,62 @@ impl Symbol {
             }
         });
     }
+
+    /// Store the orientation in the one form eeschema writes for it.
+    ///
+    /// Several rotation and mirror pairs draw the same body: `(mirror x)` is
+    /// `(mirror y)` turned 180°. eeschema keeps only the transform, so on its
+    /// next save it writes whichever pair [`kicad_orientation`] names, and a
+    /// pair it would not write survives only until KiCad touches the file.
+    /// The body, its pins and its field text are the same either way, so only
+    /// the two tokens change; the fields are not moved.
+    pub fn normalize_orientation(&mut self) {
+        let rotation = self.at.rotation.unwrap_or(0.0);
+        let (canonical_rotation, canonical_mirror) =
+            kicad_orientation(rotation, self.mirror.as_deref());
+        if canonical_rotation != rotation {
+            self.at.rotation = Some(canonical_rotation);
+        }
+        if canonical_mirror != self.mirror.as_deref() {
+            self.mirror = canonical_mirror.map(str::to_owned);
+        }
+    }
+}
+
+/// The rotation and mirror eeschema writes for a placement's orientation.
+///
+/// `SCH_SYMBOL::GetOrientation` searches a fixed list for the first pair
+/// whose transform matches: the four plain turns, then `(mirror x)` at 0°,
+/// 90° and 270°, then `(mirror y)` at each turn. `(mirror x)` at 180° is not
+/// on the list; it is `(mirror y)` at 0°. So `(mirror y)` survives only at
+/// 0°, and at any other turn it is written as `(mirror x)` turned a further
+/// 180°. Measured by re-saving through `kicad-cli sch upgrade --force`
+/// (KiCad 10.0.6): 180° `x` became 0° `y`, 180° `y` became 0° `x`, and 90°
+/// `y` became 270° `x`; each of the eight reflected quarter turns, written in
+/// the pair named here, came back unchanged. `(mirror xy)` is a 180° turn,
+/// not a reflection.
+///
+/// An angle that is not a quarter turn is returned unchanged.
+pub fn kicad_orientation(rotation: f64, mirror: Option<&str>) -> (f64, Option<&'static str>) {
+    let (x, y) = mirror_axes(mirror);
+    let turn = rotation.rem_euclid(360.0);
+    if turn % 90.0 != 0.0 {
+        let token = match (x, y) {
+            (false, false) => None,
+            (true, false) => Some("x"),
+            (false, true) => Some("y"),
+            (true, true) => Some("xy"),
+        };
+        return (rotation, token);
+    }
+    match (x, y) {
+        (false, false) => (turn, None),
+        (true, true) => ((turn + 180.0).rem_euclid(360.0), None),
+        (true, false) if turn == 180.0 => (0.0, Some("y")),
+        (true, false) => (turn, Some("x")),
+        (false, true) if turn == 0.0 => (0.0, Some("y")),
+        (false, true) => ((turn + 180.0).rem_euclid(360.0), Some("x")),
+    }
 }
 
 /// Which axes a mirror token reflects about, as `(x, y)`. Counted from the
@@ -654,6 +710,46 @@ impl<'a> IntoIterator for &'a mut SymbolCollection {
 fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
     let (dx, dy) = (ax - bx, ay - by);
     (dx * dx + dy * dy).sqrt()
+}
+
+#[cfg(test)]
+mod kicad_orientation_tests {
+    use super::kicad_orientation;
+
+    /// Every quarter turn under each reflection, against the pair eeschema
+    /// writes back. The marked rows are the ones eeschema rewrote when given
+    /// the requested pair; all eight reflected rows were checked through
+    /// `kicad-cli sch upgrade --force` (KiCad 10.0.6).
+    #[test]
+    fn each_orientation_takes_the_pair_eeschema_writes() {
+        for (rotation, mirror, expected) in [
+            (0.0, None, (0.0, None)),
+            (90.0, None, (90.0, None)),
+            (180.0, None, (180.0, None)),
+            (270.0, None, (270.0, None)),
+            (0.0, Some("x"), (0.0, Some("x"))),
+            (90.0, Some("x"), (90.0, Some("x"))),
+            (180.0, Some("x"), (0.0, Some("y"))), // measured
+            (270.0, Some("x"), (270.0, Some("x"))),
+            (0.0, Some("y"), (0.0, Some("y"))),
+            (90.0, Some("y"), (270.0, Some("x"))), // measured
+            (180.0, Some("y"), (0.0, Some("x"))),  // measured
+            (270.0, Some("y"), (90.0, Some("x"))), // measured
+            (90.0, Some("xy"), (270.0, None)),
+            (450.0, Some("x"), (90.0, Some("x"))),
+        ] {
+            assert_eq!(
+                kicad_orientation(rotation, mirror),
+                expected,
+                "{rotation}° {mirror:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_angle_off_the_quarter_turns_is_left_alone() {
+        assert_eq!(kicad_orientation(45.0, Some("y")), (45.0, Some("y")));
+    }
 }
 
 #[cfg(test)]

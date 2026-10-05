@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
+- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -86,8 +86,8 @@ and Windows servers do not.
 
 ## Schematic
 
-### `sch_components` · 18 tools
-**Purpose:** Add, edit, move, rotate, and delete schematic symbols.
+### `sch_components` · 19 tools
+**Purpose:** Add, edit, move, rotate, mirror, and delete schematic symbols.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
 | Tool | Description |
@@ -99,6 +99,7 @@ and Windows servers do not.
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. Does NOT adjust connected wires; junction dots are re-judged where the pins turned, and a no-connect flag travels with the pin it protects. |
+| `mirror_schematic_component` | Set or clear a placed component's mirror (`x`, `y` or `none`), on every placed unit or, with `unit`, on one unit alone. Field text reflects with the body. The orientation is stored in the rotation and mirror pair eeschema writes, so the stored rotation can change (180° with `x` is stored as 0° with `y`), and a later `rotate_schematic_component` works from that stored angle; `mirrored_units` reports each selected unit as written, and a call that changes nothing does not rewrite the file. Does NOT adjust connected wires; junction dots are re-judged where the pins moved, and a no-connect flag travels with the pin it protects. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
 | `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). Konnect's own implementation; kicad-cli has no annotate command. |

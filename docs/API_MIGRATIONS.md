@@ -3,6 +3,33 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `mirror_schematic_component` (minor release)
+
+A new `sch_components` tool sets or clears the mirror of a placed component:
+`mirror_schematic_component(schematic, reference, mirror, unit?)`. `mirror`
+takes `"x"`, `"y"` or `"none"`, the vocabulary `add_schematic_component`
+already uses, and is absolute rather than a toggle. Without `unit`, every
+placed unit takes it. With `unit`, only that unit changes, because KiCad stores
+the mirror per placed unit and one gate of a package is often reflected while
+its siblings and power unit are not. Field text reflects with the body (#613).
+Junctions and no-connect flags are handled as `rotate_schematic_component`
+handles them.
+
+Several rotation and mirror pairs draw the same body, and eeschema writes only
+one of them: 180° with `x` becomes 0° with `y`, and 90° with `y` becomes 270°
+with `x`. The tool stores that pair, so a reflection can change a unit's stored
+rotation without turning it, and KiCad's next save changes nothing. A later
+`rotate_schematic_component` works from the stored angle, so take it from the
+response rather than from the angle the unit was given. The response
+lists each selected unit as written, in `mirrored_units` (`unit`, `uuid`,
+`rotation`, `mirror_x`, `mirror_y`, `changed`), with `changed_unit_count`. As in
+every component tool, the top-level fields describe the lowest-numbered unit. A
+call that changes nothing leaves the file untouched.
+
+Until now a placed symbol could not be reflected at all: the only way was to
+delete it and place it again with `mirror`. No existing tool's arguments or
+responses change. `sch_components` rises from 18 to 19 tools (#450).
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
