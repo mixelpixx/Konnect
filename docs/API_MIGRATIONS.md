@@ -3,6 +3,19 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: computed schematic coordinates are reported as KiCad places them (patch release)
+
+Pin positions, stub ends and symbol bounds are now rounded to the six decimals
+KiCad writes before they reach a response. `batch_get_schematic_pin_locations`
+used to report a pin at 101.6 + 15.24 as `116.83999999999999`; it now reports
+`116.84`. The same holds for every response that carries a transformed pin
+position, for `connect_to_net`'s and `batch_connect_to_net`'s stub ends, for
+`create_symbol`'s `units[].pins[]`, and for `check_schematic_overlaps`'
+`bounds_*` and `overlap_*_mm` and `get_schematic_layout`'s `width` and
+`height`. A value changes only past its sixth decimal, by at most 0.0000005
+mm; for the float noise this removes, by less than 1e-9 mm. Nothing else in
+the request or response changes (#747).
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the

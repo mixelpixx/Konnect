@@ -24,6 +24,9 @@ Three saves of one schematic, all written by KiCad 10.0.5, used to pin
 `multichannel_channel_strip.kicad_sch` is KiCad's own `multichannel` demo
 child sheet, verbatim: its parent instantiates it four times, so every symbol
 carries four `(instances …)` paths. It pins per-sheet-instance numbering.
+`check_schematic_overlaps` also finds one overlap in it, C12 (at
+`(208.28, 67.31)`) over IC2's unit 2 (at `(213.36, 73.66)`), which reports
+7.62 × 0.762 mm and not `0.7620000000000005` (#747).
 
 Byte evidence: this directory is `-text` in `.gitattributes`; never
 eol-normalise these files.
