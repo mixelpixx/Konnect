@@ -225,7 +225,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Create a new KiCAD schematic symbol and append it to a .kicad_sym library file. \
              Supports single-unit symbols (via `pins`) and multi-unit parts like dual/quad \
              op-amps or gate banks (via `units` + optional `power_pins`). By default each unit \
-             gets a rectangular body sized to its pins; set `glyph` (symbol-level and/or per \
+             gets a rectangular body sized to its pins. Omitted edge-axis coordinates are \
+             distributed at 2.54 mm pitch on the angle-selected edge (default left); supplied \
+             coordinates retain the existing body-edge alignment. Set `glyph` (symbol-level and/or per \
              unit) to draw a conventional op-amp triangle or logic-gate body instead. With a \
              glyph, pins auto-place by their `type` (inputs left in the order listed top-to- \
              bottom, output right, power top/bottom) and their x/y are ignored.",
@@ -3861,7 +3863,62 @@ fn emit_symbol_graphics(graphics: &[serde_json::Value]) -> (String, SymbolRect) 
     (sexp, bounds)
 }
 
-/// The default rectangle body + caller-positioned pins. Pin types are assumed
+/// Space pins whose edge-axis coordinate was omitted, without moving supplied
+/// edge-axis coordinates. Repeated physical numbers share one automatic slot.
+fn distribute_rect_pins(pins: &[serde_json::Value], geoms: &mut [PinGeom]) {
+    for edge in [PinEdge::Left, PinEdge::Right, PinEdge::Top, PinEdge::Bottom] {
+        let vertical = matches!(edge, PinEdge::Left | PinEdge::Right);
+        let axis = if vertical { "y" } else { "x" };
+        let indices: Vec<_> = geoms
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| pin_edge(g.angle) == Some(edge))
+            .map(|(i, _)| i)
+            .collect();
+        let mut occupied: Vec<_> = indices
+            .iter()
+            .filter_map(|&i| pins[i][axis].as_f64())
+            .collect();
+        let mut numbers = Vec::new();
+        for &i in &indices {
+            if pins[i][axis].as_f64().is_none() {
+                let number = pins[i]["number"].as_str().unwrap_or("1");
+                if !numbers.contains(&number) {
+                    numbers.push(number);
+                }
+            }
+        }
+        let mut positions = Vec::new();
+        let mut candidate = (numbers.len().saturating_sub(1) as f64) * 1.27;
+        for _ in &numbers {
+            while occupied
+                .iter()
+                .any(|value| (value - candidate).abs() < 1e-9)
+            {
+                candidate -= 2.54;
+            }
+            candidate = konnect_sexp::geometry::round6(candidate);
+            positions.push(candidate);
+            occupied.push(candidate);
+            candidate -= 2.54;
+        }
+        for i in indices {
+            if pins[i][axis].as_f64().is_none() {
+                let slot = numbers
+                    .iter()
+                    .position(|number| *number == pins[i]["number"].as_str().unwrap_or("1"))
+                    .expect("omitted-coordinate pin owns a slot");
+                if vertical {
+                    geoms[i].y = positions[slot];
+                } else {
+                    geoms[i].x = positions[slot];
+                }
+            }
+        }
+    }
+}
+
+/// The default rectangle body + caller-positioned or distributed pins. Pin types are assumed
 /// already validated by `build_symbol_unit`.
 fn build_rect_unit(
     pins_val: &[serde_json::Value],
@@ -3877,6 +3934,7 @@ fn build_rect_unit(
             name: pin["name"].as_str().unwrap_or("~").to_string(),
         });
     }
+    distribute_rect_pins(pins_val, &mut pin_geoms);
     let body = symbol_body_rect(&pin_geoms, show_names);
     // Fitting the names can push the body past the pins that defined it.
     // Slide them back out, keeping the length the caller asked for.
@@ -3919,6 +3977,114 @@ fn build_rect_unit(
 }
 
 type SymbolRect = Option<(f64, f64, f64, f64)>;
+
+#[cfg(test)]
+mod omitted_rect_pin_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn served_rect_units_distribute_omitted_coordinates_and_read_back() {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("omitted.kicad_sym");
+        let pins = |count: usize, offset: usize| {
+            (0..count).map(|i| {
+            json!({"number": (offset+i).to_string(), "name": format!("P{i}"), "type": "passive"})
+        }).collect::<Vec<_>>()
+        };
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 464, "method": "tools/call",
+                "params": {"name": "create_symbol", "arguments": {
+                "library_path": path, "name": "Omitted", "reference_prefix": "U",
+                "units": [{"pins": pins(6, 1)}, {"pins": pins(6, 11)}, {"pins": pins(63, 21), "glyph": "opamp"}]
+                }}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(response["isError"], true, "{response}");
+        let report: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        // Optional local evidence only: hosted regression does not require KiCad.
+        if let Some(cli) = std::env::var_os("KONNECT_TEST_SYMBOL_CLI") {
+            let result = std::process::Command::new(cli)
+                .args(["sym", "upgrade", "--force"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let root = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let symbol = root.find("symbol").unwrap();
+        for (i, count) in [6, 6, 63].into_iter().enumerate() {
+            assert_eq!(report["units"][i]["body"], "rectangle");
+            let unit_name = format!("Omitted_{}_1", i + 1);
+            let unit = symbol
+                .find_all("symbol")
+                .into_iter()
+                .find(|u| u.get(1).and_then(SexpNode::as_str) == Some(unit_name.as_str()))
+                .unwrap();
+            let written = unit.find_all("pin");
+            assert_eq!(written.len(), count);
+            let reported = report["units"][i]["pins"].as_array().unwrap();
+            let mut positions = Vec::new();
+            for (pin, observed) in written.iter().zip(reported) {
+                let at = pin.find("at").unwrap();
+                let position = (at.get_f64(1).unwrap(), at.get_f64(2).unwrap());
+                assert!(
+                    !positions.contains(&position),
+                    "pins collided within {unit_name}"
+                );
+                positions.push(position);
+                assert_eq!(observed["x"].as_f64().unwrap(), position.0);
+                assert_eq!(observed["y"].as_f64().unwrap(), position.1);
+                assert_eq!(pin.find_str("number"), observed["number"].as_str());
+            }
+            for pair in positions.windows(2) {
+                assert!(((pair[0].1 - pair[1].1) - 2.54).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_rect_axes_preserve_explicit_coordinates_and_stacks() {
+        for angle in [0, 180, 90, 270] {
+            let vertical = angle == 0 || angle == 180;
+            let input = vec![
+                json!({"number":"1","name":"EXPLICIT","type":"passive","angle":angle,"x":0,"y":0}),
+                json!({"number":"2","name":"A","type":"passive","angle":angle}),
+                json!({"number":"2","name":"STACK","type":"passive","angle":angle}),
+                json!({"number":"3","name":"B","type":"passive","angle":angle}),
+            ];
+            let (_, _, resolved) = build_rect_unit(&input, true);
+            let axis = |pin: &ResolvedPin| if vertical { pin.y } else { pin.x };
+            assert_eq!(axis(&resolved[0]), 0.0);
+            assert_eq!(axis(&resolved[1]), axis(&resolved[2]));
+            assert_ne!(axis(&resolved[1]), axis(&resolved[3]));
+            assert_ne!(axis(&resolved[1]), 0.0);
+            assert_ne!(axis(&resolved[3]), 0.0);
+            let explicit_only = vec![input[0].clone()];
+            let (_, _, explicit) = build_rect_unit(&explicit_only, true);
+            assert_eq!(
+                (resolved[0].x, resolved[0].y),
+                (explicit[0].x, explicit[0].y)
+            );
+        }
+    }
+}
 
 /// Where a pin ended up, next to where the caller asked for it.
 ///

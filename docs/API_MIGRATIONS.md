@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
+
+`create_symbol` no longer places every coordinate-less rectangular-unit pin at
+one point. On each angle-selected edge (left by default), omitted `y` values
+for left/right pins or omitted `x` values for top/bottom pins are spaced at
+2.54 mm pitch in input order. Supplied edge-axis coordinates are preserved and
+automatic slots avoid them. Repeated physical pin numbers share an automatic
+slot on the same edge, preserving intentional graphical stacks.
+
+This shared rectangle behavior applies to `pins`, `units[].pins`, and a glyph
+that falls back to a rectangle. Existing body sizing can still move the other
+coordinate outward to meet the body; use the returned resolved pin coordinates
+for wiring. Custom `graphics` still require explicit coordinates and glyphs
+that fit retain their established layout. Tool schemas and response shapes are
+unchanged; this does not infer electrical pin roles or redesign a supplied layout.
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
