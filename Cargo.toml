@@ -93,7 +93,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Default features for now — the T2.1 spike trims to the plumbing actually
 # used once the API surface is settled (default-features=false breaks
 # gix-hash's backend selection).
-gix = { version = "0.87", features = ["status", "worktree-mutation"] }
+gix = { version = "0.88", features = ["status", "worktree-mutation"] }
 
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }
