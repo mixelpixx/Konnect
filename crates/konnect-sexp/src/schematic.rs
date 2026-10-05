@@ -2,7 +2,7 @@
 //!
 //! Provides typed query functions used by the tool implementations.
 
-use crate::geometry::{transform_pin, PinTransform};
+use crate::geometry::{round6, transform_pin, PinTransform};
 use crate::parser::{parse_sexp, SexpNode};
 use crate::writer::read_consistent;
 use crate::SexpError;
@@ -1006,6 +1006,10 @@ pub fn find_t_junctions(wires: &[Wire], tol: f64) -> Vec<(f64, f64)> {
 }
 
 // ─── S-expression formatters for new elements ─────────────────────────────────
+//
+// Every formatter here rounds its coordinates to the six decimals KiCAD
+// writes. Callers pass f64 sums such as 101.6 - 3.81 = 97.78999999999999,
+// which would otherwise reach the file as they are (#766).
 
 pub fn format_wire(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
     format_schematic_line("wire", x1, y1, x2, y2)
@@ -1016,6 +1020,7 @@ pub fn format_bus(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
 }
 
 fn format_schematic_line(kind: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+    let (x1, y1, x2, y2) = (round6(x1), round6(y1), round6(x2), round6(y2));
     let uuid = crate::writer::new_uuid();
     format!(
         "({kind}\n\t\t(pts\n\t\t\t(xy {x1} {y1}) (xy {x2} {y2})\n\t\t)\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"{uuid}\")\n\t)"
@@ -1023,6 +1028,7 @@ fn format_schematic_line(kind: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> Stri
 }
 
 pub fn format_junction(x: f64, y: f64) -> String {
+    let (x, y) = (round6(x), round6(y));
     let uuid = crate::writer::new_uuid();
     format!(
         "\n  (junction\n    (at {x} {y})\n    (diameter 0)\n    (color 0 0 0 0)\n    (uuid \"{uuid}\")\n  )"
@@ -1030,6 +1036,7 @@ pub fn format_junction(x: f64, y: f64) -> String {
 }
 
 pub fn format_no_connect(x: f64, y: f64) -> String {
+    let (x, y) = (round6(x), round6(y));
     let uuid = crate::writer::new_uuid();
     format!("\n  (no_connect\n    (at {x} {y})\n    (uuid \"{uuid}\")\n  )")
 }
@@ -1066,6 +1073,7 @@ impl BusEntryDirection {
 }
 
 pub fn format_bus_entry(x: f64, y: f64, direction: BusEntryDirection) -> String {
+    let (x, y) = (round6(x), round6(y));
     let uuid = crate::writer::new_uuid();
     let (width, height) = direction.size();
     format!(
@@ -1094,8 +1102,10 @@ pub fn format_hierarchical_sheet(spec: HierarchicalSheetSpec<'_>) -> String {
     let project_name = escape_quoted_text(spec.project_name);
     let parent_instance_path = escape_quoted_text(spec.parent_instance_path);
     let page = escape_quoted_text(spec.page);
-    let name_y = spec.y - 0.635;
-    let file_y = spec.y + spec.height + 0.635;
+    let (x, y) = (round6(spec.x), round6(spec.y));
+    let (width, height) = (round6(spec.width), round6(spec.height));
+    let name_y = round6(y - 0.635);
+    let file_y = round6(y + height + 0.635);
     format!(
         r#"
   (sheet
@@ -1127,10 +1137,6 @@ pub fn format_hierarchical_sheet(spec: HierarchicalSheetSpec<'_>) -> String {
       )
     )
   )"#,
-        x = spec.x,
-        y = spec.y,
-        width = spec.width,
-        height = spec.height,
     )
 }
 
@@ -1176,6 +1182,7 @@ pub fn format_sheet_pin(
     rotation: f64,
 ) -> String {
     let name = escape_quoted_text(name);
+    let (x, y) = (round6(x), round6(y));
     let uuid = crate::writer::new_uuid();
     format!(
         "(pin \"{name}\" {}\n\t(at {x} {y} {rotation})\n\t(uuid \"{uuid}\")\n)",
@@ -1188,6 +1195,7 @@ fn escape_quoted_text(value: &str) -> String {
 }
 
 pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
+    let (x, y) = (round6(x), round6(y));
     let uuid = crate::writer::new_uuid();
     let net = escape_quoted_text(net);
     // The tag must be `label`: KiCAD has no `net_label` in its schematic
@@ -1438,6 +1446,41 @@ mod pin_endpoint_tests {
 #[cfg(test)]
 mod label_tag_tests {
     use super::*;
+
+    /// Pin endpoints come out of `f64` sums such as `101.6 - 3.81` =
+    /// `97.78999999999999`. Every raw formatter writes them the way KiCad
+    /// does, `97.79` (#766).
+    #[test]
+    fn raw_formatters_write_the_coordinates_kicad_writes() {
+        let (x, y) = (120.65 + 3.81, 101.6 - 3.81);
+        assert_eq!((x, y), (124.46000000000001, 97.78999999999999));
+        assert!(format_wire(x, 88.9, 132.08, y).contains("(xy 124.46 88.9) (xy 132.08 97.79)"));
+        assert!(format_bus(x, 88.9, 132.08, y).contains("(xy 124.46 88.9) (xy 132.08 97.79)"));
+        assert!(format_junction(x, y).contains("(at 124.46 97.79)"));
+        assert!(format_no_connect(x, y).contains("(at 124.46 97.79)"));
+        assert!(format_bus_entry(x, y, BusEntryDirection::UpLeft).contains("(at 124.46 97.79)"));
+        assert!(format_net_label("N", x, y, 0.0).contains("(at 124.46 97.79 0)"));
+        assert!(
+            format_sheet_pin("P", SheetPinType::Input, x, y, 0.0).contains("(at 124.46 97.79 0)")
+        );
+
+        // The sheet derives its field rows itself, and 97.79 + 2.54 + 0.635
+        // is 100.96500000000002 in f64.
+        let sheet = format_hierarchical_sheet(HierarchicalSheetSpec {
+            name: "S",
+            file: "s.kicad_sch",
+            x,
+            y: 97.79,
+            width: 25.4,
+            height: 2.54,
+            project_name: "p",
+            parent_instance_path: "/",
+            page: "2",
+        });
+        assert!(sheet.contains("(at 124.46 97.79)"), "{sheet}");
+        assert!(sheet.contains("(at 124.46 97.155 0)"), "{sheet}");
+        assert!(sheet.contains("(at 124.46 100.965 0)"), "{sheet}");
+    }
 
     #[test]
     fn format_no_connect_emits_a_parseable_uuid_item() {

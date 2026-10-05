@@ -3,6 +3,35 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: computed coordinates are written as KiCad writes them (patch release)
+
+Coordinates that come out of arithmetic rather than the grid snap are now
+rounded to the six decimals KiCad writes before they reach a file (#766):
+
+- `move_labels_by_offset` used to write a label at 167.64 moved by −5.08 as
+  `162.55999999999997`. It now writes `162.56`.
+- `fix_connectivity` used to move a wire end onto a pin at
+  `97.78999999999999`. It now writes `97.79`, and `fixes[].to` reports the
+  rounded point, both in a dry run and when applied.
+- `copy_routing_pattern` rounds the translated `(start …)`, `(end …)` and
+  `(at …)` it writes. It finds no tracks on a board KiCad saved (#802), so
+  this applies only to boards it can read. Its `dx` and `dy` response fields
+  are unchanged.
+- Every schematic item written as raw text is rounded the same way: the wires,
+  buses, junctions and bus entries of `connect_pins`, `batch_connect_pins`,
+  `add_schematic_connection`, `connect_passthrough`, `split_wire_at_point`,
+  `add_bus`, `batch_add_bus`, `add_bus_entry` and `connect_pins_to_bus`; the
+  labels `batch_connect_to_net`, `connect_passthrough` and
+  `connect_pins_to_bus` place at the end of a stub; and the sheets and field
+  positions `add_hierarchical_sheet` and `duplicate_sheet` write. A wire
+  `connect_pins` draws to a pin endpoint is an example.
+
+A sum like those above moves by less than 1e-12 mm. A coordinate a caller
+passes with more than six decimals now moves by at most 0.0000005 mm, finer
+than the 0.0001 mm KiCad itself stores in a schematic. Responses are
+unchanged except `fixes[].to`: a computed point a response echoes is still
+unrounded (#747), and a caller's own coordinate is still echoed as given.
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the

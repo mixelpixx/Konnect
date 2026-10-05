@@ -8,7 +8,7 @@ use crate::tool;
 use crate::tools::{
     get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
 };
-use konnect_sexp::writer::write_atomic;
+use konnect_sexp::{geometry::round6, writer::write_atomic};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
@@ -1101,7 +1101,9 @@ fn translate_block(
                 let parts: Vec<&str> = coords_str.split_whitespace().collect();
                 if parts.len() >= 2 {
                     if let (Ok(x), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                        new_result.push_str(&format!("{} {}", x + dx, y + dy));
+                        // Rounded: the offset 101.6 - 99.06 is 2.539999999999992
+                        // in f64, so the sum carries its noise (#766).
+                        new_result.push_str(&format!("{} {}", round6(x + dx), round6(y + dy)));
                         if parts.len() > 2 {
                             new_result.push(' ');
                             new_result.push_str(&parts[2..].join(" "));
@@ -1534,6 +1536,29 @@ mod tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    /// The copy of KiCad's own segment `(100.5, 50)`–`(105, 50)`, moved by
+    /// `101.6 - 99.06` = `2.539999999999992` and `53.34 - 48.26` =
+    /// `5.080000000000005`, must read as KiCad writes the sums (#766). The
+    /// block is cut out of the board because `find_routing_blocks` cannot
+    /// find it in a KiCad-saved file (#802).
+    #[test]
+    fn a_translated_block_writes_the_coordinates_kicad_writes() {
+        let board = include_str!("../../tests/fixtures/specctra_two_resistors_locked.kicad_pcb");
+        let start = board.find("(segment").expect("fixture segment");
+        let (_, end) = konnect_sexp::writer::find_balanced_block(board, start).expect("balanced");
+        let block = &board[start..end];
+        assert!(block.contains("(start 100.5 50)"), "{block}");
+
+        let moved = translate_block(
+            block,
+            101.6 - 99.06,
+            53.34 - 48.26,
+            &std::collections::HashMap::new(),
+        );
+        assert!(moved.contains("(start 103.04 55.08)"), "{moved}");
+        assert!(moved.contains("(end 107.54 55.08)"), "{moved}");
     }
 
     #[test]
