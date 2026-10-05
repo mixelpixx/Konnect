@@ -20,6 +20,7 @@ pub mod integration;
 mod jlcpcb_midpoints;
 mod lcsc_packages;
 pub mod library;
+mod library_footprint;
 pub(crate) mod live_board;
 pub mod manufacturing;
 pub(crate) mod navigation_target;
