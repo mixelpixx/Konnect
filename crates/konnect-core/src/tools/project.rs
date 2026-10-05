@@ -574,7 +574,7 @@ async fn handle_open_viewer(
             }
             cmd.arg(&sch_path);
 
-            match launch_viewer(cmd, VIEWER_STARTUP_WINDOW).await {
+            match launch_viewer(cmd, super::launch::STARTUP_WINDOW).await {
                 Ok(()) => Ok(CallToolResult::text(
                     serde_json::to_string(&json!({
                         "launched": true,
@@ -594,86 +594,16 @@ async fn handle_open_viewer(
     }
 }
 
-/// How long the viewer must stay up before it counts as launched. A viewer
-/// that cannot open a window, such as one started without a display on Linux,
-/// exits well inside this (#702).
-const VIEWER_STARTUP_WINDOW: Duration = Duration::from_secs(1);
-
-/// Stderr lines quoted when the viewer exits during startup, and the length
-/// each is cut to, so a huge panic message cannot flood the tool result.
-const VIEWER_STDERR_TAIL_LINES: usize = 20;
-const VIEWER_STDERR_LINE_CHARS: usize = 500;
-
-/// How long to wait for the rest of a dead viewer's stderr. A `kicad-cli`
-/// render the viewer started can hold the pipe open after the viewer exits.
-const VIEWER_STDERR_DRAIN: Duration = Duration::from_millis(500);
-
-/// Spawns the viewer and watches it for `window`. A successful `spawn()` only
-/// means `exec` worked, so an exit inside the window is a failed launch,
-/// reported with the exit status and the tail of the viewer's stderr.
-async fn launch_viewer(mut cmd: std::process::Command, window: Duration) -> Result<(), String> {
-    use std::collections::VecDeque;
-    use std::process::Stdio;
-    use std::sync::{Arc, Mutex};
-    use tokio::io::AsyncBufReadExt;
-
-    // stdin and stdout carry the stdio transport's JSON-RPC stream, so the
-    // viewer must not hold them. Its stderr still reaches the server log.
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    // Not `kill_on_drop`: the viewer outlives this call.
-    let mut child = tokio::process::Command::from(cmd)
-        .spawn()
-        .map_err(|e| format!("Failed to launch viewer: {e}"))?;
-
-    let tail = Arc::new(Mutex::new(VecDeque::new()));
-    let forwarder = child.stderr.take().map(|stderr| {
-        let tail = Arc::clone(&tail);
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).split(b'\n');
-            while let Ok(Some(line)) = lines.next_segment().await {
-                let line = String::from_utf8_lossy(&line).trim_end().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                tracing::warn!(target: "schematic_viewer", "{line}");
-                // Once the caller has returned, nobody reads the tail.
-                if Arc::strong_count(&tail) == 1 {
-                    continue;
-                }
-                if let Ok(mut tail) = tail.lock() {
-                    if tail.len() == VIEWER_STDERR_TAIL_LINES {
-                        tail.pop_front();
-                    }
-                    tail.push_back(
-                        line.chars()
-                            .take(VIEWER_STDERR_LINE_CHARS)
-                            .collect::<String>(),
-                    );
-                }
-            }
-        })
-    });
-
-    let status = match tokio::time::timeout(window, child.wait()).await {
-        Err(_still_running) => return Ok(()),
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return Err(format!("Failed to check the viewer process: {e}")),
-    };
-
-    if let Some(forwarder) = forwarder {
-        let _ = tokio::time::timeout(VIEWER_STDERR_DRAIN, forwarder).await;
-    }
-    let tail = tail
-        .lock()
-        .map(|mut tail| tail.make_contiguous().join("\n"))
-        .unwrap_or_default();
-    Err(if tail.is_empty() {
-        format!("Schematic viewer exited during startup ({status}) with no stderr output.")
-    } else {
-        format!("Schematic viewer exited during startup ({status}). Its stderr ended with:\n{tail}")
-    })
+/// Spawns the viewer and watches it for `window`. An exit inside the window
+/// is a failed launch, reported with the exit status and stderr tail.
+async fn launch_viewer(cmd: std::process::Command, window: Duration) -> Result<(), String> {
+    let mut viewer = super::launch::spawn(
+        cmd,
+        "Schematic viewer",
+        |line| tracing::warn!(target: "schematic_viewer", "{line}"),
+    )
+    .map_err(|e| format!("Failed to launch viewer: {e}"))?;
+    viewer.watch(window).await
 }
 
 fn find_viewer_binary() -> Option<std::path::PathBuf> {
@@ -1774,87 +1704,21 @@ mod viewer_launch_tests {
 
     /// The panic tao prints when GTK cannot open a display, then the exit
     /// code a Rust panic gives, as the issue's reproduction recorded them.
+    /// The rest of the watching is tested in `tools::launch`.
     #[tokio::test]
     async fn a_viewer_that_crashes_on_startup_is_a_failed_launch() {
         let err = launch_viewer(
-            sh("echo 'starting' >&2; \
-                echo 'Failed to initialize gtk backend!' >&2; exit 101"),
+            sh("echo 'Failed to initialize gtk backend!' >&2; exit 101"),
             Duration::from_secs(10),
         )
         .await
         .expect_err("an exit inside the window must not count as launched");
-        assert!(err.contains("101"), "exit status missing: {err}");
         assert!(
-            err.contains("Failed to initialize gtk backend!"),
-            "stderr missing: {err}"
+            err.starts_with("Schematic viewer exited during startup")
+                && err.contains("101")
+                && err.ends_with("Failed to initialize gtk backend!"),
+            "{err}"
         );
-    }
-
-    #[tokio::test]
-    async fn a_clean_exit_during_startup_is_still_a_failed_launch() {
-        let err = launch_viewer(sh("exit 0"), Duration::from_secs(10))
-            .await
-            .expect_err("a viewer that exits shows no window");
-        assert!(err.contains("no stderr output"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn only_the_tail_of_a_long_stderr_is_quoted() {
-        let err = launch_viewer(
-            sh("i=1; while [ $i -le 30 ]; do echo line$i >&2; i=$((i+1)); done; exit 1"),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.contains("line11\n") && err.ends_with("line30"), "{err}");
-        assert!(!err.contains("line10\n"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_very_long_stderr_line_is_cut() {
-        let err = launch_viewer(
-            sh("printf '%2000s\\n' '' | tr ' ' a >&2; exit 1"),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.ends_with(&"a".repeat(500)), "{err}");
-        assert!(!err.contains(&"a".repeat(501)), "{err}");
-    }
-
-    /// A `kicad-cli` render the viewer started can still be writing after
-    /// the viewer itself has exited.
-    #[tokio::test]
-    async fn stderr_from_a_child_the_viewer_started_is_still_quoted() {
-        let err = launch_viewer(
-            sh("(sleep 0.2; echo 'render failed' >&2) & exit 1"),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.ends_with("render failed"), "{err}");
-    }
-
-    /// stdin and stdout are the stdio transport's JSON-RPC stream.
-    #[tokio::test]
-    async fn the_viewer_does_not_hold_the_servers_stdin_or_stdout() {
-        let err = launch_viewer(
-            sh(
-                "[ /dev/fd/0 -ef /dev/null ] && [ /dev/fd/1 -ef /dev/null ] \\
-                && echo detached >&2; exit 1",
-            ),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.ends_with("detached"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_viewer_still_running_after_the_window_is_launched() {
-        launch_viewer(sh("sleep 3"), Duration::from_millis(200))
-            .await
-            .expect("a viewer that outlives the window is up");
     }
 
     #[tokio::test]

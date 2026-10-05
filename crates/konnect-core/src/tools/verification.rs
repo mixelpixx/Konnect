@@ -880,6 +880,9 @@ async fn handle_check_kicad_ui(
     }
 }
 
+/// How often the `wait_ready` loop pings KiCad, watching the process between.
+const KICAD_IPC_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
 async fn handle_launch_kicad_ui(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -888,65 +891,67 @@ async fn handle_launch_kicad_ui(
     let timeout_secs = args["timeout_seconds"].as_u64().unwrap_or(30);
     let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
 
-    let mut cmd = tokio::process::Command::new(&binary);
+    let mut cmd = std::process::Command::new(&binary);
     if let Some(project) = args["project"].as_str() {
         cmd.arg(project);
     }
 
-    // Spawn detached — we don't wait for the process to exit
-    match cmd.spawn() {
-        Ok(_child) => {
-            if wait_ready {
-                // Poll IPC until responsive or timeout
-                let addr = ctx.config.ipc_address.clone();
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let addr2 = addr.clone();
-                    let ok = task::spawn_blocking(move || {
-                        konnect_ipc::client::KiCadIpcClient::new(&addr2)
-                            .ping()
-                            .unwrap_or(false)
-                    })
-                    .await
-                    .unwrap_or(false);
-
-                    if ok {
-                        return Ok(CallToolResult::text(
-                            serde_json::to_string(&json!({
-                                "launched": true,
-                                "ipc_ready": true
-                            }))
-                            .unwrap(),
-                        ));
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(CallToolResult::text(
-                            serde_json::to_string(&json!({
-                                "launched": true,
-                                "ipc_ready": false,
-                                "note": "KiCAD launched but IPC not yet responsive within timeout"
-                            }))
-                            .unwrap(),
-                        ));
-                    }
-                }
-            }
-
-            Ok(CallToolResult::text(
-                serde_json::to_string(&json!({
-                    "launched": true,
-                    "ipc_ready": null
-                }))
-                .unwrap(),
-            ))
+    let mut kicad = match super::launch::spawn(
+        cmd,
+        "KiCAD",
+        |line| tracing::warn!(target: "kicad", "{line}"),
+    ) {
+        Ok(kicad) => kicad,
+        Err(e) => {
+            return Ok(CallToolResult::error(format!(
+                "Failed to launch KiCAD ({}): {}",
+                binary, e
+            )))
         }
-        Err(e) => Ok(CallToolResult::error(format!(
-            "Failed to launch KiCAD ({}): {}",
-            binary, e
-        ))),
+    };
+
+    if !wait_ready {
+        if let Err(message) = kicad.watch(super::launch::STARTUP_WINDOW).await {
+            return Ok(CallToolResult::error(message));
+        }
+        return Ok(CallToolResult::json(&json!({
+            "launched": true,
+            "ipc_ready": null
+        })));
+    }
+
+    // Poll IPC until responsive or timeout. A KiCad that exited will never
+    // answer, so its exit ends the wait, even while a ping is in flight.
+    let addr = ctx.config.ipc_address.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if let Err(message) = kicad.watch(KICAD_IPC_POLL).await {
+            return Ok(CallToolResult::error(message));
+        }
+        let addr2 = addr.clone();
+        let ping = task::spawn_blocking(move || {
+            konnect_ipc::client::KiCadIpcClient::new(&addr2)
+                .ping()
+                .unwrap_or(false)
+        });
+        let ok = tokio::select! {
+            ok = ping => ok.unwrap_or(false),
+            message = kicad.exited() => return Ok(CallToolResult::error(message)),
+        };
+
+        if ok {
+            return Ok(CallToolResult::json(&json!({
+                "launched": true,
+                "ipc_ready": true
+            })));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(CallToolResult::json(&json!({
+                "launched": true,
+                "ipc_ready": false,
+                "note": "KiCAD launched but IPC not yet responsive within timeout"
+            })));
+        }
     }
 }
 
@@ -2143,5 +2148,157 @@ mod required_coordinate_tests {
                 "a refused copy must not touch the board"
             );
         }
+    }
+}
+
+/// `launch_kicad_ui` used to report `launched: true` for any successful
+/// `spawn()`, including a KiCad that exited at once for lack of a display
+/// (#764). `/bin/sh` stands in for KiCad and runs the `project` argument as
+/// its script, so these run on Unix only.
+#[cfg(all(test, unix))]
+mod kicad_launch_tests {
+    use crate::{mcp::handler::McpHandler, test_support::MockIpcServer, tools::ServerConfig};
+    use konnect_ipc::gen::kiapi;
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+
+    /// What KiCad 10.0.6 prints, and its exit code, when started with
+    /// `DISPLAY` and `WAYLAND_DISPLAY` unset (the issue's reproduction).
+    const NO_DISPLAY: &str =
+        "echo '00:41:31: Error: Unable to initialize GTK+, is DISPLAY set properly?' >&2; exit 255\n";
+
+    /// Calls `launch_kicad_ui` through the served dispatch and returns the
+    /// result's `isError` and text.
+    async fn launch(script: &str, ipc_address: &str, arguments: Value) -> (bool, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_kicad = dir.path().join("kicad.sh");
+        std::fs::write(&fake_kicad, script).unwrap();
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: "/bin/sh".into(),
+            ipc_address: ipc_address.into(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let mut args = json!({"project": fake_kicad.display().to_string()});
+        args.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        let result = handler
+            .handle_message(json!({"jsonrpc":"2.0", "id":764,
+            "method":"tools/call", "params":{"name":"launch_kicad_ui","arguments":args}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        (
+            result["isError"].as_bool().unwrap_or(false),
+            result["content"][0]["text"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// A KiCad endpoint that answers every request after `delay`.
+    fn ping_answered(delay: Duration) -> MockIpcServer {
+        MockIpcServer::spawn("launch-kicad", move |_| {
+            std::thread::sleep(delay);
+            kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message: None,
+            }
+        })
+    }
+
+    const NOBODY: &str = "inproc://konnect-core-764-nobody-listens";
+
+    fn assert_reports_the_exit(text: &str) {
+        assert!(
+            text.starts_with("KiCAD exited during startup")
+                && text.contains("255")
+                && text.ends_with("Error: Unable to initialize GTK+, is DISPLAY set properly?"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kicad_that_exits_on_startup_is_not_launched() {
+        let (is_error, text) = launch(NO_DISPLAY, NOBODY, json!({"wait_ready": false})).await;
+        assert!(is_error, "{text}");
+        assert_reports_the_exit(&text);
+    }
+
+    /// The wait used to run to its timeout and then suggest a retry.
+    #[tokio::test]
+    async fn waiting_for_ipc_ends_when_kicad_exits() {
+        let started = Instant::now();
+        let (is_error, text) = launch(
+            NO_DISPLAY,
+            NOBODY,
+            json!({"wait_ready": true, "timeout_seconds": 30}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+        assert_reports_the_exit(&text);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited out the timeout"
+        );
+    }
+
+    /// The first ping goes out at 0.5 s and is answered at 2.5 s; KiCad
+    /// exits at 1 s, while that ping is still in flight.
+    #[tokio::test]
+    async fn kicad_that_exits_during_a_ping_is_not_ready() {
+        let slow = ping_answered(Duration::from_secs(2));
+        let (is_error, text) = launch(
+            "sleep 1; echo 'Segmentation fault' >&2; exit 139\n",
+            slow.address(),
+            json!({"wait_ready": true, "timeout_seconds": 30}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+        assert!(
+            text.starts_with("KiCAD exited during startup")
+                && text.contains("139")
+                && text.ends_with("Segmentation fault"),
+            "{text}"
+        );
+        // Let the abandoned ping finish, or the runtime waits out its receive
+        // timeout on shutdown.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drop(slow);
+    }
+
+    #[tokio::test]
+    async fn kicad_still_running_after_the_window_is_launched() {
+        let (is_error, text) = launch("sleep 3\n", NOBODY, json!({"wait_ready": false})).await;
+        assert!(!is_error, "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"launched": true, "ipc_ready": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn kicad_that_answers_ipc_is_ready() {
+        let kicad = ping_answered(Duration::ZERO);
+        let (is_error, text) = launch(
+            "sleep 3\n",
+            kicad.address(),
+            json!({"wait_ready": true, "timeout_seconds": 10}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"launched": true, "ipc_ready": true})
+        );
     }
 }

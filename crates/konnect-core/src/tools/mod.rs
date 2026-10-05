@@ -18,6 +18,7 @@ mod footprint_metadata;
 mod footprint_models;
 pub mod integration;
 mod jlcpcb_midpoints;
+pub(crate) mod launch;
 mod lcsc_packages;
 pub mod library;
 mod library_footprint;
