@@ -29,14 +29,14 @@ tags and 3D models. Its fields still came from a fixed template:
   `KiLib_Generator` on 12,018 stock footprints, were left off.
 
 A footprint the sync adds now has the library's fields:
-- **Reference and Value** with the library's layer, visibility, font and
-  position, holding the schematic's text;
+- **Reference and Value** with the library's layer, visibility, font,
+  position and keep-upright setting, holding the schematic's text;
 - **Datasheet and Description** where the library has them;
 - **every custom property.**
 
-The post-apply readback also checks each field that was sent: its text, layer
-and visibility. A difference is reported as `board_readback_differs`, as other
-readback differences are.
+The post-apply readback also checks each field that was sent: its text, layer,
+visibility and whether it is kept upright. A difference is reported as
+`board_readback_differs`, as other readback differences are.
 
 A footprint whose properties cannot be read is still placed, with the default
 fields as before. The plan then carries a non-blocking `library_fields_not_carried`
@@ -45,13 +45,13 @@ diagnostic naming the footprint, its parts and the reason. 15 of KiCad 10.0.5's
 
 The library property reader is shared with `update_footprints_from_library`.
 Both now read `(unlocked yes)` on a property instead of refusing the footprint:
-KiCad's footprint editor writes it, and 3,353 stock footprints carry it.
-`update_footprints_from_library` still refuses those footprints for any other
-child it cannot represent.
-
-Through KiCad 10.0.5's API, a field is saved with `(unlocked yes)` whatever
-locked state is sent, so such fields can still differ from a library that
-leaves them locked (#789).
+3,353 stock footprints carry it. The clause is KiCad's keep-upright setting,
+not a lock: a field without it is kept upright, and one with it is not. Fields
+used to be sent as not kept upright, so KiCad saved `(unlocked yes)` on every
+field either tool wrote; they now keep the library's setting.
+`update_footprints_from_library` still refuses footprints for any other child
+it cannot represent, including a `(locked …)` clause on a property, which no
+stock footprint carries.
 
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 

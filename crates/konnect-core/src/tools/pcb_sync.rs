@@ -1335,12 +1335,14 @@ struct FootprintShape {
     fields: BTreeMap<String, FieldShape>,
 }
 
-/// What a field shows: its text, its layer and whether it is visible.
+/// What a field shows: its text, its layer, whether it is visible and
+/// whether KiCad keeps it upright as the footprint turns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FieldShape {
     text: String,
     layer: i32,
     visible: bool,
+    upright: bool,
 }
 
 impl FieldShape {
@@ -1353,6 +1355,10 @@ impl FieldShape {
                 .unwrap_or_default(),
             layer: board_text.map(|text| text.layer).unwrap_or_default(),
             visible: field.visible,
+            upright: board_text
+                .and_then(|text| text.text.as_ref())
+                .and_then(|text| text.attributes.as_ref())
+                .is_some_and(|attributes| attributes.keep_upright),
         }
     }
 
@@ -1362,7 +1368,12 @@ impl FieldShape {
             .and_then(konnect_ipc::builders::layer_name)
             .unwrap_or("unknown layer");
         let shown = if self.visible { "visible" } else { "hidden" };
-        format!("{:?} on {layer}, {shown}", self.text)
+        let upright = if self.upright {
+            "kept upright"
+        } else {
+            "not kept upright"
+        };
+        format!("{:?} on {layer}, {shown}, {upright}", self.text)
     }
 }
 
@@ -5293,6 +5304,15 @@ mod tests {
                         text.layer = BoardLayer::BlFSilkS as i32;
                     }
                 }
+                if let Some(attributes) = footprint
+                    .reference_field
+                    .as_mut()
+                    .and_then(|field| field.text.as_mut())
+                    .and_then(|text| text.text.as_mut())
+                    .and_then(|text| text.attributes.as_mut())
+                {
+                    attributes.keep_upright = false;
+                }
                 if let Some(definition) = footprint.definition.as_mut() {
                     definition.items.retain(|child| {
                         !konnect_ipc::builders::any_is(child, "kiapi.board.types.Field")
@@ -5715,9 +5735,11 @@ mod tests {
 
     /// #789's second increment through the served boundary. The added 0603
     /// carries its library's fields: Reference and Value on the library's
-    /// layers with its visibility and lock (Value on `F.Fab`, shown, not the
-    /// hidden silkscreen field the builder gave it), and the custom
-    /// `KiLib_Generator` property. Their text is the schematic's.
+    /// layers with its visibility (Value on `F.Fab`, shown, not the hidden
+    /// silkscreen field the builder gave it), and the custom
+    /// `KiLib_Generator` property. Their text is the schematic's. None of the
+    /// library's properties carries `(unlocked yes)`, so each is kept upright,
+    /// and each is sent unlocked, as KiCad creates a field.
     #[tokio::test]
     async fn an_added_footprint_carries_its_library_fields() {
         use konnect_ipc::gen::kiapi::board::types::BoardLayer;
@@ -5734,12 +5756,13 @@ mod tests {
         let shown = |field: &Option<konnect_ipc::gen::kiapi::board::types::Field>| {
             let field = field.as_ref().expect("a field");
             let text = field.text.as_ref().unwrap();
-            (
-                text.text.as_ref().unwrap().text.clone(),
-                text.layer,
-                field.visible,
-                text.locked,
-            )
+            let shown = text.text.as_ref().unwrap();
+            assert!(
+                shown.attributes.as_ref().unwrap().keep_upright,
+                "{} is kept upright",
+                field.name
+            );
+            (shown.text.clone(), text.layer, field.visible, text.locked)
         };
         assert_eq!(
             shown(&sent.reference_field),
@@ -5747,7 +5770,7 @@ mod tests {
                 "C1".to_string(),
                 BoardLayer::BlFSilkS as i32,
                 true,
-                LockedState::LsLocked as i32
+                LockedState::LsUnlocked as i32
             )
         );
         assert_eq!(
@@ -5756,7 +5779,7 @@ mod tests {
                 "part".to_string(),
                 BoardLayer::BlFFab as i32,
                 true,
-                LockedState::LsLocked as i32
+                LockedState::LsUnlocked as i32
             )
         );
         let custom: Vec<_> = sent
@@ -5779,15 +5802,16 @@ mod tests {
                 "SMD_2terminal_chip_molded".to_string(),
                 BoardLayer::BlFSilkS as i32,
                 false,
-                LockedState::LsLocked as i32
+                LockedState::LsUnlocked as i32
             )
         );
     }
 
     /// The readback holds the board to the fields that were sent. A board
-    /// that dropped the custom property and put Value back on the hidden
-    /// silkscreen field, which is what the sync used to build, is reported
-    /// field by field, after the commit.
+    /// that dropped the custom property, put Value back on the hidden
+    /// silkscreen field, which is what the sync used to build, and stopped
+    /// keeping Reference upright, which is what the sync used to send, is
+    /// reported field by field, after the commit.
     #[tokio::test]
     async fn the_readback_names_library_fields_the_board_did_not_keep() {
         let served = ServedSync::reading_back(Readback::WithoutLibraryFields).await;
@@ -5803,16 +5827,22 @@ mod tests {
             .filter(|diagnostic| diagnostic["code"] == "board_readback_differs")
             .map(|diagnostic| diagnostic["message"].as_str().unwrap())
             .collect();
-        assert_eq!(messages.len(), 2, "{applied:#}");
+        assert_eq!(messages.len(), 3, "{applied:#}");
         assert!(
             messages.iter().any(|message| message.contains(
-                "C1: sent field KiLib_Generator as \"SMD_2terminal_chip_molded\" on F.SilkS, hidden, board now has none"
+                "C1: sent field KiLib_Generator as \"SMD_2terminal_chip_molded\" on F.SilkS, hidden, kept upright, board now has none"
             )),
             "{messages:#?}"
         );
         assert!(
             messages.iter().any(|message| message.contains(
-                "C1: sent field Value as \"part\" on F.Fab, visible, board now has \"part\" on F.SilkS, hidden"
+                "C1: sent field Value as \"part\" on F.Fab, visible, kept upright, board now has \"part\" on F.SilkS, hidden, kept upright"
+            )),
+            "{messages:#?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "C1: sent field Reference as \"C1\" on F.SilkS, visible, kept upright, board now has \"C1\" on F.SilkS, visible, not kept upright"
             )),
             "{messages:#?}"
         );

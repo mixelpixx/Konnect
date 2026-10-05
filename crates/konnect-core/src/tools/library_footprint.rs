@@ -207,10 +207,13 @@ pub(crate) fn properties(root: &SexpNode) -> Result<LibraryProperties> {
 /// dropping part of its authored presentation would place it differently from
 /// the library even when its value survived.
 ///
-/// `(unlocked yes)` is KiCad's own clause for a field that moves independently
-/// of its footprint; its footprint editor writes it, and 3,353 of KiCad
-/// 10.0.5's 15,451 stock footprints carry it. Without it a field is locked, as
-/// the library authors it.
+/// `(unlocked yes)` is KiCad's keep-upright clause, not a lock: KiCad keeps
+/// every footprint text upright unless the clause says yes, and writes the
+/// clause exactly when a text is not kept upright. 7,047 of the 49,803
+/// properties in KiCad 10.0.5's stock footprints carry it. A field's lock is a
+/// separate `(locked …)` clause, which no stock footprint or demo board writes
+/// on a property; it is refused like any other clause this reader does not
+/// carry, and a field is sent unlocked, as KiCad creates one.
 ///
 /// With `require_typed_field` off, a property missing its position, layer or
 /// effects is accepted with no typed form.
@@ -339,6 +342,7 @@ fn property(
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
+    attributes.keep_upright = !unlocked.unwrap_or(false);
     Ok(Some(kiapi::board::types::Field {
         id: None,
         name: name.to_string(),
@@ -354,11 +358,7 @@ fn property(
             }),
             layer,
             knockout: knockout.unwrap_or(false),
-            locked: if unlocked.unwrap_or(false) {
-                LockedState::LsUnlocked
-            } else {
-                LockedState::LsLocked
-            } as i32,
+            locked: LockedState::LsUnlocked as i32,
             parent: None,
         }),
         visible: !hidden.unwrap_or(false),
@@ -539,7 +539,8 @@ fn property_effects(
         visible: true,
         mirrored,
         multiline: false,
-        keep_upright: false,
+        // The caller sets this from the property's `(unlocked …)` clause.
+        keep_upright: true,
         size: Some(konnect_ipc::builders::vec2(width, height)),
     })
 }
@@ -652,7 +653,8 @@ mod tests {
 
     /// The KiCad-written 0603's properties: Reference and Value with the
     /// library's own layer, visibility and font, and its one custom property.
-    /// None carries `(unlocked …)`, so each is locked, as the library has it.
+    /// None carries `(unlocked …)`, so each is kept upright, as KiCad reads
+    /// it, and each is sent unlocked, as KiCad creates a field.
     #[test]
     fn a_kicad_library_footprint_reads_its_properties_whole() {
         use kiapi::board::types::BoardLayer;
@@ -662,6 +664,13 @@ mod tests {
 
         let layer_visible_locked = |field: &kiapi::board::types::Field| {
             let text = field.text.as_ref().unwrap();
+            let upright = text
+                .text
+                .as_ref()
+                .and_then(|text| text.attributes.as_ref())
+                .unwrap()
+                .keep_upright;
+            assert!(upright, "{} is kept upright", field.name);
             (text.layer, field.visible, text.locked)
         };
         let reference = properties.reference.as_ref().expect("a typed Reference");
@@ -670,7 +679,7 @@ mod tests {
             (
                 BoardLayer::BlFSilkS as i32,
                 true,
-                LockedState::LsLocked as i32
+                LockedState::LsUnlocked as i32
             )
         );
         let value = properties.value.as_ref().expect("a typed Value");
@@ -679,7 +688,7 @@ mod tests {
             (
                 BoardLayer::BlFFab as i32,
                 true,
-                LockedState::LsLocked as i32
+                LockedState::LsUnlocked as i32
             )
         );
         let font = value.text.as_ref().unwrap().text.as_ref().unwrap();
@@ -699,40 +708,52 @@ mod tests {
             (
                 BoardLayer::BlFSilkS as i32,
                 false,
-                LockedState::LsLocked as i32
+                LockedState::LsUnlocked as i32
             )
         );
         assert!(properties.datasheet.is_none() && properties.description.is_none());
     }
 
-    /// `(unlocked yes)`, as KiCad's footprint editor writes it, is read as an
-    /// unlocked field rather than refused; `(unlocked no)` is locked; anything
-    /// else is refused.
+    /// `(unlocked yes)` is KiCad's keep-upright clause: a field carrying it is
+    /// not kept upright, and one without it, or with `(unlocked no)`, is. It
+    /// never locks the field. A `(locked …)` clause, which no KiCad library
+    /// file writes on a property, is refused rather than dropped, and so is
+    /// any value but yes or no. @davidtdab found the clause read as a lock in
+    /// #820's first version.
     #[test]
-    fn unlocked_is_read_as_the_fields_locked_state() {
+    fn unlocked_is_read_as_keep_upright_not_as_a_lock() {
         use kiapi::common::types::LockedState;
 
-        let with = |unlocked: &str| {
+        let with = |clause: &str| {
             C_0603.replace(
                 "(property \"KiLib_Generator\" \"SMD_2terminal_chip_molded\"",
-                &format!("(property \"KiLib_Generator\" \"SMD_2terminal_chip_molded\" {unlocked}"),
+                &format!("(property \"KiLib_Generator\" \"SMD_2terminal_chip_molded\" {clause}"),
             )
         };
-        let locked_state = |source: &str| {
+        let upright_and_lock = |source: &str| {
             let properties = properties(&root(source))?;
-            Ok::<_, anyhow::Error>(properties.custom[0].text.as_ref().unwrap().locked)
+            let text = properties.custom[0].text.clone().unwrap();
+            let upright = text.text.unwrap().attributes.unwrap().keep_upright;
+            Ok::<_, anyhow::Error>((upright, text.locked))
         };
+        let unlocked = LockedState::LsUnlocked as i32;
         assert_ne!(with("(unlocked yes)"), C_0603);
         assert_eq!(
-            locked_state(&with("(unlocked yes)")).unwrap(),
-            LockedState::LsUnlocked as i32
+            upright_and_lock(&with("(unlocked yes)")).unwrap(),
+            (false, unlocked)
         );
         assert_eq!(
-            locked_state(&with("(unlocked no)")).unwrap(),
-            LockedState::LsLocked as i32
+            upright_and_lock(&with("(unlocked no)")).unwrap(),
+            (true, unlocked)
         );
-        let refusal = locked_state(&with("(unlocked maybe)")).unwrap_err();
+        assert_eq!(upright_and_lock(C_0603).unwrap(), (true, unlocked));
+        let refusal = upright_and_lock(&with("(unlocked maybe)")).unwrap_err();
         assert!(format!("{refusal:#}").contains("unlocked"), "{refusal:#}");
+        let refusal = upright_and_lock(&with("(locked yes)")).unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains("clause 'locked' is not supported"),
+            "{refusal:#}"
+        );
     }
 
     #[test]
