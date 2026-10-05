@@ -399,6 +399,62 @@ fn board_lock_refusal_from(
     }
 }
 
+/// Refuse a write to a board's project file while a KiCad program holds the
+/// project (#804).
+///
+/// pcbnew, Eeschema and the project manager each create
+/// `~<project>.kicad_pro.lck` beside the project, and pcbnew and Eeschema
+/// rewrite the project file from their own copy when they save, so a change
+/// written while one of them holds it is reported and then reverted.
+/// [`refuse_if_board_open_in_kicad`] cannot see Eeschema, which holds no
+/// board. The lock does not say which program holds it, so every lock
+/// refuses: telling the project manager's lock from an editor's would take
+/// process inspection. A lock that cannot be inspected refuses too.
+pub(crate) fn refuse_if_project_locked_by_kicad(
+    project_path: &std::path::Path,
+    what: &str,
+) -> Option<CallToolResult> {
+    project_lock_refusal_from(project_path, what, live_board::project_lock(project_path))
+}
+
+fn project_lock_refusal_from(
+    project_path: &std::path::Path,
+    what: &str,
+    observed: live_board::EditorLock,
+) -> Option<CallToolResult> {
+    let (reason, situation) = match observed {
+        live_board::EditorLock::Absent => return None,
+        live_board::EditorLock::Present(lock_path) => (
+            "kicad_project_lock_present",
+            format!(
+                "KiCad's project lock '{}' is present, so a KiCad program holds this project.",
+                lock_path.display()
+            ),
+        ),
+        live_board::EditorLock::Unreadable(lock_path, error) => (
+            "kicad_project_lock_unreadable",
+            format!(
+                "KiCad's project lock '{}' could not be inspected ({error}), so a KiCad program \
+                 holding this project cannot be ruled out.",
+                lock_path.display()
+            ),
+        ),
+    };
+    Some(CallToolResult::error_kind(
+        ToolErrorKind::UnsafeFileFallback {
+            path: project_path.display().to_string(),
+            reason: reason.to_string(),
+        },
+        format!(
+            "{situation} pcbnew and Eeschema rewrite the project file from their own copy when \
+             they save, so a {what} written to it now would be reverted. Konnect did not modify \
+             the project file. Close the project in KiCad, or make the change there, and retry. \
+             If no KiCad program has this project open, the lock was left behind by a crash: \
+             delete it and retry."
+        ),
+    ))
+}
+
 /// Refuse a direct file edit when KiCAD is reachable AND holds this very
 /// board open: pcbnew saves from its in-memory state, so the file edit would
 /// be silently discarded on its next save — success reported, nothing kept
@@ -3563,6 +3619,31 @@ mod board_session_safety_tests {
         );
         assert_eq!(error_reason(&result), "kicad_lock_unreadable");
         assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    /// A project lock that cannot be inspected refuses too, under its own
+    /// reason: its absence was not established (#804).
+    #[test]
+    fn an_uninspectable_project_lock_fails_closed_with_distinct_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("demo.kicad_pro");
+        std::fs::write(&project, "{}").unwrap();
+        let observed = live_board::project_lock_with(&project, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mock access denied",
+            ))
+        });
+
+        let result = project_lock_refusal_from(&project, "netclass change", observed)
+            .expect("inspection failure must refuse");
+
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert_eq!(error_reason(&result), "kicad_project_lock_unreadable");
+        assert_eq!(std::fs::read(&project).unwrap(), b"{}");
     }
 
     /// Both refusals are correct, but `reason` is machine-readable and the

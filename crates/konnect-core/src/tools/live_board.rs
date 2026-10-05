@@ -166,7 +166,35 @@ pub(crate) fn editor_lock_with(
     board_path: &Path,
     inspect: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> EditorLock {
-    let Some(lock_path) = konnect_sexp::writer::kicad_editor_lock_path(board_path) else {
+    lock_with(
+        konnect_sexp::writer::kicad_editor_lock_path(board_path),
+        inspect,
+    )
+}
+
+/// Whether KiCad's project lock sits beside a project file (#804), with the
+/// same three answers as [`editor_lock`].
+pub(crate) fn project_lock(project_path: &Path) -> EditorLock {
+    project_lock_with(project_path, |path| {
+        std::fs::symlink_metadata(path).map(|_| ())
+    })
+}
+
+pub(crate) fn project_lock_with(
+    project_path: &Path,
+    inspect: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> EditorLock {
+    lock_with(
+        konnect_sexp::writer::kicad_project_lock_path(project_path),
+        inspect,
+    )
+}
+
+fn lock_with(
+    lock_path: Option<std::path::PathBuf>,
+    inspect: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> EditorLock {
+    let Some(lock_path) = lock_path else {
         return EditorLock::Absent;
     };
     match inspect(&lock_path) {

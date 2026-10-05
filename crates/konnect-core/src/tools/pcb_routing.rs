@@ -233,8 +233,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Create or update a netclass in the project's design rules. Writes \
              net_settings in the sibling .kicad_pro (where KiCad keeps netclasses \
              since v7); the board file is never touched. Requires the project file \
-             to exist. Refuses while KiCad holds the board open, because KiCad's next \
-             save rewrites the project file from its own copy. An update changes only \
+             to exist. Refuses while KiCad holds the board or the project (its \
+             ~<project>.kicad_pro.lck), because pcbnew and Eeschema rewrite the project \
+             file from their own copy when they save. An update changes only \
              the settings you name. To see what a \
              class holds, call get_netclasses rather than this tool: naming a class \
              that does not exist here creates it with the defaults, so a call meant \
@@ -294,8 +295,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Assign a net to an existing netclass, as a netclass_patterns entry in \
              the sibling .kicad_pro. The class must already exist (create_netclass). \
              Reassigning moves the net's entry to the new class. Refuses while KiCad \
-             holds the board open, because KiCad's next save rewrites the project \
-             file from its own copy.",
+             holds the board or the project (its ~<project>.kicad_pro.lck), because \
+             pcbnew and Eeschema rewrite the project file from their own copy when \
+             they save.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1318,15 +1320,25 @@ fn load_project_settings(
 
 /// The netclass writers' guard. Saving the board in KiCad also rewrites the
 /// project file from KiCad's own copy, so a netclass edit made here while it
-/// holds the board is reported and then silently reverted (#791). It runs
-/// before the read as well as the write: while KiCad holds the board, the
-/// file can be older than what KiCad holds, so even an answer that changes
-/// nothing would come from a stale copy.
-async fn refuse_while_kicad_holds_the_board(
+/// holds the board is reported and then silently reverted (#791). Eeschema
+/// rewrites it on save too and holds no board, so a project lock refuses as
+/// well (#804). It runs before the read as well as the write: while KiCad
+/// holds the project, the file can be older than what KiCad holds, so even an
+/// answer that changes nothing would come from a stale copy.
+async fn refuse_while_kicad_holds_the_project(
     ctx: &ToolContext,
     board_path: &std::path::Path,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, board_path, "netclass change").await
+    if let Some(refusal) =
+        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, board_path, "netclass change")
+            .await?
+    {
+        return Ok(Some(refusal));
+    }
+    Ok(crate::tools::pcb_board::refuse_if_project_locked_by_kicad(
+        &project_settings_path(board_path),
+        "netclass change",
+    ))
 }
 
 fn save_project_settings(
@@ -1385,7 +1397,7 @@ async fn handle_create_netclass(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
+    if let Some(refusal) = refuse_while_kicad_holds_the_project(ctx, &board_path).await? {
         return Ok(refusal);
     }
     // KiCad's key, this tool's argument name, and the value a *new* class
@@ -1824,7 +1836,7 @@ async fn handle_assign_net_to_class(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
+    if let Some(refusal) = refuse_while_kicad_holds_the_project(ctx, &board_path).await? {
         return Ok(refusal);
     }
 

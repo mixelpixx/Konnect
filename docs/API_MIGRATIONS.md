@@ -3,6 +3,27 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: project-file writers also refuse while KiCad holds the project (patch release)
+
+`set_design_rules`, `set_predefined_sizes`, `create_netclass` and
+`assign_net_to_class` already refused while KiCad held the board. Eeschema
+rewrites the project file from its own copy when it saves too, and it holds no
+board. So with only the schematic editor open, these tools wrote the
+`.kicad_pro`, reported success, and the next schematic save reverted the change.
+Measured on KiCad 10.0.5 (#804).
+
+All four now also refuse while KiCad's project lock, `~<project>.kicad_pro.lck`,
+sits beside the project file. pcbnew, Eeschema and the project manager each
+create that lock while they hold the project. The lock does not say which
+program holds it, so the project manager's lock refuses too. The refusal is
+`unsafe_file_fallback`, with reason `kicad_project_lock_present`, or
+`kicad_project_lock_unreadable` when the lock cannot be inspected. It names the
+lock and leaves the project file unchanged.
+
+Close the project in KiCad, or make the change there, and retry. A lock left by
+a crash, with no KiCad program running, refuses until it is deleted. Response
+shapes are unchanged.
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
