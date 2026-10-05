@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `move_labels_by_offset` moves the label it names, with its fields (patch release)
+
+`move_labels_by_offset` used to edit the first `(at ` in each label's text. For
+a label whose name contains `(at `, that match was inside the name: the tool
+rewrote the name, left the label where it was, and still counted it in
+`moved_labels`. It also moved only the anchor, so a global label's
+`Intersheetrefs` field stayed at its old position.
+
+It now edits the label's own `(at …)` and the `(at …)` of each of its fields,
+as KiCad's own move does, and leaves the name alone. Moved coordinates carry no
+float noise: `114.3 - 2.54` is written as `111.76`. After the write the tool
+reads the file back. If any label of that name is not at its moved anchor, the
+call fails with `mutation_outcome_uncertain`; the file has been written, so
+reload it before retrying. Arguments and the success response are unchanged
+(#803).
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the

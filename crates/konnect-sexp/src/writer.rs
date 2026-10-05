@@ -774,6 +774,19 @@ pub fn find_direct_child_blocks(content: &str, parent_tag: &str) -> Vec<(usize, 
     out
 }
 
+/// Byte ranges of the direct `(tag …)` children of the first `(parent_tag …)`
+/// block in `content`.
+pub fn direct_children_with_tag(content: &str, parent_tag: &str, tag: &str) -> Vec<(usize, usize)> {
+    find_direct_child_blocks(content, parent_tag)
+        .into_iter()
+        .filter(|&(start, end)| {
+            crate::parser::parse_sexp(&content[start..end])
+                .ok()
+                .is_some_and(|node| node.head() == Some(tag))
+        })
+        .collect()
+}
+
 /// Byte range of the direct child of `(parent_tag …)` that encloses `pos`.
 ///
 /// Unlike walking backward to a fixed indentation pattern, this cannot fall

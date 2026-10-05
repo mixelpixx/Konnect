@@ -14,7 +14,10 @@ use konnect_sexp::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
         pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_direct_child_blocks, write_atomic_if_unchanged, SexpEdit},
+    writer::{
+        apply_edits, direct_children_with_tag, find_direct_child_blocks, write_atomic_if_unchanged,
+        SexpEdit,
+    },
     SexpError,
 };
 use serde_json::json;
@@ -1120,17 +1123,6 @@ fn wire_block(content: &str, uuid: &str) -> Result<(usize, usize), ConnectivityT
                 .collect(),
         }),
     }
-}
-
-fn direct_children_with_tag(source: &str, parent: &str, tag: &str) -> Vec<(usize, usize)> {
-    find_direct_child_blocks(source, parent)
-        .into_iter()
-        .filter(|(start, end)| {
-            parse_sexp(&source[*start..*end])
-                .ok()
-                .is_some_and(|node| node.head() == Some(tag))
-        })
-        .collect()
 }
 
 fn wire_endpoint_block(

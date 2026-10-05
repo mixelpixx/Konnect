@@ -19,9 +19,9 @@ use konnect_sexp::{
         read_schematic, Wire,
     },
     writer::{
-        apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
-        find_direct_child_blocks, find_enclosing_block, read_consistent, write_atomic_if_unchanged,
-        SexpEdit,
+        apply_edits, direct_children_with_tag, find_balanced_block, find_block_starts,
+        find_block_with_leading_whitespace, find_direct_child_blocks, find_enclosing_block,
+        read_consistent, write_atomic_if_unchanged, SexpEdit,
     },
 };
 use serde_json::json;
@@ -1826,6 +1826,8 @@ async fn handle_delete_net_label(
 struct LabelBlock {
     /// Byte offset of the block's opening paren.
     start: usize,
+    /// Byte offset just past the block's closing paren.
+    end: usize,
     /// S-expression tag: `label`, `global_label`, or `hierarchical_label`.
     kind: &'static str,
     net: String,
@@ -1864,6 +1866,7 @@ fn find_label_blocks(content: &str) -> Vec<LabelBlock> {
             };
             out.push(LabelBlock {
                 start: bs,
+                end: be,
                 kind,
                 net: net.to_string(),
                 x,
@@ -2034,39 +2037,83 @@ async fn handle_move_labels_by_offset(
         )));
     }
 
-    // Edit each label's (at X Y ROT) anchor in place, preserving the rotation.
     let mut edits = Vec::new();
     for label in &matching {
-        let (block_start, block_end) = find_balanced_block(&content, label.start)
-            .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
-        let block = &content[block_start..block_end];
-        let at_rel = block
-            .find("(at ")
-            .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
-        let at_val = block_start + at_rel + "(at ".len();
-        let at_close = content[at_val..]
-            .find(')')
-            .map(|o| at_val + o)
-            .ok_or_else(|| anyhow::anyhow!("Malformed (at)"))?;
-        let rotation = content[at_val..at_close]
-            .split_whitespace()
-            .nth(2)
-            .unwrap_or("0")
-            .to_string();
-        edits.push(SexpEdit::replace(
-            at_val,
-            at_close,
-            format!("{} {} {}", label.x + dx, label.y + dy, rotation),
-        ));
+        edits.extend(label_offset_edits(label, &content, dx, dy)?);
     }
 
-    let moved = edits.len();
+    let targets: Vec<(f64, f64)> = matching
+        .iter()
+        .map(|l| (round6(l.x + dx), round6(l.y + dy)))
+        .collect();
     let new_content = apply_edits(content, edits);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
+    if !labels_landed(&read_consistent(&sch_path)?, &net, &targets) {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "move_labels_by_offset",
+            format!("the written file does not hold every '{net}' label at its moved anchor"),
+        ));
+    }
     Ok(CallToolResult::json(
-        &json!({ "moved_labels": moved, "net": net }),
+        &json!({ "moved_labels": targets.len(), "net": net }),
     ))
+}
+
+/// Whether `content` holds exactly one `net` label at each of `targets`, and
+/// no other label of that name.
+fn labels_landed(content: &str, net: &str, targets: &[(f64, f64)]) -> bool {
+    let mut missing = targets.to_vec();
+    for label in find_label_blocks(content).iter().filter(|l| l.net == net) {
+        let Some(i) = missing
+            .iter()
+            .position(|&(x, y)| same_point(label.x, x) && same_point(label.y, y))
+        else {
+            return false;
+        };
+        missing.swap_remove(i);
+    }
+    missing.is_empty()
+}
+
+/// Edits that move one label block by `(dx, dy)`: its anchor and each field's
+/// position, as KiCad's own move does. Only direct children are edited, so a
+/// label or field value that reads `(at …)` is left alone (#803).
+fn label_offset_edits(
+    label: &LabelBlock,
+    content: &str,
+    dx: f64,
+    dy: f64,
+) -> anyhow::Result<Vec<SexpEdit>> {
+    let block = &content[label.start..label.end];
+    let mut ats = direct_children_with_tag(block, label.kind, "at");
+    for (start, end) in direct_children_with_tag(block, label.kind, "property") {
+        let fields = direct_children_with_tag(&block[start..end], "property", "at");
+        ats.extend(fields.into_iter().map(|(s, e)| (start + s, start + e)));
+    }
+    ats.into_iter()
+        .map(|(start, end)| offset_at(&block[start..end], label.start + start, dx, dy))
+        .collect()
+}
+
+/// Move the `(at X Y …)` block `at`, found at byte `offset` of the file, by
+/// `(dx, dy)`, keeping any rotation after the coordinates.
+fn offset_at(at: &str, offset: usize, dx: f64, dy: f64) -> anyhow::Result<SexpEdit> {
+    let malformed = || anyhow::anyhow!("Malformed {at}");
+    let body = at
+        .strip_prefix("(at")
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(malformed)?;
+    let mut parts = body.split_whitespace();
+    let mut coord = || parts.next().and_then(|s| s.parse::<f64>().ok());
+    let (Some(x), Some(y)) = (coord(), coord()) else {
+        return Err(malformed());
+    };
+    let mut tokens = vec![round6(x + dx).to_string(), round6(y + dy).to_string()];
+    tokens.extend(parts.map(str::to_owned));
+    let moved = format!("(at {})", tokens.join(" "));
+    Ok(SexpEdit::replace(offset, offset + at.len(), moved))
 }
 
 async fn handle_batch_rotate_labels(
@@ -3784,6 +3831,127 @@ mod label_tests {
         .unwrap();
         assert!(result.is_error, "zero matches must not report success");
         assert_eq!(before, std::fs::read_to_string(&path).unwrap());
+    }
+
+    const LABEL_MOVE: &str = include_str!("../../tests/fixtures/label_move_kicad10.kicad_sch");
+
+    fn label_move_sheet() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = sch_with("");
+        std::fs::write(&path, LABEL_MOVE).unwrap();
+        (dir, path)
+    }
+
+    async fn move_label(path: &std::path::Path, net: &str, dx: f64, dy: f64) -> String {
+        let result = handle_move_labels_by_offset(
+            &json!({ "schematic": path.display().to_string(), "net": net, "dx": dx, "dy": dy }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["moved_labels"], 1);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The label named `(at 1 2)` moves 2.54mm along its wire and keeps its
+    /// name, which is the only line that changes (#803).
+    #[tokio::test]
+    async fn move_labels_by_offset_moves_a_label_whose_name_reads_at() {
+        let (_d, path) = label_move_sheet();
+
+        let after = move_label(&path, "(at 1 2)", 2.54, 0.0).await;
+        let expected = LABEL_MOVE.replace(
+            "(label \"(at 1 2)\"\n\t\t(at 114.3 97.79 0)",
+            "(label \"(at 1 2)\"\n\t\t(at 116.84 97.79 0)",
+        );
+        assert_ne!(expected, LABEL_MOVE);
+        assert_eq!(after, expected);
+    }
+
+    /// Moving both labels gives the committed result, which KiCad resaves
+    /// byte for byte: `PWR`'s Intersheetrefs field moves with its anchor,
+    /// as KiCad's own move takes it (#803).
+    #[tokio::test]
+    async fn move_labels_by_offset_moves_a_global_labels_fields() {
+        let (_d, path) = label_move_sheet();
+
+        move_label(&path, "(at 1 2)", 2.54, 0.0).await;
+        let after = move_label(&path, "PWR", 2.54, 0.0).await;
+        assert_eq!(
+            after,
+            include_str!("../../tests/fixtures/label_move_kicad10.moved.kicad_sch")
+        );
+    }
+
+    /// `114.3 - 2.54` is `111.75999999999999` in `f64`. A moved field is
+    /// written without that noise, like the anchor (#803).
+    #[tokio::test]
+    async fn move_labels_by_offset_writes_field_positions_kicad_writes() {
+        let (_d, path) = label_move_sheet();
+
+        let after = move_label(&path, "PWR", -2.54, -2.54).await;
+        assert!(after.contains("(at 111.76 102.87 0)"), "{after}");
+        assert!(after.contains("(at 121.92 99.06 0)"), "{after}");
+        assert!(!after.contains("9999"), "{after}");
+    }
+
+    /// The same move through `tools/call`, as a client sends it (#803).
+    #[tokio::test]
+    async fn move_labels_by_offset_through_the_served_dispatch() {
+        let (_d, path) = label_move_sheet();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        for net in ["(at 1 2)", "PWR"] {
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 803,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "move_labels_by_offset",
+                        "arguments": {
+                            "schematic": path.display().to_string(),
+                            "net": net, "dx": 2.54, "dy": 0
+                        }
+                    }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("successful JSON-RPC response");
+            assert_ne!(result["isError"], json!(true), "{result}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            include_str!("../../tests/fixtures/label_move_kicad10.moved.kicad_sch")
+        );
+    }
+
+    /// Readback refuses the file the text search used to write: the label
+    /// renamed `(at 116.84 97.79 0)` and left at (114.3, 97.79) (#803).
+    #[test]
+    fn labels_landed_refuses_a_renamed_label() {
+        let moved = include_str!("../../tests/fixtures/label_move_kicad10.moved.kicad_sch");
+        let target = [(116.84, 97.79)];
+        assert!(labels_landed(moved, "(at 1 2)", &target));
+
+        let renamed = LABEL_MOVE.replace("(label \"(at 1 2)\"", "(label \"(at 116.84 97.79 0)\"");
+        assert_ne!(renamed, LABEL_MOVE);
+        assert!(!labels_landed(&renamed, "(at 1 2)", &target));
+        assert!(!labels_landed(LABEL_MOVE, "(at 1 2)", &target));
     }
 }
 
