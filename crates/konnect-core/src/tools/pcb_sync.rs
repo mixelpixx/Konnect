@@ -289,6 +289,9 @@ struct PreparedFootprint {
     /// footprint definition.
     description_and_keywords: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
     models: Vec<konnect_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    /// The library's properties as typed fields, or why they could not be
+    /// read. Unreadable properties never refuse the part (#789).
+    library_fields: std::result::Result<super::library_footprint::LibraryProperties, String>,
     width: f64,
     height: f64,
 }
@@ -394,6 +397,8 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
+            plan.diagnostics
+                .extend(library_fields_not_carried(&plan, &prepared));
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -1326,6 +1331,39 @@ struct FootprintShape {
     attributes: AttributeSet,
     /// Sorted, so the comparison does not depend on the order KiCad lists them.
     model_files: Vec<String>,
+    /// Every field by name: the mandatory four and the custom ones (#789).
+    fields: BTreeMap<String, FieldShape>,
+}
+
+/// What a field shows: its text, its layer and whether it is visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldShape {
+    text: String,
+    layer: i32,
+    visible: bool,
+}
+
+impl FieldShape {
+    fn of(field: &konnect_ipc::gen::kiapi::board::types::Field) -> Self {
+        let board_text = field.text.as_ref();
+        Self {
+            text: board_text
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.clone())
+                .unwrap_or_default(),
+            layer: board_text.map(|text| text.layer).unwrap_or_default(),
+            visible: field.visible,
+        }
+    }
+
+    fn listed(&self) -> String {
+        let layer = konnect_ipc::gen::kiapi::board::types::BoardLayer::try_from(self.layer)
+            .ok()
+            .and_then(konnect_ipc::builders::layer_name)
+            .unwrap_or("unknown layer");
+        let shown = if self.visible { "visible" } else { "hidden" };
+        format!("{:?} on {layer}, {shown}", self.text)
+    }
 }
 
 /// Every instance attribute KiCad reports for a footprint, named by the
@@ -1409,6 +1447,16 @@ fn footprint_shapes<'a>(
             attributes: AttributeSet::of(footprint.attributes.as_ref()),
             ..Default::default()
         };
+        for (name, field) in [
+            ("Reference", &footprint.reference_field),
+            ("Value", &footprint.value_field),
+            ("Datasheet", &footprint.datasheet_field),
+            ("Description", &footprint.description_field),
+        ] {
+            if let Some(field) = field {
+                shape.fields.insert(name.to_string(), FieldShape::of(field));
+            }
+        }
         for child in &definition.items {
             match konnect_ipc::builders::any_type_name(child) {
                 "kiapi.board.types.Pad" => shape.pads += 1,
@@ -1420,6 +1468,13 @@ fn footprint_shapes<'a>(
                         kiapi::board::types::Footprint3DModel::decode(child.value.as_slice())
                     {
                         shape.model_files.push(model.filename);
+                    }
+                }
+                "kiapi.board.types.Field" => {
+                    if let Ok(field) = kiapi::board::types::Field::decode(child.value.as_slice()) {
+                        shape
+                            .fields
+                            .insert(field.name.clone(), FieldShape::of(&field));
                     }
                 }
                 _ => {}
@@ -1499,6 +1554,22 @@ fn verify_board_matches_what_was_sent(
                 want.model_files.join(", "),
                 got.model_files.join(", ")
             ));
+        }
+        // Only the fields that were sent: KiCad fills in a Datasheet and a
+        // Description of its own when none was sent, and those are not a loss.
+        for (name, sent) in &want.fields {
+            match got.fields.get(name) {
+                Some(kept) if kept == sent => {}
+                Some(kept) => suspicious.push(format!(
+                    "{reference}: sent field {name} as {}, board now has {}",
+                    sent.listed(),
+                    kept.listed()
+                )),
+                None => suspicious.push(format!(
+                    "{reference}: sent field {name} as {}, board now has none",
+                    sent.listed()
+                )),
+            }
         }
     }
     if !corrupted.is_empty() {
@@ -1993,8 +2064,6 @@ fn prepare_footprint_source(
     let unsupported =
         |error: anyhow::Error| ("unsupported_library_footprint", format!("{error:#}"));
     let pads = super::pcb_components::extract_pad_definitions(source).map_err(unsupported)?;
-    let graphics =
-        super::pcb_components::extract_graphic_definitions(source).map_err(unsupported)?;
     let fields = super::pcb_components::extract_field_placement(source);
     // Read with the same readers `update_footprints_from_library` uses, so a
     // footprint the sync places carries what a refresh would give it (#789).
@@ -2004,6 +2073,17 @@ fn prepare_footprint_source(
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
+    let library_fields =
+        super::library_footprint::properties(&root).map_err(|error| format!("{error:#}"));
+    // Properties travel as typed fields when they can be read. Drawing visible
+    // ones as plain text as well would show them twice; that drawing is only
+    // the fallback for a footprint whose properties could not be read.
+    let graphics = if library_fields.is_ok() {
+        super::pcb_components::extract_graphic_definitions_without_properties(source)
+    } else {
+        super::pcb_components::extract_graphic_definitions(source)
+    }
+    .map_err(unsupported)?;
     let (width, height) = footprint_dimensions(&pads, &graphics);
     Ok(PreparedFootprint {
         pads,
@@ -2012,6 +2092,7 @@ fn prepare_footprint_source(
         attributes,
         description_and_keywords,
         models,
+        library_fields,
         width,
         height,
     })
@@ -2040,7 +2121,105 @@ fn apply_library_data(
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }),
     );
+    if let Ok(fields) = &part.library_fields {
+        apply_library_fields(footprint, fields)?;
+    }
     Ok(())
+}
+
+/// Give an added footprint its library's fields (#789):
+/// - Reference and Value with the library's layer, visibility, font and lock
+///   (their text is the schematic's, set by [`apply_footprint_fields`]);
+/// - Datasheet and Description where the library has them;
+/// - every custom property, such as `KiLib_Generator`.
+///
+/// They are placed with the library refresh's own transform, so both tools
+/// put a library field in the same place. The sync places on the front only.
+fn apply_library_fields(
+    footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+    fields: &super::library_footprint::LibraryProperties,
+) -> Result<()> {
+    let position = footprint
+        .position
+        .context("built footprint has no position")?;
+    let rotation = footprint
+        .orientation
+        .as_ref()
+        .map(|angle| angle.value_degrees)
+        .unwrap_or(0.0);
+    let place = |field: &konnect_ipc::gen::kiapi::board::types::Field| {
+        super::pcb_footprint_update::transform_library_property(field, &position, rotation, false)
+    };
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("built footprint has no definition")?;
+    if let Some(field) = &fields.reference {
+        let placed = place(field)?;
+        definition.reference_field = Some(placed.clone());
+        footprint.reference_field = Some(placed);
+    }
+    if let Some(field) = &fields.value {
+        let placed = place(field)?;
+        definition.value_field = Some(placed.clone());
+        footprint.value_field = Some(placed);
+    }
+    if let Some(field) = &fields.datasheet {
+        let placed = place(field)?;
+        definition.datasheet_field = Some(placed.clone());
+        footprint.datasheet_field = Some(placed);
+    }
+    if let Some(field) = &fields.description {
+        let placed = place(field)?;
+        definition.description_field = Some(placed.clone());
+        footprint.description_field = Some(placed);
+    }
+    for field in &fields.custom {
+        definition.items.push(konnect_ipc::builders::pack_any(
+            &place(field)?,
+            "kiapi.board.types.Field",
+        ));
+    }
+    Ok(())
+}
+
+/// Footprints the plan adds whose library properties could not be read.
+/// They are placed with the fields every footprint gets, and the plan says so
+/// rather than refusing the part over presentation metadata (#789).
+fn library_fields_not_carried(
+    plan: &SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+) -> Vec<SyncDiagnostic> {
+    let mut references: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for change in &plan.changes {
+        if let PlannedChange::Add {
+            footprint_id,
+            reference,
+            ..
+        } = change
+        {
+            references
+                .entry(footprint_id.as_str())
+                .or_default()
+                .push(reference.clone());
+        }
+    }
+    references
+        .into_iter()
+        .filter_map(|(footprint_id, references)| {
+            let reason = prepared.get(footprint_id)?.library_fields.as_ref().err()?;
+            Some(footprint_conflict(
+                "library_fields_not_carried",
+                format!(
+                    "{footprint_id}'s library properties could not be read, so {} will be \
+                     placed with default fields, not the library's: {reason}",
+                    listed(&references)
+                ),
+                footprint_id,
+                references,
+            ))
+        })
+        .collect()
 }
 
 /// Prepare every footprint the plan adds. One that cannot be prepared does
@@ -3251,14 +3430,8 @@ mod tests {
 
         let sent = footprint_with_artwork("U4");
         let expected = footprint_shapes(std::iter::once(&sent));
-        assert_eq!(
-            expected["U4"],
-            FootprintShape {
-                pads: 1,
-                drawings: 6,
-                ..Default::default()
-            }
-        );
+        // The pad and drawing counts are what #244 got wrong.
+        assert_eq!((expected["U4"].pads, expected["U4"].drawings), (1, 6));
 
         // Exactly #244: decode every child as a Pad and pack it back as one.
         let mut corrupted =
@@ -3277,14 +3450,7 @@ mod tests {
         // decode as a `Pad`, while `BoardGraphicShape`'s do not — which is why
         // #239 reported footprints losing their *graphics* while their
         // reference and value text stayed put.
-        assert_eq!(
-            actual["U4"],
-            FootprintShape {
-                pads: 6,
-                drawings: 1,
-                ..Default::default()
-            }
-        );
+        assert_eq!((actual["U4"].pads, actual["U4"].drawings), (6, 1));
         assert_ne!(actual["U4"], expected["U4"]);
     }
 
@@ -4779,6 +4945,9 @@ mod tests {
         /// What was sent with its mounting style and models, but DNP cleared:
         /// one flag lost while everything the old check looked at survives.
         WithoutDnp,
+        /// What was sent without its custom fields, and with Value moved back
+        /// to the hidden silkscreen field the builder used to give it.
+        WithoutLibraryFields,
     }
 
     impl ServedSync {
@@ -5108,6 +5277,26 @@ mod tests {
                     .expect("a footprint");
                 if let Some(attributes) = footprint.attributes.as_mut() {
                     attributes.do_not_populate = false;
+                }
+                konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+            }
+            Readback::WithoutLibraryFields => {
+                use konnect_ipc::gen::kiapi::board::types::BoardLayer;
+                let mut footprint =
+                    konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .expect("a footprint");
+                if let Some(value) = footprint.value_field.as_mut() {
+                    value.visible = false;
+                    if let Some(text) = value.text.as_mut() {
+                        text.layer = BoardLayer::BlFSilkS as i32;
+                    }
+                }
+                if let Some(definition) = footprint.definition.as_mut() {
+                    definition.items.retain(|child| {
+                        !konnect_ipc::builders::any_is(child, "kiapi.board.types.Field")
+                    });
                 }
                 konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
             }
@@ -5524,6 +5713,164 @@ mod tests {
         assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
     }
 
+    /// #789's second increment through the served boundary. The added 0603
+    /// carries its library's fields: Reference and Value on the library's
+    /// layers with its visibility and lock (Value on `F.Fab`, shown, not the
+    /// hidden silkscreen field the builder gave it), and the custom
+    /// `KiLib_Generator` property. Their text is the schematic's.
+    #[tokio::test]
+    async fn an_added_footprint_carries_its_library_fields() {
+        use konnect_ipc::gen::kiapi::board::types::BoardLayer;
+        use konnect_ipc::gen::kiapi::common::types::LockedState;
+
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let applied = served
+            .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["diagnostics"], serde_json::json!([]), "{applied:#}");
+        let sent = &served.sent_footprints()[0];
+        let shown = |field: &Option<konnect_ipc::gen::kiapi::board::types::Field>| {
+            let field = field.as_ref().expect("a field");
+            let text = field.text.as_ref().unwrap();
+            (
+                text.text.as_ref().unwrap().text.clone(),
+                text.layer,
+                field.visible,
+                text.locked,
+            )
+        };
+        assert_eq!(
+            shown(&sent.reference_field),
+            (
+                "C1".to_string(),
+                BoardLayer::BlFSilkS as i32,
+                true,
+                LockedState::LsLocked as i32
+            )
+        );
+        assert_eq!(
+            shown(&sent.value_field),
+            (
+                "part".to_string(),
+                BoardLayer::BlFFab as i32,
+                true,
+                LockedState::LsLocked as i32
+            )
+        );
+        let custom: Vec<_> = sent
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Field"))
+            .map(|child| {
+                konnect_ipc::gen::kiapi::board::types::Field::decode(child.value.as_slice())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].name, "KiLib_Generator");
+        assert_eq!(
+            shown(&Some(custom[0].clone())),
+            (
+                "SMD_2terminal_chip_molded".to_string(),
+                BoardLayer::BlFSilkS as i32,
+                false,
+                LockedState::LsLocked as i32
+            )
+        );
+    }
+
+    /// The readback holds the board to the fields that were sent. A board
+    /// that dropped the custom property and put Value back on the hidden
+    /// silkscreen field, which is what the sync used to build, is reported
+    /// field by field, after the commit.
+    #[tokio::test]
+    async fn the_readback_names_library_fields_the_board_did_not_keep() {
+        let served = ServedSync::reading_back(Readback::WithoutLibraryFields).await;
+        let applied = served
+            .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let messages: Vec<&str> = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == "board_readback_differs")
+            .map(|diagnostic| diagnostic["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(messages.len(), 2, "{applied:#}");
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "C1: sent field KiLib_Generator as \"SMD_2terminal_chip_molded\" on F.SilkS, hidden, board now has none"
+            )),
+            "{messages:#?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "C1: sent field Value as \"part\" on F.Fab, visible, board now has \"part\" on F.SilkS, hidden"
+            )),
+            "{messages:#?}"
+        );
+    }
+
+    /// A footprint whose properties the reader refuses is still placed, with
+    /// the fields every footprint gets, and the plan says which footprint and
+    /// part and why. Presentation metadata never refuses a part (#789).
+    #[tokio::test]
+    async fn a_footprint_whose_properties_cannot_be_read_is_placed_and_reported() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        // The stock 0603 with its Reference property written twice, the shape
+        // of the 15 stock footprints the reader refuses.
+        let library = served.board.parent().unwrap().join("Capacitor_SMD.pretty");
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let twice = source.replacen(
+            "\t(property \"KiLib_Generator\"",
+            "\t(property \"Reference\" \"REF**\"\n\t\t(at 0 0 0)\n\t\t(layer \"F.Fab\")\n\t\t(effects (font (size 1 1) (thickness 0.15)))\n\t)\n\t(property \"KiLib_Generator\"",
+            1,
+        );
+        assert_ne!(twice, source);
+        std::fs::write(library.join("C_0603_TwoReferences.kicad_mod"), twice).unwrap();
+        let footprint_id = "Capacitor_SMD:C_0603_TwoReferences";
+
+        let plan = served
+            .dry_run(&exported_netlist(&[("C1", footprint_id, &["1", "2"])]))
+            .await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["changes"].as_array().unwrap().len(), 1, "{plan:#}");
+        let diagnostics = plan["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{plan:#}");
+        assert_eq!(diagnostics[0]["code"], "library_fields_not_carried");
+        assert_eq!(diagnostics[0]["footprint_id"], footprint_id);
+        assert_eq!(diagnostics[0]["references"], serde_json::json!(["C1"]));
+        let message = diagnostics[0]["message"].as_str().unwrap();
+        assert!(message.contains("more than once"), "{message}");
+    }
+
+    /// The apply reports the same `staging` evidence as the dry run, owed
+    /// from #799: both read it off the plan made against the snapshot.
+    #[tokio::test]
+    async fn the_apply_reports_staging_as_the_dry_run_does() {
+        let served = ServedSync::build(None, kicad_10_refusals(), Readback::AsSent).await;
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
+
+        let planned = served.dry_run(&netlist).await;
+        let applied = served.apply(&netlist).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let expected = serde_json::json!({
+            "basis": "no_measured_geometry",
+            "unavailable_item_classes": [refused_class("tables"), refused_class("generators")],
+        });
+        assert_eq!(planned["staging"], expected, "{planned:#}");
+        assert_eq!(applied["staging"], expected, "{applied:#}");
+    }
+
     /// The schematic decides DNP, over whatever the library footprint says,
     /// as KiCad's own Update PCB from Schematic does. The library data is
     /// applied first and the schematic's fields second, so the order is what
@@ -5565,6 +5912,46 @@ mod tests {
         // A library footprint marked DNP; the schematic says it is fitted.
         part.attributes.do_not_populate = true;
         assert!(!built_dnp(&part, false));
+    }
+
+    /// A visible custom property travels as its typed field only. Drawing it as
+    /// plain text as well, which the sync did when it carried no fields, would
+    /// show it twice. The text drawing stays the fallback for a footprint whose
+    /// properties cannot be read.
+    #[test]
+    fn a_visible_custom_property_is_carried_once() {
+        let drawn_text = |part: &PreparedFootprint| {
+            part.graphics
+                .iter()
+                .filter(|graphic| {
+                    matches!(graphic, konnect_ipc::IpcGraphicDefinition::Text { text, .. }
+                        if text == "SMD_2terminal_chip_molded")
+                })
+                .count()
+        };
+        // The 0603's KiLib_Generator property, shown instead of hidden.
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let visible = source.replacen(
+            "\t\t(layer \"F.SilkS\")\n\t\t(hide yes)",
+            "\t\t(layer \"F.SilkS\")",
+            1,
+        );
+        assert_ne!(visible, source);
+
+        let part = prepare_footprint_source(&visible).unwrap();
+        let fields = part.library_fields.as_ref().expect("readable properties");
+        assert!(fields.custom[0].visible);
+        assert_eq!(drawn_text(&part), 0, "carried as a field, not drawn too");
+
+        // Unreadable properties: nothing is carried, so it is drawn as before.
+        let twice = visible.replacen(
+            "\t(property \"KiLib_Generator\"",
+            "\t(property \"Value\" \"again\"\n\t\t(at 0 0 0)\n\t\t(layer \"F.Fab\")\n\t\t(effects (font (size 1 1) (thickness 0.15)))\n\t)\n\t(property \"KiLib_Generator\"",
+            1,
+        );
+        let fallback = prepare_footprint_source(&twice).unwrap();
+        assert!(fallback.library_fields.is_err());
+        assert_eq!(drawn_text(&fallback), 1, "drawn when it cannot be carried");
     }
 
     /// A model the shared reader refuses refuses the footprint, under the code

@@ -19,6 +19,40 @@ for wiring. Custom `graphics` still require explicit coordinates and glyphs
 that fit retain their established layout. Tool schemas and response shapes are
 unchanged; this does not infer electrical pin roles or redesign a supplied layout.
 
+## Unreleased: `update_pcb_from_schematic` gives footprints their library's fields (patch release)
+
+The previous release carried a footprint's library attributes, description,
+tags and 3D models. Its fields still came from a fixed template:
+- Value went on the silkscreen, hidden, and Reference and Value had no font
+  thickness;
+- the library's Datasheet, Description and custom properties, such as the
+  `KiLib_Generator` on 12,018 stock footprints, were left off.
+
+A footprint the sync adds now has the library's fields:
+- **Reference and Value** with the library's layer, visibility, font and
+  position, holding the schematic's text;
+- **Datasheet and Description** where the library has them;
+- **every custom property.**
+
+The post-apply readback also checks each field that was sent: its text, layer
+and visibility. A difference is reported as `board_readback_differs`, as other
+readback differences are.
+
+A footprint whose properties cannot be read is still placed, with the default
+fields as before. The plan then carries a non-blocking `library_fields_not_carried`
+diagnostic naming the footprint, its parts and the reason. 15 of KiCad 10.0.5's
+15,451 stock footprints repeat a property name and are placed this way.
+
+The library property reader is shared with `update_footprints_from_library`.
+Both now read `(unlocked yes)` on a property instead of refusing the footprint:
+KiCad's footprint editor writes it, and 3,353 stock footprints carry it.
+`update_footprints_from_library` still refuses those footprints for any other
+child it cannot represent.
+
+Through KiCad 10.0.5's API, a field is saved with `(unlocked yes)` whatever
+locked state is sent, so such fields can still differ from a library that
+leaves them locked (#789).
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
