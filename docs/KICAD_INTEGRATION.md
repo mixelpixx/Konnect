@@ -213,6 +213,13 @@ list above is not consulted, and `get_installation_info` reports
 `log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
 
+A blank or whitespace-only configured `jlcpcb_db_path` means unset for all
+JLCPCB database tools. They use the platform default (`%APPDATA%/konnect/jlcpcb.db`
+on Windows, `$HOME/.konnect/jlcpcb.db` elsewhere) unless a nonblank configured
+path is supplied. Nonblank configured paths are preserved without trimming;
+the download tool's per-call `output_path` takes precedence. This normalization does not rewrite
+your settings file or download a database at startup.
+
 ## Plugin, Viewer, And Packaging
 
 `plugin` contains the legacy KiCad 10 Python ActionPlugin for settings/server
