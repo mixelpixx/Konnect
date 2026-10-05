@@ -157,7 +157,7 @@ and Windows servers do not.
 |------|-------------|
 | `list_schematic_wires` | List all wire segments with start/end coordinates and UUIDs. |
 | `list_schematic_nets` | List all distinct net names from net labels, global labels, and power symbols. |
-| `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types. |
+| `list_schematic_labels` | List all net, global, and hierarchical labels with positions, net names, types, and UUIDs (usable with `batch_delete`). |
 | `get_net_connections` | Get all pins and labels connected to a named net. |
 | `get_net_connectivity` | Build the full connectivity graph for a net using union-find. Returns wires, labels, and T-junction locations. |
 | `get_pin_connections` | Get the net connected to a specific pin by tracing wires from the pin endpoint. |
