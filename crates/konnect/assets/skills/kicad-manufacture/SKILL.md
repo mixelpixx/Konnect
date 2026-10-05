@@ -139,7 +139,13 @@ from the automated result alone.
 5. Open the Gerbers and drills in a viewer. Inspect layer registration, outline,
    apertures, holes/slots, mask, paste, and silkscreen.
 6. For assembly, inspect BOM contents, DNP handling, designator coverage, CPL
-   side/units/origin/rotation, and the fabricator's export preview.
+   side/units/origin/rotation, and the fabricator's export preview. A part is
+   DNP only through the symbol's native attribute (`dnp` on
+   `edit_schematic_component`, read back by `get_schematic_component`). A
+   custom field named DNP is not that attribute: a BOM export with DNP exclusion
+   keeps the part, and the field can even fill the BOM's DNP column. A board
+   footprint carries its own flag and follows the schematic only after the
+   board is updated from it.
 
 The `files` field is derived from regular, non-empty artifacts verified at the
 export boundary; `files_generated` describes each successful export. That

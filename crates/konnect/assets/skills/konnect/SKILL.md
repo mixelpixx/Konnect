@@ -57,6 +57,7 @@ does not establish that a missing server-side check ran.
 |---|---|---|
 | "Review my schematic" | 2 | Load `sch_analysis` toolset, use analysis tools |
 | "Change R5 from 10k to 4.7k" | 1 | `load_toolset("sch_components")` then `edit_schematic_component` |
+| "Mark C7 do-not-populate" | 1 | `load_toolset("sch_components")` then `edit_schematic_component` with `dnp: true` (KiCad's native attribute; a property named DNP is not that attribute, and is refused), then confirm `dnp` in `get_schematic_component` |
 | "What's connected to SCL?" | 2 | `load_toolset("sch_analysis")` then `get_net_connections` |
 | "Add a 100nF cap to U3 VCC" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |
 | "Rename net /CLK to /SYS_CLK" | 1 | Warn about downstream effects, then MCP tools |

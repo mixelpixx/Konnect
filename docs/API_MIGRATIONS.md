@@ -3,6 +3,44 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: schematic component tools set and report KiCad's native DNP attribute (minor release)
+
+KiCad marks a part do-not-populate with the symbol attribute `(dnp yes|no)`.
+No schematic tool could set it, so a caller fell back to a custom property
+named `DNP`. KiCad does not treat that property as DNP: its plot draws the part
+as fitted and `kicad-cli sch export bom --exclude-dnp` keeps it, while the
+property fills the BOM's DNP column (#415).
+
+- **New argument:** an optional boolean `dnp` on `edit_schematic_component`,
+  and on each `batch_edit_schematic_components` entry. `true` writes
+  `(dnp yes)` and `false` writes `(dnp no)` on every placed unit of the
+  reference, in the same single write as the rest of the edit. Omitting it
+  changes nothing. A symbol from before KiCad 7, which has no token, gets one
+  after `(on_board …)`/`(in_pos_files …)`, where KiCad writes it. KiCad 10
+  per-variant overrides inside `(instances …)` are not touched. `unit` does
+  not select a unit for `dnp`: it scopes `field_placements` only, so
+  `edit_schematic_component` refuses `unit` beside `dnp` when no
+  `field_placements` are given. A unit carrying two `(dnp …)` tokens refuses
+  the whole `edit_schematic_component` call; in the batch it is an entry
+  error, like a malformed field.
+- **Now refused:** a property named `DNP` in any case, through
+  `edit_schematic_component`'s and `batch_edit_schematic_components`' `fields`
+  and through `add_component_annotation`'s `key`, whatever the value's type.
+  The whole request is refused with `invalid_argument` naming the `dnp`
+  argument, before anything is written: no other field or batch entry in it
+  is applied. A `DNP` property a file already carries is neither refused on
+  other edits nor removed.
+- **New response fields:** `dnp` on `get_schematic_component` (the lowest
+  placed unit's state, plus `dnp` on each `units` entry) and on each `list_schematic_components`
+  row, read from the file. Every response built from the committed component
+  readback (`edit_schematic_component`, `move_schematic_component`,
+  `rotate_schematic_component`, `replace_component`, `add_schematic_component`
+  and the other placement tools) carries the same fields. That readback now
+  also checks that the written file holds the expected DNP state: the edit's
+  requested one, and otherwise the one the file had before. A
+  `batch_edit_schematic_components` entry that set `dnp` reports the state
+  read back from the written file.
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
