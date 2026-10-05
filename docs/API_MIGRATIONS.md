@@ -3,6 +3,26 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `launch_kicad_ui` reports a KiCad that exits during startup (patch release)
+
+`launch_kicad_ui` used to return `launched: true` as soon as the KiCad process
+spawned, even when KiCad exited straight away, as it does on Linux with no
+`DISPLAY` or `WAYLAND_DISPLAY`. With `wait_ready: true` the call then waited
+out `timeout_seconds` and returned `ipc_ready: false`, which read as "retry".
+
+Now an exit before KiCad is up is an error whose message gives the exit status
+and the last 20 lines of KiCad's stderr, each cut to 500 characters, the same
+way `open_schematic_viewer` reports one. With `wait_ready: true` the wait ends
+as soon as KiCad exits, even while a ping is waiting for an answer, rather than
+at the timeout. With `wait_ready: false` KiCad is watched for one second,
+so a successful call now takes about one second longer. Successful responses
+are unchanged.
+
+KiCad no longer inherits the server's stdin and stdout, which carry the stdio
+transport's JSON-RPC stream. Both are `/dev/null` (`NUL` on Windows). KiCad's
+stderr is read by the server and written to the server log as `kicad`
+warnings, so that output now stops when the server exits (#764).
+
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 
 `set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
