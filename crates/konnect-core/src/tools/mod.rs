@@ -1282,7 +1282,38 @@ pub(crate) struct StubDirection {
 impl StubDirection {
     /// Where a stub of `length` mm from `anchor` ends, and its label sits.
     pub(crate) fn end(&self, (x, y): (f64, f64), length: f64) -> (f64, f64) {
-        (x + self.dx * length, y + self.dy * length)
+        use konnect_sexp::geometry::round6;
+        (round6(x + self.dx * length), round6(y + self.dy * length))
+    }
+}
+
+/// Numbers in `text` with more than the six decimals KiCad writes, such as
+/// `54.60999999999999` (#747).
+#[cfg(test)]
+pub(crate) fn long_decimals(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .filter(|token| token.parse::<f64>().is_ok())
+        .filter(|token| {
+            token
+                .split_once('.')
+                .is_some_and(|(_, frac)| frac.len() > 6)
+        })
+        .collect()
+}
+
+/// Numbers in a JSON response that KiCad would not write: more than six
+/// decimals, or an exponent such as `5e-17` (#747).
+#[cfg(test)]
+pub(crate) fn noisy_numbers(value: &Value) -> Vec<String> {
+    match value {
+        Value::Number(number) => {
+            let text = number.to_string();
+            let noisy = text.contains(['e', 'E']) || !long_decimals(&text).is_empty();
+            noisy.then_some(text).into_iter().collect()
+        }
+        Value::Array(items) => items.iter().flat_map(noisy_numbers).collect(),
+        Value::Object(fields) => fields.values().flat_map(noisy_numbers).collect(),
+        _ => Vec::new(),
     }
 }
 

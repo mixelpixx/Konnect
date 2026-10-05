@@ -47,7 +47,8 @@ pub struct PinTransform {
 /// * `t`              — component placement transform.
 ///
 /// # Returns
-/// `(schematic_x, schematic_y)` in millimetres.
+/// `(schematic_x, schematic_y)` in millimetres, rounded to the six decimals
+/// KiCad writes (see [`round6`]).
 ///
 /// # Examples
 /// ```
@@ -81,8 +82,10 @@ pub fn transform_pin(pin_x: f64, pin_y: f64, t: PinTransform) -> (f64, f64) {
         rx = -rx;
     }
 
-    // Step 4: Translate to component origin.
-    (t.comp_x + rx, t.comp_y + ry)
+    // Step 4: Translate to component origin. Rounded, because 50.8 + 3.81
+    // is `54.60999999999999` in `f64` and callers copy it into the next call
+    // (#747).
+    (round6(t.comp_x + rx), round6(t.comp_y + ry))
 }
 
 /// Map a library-space (Y-up) direction through a placement, returning the
@@ -399,6 +402,20 @@ mod tests {
             t(100.0, 100.0, 270.0, false, false),
             (103.81, 100.0),
             "rot270",
+        );
+    }
+
+    /// 101.6 + 15.24 is `116.83999999999999` in `f64`, and a 90° rotation
+    /// leaves `cos` at 6e-17. KiCad puts the pin at 116.84 (#747).
+    #[test]
+    fn transformed_pins_carry_no_float_noise() {
+        assert_eq!(
+            transform_pin(15.24, 7.62, t(101.6, 101.6, 0.0, false, false)),
+            (116.84, 93.98)
+        );
+        assert_eq!(
+            transform_pin(0.0, 3.81, t(63.5, 63.5, 90.0, false, false)),
+            (59.69, 63.5)
         );
     }
 

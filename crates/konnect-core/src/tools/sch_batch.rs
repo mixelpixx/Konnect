@@ -4111,15 +4111,7 @@ mod bulk_move_coordinate_text_tests {
         assert_eq!(symbol_at("#PWR002"), "(at 45.72 167.64 0)");
         assert_eq!(symbol_at("R8"), "(at 54.61 139.7 90)");
         // KiCad never writes more than six decimals.
-        let noisy: Vec<&str> = after
-            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
-            .filter(|token| token.parse::<f64>().is_ok())
-            .filter(|token| {
-                token
-                    .split_once('.')
-                    .is_some_and(|(_, frac)| frac.len() > 6)
-            })
-            .collect();
+        let noisy = crate::tools::long_decimals(&after);
         assert!(noisy.is_empty(), "unrounded coordinates written: {noisy:?}");
 
         let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
@@ -4703,5 +4695,123 @@ mod batch_connect_options_tests {
         assert!(def.input_validator.is_valid(&args(0.0)));
         assert!(def.input_validator.is_valid(&args(2.54)));
         assert!(!def.input_validator.is_valid(&args(-1.0)));
+    }
+
+    /// #747: a symbol's size is the difference of its bounds, which `f64`
+    /// gets wrong in the last digits even when the bounds are clean. On
+    /// KiCad's `multichannel` demo sheet the old response said
+    /// `7.6200000000000045` and `20.319999999999993`.
+    #[tokio::test]
+    async fn layout_sizes_carry_no_float_noise() {
+        let (_d, path) = fixture_named("multichannel_channel_strip.kicad_sch");
+        let result = handle_get_layout(&json!({ "schematic": path.display().to_string() }), &ctx())
+            .await
+            .unwrap();
+        let layout = body(&result);
+        let noisy = crate::tools::noisy_numbers(&layout);
+        assert!(noisy.is_empty(), "reported {noisy:?}");
+
+        let size = |reference: &str, unit: u64| {
+            let component = layout["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["reference"] == reference && c["unit"] == unit)
+                .unwrap_or_else(|| panic!("{reference} unit {unit} reported"));
+            (
+                component["bounds"]["width"].clone(),
+                component["bounds"]["height"].clone(),
+            )
+        };
+        assert_eq!(size("C12", 1), (json!(7.62), json!(4.064)));
+        assert_eq!(size("IC2", 2), (json!(20.32), json!(20.32)));
+    }
+
+    /// #747 through the served dispatch: pin positions and stub ends come back
+    /// as KiCad places them, not as `54.60999999999999`. The pin positions are
+    /// KiCad's ERC answer for this file, restated as literals; see the README.
+    #[tokio::test]
+    async fn served_responses_report_kicads_coordinates() {
+        let (_d, path) = fixture();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("handler builds");
+        let call = |name: &'static str, arguments: Value| {
+            let handler = &handler;
+            async move {
+                let response = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0",
+                        "id": 747,
+                        "method": "tools/call",
+                        "params": { "name": name, "arguments": arguments }
+                    }))
+                    .await
+                    .expect("tools/call receives a response");
+                let result = response.result.expect("successful JSON-RPC response");
+                assert_ne!(result["isError"], json!(true), "{name}: {result}");
+                let body: Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                let noisy = crate::tools::noisy_numbers(&body);
+                assert!(noisy.is_empty(), "{name} reported {noisy:?}");
+                body
+            }
+        };
+        // (pin, ERC position in mm, stub end 2.54 mm outward).
+        let promised = [
+            ("U1", "5", (116.84, 93.98), (119.38, 93.98)),
+            ("U1", "8", (101.6, 86.36), (101.6, 83.82)),
+            ("U1", "4", (101.6, 116.84), (101.6, 119.38)),
+            ("U2", "5", (162.56, 93.98), (160.02, 93.98)),
+            ("R1", "1", (59.69, 63.5), (57.15, 63.5)),
+        ];
+
+        let located = call(
+            "batch_get_schematic_pin_locations",
+            json!({ "schematic": path.display().to_string(), "references": ["U1", "U2", "R1"] }),
+        )
+        .await;
+        let reported: BTreeMap<(&str, &str), &Value> = located["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| {
+                let reference = c["reference"].as_str().unwrap();
+                c["pins"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(move |p| ((reference, p["number"].as_str().unwrap()), p))
+            })
+            .collect();
+        for (reference, number, (x, y), _) in promised {
+            let pin = reported[&(reference, number)];
+            assert_eq!(
+                (&pin["x"], &pin["y"]),
+                (&json!(x), &json!(y)),
+                "{reference}.{number}"
+            );
+        }
+
+        let added = call(
+            "batch_connect_to_net",
+            json!({ "schematic": path.display().to_string(), "net_name": "N",
+                    "stub_length": 2.54, "pins": pins() }),
+        )
+        .await;
+        let added = added["added"].as_array().unwrap();
+        assert_eq!(added.len(), promised.len(), "{added:?}");
+        for (entry, (reference, number, (x, y), (lx, ly))) in added.iter().zip(promised) {
+            assert_eq!(
+                entry["wire"],
+                json!({ "x1": x, "y1": y, "x2": lx, "y2": ly }),
+                "{reference}.{number}"
+            );
+            assert_eq!(entry["label"]["x"], json!(lx), "{reference}.{number}");
+            assert_eq!(entry["label"]["y"], json!(ly), "{reference}.{number}");
+        }
     }
 }

@@ -82,3 +82,22 @@ The fixture itself reports 18 `pin_not_connected`, 4 `power_pin_not_driven`,
 1 `wire_dangling` and 2 `unconnected_wire_endpoint` from
 `kicad-cli sch erc --severity-all`. No pin is wired and the wire touches
 nothing, so this is expected.
+
+## Coordinates in the response (#747)
+
+`kicad-cli sch erc --format json --severity-all --units mm` (KiCad 10.0.6)
+reports each unconnected pin's position, in units of 100 mm. Scaled to mm, it
+places the five pins where the label table above has them:
+
+| Pin | ERC `pos` | mm |
+|---|---|---|
+| U1.5 | (1.1684, 0.9398) | (116.84, 93.98) |
+| U1.8 | (1.016, 0.8636) | (101.6, 86.36) |
+| U1.4 | (1.016, 1.1684) | (101.6, 116.84) |
+| U2.5 | (1.6256, 0.9398) | (162.56, 93.98) |
+| R1.1 | (0.5969, 0.635) | (59.69, 63.5) |
+
+`served_responses_report_kicads_coordinates` asserts these exact values from
+`batch_get_schematic_pin_locations`, and the 2.54 mm stub ends from the table
+above in `batch_connect_to_net`'s `wire` and `label`. Before the fix the
+responses said `116.83999999999999` and `93.97999999999999`.

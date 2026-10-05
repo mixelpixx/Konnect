@@ -8,6 +8,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
@@ -3944,8 +3945,10 @@ impl ResolvedPin {
             number: pin["number"].as_str().unwrap_or("1").to_string(),
             name: pin["name"].as_str().unwrap_or("~").to_string(),
             requested,
-            x,
-            y,
+            // To the six decimals `fmt_f64` writes, so the report matches the
+            // file (#747).
+            x: round6(x),
+            y: round6(y),
         }
     }
 
@@ -8353,6 +8356,25 @@ mod tests {
         let text = warnings[0].as_str().unwrap();
         assert!(text.contains("14 of 14 pins"), "{text}");
         assert!(text.contains("unit 1"), "{text}");
+    }
+
+    /// #747: a pin slid out to the widened body is reported where the file
+    /// puts it. KiCad 10.0.6 resaves this symbol with its pins at ±27.94; the
+    /// response used to say `-27.939999999999998`.
+    #[tokio::test]
+    async fn slid_out_pins_report_the_written_coordinate() {
+        let names: Vec<String> = (0..12).map(|i| format!("VERYLONGPINNAME{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let report = module_response(&names, 7.62).await;
+
+        let noisy = crate::tools::noisy_numbers(&report);
+        assert!(noisy.is_empty(), "reported {noisy:?}");
+        let pins = report["units"][0]["pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 12, "{report}");
+        for pin in pins {
+            let x = pin["x"].as_f64().unwrap();
+            assert_eq!(x.abs(), 27.94, "{pin}");
+        }
     }
 
     /// The other row of the report's table: short names need no extra width, so
