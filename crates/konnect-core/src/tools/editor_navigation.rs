@@ -129,17 +129,8 @@ async fn handle_get_editor_state(
     match result {
         Ok(observation) => Ok(CallToolResult::json(&observation)),
         Err(error) => {
-            if let Some(document_error) = error
-                .chain()
-                .find_map(|cause| cause.downcast_ref::<konnect_ipc::IpcDocumentObservationError>())
-            {
-                return Ok(CallToolResult::error_kind(
-                    ToolErrorKind::StaleTarget {
-                        target: format!("{} editor document state", document_error.editor.as_str()),
-                        reason: document_error.reason.clone(),
-                    },
-                    document_error.to_string(),
-                ));
+            if let Some(result) = document_identity_result(&error) {
+                return Ok(result);
             }
             if let Some(status) = konnect_ipc::ApiStatusError::from_error(&error) {
                 if status.is_unsupported() {
@@ -174,6 +165,32 @@ async fn handle_get_editor_state(
             }
         }
     }
+}
+
+/// A live document identity KiCad cannot provide, or provided malformed. KiCad
+/// 10.x's schematic editor reports no project or sheet path, which is a
+/// capability boundary, not a stale target (#771). A malformed identity on a
+/// supported path stays a stale target.
+fn document_identity_result(error: &anyhow::Error) -> Option<CallToolResult> {
+    if let Some(identity) = konnect_ipc::IpcEditorIdentityUnsupported::from_error(error) {
+        return Some(CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: format!("{}_editor_document_identity", identity.editor.as_str()),
+                kicad_version: identity.kicad_version.clone(),
+            },
+            identity.to_string(),
+        ));
+    }
+    let malformed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<konnect_ipc::IpcDocumentObservationError>())?;
+    Some(CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target: format!("{} editor document state", malformed.editor.as_str()),
+            reason: malformed.reason.clone(),
+        },
+        malformed.to_string(),
+    ))
 }
 
 fn editor_unavailable(reason: &str) -> CallToolResult {
@@ -285,6 +302,9 @@ fn parse_selection_target(args: &serde_json::Value) -> Result<IpcEditorDocument,
 }
 
 fn selection_error_result(error: anyhow::Error) -> CallToolResult {
+    if let Some(result) = document_identity_result(&error) {
+        return result;
+    }
     if let Some(selection) = konnect_ipc::IpcSelectionObservationError::from_error(&error) {
         let kind = match selection.kind {
             IpcSelectionObservationErrorKind::WrongProject => ToolErrorKind::WrongProject {
@@ -678,6 +698,9 @@ fn selection_mutation_error_result(error: anyhow::Error) -> CallToolResult {
         };
         return CallToolResult::error_kind(kind, mutation.to_string());
     }
+    if let Some(result) = document_identity_result(&error) {
+        return result;
+    }
     if konnect_ipc::IpcSelectionObservationError::from_error(&error).is_some() {
         return selection_error_result(error);
     }
@@ -854,6 +877,9 @@ fn cross_probe_error_result(error: anyhow::Error) -> CallToolResult {
                 cross_probe.to_string(),
             ),
         };
+    }
+    if let Some(result) = document_identity_result(&error) {
+        return result;
     }
     if konnect_ipc::IpcSelectionObservationError::from_error(&error).is_some() {
         return selection_error_result(error);
