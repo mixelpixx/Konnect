@@ -55,7 +55,10 @@ and its npm tree, Python and its pip packages, wxPython, kicad-skip, and KiCAD's
 SWIG bindings — two package ecosystems plus a binding layer, every one of them a
 moving target that can break an install. Konnect is a single static binary —
 20–25 MB depending on platform, a ~9 MB download. There is nothing to install
-alongside it and nothing to version-match.
+alongside the server for MCP transport itself. KiCad 10 and `kicad-cli` are
+required for the corresponding live-editor, check and export workflows;
+autorouting additionally needs Java and a compatible Freerouting JAR. Run
+`check_freerouting` to establish readiness rather than assuming these are bundled.
 
 **SWIG is a dead end.** The original's PCB backend depends on KiCAD's SWIG Python
 bindings, which KiCAD is deprecating in favor of its IPC API. SWIG also carried
@@ -99,6 +102,22 @@ directly:
 - **Watch it happen** — a live schematic viewer auto-refreshes as the AI edits
 
 The full tool catalog is documented in [tool-directory.md](tool-directory.md).
+
+### Before editing a project
+
+Save and close the schematic in Eeschema before asking Konnect to modify its
+saved `.kicad_sch` files. For live PCB edits, keep the exact board open with
+IPC enabled: Konnect asks KiCad to change its own in-memory document. A direct
+file edit is a different path and must not race an editor holding newer state.
+For project-settings tools that write `.kicad_pro`, save and close the project
+in KiCad first; the PCB and schematic editors can both rewrite that file.
+Read-only calls do not imply permission to write, and saved-file results may
+exclude unsaved changes.
+
+If a tool refuses because of an editor lock, preserve the refusal and close
+the editor normally. See [lock recovery](docs/TROUBLESHOOTING.md#a-schematic-write-is-blocked-by-a-kicad-editor-lock)
+and [file ownership](docs/KICAD_INTEGRATION.md#file-ownership-before-mutation).
+Atomic writes protect file publication, not ownership of unsaved editor state.
 
 ## How it works
 

@@ -39,6 +39,22 @@ that could not run or a result that could not be decoded. Required unavailable
 evidence makes a design verdict incomplete; it does not automatically block an
 unrelated contribution.
 
+## For callers: editor ownership
+
+For a live PCB mutation, use a supported IPC tool against the exact requested
+board. For a saved schematic mutation, save and close that schematic in Eeschema
+first. For project-settings tools writing `.kicad_pro`, save and close the
+project in KiCad first: the schematic editor can overwrite settings even when
+no PCB editor is open. Server-side protection varies by installed version;
+this prerequisite does not claim every writer already enforces it.
+
+Preserve an editor-lock or `unsafe_file_fallback` refusal. Close the owning
+editor normally, reconcile unsaved state, and retry only after ownership is
+resolved. Remove a lock manually only after confirming it is stale and no
+editor owns the file; never use deletion or server restart as an automatic
+bypass. Read-only inspection and successful MCP connection do not authorize
+a file write. Atomic publication does not prevent a later editor save.
+
 ## For contributors: describe the changed behavior
 
 For a PR changing tool behavior, complete the behavioral table in the PR template.
@@ -72,8 +88,10 @@ Do not claim all-or-nothing behavior when the backend cannot provide it.
 
 ## Bounded migration inventory
 
-The shared `outcome` envelope is initially implemented only for
-`add_schematic_component`, `batch_place_components`, and `run_design_review`.
+The shared `outcome` envelope is adopted for `add_schematic_component`,
+`annotate_schematic`, `batch_place_components`, and `run_design_review`.
+The four names are checked against the
+code-owned catalogue, not an assumption that every tool uses the envelope.
 That pilot is intentionally bounded. The following adjacent paths retain their
 existing response contracts until their focused issues are resolved. The
 machine-checked source of this baseline is
@@ -84,7 +102,15 @@ table below is its human-readable explanation.
 |---|---|---|---|
 | DRC entry points | #408 introduces shared explicit save/refill ordering and source evidence. Default calls still read saved files; general source authority and the outcome-envelope migration remain incomplete. | [#119](https://github.com/mixelpixx/Konnect/issues/119), [#574](https://github.com/mixelpixx/Konnect/issues/574) | One owned DRC execution/result contract identifies source state and unavailable or partial evidence, including the remaining migration. |
 | Explicit config loading | A failed explicit plugin config can fall through to defaults and report success. | [#545](https://github.com/mixelpixx/Konnect/issues/545) | Explicit-config refusal is structured, does not start with substituted defaults, and has regression coverage. |
-| Live/file board readers | `get_layer_list` and `get_netclasses` read the saved file while sibling writers can operate on the live board. | [#542](https://github.com/mixelpixx/Konnect/issues/542) | Readers disclose and consistently select the live or saved source, with stale-file coverage. |
+
+The former live/file-reader entry was resolved by
+[#542](https://github.com/mixelpixx/Konnect/issues/542).
+`get_layer_list` selects live or saved enabled layers; stackup enrichment is
+explicitly saved-file evidence. `get_netclasses` selects live or saved board nets,
+while class definitions and assignment patterns remain disclosed `.kicad_pro`
+facts. Neither result claims saved project facts are unsaved live settings.
+The reviewed legacy ceiling is reduced with that completed source-selection debt;
+this does not adopt either reader into the outcome-envelope pilot.
 
 New migrations should reuse the shared outcome type, but each remains a focused
 change with its own compatibility and failure evidence. This inventory is not a
@@ -116,15 +142,16 @@ remain visible in issues; fixing one tool does not require migrating every other
 handler first. Keep fixes focused and expose one review-ready step per overlapping
 dependency chain under the existing branch workflow.
 
-Implementation tracked by [#549](https://github.com/mixelpixx/Konnect/issues/549)
-is separate from this policy:
+The initial implementation tracked by [#549](https://github.com/mixelpixx/Konnect/issues/549)
+landed through the following PRs. These are implementation references, not an
+open implementation queue or a claim of universal handler adoption:
 
-| Follow-up | Planned automation or implementation |
+| Merged PR | Implemented baseline |
 |---|---|
 | [#551](https://github.com/mixelpixx/Konnect/pull/551) | Compiled/cached Draft 2020-12 validation for domain and meta-tools, catalogue conformance, checked unit handling, and positive sheet dimensions; coordinated with #546/#547/#543 |
 | [#552](https://github.com/mixelpixx/Konnect/pull/552) | Shared, lifecycle-owned `inproc://` IPC test fixture; migrates the five racy mocks from #544 and covers readiness, concurrency, repeated use, and cleanup after success or responder failure |
 | [#553](https://github.com/mixelpixx/Konnect/pull/553) | Shared outcomes and initial handler/observer migration |
-| [#554](https://github.com/mixelpixx/Konnect/pull/554) | Named CI gate for the adopted outcome catalogue, served-dispatch outcome preservation, and a reviewed three-entry legacy-debt ratchet |
+| [#554](https://github.com/mixelpixx/Konnect/pull/554) | Named CI gate for the adopted outcome catalogue, served-dispatch outcome preservation, and the initial three-entry legacy-debt ratchet (now two entries after #542) |
 
 The dispatch compiles, caches, and enforces every advertised tool schema before
 the handler runs. Handlers still own domain rules and checked direct-call paths.

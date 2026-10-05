@@ -96,7 +96,16 @@ When changing a tool's behavior, follow the
 behavior table in the PR template. It covers input/default handling, target and
 source, observed results, failure timing, and safe recovery. Apply it to the
 change under review; unrelated legacy migrations are separate work. The contract
-distinguishes review requirements from automation still being implemented.
+distinguishes review requirements from the implemented pilot and remaining
+legacy migration.
+
+For a demonstrated shared defect, record a bounded caller/sibling-path sweep
+under [same-class defect review](GOVERNANCE.md#same-class-defect-review): the
+invariant, paths covered or intentionally different, and linked remaining gaps
+with their next actor. This is class-level accounting, not a demand to fix an
+entire tracker in one PR. For direct-file writers, identify the files changed
+and the KiCad programs that can overwrite them; use the
+[ownership gates](docs/KICAD_INTEGRATION.md#file-ownership-before-mutation).
 
 Use an imperative title such as `fix(schematic): preserve tab-indented wire blocks`.
 The description should state:

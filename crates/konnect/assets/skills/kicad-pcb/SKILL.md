@@ -20,8 +20,9 @@ Most PCB layout operations require KiCAD to be running with the board file open.
 connection communicates with the running KiCAD instance in real-time.
 
 Some board-construction and component tools have guarded closed-board paths. IPC-first
-tools fall back to the file only when the transport is unreachable and the target board
-has not been observed live during this server session. These paths use revision-aware
+tools use the shared observed-editor and lock gates: a confirmed non-open target,
+or a never-reached endpoint with no target lock, may permit file fallback. A
+previously observed board lost to transport failure refuses. These paths use revision-aware
 atomic writes: placement preserves pads, graphics, attributes, and models; moves
 preserve the existing angle; rotations update the footprint and its child angles; the
 closed-board flip fallback mirrors supported geometry and swaps front/back layers,
@@ -32,9 +33,9 @@ live KiCad holds the board. A reachable KiCad that predates 10.0.6 returns
 the structured error **unsupported_capability**; every reachable rejection stays closed instead of racing
 the editor with a file edit.
 
-`unsafe_file_fallback` is a stop condition. It means Konnect reached this board live
-earlier in the current server session but IPC is now unreachable, so the saved file may
-be older than lost editor state. Pause mutation work, tell the user that Konnect left
+`unsafe_file_fallback` is a stop condition. Its reason identifies the unsafe state,
+such as a present/uninspectable editor lock or loss of a previously observed live
+board; the saved file may be older than editor state. Pause mutation work, tell the user that Konnect left
 the file unchanged, and ask them to reopen/recover, reconcile, and save the board in
 KiCad. A read-only tool taking `board_source` can return the same kind, where nothing
 was going to be written: reporting the saved file as current would be the unsafe act.

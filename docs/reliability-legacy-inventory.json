@@ -6,7 +6,7 @@
     "batch_place_components",
     "run_design_review"
   ],
-  "legacy_entry_ceiling": 3,
+  "legacy_entry_ceiling": 2,
   "legacy_entries": [
     {
       "id": "drc-source-and-policy",
@@ -34,18 +34,6 @@
         "https://github.com/mixelpixx/Konnect/issues/545"
       ],
       "removal_criteria": "Explicit-config failure is a structured startup refusal, no substituted defaults are started, and regression coverage exercises the plugin entry point."
-    },
-    {
-      "id": "live-file-board-readers",
-      "paths": [
-        "crates/konnect-core/src/tools/pcb_board.rs",
-        "crates/konnect-core/src/tools/pcb_routing.rs"
-      ],
-      "rationale": "get_layer_list and get_netclasses read the saved board while sibling mutations can target live KiCad state.",
-      "tracking_issues": [
-        "https://github.com/mixelpixx/Konnect/issues/542"
-      ],
-      "removal_criteria": "Both readers consistently select and disclose live or saved state, including stale-file regression coverage."
     }
   ]
 }

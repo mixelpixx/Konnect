@@ -180,6 +180,30 @@ safe, scoped correction may proceed while broader expansion is deferred; a
 tracker's unfinished work is not automatically its dependency. Required CI,
 material safety evidence, and substantive review findings remain binding.
 
+## Same-class defect review
+
+When a demonstrated defect involves a shared mechanism or a repeated tool
+pattern, triage and review must include a bounded sibling-path sweep. Identify
+the violated invariant, inspect the affected helper's callers and equivalent
+paths, and record which are covered, exposed, or intentionally different, with
+the reason. Prefer one shared owner for the invariant over per-tool checks.
+
+The issue or PR records the sweep boundary, evidence, and any remaining gaps
+with a linked issue and next actor. Distinguish completion of this PR's accepted
+fix from coverage of the defect class. Add a regression that exercises the
+shared boundary and representative callers; use the existing negative-control
+rule for a new guard. If practical, check that callers cannot bypass the boundary.
+
+A focused safe fix may land with explicitly tracked sibling gaps. A material
+safety gap in the change itself still blocks it. This rule does not require
+whole-tracker completion, speculative variations, or a whole-codebase audit on
+every PR. Apply proportionate scope review when the sweep suggests expansion.
+
+For direct KiCad file writers, identify every file changed and which KiCad
+program can overwrite it; atomicity and revision checks alone do not establish
+editor ownership. Use the existing shared guards and the
+[file-ownership rule](docs/KICAD_INTEGRATION.md#file-ownership-before-mutation).
+
 ## Branches and the PR queue
 
 The detailed contributor workflow is in

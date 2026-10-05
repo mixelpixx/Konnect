@@ -8,15 +8,23 @@ the safest implementation usually follows an existing neighboring tool.
 
 | Operation | Preferred path | Required safety gate |
 |---|---|---|
-| Saved schematic mutation | `konnect-schematic-editor` or `konnect-sexp` | Revision-aware atomic write; transaction journal for multi-file changes |
+| Saved schematic mutation | `konnect-schematic-editor` or `konnect-sexp` | Target editor-lock refusal plus revision-aware atomic write; transaction journal for multi-file changes |
 | Live board mutation | `konnect-ipc` | `KiCadIpcClient::ensure_board_is_active` before sending the mutation |
-| Board mutation with a safe closed-file implementation | IPC first, file fallback | `attempt_ipc_write` in `tools/pcb_board.rs`; fallback only when IPC is unreachable |
+| Board mutation with a safe closed-file implementation | IPC first, file fallback | `attempt_ipc_write` in `tools/pcb_board.rs`; its observed editor state and lock checks authorize fallback, not transport failure alone |
 | Board file mutation with no IPC implementation | `konnect-sexp` or focused parser/edit code | `refuse_if_board_open_in_kicad` before touching the file |
+| Project settings (`.kicad_pro`) mutation | Existing project-settings writers | Existing board guard before reading/writing; require a closed project workflow and consult the ownership limitations below |
 | KiCad-supported check or export | `kicad-cli` through `tools/cli.rs` | Validate exit status, output existence, and parsed result coverage |
 
 Do not fall back to a file edit after a request reached KiCad and was rejected or
 timed out. `konnect-ipc` classifies that differently from an unreachable
 transport because KiCad may already hold or have changed the target document.
+
+Read [file ownership before mutation](KICAD_INTEGRATION.md#file-ownership-before-mutation)
+when changing a file writer. Check every target, including sibling project files,
+against the programs that can save it; an atomic write is not an editor lock.
+For a shared defect, complete the bounded
+[same-class sweep](../GOVERNANCE.md#same-class-defect-review) rather than copying
+the nearest handler's assumptions unchecked.
 
 ## Define And Implement The Tool
 

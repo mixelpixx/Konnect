@@ -38,6 +38,15 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 
 ## Standard Workflow
 
+### Editor ownership
+
+Before a saved-file mutation, read "For callers: editor ownership" in
+[the reliability contract](references/reliability-contract.md). Route live board
+changes through supported IPC; save and close Eeschema for schematic mutations
+and close the project for `.kicad_pro` settings changes. Preserve lock refusals
+and ask for a normal editor close rather than removing locks or restarting the
+server to bypass protection. MCP availability alone does not prove write safety.
+
 Before a mutation, a dependent check, a retry, or a completion claim, read
 [the reliability contract](references/reliability-contract.md), starting with
 "For callers: establish what happened". Apply its outcome, source, coverage and

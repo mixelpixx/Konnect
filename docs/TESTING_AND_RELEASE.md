@@ -34,6 +34,24 @@ The viewer is outside the Cargo workspace. Build or test it from
 
 ## Evidence-Focused Regression Tests
 
+For a demonstrated shared defect, record the bounded sibling-path sweep in
+[governance](../GOVERNANCE.md#same-class-defect-review). A regression for one
+handler does not establish coverage of its siblings. File-writer evidence must
+name the actual target files and owning editors. Exercise the affected ownership
+states: target editor open, another document open, closed target, and a
+present/uninspectable lock. For `.kicad_pro`, consider PCB-editor, Eeschema-only
+and manager-only sessions; record actual refusal coverage separately from a
+closed-project caller prerequisite. Use existing shared fixtures rather than
+inventing an all-platform matrix for every documentation change.
+
+`tools/board_source_contract_tests.rs` covers selected live/saved sources and
+stale-file controls for the readers resolved under #542. `outcome.rs` enforces
+the adopted-tool catalogue and remaining legacy-inventory ceiling. When retiring
+an inventory entry, compare its removal criteria with the implemented behavior
+and regressions, then lower both the JSON ceiling and the test-owned constant.
+Documentation/guard metadata changes need these focused checks; they do not
+require a fresh live-KiCad session for unchanged runtime behavior.
+
 When a tool returns a count, success state, or verdict, test the evidence behind
 that field. The v0.7 reference cases include:
 

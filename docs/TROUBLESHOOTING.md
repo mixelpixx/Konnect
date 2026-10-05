@@ -388,6 +388,16 @@ This option is unavailable on KiCad 11 after removal of the legacy SWIG Python
 API. Konnect then uses its Rust exporter unless KiCad gains an equivalent
 supported IPC operation.
 
+## Project settings refuse, or revert after KiCad saves
+
+`set_design_rules`, `set_predefined_sizes`, `create_netclass` and
+`assign_net_to_class` edit `.kicad_pro`, not the live editor's settings.
+Save and close the project in KiCad before using them, then reopen it to load
+the changes. Current board-open guards cannot establish that Eeschema alone
+is not holding the project file; its next save can overwrite an external edit.
+See the [current protection boundary and proposed project-lock fix](KICAD_INTEGRATION.md#file-ownership-before-mutation).
+An apparent successful file write is not proof that a live editor adopted it.
+
 ## A schematic write is blocked by a KiCad editor lock
 
 Konnect refuses to change a `.kicad_sch` file while the sibling

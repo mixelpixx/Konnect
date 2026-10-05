@@ -45,6 +45,15 @@ For file or IPC mutations, explain target validation, atomicity/rollback, and fa
 Write "No public compatibility impact" when applicable.
 -->
 
+### Same-class sweep
+
+<!-- For a demonstrated shared defect, follow GOVERNANCE.md#same-class-defect-review.
+Name the invariant, bounded caller/sibling set, covered/exposed/intentionally
+different paths and evidence. Link remaining gaps with a next actor. Otherwise
+say N/A with a reason. For file writers, name each changed file and the KiCad
+programs that can overwrite it. A focused PR need not complete a whole tracker.
+-->
+
 ## Validation
 
 ### Changed tool behavior

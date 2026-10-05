@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     use serde::Deserialize;
 
-    const LEGACY_BASELINE_CEILING: usize = 3;
+    const LEGACY_BASELINE_CEILING: usize = 2;
 
     #[derive(Debug, Deserialize)]
     struct ReliabilityBaseline {

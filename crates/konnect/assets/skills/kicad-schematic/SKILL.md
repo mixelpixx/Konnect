@@ -16,6 +16,13 @@ ALL modifications go through MCP tools — never edit .kicad_sch files directly.
 
 ## Toolset Loading
 
+Save and close the target schematic in Eeschema before a mutation: these tools
+edit the saved file, not Eeschema's in-memory document. A sibling editor-lock
+refusal means stop and ask for a normal close; read-only inspection may continue.
+For recovery, read "For callers: editor ownership" in the konnect skill's
+`references/reliability-contract.md`. After editing, reopen the schematic to
+inspect the updated saved state.
+
 Before any schematic work, load the required toolsets:
 
 ```

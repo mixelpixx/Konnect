@@ -3,6 +3,32 @@
 Konnect uses direct KiCad file editing, KiCad IPC, and `kicad-cli`. The correct
 path depends on the operation and whether KiCad currently owns the document.
 
+## File ownership before mutation
+
+Direct file mutation requires establishing that KiCad does not hold newer state
+for the affected file. Prefer supported IPC for a live document; otherwise
+require a closed target and the existing lock/revision guards. A filesystem
+atomic write and a revision check prevent different failures; neither prevents
+KiCad from later saving its in-memory copy over a successful file edit.
+
+`konnect-sexp/src/writer.rs` refuses `.kicad_sch` and `.kicad_pcb` writes when
+their sibling `~<filename>.lck` exists or cannot be inspected. Preserve these
+shared checks, including transaction paths. Close the affected editor normally;
+an unreadable or crash-left lock is not permission to overwrite. See
+[lock recovery](TROUBLESHOOTING.md#a-schematic-write-is-blocked-by-a-kicad-editor-lock).
+Read-only inspection is separate from mutation authorization.
+
+Project-settings tools `set_design_rules`, `set_predefined_sizes`,
+`create_netclass` and `assign_net_to_class` write the sibling `.kicad_pro`.
+Current `main` guards these against an open board, but Eeschema can also save
+the project file without holding a board. Save and close the project before
+using these tools. [#817](https://github.com/mixelpixx/Konnect/pull/817) proposes
+an additional project-lock guard, including a manager-only lock; this paragraph
+does not claim that unmerged protection is available in an installed release.
+When that guard lands, update this limitation along with the developer checklist
+and troubleshooting. The guard does not need to forbid supported live IPC edits
+or unrelated read-only work.
+
 ## Schematic File Editing
 
 Schematic handlers under `crates/konnect-core/src/tools/sch_*.rs` operate on
@@ -15,6 +41,8 @@ Existing-file writes use the atomic/conflict-aware machinery in
 `konnect-sexp/src/writer.rs`. Multi-file changes use
 `konnect-sexp/src/transaction.rs`; a source revision change must become a
 conflict rather than an overwrite.
+The target schematic must also be closed in Eeschema; the shared writer's
+editor-lock refusal is independent of atomic publication and revision matching.
 
 ## KiCad IPC
 
@@ -37,8 +65,11 @@ The three board-write gates are:
 - `KiCadIpcClient::ensure_board_is_active` in `konnect-ipc/src/client.rs`
   prevents a request naming one board from changing another open board.
 - `attempt_ipc_write` in `konnect-core/src/tools/pcb_board.rs` permits a file
-  fallback only when IPC is unreachable. A response from KiCad, including a
-  rejection, fails closed.
+  fallback for an observed `NotOpen` target, or a never-reached endpoint with
+  no target editor lock. A previously observed board lost to transport failure,
+  uncertain/recovered write, unresolved identity, rejection, or unserved endpoint
+  refuses. The shared file writer also checks the target lock before publication.
+  Transport failure by itself is not a closed-board verdict.
 - `refuse_if_board_open_in_kicad` in the same module protects file-only tools
   from edits KiCad would discard on its next save.
 
