@@ -209,8 +209,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_power_symbol",
-            "Add a power symbol (VCC, GND, etc.) to the schematic. Snaps the position to the \
-             1.27mm grid like the other placers, and reports the placed coordinates. Auto-numbers the \
+            "Add a power symbol (VCC, GND, etc.) to the schematic. Name the pin it ties to \
+             with reference + pin_number, or give x + y. A named pin places the symbol on the \
+             pin's endpoint and, unless rotation is given, turns it to face away from the body. \
+             Coordinates snap to the 1.27mm grid like the other placers. Reports the placed \
+             coordinates. Auto-numbers the \
              internal #PWR reference to the lowest number free on the sheet. Preserves every \
              saved hierarchy instance and reports committed-file readback; refuses stale \
              instance metadata before writing.",
@@ -219,10 +222,15 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string" },
                     "power_net": { "type": "string", "description": "Net name (e.g. 'VCC', 'GND')" },
-                    "x": { "type": "number" }, "y": { "type": "number" },
-                    "rotation": { "type": "number", "default": 0 }
+                    "reference": { "type": "string",
+                        "description": "Component reference, e.g. 'U1'. Use with pin_number instead of x/y." },
+                    "pin_number": { "type": "string", "description": "Pin number, e.g. '3'" },
+                    "x": { "type": "number", "description": "X in mm; alternative to reference + pin_number" },
+                    "y": { "type": "number", "description": "Y in mm" },
+                    "rotation": { "type": "number",
+                        "description": "Degrees. Defaults to facing away from a named pin's body, else 0." }
                 },
-                "required": ["schematic", "power_net", "x", "y"]
+                "required": ["schematic", "power_net"]
             }),
             |args, ctx| async move { handle_add_power_symbol(args, ctx).await }
         ),
@@ -2109,6 +2117,173 @@ fn next_pwr_number(sch: &cse::Schematic) -> u32 {
     (1u32..).find(|n| !used.contains(n)).unwrap_or(1)
 }
 
+/// Where `add_power_symbol` was asked to put the symbol.
+enum PowerSelector {
+    Point {
+        x: f64,
+        y: f64,
+    },
+    Pin {
+        reference: String,
+        pin_number: String,
+    },
+}
+
+impl PowerSelector {
+    /// Exactly one way in: `reference` + `pin_number`, or `x` + `y`. Mixed or
+    /// half-given selectors are refused before the file is read.
+    fn from_args(args: &serde_json::Value) -> Result<Self, CallToolResult> {
+        const EITHER: &str = "give either 'reference' + 'pin_number' or 'x' + 'y'";
+        // A missing half names the other way in; a malformed one keeps the
+        // helper's own reason.
+        fn text<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, CallToolResult> {
+            if args[key].is_null() {
+                return Err(crate::tools::invalid_arg(key, EITHER));
+            }
+            require_str(args, key)
+        }
+        fn number(args: &serde_json::Value, key: &str) -> Result<f64, CallToolResult> {
+            if args[key].is_null() {
+                return Err(crate::tools::invalid_arg(key, EITHER));
+            }
+            require_f64(args, key)
+        }
+        let given = |key: &str| !args[key].is_null();
+        if given("reference") || given("pin_number") {
+            if let Some(field) = ["x", "y"].into_iter().find(|key| given(key)) {
+                return Err(crate::tools::invalid_arg(
+                    field,
+                    &format!("{EITHER}, not both"),
+                ));
+            }
+            let reference = text(args, "reference")?;
+            let pin_number = text(args, "pin_number")?;
+            return Ok(Self::Pin {
+                reference: reference.to_owned(),
+                pin_number: pin_number.to_owned(),
+            });
+        }
+        Ok(Self::Point {
+            x: number(args, "x")?,
+            y: number(args, "y")?,
+        })
+    }
+}
+
+/// The selector with any named pin resolved against the file.
+enum PowerSite {
+    Point {
+        x: f64,
+        y: f64,
+    },
+    /// The pin's endpoint and the direction leading away from its body.
+    Pin {
+        endpoint: (f64, f64),
+        outward: f64,
+    },
+}
+
+/// Find the one pin `reference` + `pin_number` names, as a [`PowerSite`].
+///
+/// Stricter than [`resolve_placed_pin`], which takes the first match: a
+/// duplicated reference, or a pin drawn on two placed units, would put the
+/// rail on a pin the caller did not choose. Every refusal is structured, and
+/// none of them writes.
+fn resolve_power_pin(
+    tree: &konnect_sexp::SexpNode,
+    reference: &str,
+    pin_number: &str,
+) -> Result<PowerSite, CallToolResult> {
+    let target = format!("{reference} pin {pin_number}");
+    let refuse = |reason: String| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: target.clone(),
+                reason: reason.clone(),
+            },
+            format!("cannot place a power symbol on {target}: {reason}. Nothing was written."),
+        )
+    };
+    let placed = extract_symbol_instances(tree)
+        .iter()
+        .filter(|i| i.reference == reference)
+        .count();
+    if placed == 0 {
+        return Err(refuse(format!("component {reference} is not present")));
+    }
+    let resolved: Vec<_> = crate::tools::placed_pins_by_reference(tree)
+        .into_iter()
+        .filter(|(inst, _)| inst.reference == reference)
+        .collect();
+    // An instance whose definition is missing may be the one carrying the pin.
+    if resolved.len() != placed {
+        return Err(refuse(format!(
+            "a placed unit of {reference} has no embedded library definition"
+        )));
+    }
+
+    let mut found: Vec<(&konnect_sexp::schematic::SymbolInstance, (f64, f64), f64)> = Vec::new();
+    for (inst, pins) in &resolved {
+        for (pin, t) in pins.iter().filter(|(p, _)| p.number == pin_number) {
+            let (x, y) = pin_endpoint(pin, *t);
+            // Stacked pins sharing a number within one placed unit are one
+            // connection point, not a choice.
+            let stacked = found.iter().any(|(other, (ox, oy), _)| {
+                other.uuid == inst.uuid
+                    && other.unit == inst.unit
+                    && konnect_sexp::geometry::points_coincident(*ox, *oy, x, y, 0.01)
+            });
+            if !stacked {
+                found.push((inst, (x, y), pin_outward_direction(pin, *t)));
+            }
+        }
+    }
+    match found.as_slice() {
+        [] => Err(refuse(format!("{reference} has no pin {pin_number}"))),
+        [(_, endpoint, outward)] => Ok(PowerSite::Pin {
+            endpoint: *endpoint,
+            outward: *outward,
+        }),
+        _ => {
+            let candidates: Vec<String> = found
+                .iter()
+                .map(|(inst, (x, y), _)| {
+                    format!(
+                        "unit {} {} at ({}, {})",
+                        inst.unit,
+                        inst.uuid.as_deref().unwrap_or("without uuid"),
+                        fmt_f64(*x),
+                        fmt_f64(*y)
+                    )
+                })
+                .collect();
+            Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                    target: target.clone(),
+                    candidates: candidates.clone(),
+                },
+                format!(
+                    "{target} names more than one placed pin: {}. Give x + y for the one \
+                     you mean. Nothing was written.",
+                    candidates.join(", ")
+                ),
+            ))
+        }
+    }
+}
+
+/// The single pin of the power symbol `lib_id` as embedded in `sch`, or `None`
+/// when the definition is missing or has other than one pin.
+fn power_symbol_pin(sch: &cse::Schematic, lib_id: &str) -> Option<konnect_sexp::schematic::LibPin> {
+    let embedded = cse::library::embedded_lib_symbol(sch, lib_id)?;
+    // Pin parsing lives in konnect-sexp, which has its own node type.
+    let node = parse_sexp(&cse::sexp::writer::write(embedded)).ok()?;
+    match konnect_sexp::schematic::extract_lib_pins_for_unit(&node, 1).as_slice() {
+        [pin] => Some(pin.clone()),
+        _ => None,
+    }
+}
+
 async fn handle_add_power_symbol(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -2118,23 +2293,26 @@ async fn handle_add_power_symbol(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
-        Ok(v) => v,
+    let selector = match PowerSelector::from_args(args) {
+        Ok(selector) => selector,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
-    // Snap like `place_one_component` does for the other two placers. Wires and
-    // labels are snapped to this grid, so a power symbol left off it cannot be
-    // reached by them: ERC reports the endpoint off grid and the pin
-    // unconnected (#662). Everything below, including the bound placement
-    // intent the readback is checked against, uses the snapped point.
-    let (x, y) = konnect_sexp::geometry::snap_point(x, y, 1.27);
+    let requested_rotation = opt_f64(args, "rotation");
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    // One read serves both the pin lookup and the edit, so the pin cannot
+    // come from a revision other than the one the write is checked against.
+    let content = read_consistent(&sch_path)?;
+    let site = match selector {
+        PowerSelector::Point { x, y } => PowerSite::Point { x, y },
+        PowerSelector::Pin {
+            reference,
+            pin_number,
+        } => match resolve_power_pin(&parse_sexp(&content)?, &reference, &pin_number) {
+            Ok(site) => site,
+            Err(e) => return Ok(e),
+        },
+    };
+    let mut sch = cse::Schematic::from_source(&sch_path, content)?;
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
         Ok(context) => context,
         Err(error) => return Ok(error.into_tool_result()),
@@ -2157,6 +2335,42 @@ async fn handle_add_power_symbol(
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
+    let (x, y, rotation) = match site {
+        // Snap like `place_one_component` does for the other two placers. Wires
+        // and labels are snapped to this grid, so a power symbol left off it
+        // cannot be reached by them: ERC reports the endpoint off grid and the
+        // pin unconnected (#662). Everything below, including the bound
+        // placement intent the readback is checked against, uses the snapped
+        // point.
+        PowerSite::Point { x, y } => {
+            let (x, y) = konnect_sexp::geometry::snap_point(x, y, 1.27);
+            (x, y, requested_rotation.unwrap_or(0.0))
+        }
+        // Not snapped: the pin is where its symbol put it, and a snapped
+        // symbol would miss an off-grid pin.
+        PowerSite::Pin { endpoint, outward } => {
+            let Some(power_pin) = power_symbol_pin(&sch, &lib_id) else {
+                return Ok(crate::tools::invalid_arg(
+                    "power_net",
+                    &format!("'{lib_id}' does not have exactly one pin; give x + y instead"),
+                ));
+            };
+            let rotation = requested_rotation
+                .unwrap_or_else(|| konnect_sexp::schematic::rotation_facing(&power_pin, outward));
+            // Put the power pin, not the symbol origin, on the endpoint.
+            let (dx, dy) = pin_endpoint(
+                &power_pin,
+                konnect_sexp::geometry::PinTransform {
+                    comp_x: 0.0,
+                    comp_y: 0.0,
+                    rotation_deg: rotation,
+                    mirror_x: false,
+                    mirror_y: false,
+                },
+            );
+            (endpoint.0 - dx, endpoint.1 - dy, rotation)
+        }
+    };
     let metadata = cse::library::symbol_metadata(&sch, &lib_id);
     let placement_fields =
         super::sch_components::PlacementFields::resolve(&lib_id, &metadata, Some(&power_net), None);
@@ -4465,6 +4679,314 @@ mod power_symbol_tests {
         let mut refs: Vec<&str> = sch.symbols.iter().filter_map(|s| s.reference()).collect();
         refs.sort_unstable();
         assert_eq!(refs, ["#PWR001", "#PWR002", "#PWR03"]);
+    }
+}
+
+#[cfg(test)]
+mod power_on_pin_tests {
+    //! `add_power_symbol` with `reference` + `pin_number` (#727), through the
+    //! served dispatch. Expected points are KiCad's ERC pin positions and
+    //! expected rotations the README's table; see
+    //! `tests/fixtures/power_on_pin_kicad10.README.md`.
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/power_on_pin_kicad10.kicad_sch");
+    const DEMO: &str = include_str!("../../tests/fixtures/power_on_off_grid_pin.kicad_sch");
+
+    /// Write `content` where its instance records expect it: the placement
+    /// preflight holds them to the file's project name.
+    fn sheet(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{name}.kicad_sch"));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    async fn handler() -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn serve(
+        handler: &crate::mcp::handler::McpHandler,
+        path: &std::path::Path,
+        mut arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        arguments["schematic"] = json!(path.display().to_string());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 727,
+                "method": "tools/call",
+                "params": { "name": "add_power_symbol", "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let mut body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        body["is_error"] = json!(result["isError"] == json!(true));
+        body
+    }
+
+    /// The committed symbol the response names: its point and rotation.
+    fn committed_at(path: &std::path::Path, placed: &serde_json::Value) -> (f64, f64, f64) {
+        let sch = cse::Schematic::load(path).unwrap();
+        let symbol = sch
+            .symbols
+            .iter()
+            .find(|s| Some(s.uuid.as_str()) == placed["uuid"].as_str())
+            .expect("the placed symbol is in the committed file");
+        (symbol.at.x, symbol.at.y, symbol.at.rotation.unwrap_or(0.0))
+    }
+
+    #[tokio::test]
+    async fn a_named_pin_takes_the_symbol_to_kicads_endpoint_facing_away() {
+        let handler = handler().await;
+        // (net, reference, pin, KiCad's ERC position, rotation). GND's pin
+        // points up into a body below it and +3V3's down into a body above,
+        // so a rail on a pin pointing away in direction D turns by D - 270
+        // or D - 90.
+        let cases = [
+            ("GND", "R1", "2", (100.33, 83.82), 0.0),  // pin points down
+            ("+3V3", "R1", "1", (100.33, 76.2), 0.0),  // pin points up
+            ("GND", "R2", "2", (134.62, 80.01), 90.0), // pin points right
+            ("GND", "R2", "1", (127.0, 80.01), 270.0), // pin points left
+            ("GND", "R3", "1", (160.02, 83.82), 0.0),  // mirrored: pin 1 below
+            ("+3V3", "U1", "8", (137.16, 113.03), 0.0), // unit 3 only
+            ("GND", "U1", "4", (137.16, 128.27), 0.0),
+            ("+3V3", "U1", "1", (107.95, 120.65), 270.0),
+            ("+3V3", "U1", "3", (92.71, 118.11), 90.0),
+            ("GND", "U2", "3", (248.92, 120.65), 90.0), // drawn by both body styles
+        ];
+        for (net, reference, pin, (x, y), rotation) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+            let placed = serve(
+                &handler,
+                &path,
+                json!({"power_net": net, "reference": reference, "pin_number": pin}),
+            )
+            .await;
+            assert_eq!(
+                placed["is_error"],
+                json!(false),
+                "{reference}.{pin}: {placed}"
+            );
+            assert_eq!(
+                (placed["x"].as_f64(), placed["y"].as_f64()),
+                (Some(x), Some(y)),
+                "{reference}.{pin}: {placed}"
+            );
+            assert_eq!(
+                placed["rotation"].as_f64(),
+                Some(rotation),
+                "{reference}.{pin}"
+            );
+            assert_eq!(
+                committed_at(&path, &placed),
+                (x, y, rotation),
+                "{reference}.{pin}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_rotation_wins_over_the_pin() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+        let placed = serve(
+            &handler,
+            &path,
+            json!({"power_net": "GND", "reference": "R2", "pin_number": "2", "rotation": 180}),
+        )
+        .await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        // GND's pin sits at its origin, so the point is the pin's whatever
+        // the rotation.
+        assert_eq!(committed_at(&path, &placed), (134.62, 80.01, 180.0));
+    }
+
+    #[tokio::test]
+    async fn coordinates_still_snap_and_default_to_no_rotation() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+        let placed = serve(
+            &handler,
+            &path,
+            json!({"power_net": "GND", "x": 221.0, "y": 100.0}),
+        )
+        .await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        assert_eq!(committed_at(&path, &placed), (220.98, 100.33, 0.0));
+    }
+
+    /// The pin form does not snap: KiCad's hv_converter demo draws C4 off the
+    /// 1.27mm grid, and KiCad's netlist joins its pin 2 to GND only if the
+    /// symbol lands on the pin's own point. Snapped, it touches nothing.
+    #[tokio::test]
+    async fn an_off_grid_pin_is_reached_where_it_is() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "HSCConverter4_load", DEMO);
+        let placed = serve(
+            &handler,
+            &path,
+            json!({"power_net": "GND", "reference": "C4", "pin_number": "2"}),
+        )
+        .await;
+        assert_eq!(placed["is_error"], json!(false), "{placed}");
+        assert_eq!(committed_at(&path, &placed), (149.352, 84.328, 90.0));
+    }
+
+    #[tokio::test]
+    async fn bad_selectors_are_refused_without_writing() {
+        let handler = handler().await;
+        // (arguments, kind, field or target)
+        let cases = [
+            (
+                json!({"reference": "R1", "pin_number": "1", "x": 100.33, "y": 76.2}),
+                "invalid_argument",
+                "x",
+            ),
+            (
+                json!({"reference": "R1", "pin_number": "1", "y": 76.2}),
+                "invalid_argument",
+                "y",
+            ),
+            (json!({"reference": "R1"}), "invalid_argument", "pin_number"),
+            (json!({"pin_number": "1"}), "invalid_argument", "reference"),
+            (json!({"x": 100.33}), "invalid_argument", "y"),
+            (json!({}), "invalid_argument", "x"),
+            (
+                json!({"reference": "R99", "pin_number": "1"}),
+                "stale_target",
+                "R99 pin 1",
+            ),
+            (
+                json!({"reference": "R1", "pin_number": "9"}),
+                "stale_target",
+                "R1 pin 9",
+            ),
+        ];
+        for (mut arguments, kind, subject) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+            arguments["power_net"] = json!("GND");
+            let refused = serve(&handler, &path, arguments.clone()).await;
+            assert_eq!(refused["is_error"], json!(true), "{arguments}: {refused}");
+            let error = &refused["error"];
+            assert_eq!(error["kind"], kind, "{arguments}: {refused}");
+            let named = if kind == "invalid_argument" {
+                &error["field"]
+            } else {
+                &error["target"]
+            };
+            assert_eq!(named, subject, "{arguments}: {refused}");
+            // A missing component and a missing pin read differently.
+            let reason = match subject {
+                "R99 pin 1" => Some("component R99 is not present"),
+                "R1 pin 9" => Some("R1 has no pin 9"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                assert_eq!(error["reason"], reason, "{refused}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                SHEET,
+                "{arguments} wrote"
+            );
+        }
+    }
+
+    /// Called directly, past the schema gate, a malformed half keeps the
+    /// helper's own reason instead of being reported as missing.
+    #[tokio::test]
+    async fn a_malformed_selector_keeps_its_own_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+        let refused = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND", "reference": "R1", "pin_number": 1
+            }),
+            &crate::tools::ToolContext::new(
+                ServerConfig::default(),
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+        let Some(crate::mcp::protocol::ToolContent::Text { text }) = refused.content.first() else {
+            panic!("expected text content, got {refused:?}");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], "pin_number", "{body}");
+        assert_eq!(body["error"]["reason"], "missing or not a string", "{body}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+
+    /// One `R4` copy loses its library definition, so it may be the one
+    /// carrying pin 1. The other copy must not be chosen in its place.
+    #[tokio::test]
+    async fn a_copy_without_a_definition_is_not_skipped() {
+        let handler = handler().await;
+        let second = SHEET.find("(at 200.66 120.65").expect("the second R4");
+        let lib_id = SHEET[..second]
+            .rfind("(lib_id \"Device:R\")")
+            .expect("its lib_id");
+        let mut content = SHEET.to_string();
+        content.replace_range(
+            lib_id..lib_id + "(lib_id \"Device:R\")".len(),
+            "(lib_id \"Device:R_unembedded\")",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", &content);
+        let refused = serve(
+            &handler,
+            &path,
+            json!({"power_net": "GND", "reference": "R4", "pin_number": "1"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["kind"], "stale_target", "{refused}");
+        assert_eq!(refused["error"]["target"], "R4 pin 1", "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    /// Two placed symbols carry `R4`. Naming its pin 1 is a choice between
+    /// them, and KiCad's netlist keeps them as two nets.
+    #[tokio::test]
+    async fn a_pin_two_symbols_share_is_ambiguous_and_nothing_is_written() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path(), "power_on_pin_kicad10", SHEET);
+        let refused = serve(
+            &handler,
+            &path,
+            json!({"power_net": "GND", "reference": "R4", "pin_number": "1"}),
+        )
+        .await;
+        assert_eq!(refused["is_error"], json!(true), "{refused}");
+        let error = &refused["error"];
+        assert_eq!(error["kind"], "ambiguous_target", "{refused}");
+        assert_eq!(error["target"], "R4 pin 1");
+        let candidates: Vec<&str> = error["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert_eq!(candidates.len(), 2, "{refused}");
+        assert!(candidates[0].ends_with("at (180.34, 116.84)"), "{refused}");
+        assert!(candidates[1].ends_with("at (200.66, 116.84)"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
     }
 }
 
