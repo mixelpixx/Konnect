@@ -1,0 +1,81 @@
+(session "specctra_stock_roundrect.native-kicad-10"
+  (base_design "specctra_stock_roundrect.native-kicad-10")
+  (placement
+    (resolution um 10)
+    (component "R_0603_1608Metric"
+      (place R2 1050000 -600000 front 0)
+    )
+    (component "C_0603_1608Metric"
+      (place C1 1100000 -500000 front 0)
+    )
+    (component "R_0402_1005Metric"
+      (place R1 1000000 -500000 front 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad "KiCad's Pcbnew")
+      (host_version "10.0.6-1.fc44")
+    )
+    (library_out 
+      (padstack "Via[0-1]_600:300_um"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net VCC
+        (wire
+          (path F.Cu 2000
+            1041750 -600000
+            1041750 -546850
+            994900 -500000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1032603 -604907
+            1036843 -604907
+            1041750 -600000
+          )
+        )
+        (via "Via[0-1]_600:300_um" 1032603 -604907
+        )
+      )
+      (net GND
+        (wire
+          (path F.Cu 2000
+            1058250 -600000
+            1058250 -549500
+            1107750 -500000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1067398 -604907
+            1063157 -604907
+            1058250 -600000
+          )
+        )
+        (via "Via[0-1]_600:300_um" 1067398 -604907
+        )
+      )
+      (net SIG
+        (wire
+          (path F.Cu 2000
+            1005100 -500000
+            1092250 -500000
+          )
+        )
+      )
+    )
+  )
+)

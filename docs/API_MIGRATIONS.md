@@ -3,6 +3,38 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `export_specctra_dsn` exports rounded-rectangle pads (minor release)
+
+`export_specctra_dsn` refused any board with a `roundrect` pad, which covers
+most stock SMD footprints. It now exports them. Specctra has no rounded
+rectangle, so the DSN carries each one as a polygon, as KiCad's own exporter
+does. The polygon's edges are tangent to the corner arcs, so it encloses the
+rounded rectangle and stands at most about 1 µm outside it. As for every pad
+shape, the pad's size is first rounded to the micrometre (#790).
+
+What changes for a caller:
+
+- The response's `capabilities.supported_profile` is now
+  `two_layer_front_side_circle_rect_roundrect_no_existing_routing_or_zones`;
+  it was `two_layer_front_side_circle_rect_no_existing_routing_or_zones`.
+- In the reverse manifest, `supported_profile.pad_shapes` lists `roundrect`.
+  A rounded-rectangle padstack has `"shape": "roundrect"` and a new
+  `corner_radius_um`: KiCad's `min(width, height) * roundrect_rratio`, rounded
+  down to the micrometre. Circle, rect and via padstacks keep their old
+  fields. `plan_specctra_ses_import` and `apply_specctra_ses` accept both
+  forms.
+- A chamfered pad, which KiCad also writes as `roundrect`, is still refused,
+  now with `pad <ref>-<n> has chamfered corners`.
+- With `native_bridge_mode` `prefer` or `require`, KiCad's polygon for a
+  rounded-rectangle pad is checked against the pad, not against the Rust
+  polygon, because the two exporters approximate the corners differently. The
+  polygon may sit inside the pad by KiCad's default 5 µm arc error and outside
+  it by the corner growth KiCad's exporter adds. A project whose maximum arc
+  error is set above 5 µm fails this check, so `require` refuses and `prefer`
+  falls back to the Rust export. Circle and rect pads still have to match
+  exactly. KiCad's native DSN of most stock footprints is still refused before
+  this check, for reasons unrelated to pad shape (#841).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
