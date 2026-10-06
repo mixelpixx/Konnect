@@ -780,6 +780,44 @@ impl std::fmt::Display for IpcDocumentObservationError {
 
 impl std::error::Error for IpcDocumentObservationError {}
 
+/// KiCad answered for an editor whose documents carry no identity Konnect can
+/// address, rather than a malformed one. KiCad 10.x reports an open schematic
+/// by its file name alone: no project and no sheet path. KiCad 11 adds the
+/// schematic editor to its IPC API and reports both (#771). Nothing is
+/// synthesized in its place: not from the saved file, the PCB document or the
+/// caller's arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcEditorIdentityUnsupported {
+    pub editor: IpcEditorKind,
+    /// The running KiCad's version, when the endpoint reports one.
+    pub kicad_version: Option<String>,
+}
+
+impl IpcEditorIdentityUnsupported {
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+impl std::fmt::Display for IpcEditorIdentityUnsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kicad = self
+            .kicad_version
+            .as_deref()
+            .map(|version| format!("KiCad {version}"))
+            .unwrap_or_else(|| "This KiCad".to_string());
+        write!(
+            formatter,
+            "{kicad} reports no project or sheet identity for its {} documents; live {} \
+             editor navigation needs KiCad 11 or later",
+            self.editor.as_str(),
+            self.editor.as_str()
+        )
+    }
+}
+
+impl std::error::Error for IpcEditorIdentityUnsupported {}
+
 /// A board-bearing operation could not resolve one exact live KiCad document.
 ///
 /// `NoOpenDocuments` and `WrongDocument` positively prove that the requested
@@ -1706,7 +1744,23 @@ impl KiCadIpcClient {
         let raw_documents = self.get_open_documents_for(requested.editor)?;
         let mut documents = Vec::with_capacity(raw_documents.len());
         for raw in raw_documents {
-            let observed = editor_document_from_specifier(requested.editor, raw.clone())?;
+            let observed = match editor_document_from_specifier(requested.editor, raw.clone()) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    if let Some(identity) = IpcEditorIdentityUnsupported::from_error(&error) {
+                        // Best effort: a standalone KiCad 10 schematic editor
+                        // does not answer GetVersion.
+                        return Err(anyhow::Error::new(IpcEditorIdentityUnsupported {
+                            kicad_version: self
+                                .get_kicad_version()
+                                .ok()
+                                .map(|version| version.full_version),
+                            ..identity.clone()
+                        }));
+                    }
+                    return Err(error);
+                }
+            };
             documents.push((raw, observed));
         }
 
@@ -1783,14 +1837,43 @@ impl KiCadIpcClient {
             }
         };
 
-        let documents = documents
-            .into_iter()
-            .map(|document| editor_document_from_specifier(editor, document))
-            .collect::<Result<Vec<_>>>()?;
+        let mut observed = Vec::with_capacity(documents.len());
+        let mut unsupported = None;
+        for document in documents {
+            match editor_document_from_specifier(editor, document) {
+                Ok(document) => observed.push(document),
+                Err(error) => match IpcEditorIdentityUnsupported::from_error(&error) {
+                    Some(identity) => unsupported = Some(identity.clone()),
+                    // A malformed identity stays a refusal of the whole
+                    // observation, whatever else the editor reported.
+                    None => return Err(error),
+                },
+            }
+        }
+        if let Some(mut identity) = unsupported {
+            identity.kicad_version = Some(version.full_version.clone());
+            let reason = identity.to_string();
+            let mut capabilities = editor_capabilities(editor, version, false);
+            for capability in [
+                &mut capabilities.observe_documents,
+                &mut capabilities.read_selection,
+                &mut capabilities.mutate_selection,
+                &mut capabilities.cross_probe,
+            ] {
+                capability.reason = Some(reason.clone());
+            }
+            return Ok(IpcEditorObservation {
+                editor,
+                addressable: false,
+                documents: Vec::new(),
+                capabilities,
+                unavailable_reason: Some(reason),
+            });
+        }
         Ok(IpcEditorObservation {
             editor,
             addressable: true,
-            documents,
+            documents: observed,
             capabilities: editor_capabilities(editor, version, true),
             unavailable_reason: None,
         })
@@ -4895,6 +4978,19 @@ fn editor_document_from_specifier(
                     human_readable: path.path_human_readable.clone(),
                 }),
             )
+        }
+        // KiCad 10.x's schematic shape: the sheet's file name where a board's
+        // would go, and no project. Unsupported, not malformed (#771).
+        (IpcEditorKind::Schematic, Some(Identifier::BoardFilename(filename)))
+            if !filename.is_empty()
+                && project
+                    .as_ref()
+                    .is_none_or(|project| project.name.is_empty() && project.path.is_empty()) =>
+        {
+            return Err(anyhow::Error::new(IpcEditorIdentityUnsupported {
+                editor: expected,
+                kicad_version: None,
+            }));
         }
         _ => {
             return Err(anyhow::Error::new(IpcDocumentObservationError {
