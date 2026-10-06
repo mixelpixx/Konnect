@@ -137,6 +137,8 @@ struct ManifestPadstack {
     layers: Vec<String>,
     size_x_um: i64,
     size_y_um: i64,
+    #[serde(default, rename = "corner_radius_um")]
+    _corner_radius_um: Option<serde::de::IgnoredAny>,
     drill_um: Option<i64>,
 }
 
