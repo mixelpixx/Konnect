@@ -256,7 +256,8 @@ pub fn tools() -> Vec<ToolDef> {
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
              is used. The first \
              supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
+             through-hole footprints, circle/rectangle pads with one shape on every copper layer, \
+             one straight-line closed outline, \
              and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
              custom DRC rules, or incomplete effective routing rules instead of approximating \
              them, and writes a \
@@ -1518,5 +1519,125 @@ mod fabrication_option_tests {
         };
         let error: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(error["error"]["field"], "layers[1]");
+    }
+}
+
+/// `export_specctra_dsn` served against a KiCad holding a board whose pad
+/// has a per-layer padstack (#842).
+#[cfg(test)]
+mod specctra_padstack_served_tests {
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::pcb_board::board_mock::spawn_kicad_holding_board;
+    use crate::tools::ServerConfig;
+    use konnect_ipc::builders::{distance, net, pack_any, vec2};
+    use konnect_ipc::gen::kiapi;
+    use serde_json::{json, Value};
+
+    const FRONT_INNER_BACK: &str =
+        include_str!("../../tests/fixtures/specctra_padstack_front_inner_back.kicad_pcb");
+
+    /// KiCad's default netclass: 0.2 mm track and clearance, 0.6/0.3 mm via.
+    fn default_class() -> kiapi::common::project::NetClass {
+        kiapi::common::project::NetClass {
+            name: "Default".to_string(),
+            board: Some(kiapi::common::project::NetClassBoardSettings {
+                clearance: Some(distance(0.2)),
+                track_width: Some(distance(0.2)),
+                via_stack: Some(kiapi::board::types::PadStack {
+                    drill: Some(kiapi::board::types::DrillProperties {
+                        diameter: Some(vec2(0.3, 0.3)),
+                        ..Default::default()
+                    }),
+                    copper_layers: vec![kiapi::board::types::PadStackLayer {
+                        size: Some(vec2(0.6, 0.6)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// KiCad's own DSN writes this pad's front square on B.Cu too, so the
+    /// refusal comes before any bridge is asked, whatever the mode.
+    #[tokio::test]
+    async fn served_export_refuses_a_per_layer_padstack_in_every_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let board = root.join("specctra_padstack_front_inner_back.kicad_pcb");
+        std::fs::write(&board, FRONT_INNER_BACK).unwrap();
+        let output = root.join("board.dsn");
+        let manifest = root.join("board.dsn.konnect.json");
+        let nets = ["GND", "VCC"];
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            let name = command.type_url.rsplit('.').next().unwrap();
+            Some(match name {
+                "SaveDocumentToString" => pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        contents: FRONT_INNER_BACK.to_string(),
+                        document: None,
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ),
+                "GetNets" => pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: (1..)
+                            .zip(nets)
+                            .map(|(code, name)| net(name, code))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ),
+                "GetNetClassForNets" => pack_any(
+                    &kiapi::board::commands::NetClassForNetsResponse {
+                        classes: nets
+                            .iter()
+                            .map(|net| (net.to_string(), default_class()))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetClassForNetsResponse",
+                ),
+                _ => return None,
+            })
+        });
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        for mode in ["disable", "prefer", "require"] {
+            let result = handler
+                .handle_message(json!({"jsonrpc": "2.0", "id": 842, "method": "tools/call",
+                    "params": {"name": "export_specctra_dsn",
+                        "arguments": {"board": board, "output": output,
+                            "native_bridge_mode": mode}}}))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert_eq!(result["isError"], true, "{mode}: {text}");
+            let error: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(error["error"]["kind"], "handler_error", "{mode}: {text}");
+            assert!(
+                error["error"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pad J1-1 has a 'front_inner_back' padstack"),
+                "{mode}: {text}"
+            );
+            assert!(!output.exists(), "{mode}");
+            assert!(!manifest.exists(), "{mode}");
+        }
     }
 }

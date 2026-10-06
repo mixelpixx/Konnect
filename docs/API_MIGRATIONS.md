@@ -3,6 +3,20 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `export_specctra_dsn` refuses per-layer padstacks (patch release)
+
+A KiCad 10 pad in `front_inner_back` or `custom` padstack mode can have a
+different shape or size on `B.Cu` and the inner layers. The exporter read only
+the front geometry and wrote it on every copper layer, so Freerouting routed
+against copper the board does not have. KiCad 10.0.6's own DSN exporter does
+the same, so the native bridge is no remedy.
+
+`export_specctra_dsn` now refuses such a pad, or a locked via with such a
+padstack, under every `native_bridge_mode`, with a `handler_error` naming the
+item and its mode. Nothing is written. A normal padstack, which KiCad saves
+with no `(padstack ...)` block, exports as before. To route the board, set the
+padstack back to normal in KiCad. Response shapes are unchanged (#842).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
