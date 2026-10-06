@@ -13,12 +13,14 @@ use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::live_board::{self, LiveBoard};
 use crate::tools::{
-    get_path, opt_str_list, require_f64, require_str, with_board_ipc_classified, ToolContext,
-    ToolDef,
+    get_path, invalid_arg, opt_str_list, require_f64, require_str, with_board_ipc_classified,
+    ToolContext, ToolDef,
 };
 use konnect_ipc::builders;
 use konnect_sexp::{
+    geometry::round6,
     parser::{parse_sexp, SexpNode},
+    schematic::parse_at,
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
         write_atomic, SexpEdit,
@@ -704,8 +706,7 @@ fn format_outline(primitives: &[OutlinePrimitive], layer: &str, width: f64) -> S
         .join("")
 }
 
-fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) -> String {
-    let uuid = new_uuid();
+fn format_gr_text(text: &str, [x, y, rot]: [f64; 3], layer: &str, size: f64, uuid: &str) -> String {
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
         "\n  (gr_text \"{escaped}\"\n    (at {x} {y} {rot})\n    (layer \"{layer}\")\n    \
@@ -2507,11 +2508,34 @@ async fn handle_add_board_text(
         BoardWrite::File(reason) => reason,
     };
 
-    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
+    // Rounded to the six decimals KiCad writes: a caller passing back a
+    // coordinate an older response reported (54.60999999999999, #747) would
+    // otherwise write that noise into the board (#838).
+    let at = [round6(x), round6(y), round6(rotation)];
+    // Rounding scales by 1e6, so a value near f64::MAX becomes `inf`, which
+    // KiCad cannot load.
+    for (field, value) in ["x", "y", "rotation"].into_iter().zip(at) {
+        if !value.is_finite() {
+            return Ok(invalid_arg(field, "must be a finite number of millimetres"));
+        }
+    }
+    let uuid = new_uuid();
+    let gr_text = format_gr_text(&text, at, &layer, size, &uuid);
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, gr_text)]);
     write_atomic(&board_path, &new_content)?;
+
+    let landed = std::fs::read_to_string(&board_path)
+        .map_err(|e| format!("the saved board could not be re-read: {e}"))
+        .and_then(|content| gr_text_landed(&content, &uuid, at));
+    if let Err(reason) = landed {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &board_path,
+            "add_board_text",
+            reason,
+        ));
+    }
 
     Ok(CallToolResult::json(&json!({
         "text": text, "x": x, "y": y, "layer": layer, "size": size,
@@ -2519,6 +2543,23 @@ async fn handle_add_board_text(
         "fallback_reason": fallback_reason.evidence(),
         "warning": fallback_reason.warning()
     })))
+}
+
+/// Confirm `content` holds the board text `uuid` at its own `(at x y rotation)`,
+/// or say why not.
+fn gr_text_landed(content: &str, uuid: &str, at: [f64; 3]) -> Result<(), String> {
+    let tree = parse_sexp(content).map_err(|e| format!("the saved board cannot be parsed: {e}"))?;
+    let written = tree
+        .find_all("gr_text")
+        .into_iter()
+        .find(|text| text.find_str("uuid") == Some(uuid))
+        .ok_or_else(|| format!("the saved board has no text {uuid}"))?;
+    match parse_at(written) {
+        Some((x, y, rotation)) if [x, y, rotation] == at => Ok(()),
+        found => Err(format!(
+            "text {uuid} is at {found:?} in the saved board, not at {at:?}"
+        )),
+    }
 }
 
 /// Shared implementation of `add_zone` and its `add_copper_pour` alias.
@@ -4922,6 +4963,116 @@ mod board_write_gate_tests {
 
         assert!(res.is_error, "a rejection must not be reported as success");
         assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+}
+
+/// `add_board_text` writes the coordinates KiCad writes (#838).
+#[cfg(test)]
+mod board_text_coordinate_tests {
+    use super::mounting_hole_tests::{blank_board, ctx_with_ipc};
+    use super::*;
+
+    /// KiCad's own serialization, from `specctra_two_resistors.README.md`.
+    const KICAD_BOARD: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+
+    /// #838 through the served dispatch. The coordinates are the float noise
+    /// older responses reported (#747); KiCad 10.0.6 resaves them, and a
+    /// rotation of `90.00000000000001`, as `(at 54.61 27.94 90)` (see the
+    /// README). Nothing else in KiCad's file changes.
+    #[tokio::test]
+    async fn the_served_dispatch_writes_the_coordinates_kicad_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, KICAD_BOARD).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 838,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_board_text",
+                    "arguments": {
+                        "board": path.display().to_string(),
+                        "text": "hi",
+                        "x": 54.60999999999999,
+                        "y": 27.939999999999998,
+                        "rotation": 90.00000000000001
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["source"], json!("file"), "{body}");
+        // The response echoes the caller's values, as #839 does.
+        assert_eq!(body["x"], json!(54.60999999999999), "{body}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let start = after.find("(gr_text \"hi\"").expect("text written");
+        let (_, end) = konnect_sexp::writer::find_balanced_block(&after, start).unwrap();
+        assert!(
+            after[start..end].contains("(at 54.61 27.94 90)"),
+            "{}",
+            &after[start..end]
+        );
+        // The splice adds a newline and indent before the block.
+        let rest = format!("{}{}", &after[..start - "\n  ".len()], &after[end..]);
+        assert_eq!(rest, KICAD_BOARD, "KiCad's own content is unchanged");
+    }
+
+    /// `1.8e303` is finite, but rounding scales it past `f64::MAX`, and the
+    /// `inf` it becomes is not a number KiCad can load. Refused unwritten.
+    #[tokio::test]
+    async fn a_coordinate_rounding_cannot_represent_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+        for field in ["x", "y", "rotation"] {
+            let mut args = json!({
+                "board": board.to_str().unwrap(),
+                "text": "hi", "x": 5.0, "y": 5.0
+            });
+            args[field] = json!(1.8e303);
+            let result = handle_add_board_text(&args, &ctx_with_ipc(String::new()))
+                .await
+                .unwrap();
+            assert!(result.is_error, "{field}");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{field}"
+            );
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), before, "{field}");
+        }
+    }
+
+    /// The readback against the file the bug wrote: the noisy `(at …)` is not
+    /// the position requested, and KiCad's resave of it is.
+    #[test]
+    fn gr_text_landed_reads_the_written_position() {
+        let block = |at: &str| {
+            format!("(kicad_pcb (gr_text \"hi\" (at {at}) (layer \"F.SilkS\") (uuid \"t1\")))")
+        };
+        let at = [54.61, 27.94, 90.0];
+        let noisy = block("54.60999999999999 27.939999999999998 90.00000000000001");
+        assert!(gr_text_landed(&noisy, "t1", at).is_err());
+        assert_eq!(gr_text_landed(&block("54.61 27.94 90"), "t1", at), Ok(()));
+        assert!(gr_text_landed(&block("54.61 27.94 90"), "t2", at).is_err());
     }
 }
 
