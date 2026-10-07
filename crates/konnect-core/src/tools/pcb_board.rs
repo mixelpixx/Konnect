@@ -13,8 +13,8 @@ use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::live_board::{self, LiveBoard};
 use crate::tools::{
-    get_path, opt_str_list, require_f64, require_str, with_board_ipc_classified, ToolContext,
-    ToolDef,
+    get_path, invalid_arg, opt_str_list, require_f64, require_str, with_board_ipc_classified,
+    ToolContext, ToolDef,
 };
 use konnect_ipc::builders;
 use konnect_sexp::{
@@ -2467,6 +2467,56 @@ async fn handle_add_mounting_hole(
     }
 }
 
+/// Read `layer` (required when there is no `default`), refusing a name KiCad
+/// has no board layer for before the IPC or file path runs (#844). KiCad 10
+/// does not validate an item's layer, and answered `BL_UNDEFINED` in footprint
+/// graphics with a crash (#237); it also refuses to load a board whose items
+/// name an undefined layer.
+fn board_layer_arg(
+    args: &serde_json::Value,
+    default: Option<&str>,
+) -> Result<String, CallToolResult> {
+    let layer = match default {
+        Some(default) if args["layer"].is_null() => default,
+        _ => require_str(args, "layer")?,
+    };
+    if builders::try_layer_from_name(layer).is_err() {
+        return Err(invalid_arg(
+            "layer",
+            &format!(
+                "'{layer}' is not a KiCad board layer; use one such as F.Cu, B.Cu, \
+                 In1.Cu..In30.Cu, F.SilkS, B.SilkS, Edge.Cuts or User.1..User.45"
+            ),
+        ));
+    }
+    Ok(layer.to_string())
+}
+
+#[cfg(test)]
+mod board_layer_arg_tests {
+    use super::*;
+
+    // A direct handler call skips the schema gate, so the helper itself must
+    // refuse a non-string `layer` rather than substitute the default.
+    #[test]
+    fn a_layer_that_is_not_a_string_is_refused_not_defaulted() {
+        for layer in [json!(37), json!(["F.Cu"])] {
+            let error = board_layer_arg(&json!({ "layer": layer }), Some("F.SilkS")).unwrap_err();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&error).as_deref(),
+                Some("invalid_argument"),
+                "{layer}"
+            );
+        }
+        for absent in [json!({}), json!({ "layer": null })] {
+            assert_eq!(
+                board_layer_arg(&absent, Some("F.SilkS")).unwrap(),
+                "F.SilkS"
+            );
+        }
+    }
+}
+
 async fn handle_add_board_text(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -2484,7 +2534,10 @@ async fn handle_add_board_text(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
+    let layer = match board_layer_arg(args, Some("F.SilkS")) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let size = args["size"].as_f64().unwrap_or(1.0);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
 
@@ -2538,8 +2591,8 @@ pub(crate) async fn add_zone_impl(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
+    let layer = match board_layer_arg(args, None) {
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
     let clearance = args["clearance"]
@@ -2656,7 +2709,10 @@ async fn handle_import_svg_logo(
     };
     let x = args["x"].as_f64().unwrap_or(0.0);
     let y = args["y"].as_f64().unwrap_or(0.0);
-    let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
+    let layer = match board_layer_arg(args, Some("F.SilkS")) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let svg_content = std::fs::read_to_string(&svg_path)?;
     let logo = crate::tools::svg_import::extract_polygons(&svg_content)?;
