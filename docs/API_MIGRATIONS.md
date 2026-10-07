@@ -3,6 +3,27 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `batch_add_power_symbol`, and no second symbol on a pin already on its rail (minor release)
+
+New tool `batch_add_power_symbol` in `sch_batch` (#856). It takes
+`power_net` and `pins: [{reference, pin_number}]`, plus optional `max_gap`
+(default 10.16 mm) and `stub_length` (default 2.54 mm, a multiple of 1.27).
+Pins that face the same way, end on one row and are within `max_gap` of a
+neighbour are joined by stubs and a bar under one power symbol. Every other pin
+gets a symbol on its endpoint. A group whose wires would touch another item is
+not joined, and its entry carries `not_joined_reason`. The response lists
+`groups` (`pins`, `joined`, `symbol`, `wire_uuids`), `already_connected`,
+`placed_count`, `wires_added_count` and `junctions_added`.
+
+`add_power_symbol` with `reference` + `pin_number` no longer adds a symbol to a
+pin that is already on `power_net`, whether a symbol sits on the pin, on a pin
+stacked with it, or is reached through a wire. It writes nothing and returns
+`{already_connected: true, power_net, existing_reference, x, y}` instead of the
+placement response. A caller that wanted the duplicate can still place it with
+`x` + `y`, which is unchanged.
+
+No tool, argument, or response field was renamed or removed.
+
 ## Unreleased: `add_power_symbol` accepts a pin (minor release)
 
 `add_power_symbol` takes `reference` + `pin_number` as an alternative to

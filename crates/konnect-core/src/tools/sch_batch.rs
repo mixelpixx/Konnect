@@ -89,6 +89,45 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_batch_connect_to_net(args, ctx).await }
         ),
         tool!(
+            "batch_add_power_symbol",
+            "Tie several pins to one power net the way a schematic is drawn by hand: pins \
+             that face the same way, sit on one row and lie within max_gap of a neighbour \
+             get a short stub each, a bar joining the stubs, and ONE power symbol on the \
+             bar. Use it for the GND or supply pins along one edge of an IC, or for a row \
+             of decoupling caps (one call per rail). A pin with no neighbour gets a symbol \
+             on its endpoint, as add_power_symbol does. Stacked pins share one symbol, and \
+             a pin already carrying this net's power symbol is skipped. A group whose stubs \
+             or bar would touch any other pin, wire, label or junction is not joined; its \
+             pins get a symbol each and the group reports why. Unresolvable pins refuse \
+             the whole call before writing. One file write with committed-file readback.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "power_net": { "type": "string", "description": "Net name (e.g. 'GND', '+3V3')" },
+                    "pins": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "Pins to tie to power_net, as {reference, pin_number}",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "pin_number": { "type": "string" }
+                            },
+                            "required": ["reference", "pin_number"]
+                        }
+                    },
+                    "max_gap": { "type": "number", "minimum": 0, "default": 10.16,
+                        "description": "Largest distance in mm between neighbouring pins of one group" },
+                    "stub_length": { "type": "number", "exclusiveMinimum": 0, "default": 2.54,
+                        "description": "Stub length in mm from each pin to the bar; a multiple of 1.27" }
+                },
+                "required": ["schematic", "power_net", "pins"]
+            }),
+            |args, ctx| async move { super::sch_wiring::handle_batch_add_power_symbol(args, ctx).await }
+        ),
+        tool!(
             "batch_place_components",
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
@@ -592,7 +631,7 @@ fn has_wire(sch: &cse::Schematic, a: (f64, f64), b: (f64, f64)) -> bool {
 
 /// Extract the message text out of a `CallToolResult` error, for folding a
 /// single-item handler's structured error into a batch tool's `errors` list.
-fn error_text(result: &CallToolResult) -> String {
+pub(crate) fn error_text(result: &CallToolResult) -> String {
     match result.content.first() {
         Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
         _ => "unknown error".to_string(),

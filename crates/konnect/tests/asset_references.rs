@@ -745,6 +745,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_found",
         "unavailable",
         "ambiguous",
+        // Power-symbol placement response fields, not callable tools (#856).
+        "already_connected",
+        "existing_reference",
+        "not_joined_reason",
     ];
 
     let mut phantom = Vec::new();

@@ -120,6 +120,7 @@ pattern.
 | Two pins physically close (<30mm)       | `connect_pins`          | Direct wire, auto-routed                 |
 | Named signal (SDA, MOSI, EN, etc.)      | `connect_to_net`        | Stub wire + net label, cleaner           |
 | Power rail (VCC, GND, +3V3)             | `add_power_symbol`      | Proper power symbol, global net          |
+| Rail on several nearby pins            | `batch_add_power_symbol` | One bar and one symbol per row of pins  |
 | Bus signals (D0-D7)                     | `connect_to_net`        | Net labels with bus naming               |
 | Cross-sheet signal                      | Global label            | Connects across schematic sheets         |
 | Multiple pins to same net (3+)          | `batch_connect_to_net`  | Efficient bulk operation                 |
@@ -194,6 +195,31 @@ add_power_symbol(schematic, power_net, x, y, rotation?)
   instance of a repeated sheet (each node's own 5V, say) takes a local net
   label via `connect_to_net` instead — `power:+5V` there shorts all the
   instances' rails together.
+- A pin already on `power_net` gets no second symbol. The response is
+  `already_connected: true` with `existing_reference`, and nothing is written.
+  This holds whether the existing symbol sits on the pin or is reached through
+  a wire, and it covers stacked pins such as an MCU's VSS pins.
+
+### batch_add_power_symbol
+
+Use when several pins go to one rail: the supply or ground pins along one edge
+of an IC, or the pins of a row of decoupling caps. Make one call per rail. It is
+in the `sch_batch` toolset.
+
+```
+batch_add_power_symbol(schematic, power_net, pins: [{reference, pin_number}], max_gap?, stub_length?)
+```
+
+- Pins that face the same way, end on one row and sit within `max_gap`
+  (default 10.16 mm) of a neighbour are joined by a stub each (`stub_length`,
+  default 2.54 mm) and a bar, with one power symbol on the bar. Other pins get
+  a symbol on their endpoint.
+- A group whose wires would touch another pin, wire, label or junction is not
+  joined. Each of its pins gets its own symbol, and `not_joined_reason` says
+  what was in the way. Move parts apart and retry if the bar matters.
+- Pins already on the rail are listed under `already_connected` and skipped.
+- A pin that cannot be resolved refuses the whole call before anything is
+  written.
 
 ---
 

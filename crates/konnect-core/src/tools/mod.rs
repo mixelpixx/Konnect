@@ -2788,6 +2788,11 @@ pub(crate) mod schematic_target_tests {
                 "add_power_symbol",
                 serde_json::json!({"power_net":"GND","x":100.0,"y":100.0}),
             ),
+            // No such pin: ownership is still the refusal, not the pin.
+            (
+                "batch_add_power_symbol",
+                serde_json::json!({"power_net":"GND","pins":[{"reference":"C201","pin_number":"99"}]}),
+            ),
             ("run_erc", serde_json::json!({})),
         ] {
             args["schematic"] = serde_json::json!(loose.display().to_string());

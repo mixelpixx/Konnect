@@ -2284,96 +2284,96 @@ fn power_symbol_pin(sch: &cse::Schematic, lib_id: &str) -> Option<konnect_sexp::
     }
 }
 
-async fn handle_add_power_symbol(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    let power_net = match require_str(args, "power_net") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let selector = match PowerSelector::from_args(args) {
-        Ok(selector) => selector,
-        Err(e) => return Ok(e),
-    };
-    let requested_rotation = opt_f64(args, "rotation");
-
-    // One read serves both the pin lookup and the edit, so the pin cannot
-    // come from a revision other than the one the write is checked against.
-    let content = read_consistent(&sch_path)?;
-    let site = match selector {
-        PowerSelector::Point { x, y } => PowerSite::Point { x, y },
-        PowerSelector::Pin {
-            reference,
-            pin_number,
-        } => match resolve_power_pin(&parse_sexp(&content)?, &reference, &pin_number) {
-            Ok(site) => site,
-            Err(e) => return Ok(e),
+/// Where a power symbol goes so its pin, not its origin, lands on `point`,
+/// facing `outward` unless `rotation` is given.
+fn power_symbol_on_point(
+    power_pin: &konnect_sexp::schematic::LibPin,
+    point: (f64, f64),
+    outward: f64,
+    rotation: Option<f64>,
+) -> (f64, f64, f64) {
+    let rotation =
+        rotation.unwrap_or_else(|| konnect_sexp::schematic::rotation_facing(power_pin, outward));
+    let (dx, dy) = pin_endpoint(
+        power_pin,
+        konnect_sexp::geometry::PinTransform {
+            comp_x: 0.0,
+            comp_y: 0.0,
+            rotation_deg: rotation,
+            mirror_x: false,
+            mirror_y: false,
         },
-    };
-    let mut sch = cse::Schematic::from_source(&sch_path, content)?;
-    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
-        Ok(context) => context,
-        Err(error) => return Ok(error.into_tool_result()),
-    };
-    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
-        return Ok(error.into_tool_result());
+    );
+    (point.0 - dx, point.1 - dy, rotation)
+}
+
+/// The `power_net` power symbols already on a sheet, by the net each one is on.
+struct ExistingPower {
+    graph: super::sch_connectivity::NetGraph,
+    /// Each symbol's net, pin point and reference.
+    symbols: Vec<(super::sch_connectivity::NetRoot, (f64, f64), String)>,
+}
+
+impl ExistingPower {
+    fn new(tree: &konnect_sexp::SexpNode, power_net: &str) -> Self {
+        use konnect_sexp::schematic::{extract_all_net_labels, extract_power_symbol_labels};
+        let mut graph = super::sch_connectivity::net_graph_for(
+            tree,
+            &extract_wires(tree),
+            &extract_all_net_labels(tree),
+        );
+        let instances = extract_symbol_instances(tree);
+        let symbols = extract_power_symbol_labels(tree)
+            .into_iter()
+            .filter(|l| l.net == power_net)
+            .filter_map(|l| {
+                let uuid = l.uuid.as_deref()?;
+                let reference = instances
+                    .iter()
+                    .find(|i| i.uuid.as_deref() == Some(uuid))?
+                    .reference
+                    .clone();
+                Some((graph.root_at(l.x, l.y), (l.x, l.y), reference))
+            })
+            .collect();
+        Self { graph, symbols }
     }
 
+    /// The nearest `power_net` symbol already on the net at `point`. Compared
+    /// by net identity, so a symbol reached through a wire counts; every
+    /// same-named symbol on the sheet is that net, hence "nearest".
+    fn at(&mut self, point: (f64, f64)) -> Option<String> {
+        if self.symbols.is_empty() {
+            return None;
+        }
+        let root = self.graph.root_at(point.0, point.1);
+        let distance = |(x, y): (f64, f64)| (x - point.0).hypot(y - point.1);
+        self.symbols
+            .iter()
+            .filter(|(r, _, _)| *r == root)
+            .min_by(|a, b| distance(a.1).total_cmp(&distance(b.1)))
+            .map(|(_, _, reference)| reference.clone())
+    }
+}
+
+/// Add a `power_net` symbol at (x, y), numbered with the next free `#PWR`.
+/// Returns its reference and the placement the readback is checked against.
+fn add_power_symbol_to(
+    sch: &mut cse::Schematic,
+    context: &crate::tools::SheetInstanceContext,
+    lib_id: &str,
+    power_net: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+) -> (String, super::sch_components::ComponentTargetUnit) {
     // Spelled by the rule `annotate_schematic` uses, which is eeschema's:
     // `#PWR01`, `#PWR010`, `#PWR0100`. `{:03}` put a second spelling of the
     // same number beside every eeschema-numbered symbol (#583).
-    let pwr_ref = super::sch_annotate::format_designator("#PWR", next_pwr_number(&sch));
-
-    // Embed the power symbol definition in lib_symbols
-    let lib_id = format!("power:{}", power_net);
-    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
-        Ok(source) => source,
-        Err(error) => return Ok(error.into_tool_result()),
-    };
-    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
-    }
-    let (x, y, rotation) = match site {
-        // Snap like `place_one_component` does for the other two placers. Wires
-        // and labels are snapped to this grid, so a power symbol left off it
-        // cannot be reached by them: ERC reports the endpoint off grid and the
-        // pin unconnected (#662). Everything below, including the bound
-        // placement intent the readback is checked against, uses the snapped
-        // point.
-        PowerSite::Point { x, y } => {
-            let (x, y) = konnect_sexp::geometry::snap_point(x, y, 1.27);
-            (x, y, requested_rotation.unwrap_or(0.0))
-        }
-        // Not snapped: the pin is where its symbol put it, and a snapped
-        // symbol would miss an off-grid pin.
-        PowerSite::Pin { endpoint, outward } => {
-            let Some(power_pin) = power_symbol_pin(&sch, &lib_id) else {
-                return Ok(crate::tools::invalid_arg(
-                    "power_net",
-                    &format!("'{lib_id}' does not have exactly one pin; give x + y instead"),
-                ));
-            };
-            let rotation = requested_rotation
-                .unwrap_or_else(|| konnect_sexp::schematic::rotation_facing(&power_pin, outward));
-            // Put the power pin, not the symbol origin, on the endpoint.
-            let (dx, dy) = pin_endpoint(
-                &power_pin,
-                konnect_sexp::geometry::PinTransform {
-                    comp_x: 0.0,
-                    comp_y: 0.0,
-                    rotation_deg: rotation,
-                    mirror_x: false,
-                    mirror_y: false,
-                },
-            );
-            (endpoint.0 - dx, endpoint.1 - dy, rotation)
-        }
-    };
-    let metadata = cse::library::symbol_metadata(&sch, &lib_id);
+    let pwr_ref = super::sch_annotate::format_designator("#PWR", next_pwr_number(sch));
+    let metadata = cse::library::symbol_metadata(sch, lib_id);
     let placement_fields =
-        super::sch_components::PlacementFields::resolve(&lib_id, &metadata, Some(&power_net), None);
+        super::sch_components::PlacementFields::resolve(lib_id, &metadata, Some(power_net), None);
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
@@ -2391,7 +2391,7 @@ async fn handle_add_power_symbol(
     // The library anchors matter most here: GND anchors Value below the
     // graphic but VCC/+5V/+3V3 anchor it above, so one fixed offset cannot
     // suit both (#101).
-    let anchors = cse::library::field_anchors(&sch, &lib_id);
+    let anchors = cse::library::field_anchors(sch, lib_id);
     let t = konnect_sexp::geometry::PinTransform {
         comp_x: x,
         comp_y: y,
@@ -2461,8 +2461,8 @@ async fn handle_add_power_symbol(
     let uuid = sym.uuid.clone();
     let placement = super::sch_components::ComponentTargetUnit::placement(
         &uuid,
-        &context,
-        &lib_id,
+        context,
+        lib_id,
         x,
         y,
         rotation,
@@ -2474,6 +2474,97 @@ async fn handle_add_power_symbol(
         1,
     );
     sch.add_symbol(sym);
+    (pwr_ref, placement)
+}
+
+async fn handle_add_power_symbol(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let power_net = match require_str(args, "power_net") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let selector = match PowerSelector::from_args(args) {
+        Ok(selector) => selector,
+        Err(e) => return Ok(e),
+    };
+    let requested_rotation = opt_f64(args, "rotation");
+
+    // One read serves both the pin lookup and the edit, so the pin cannot
+    // come from a revision other than the one the write is checked against.
+    let content = read_consistent(&sch_path)?;
+    let site = match selector {
+        PowerSelector::Point { x, y } => PowerSite::Point { x, y },
+        PowerSelector::Pin {
+            reference,
+            pin_number,
+        } => {
+            let tree = parse_sexp(&content)?;
+            let site = match resolve_power_pin(&tree, &reference, &pin_number) {
+                Ok(site) => site,
+                Err(e) => return Ok(e),
+            };
+            // A pin already on this rail needs no second symbol; on a stacked
+            // pin it would hide exactly behind the first (#856).
+            if let PowerSite::Pin { endpoint, .. } = site {
+                if let Some(existing) = ExistingPower::new(&tree, &power_net).at(endpoint) {
+                    return Ok(CallToolResult::json(&json!({
+                        "already_connected": true,
+                        "power_net": power_net,
+                        "existing_reference": existing,
+                        "x": round6(endpoint.0),
+                        "y": round6(endpoint.1),
+                    })));
+                }
+            }
+            site
+        }
+    };
+    let mut sch = cse::Schematic::from_source(&sch_path, content)?;
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
+
+    // Embed the power symbol definition in lib_symbols
+    let lib_id = format!("power:{}", power_net);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
+    }
+    let (x, y, rotation) = match site {
+        // Snap like `place_one_component` does for the other two placers. Wires
+        // and labels are snapped to this grid, so a power symbol left off it
+        // cannot be reached by them: ERC reports the endpoint off grid and the
+        // pin unconnected (#662). Everything below, including the bound
+        // placement intent the readback is checked against, uses the snapped
+        // point.
+        PowerSite::Point { x, y } => {
+            let (x, y) = konnect_sexp::geometry::snap_point(x, y, 1.27);
+            (x, y, requested_rotation.unwrap_or(0.0))
+        }
+        // Not snapped: the pin is where its symbol put it, and a snapped
+        // symbol would miss an off-grid pin.
+        PowerSite::Pin { endpoint, outward } => {
+            let Some(power_pin) = power_symbol_pin(&sch, &lib_id) else {
+                return Ok(crate::tools::invalid_arg(
+                    "power_net",
+                    &format!("'{lib_id}' does not have exactly one pin; give x + y instead"),
+                ));
+            };
+            power_symbol_on_point(&power_pin, endpoint, outward, requested_rotation)
+        }
+    };
+    let (pwr_ref, placement) =
+        add_power_symbol_to(&mut sch, &context, &lib_id, &power_net, x, y, rotation);
     sch.overwrite()?;
 
     // A power pin landing mid-segment on an existing wire needs a junction
@@ -2493,6 +2584,489 @@ async fn handle_add_power_symbol(
         .collect::<Vec<_>>());
 
     Ok(CallToolResult::json(&observed))
+}
+
+/// One endpoint `batch_add_power_symbol` powers: every requested pin that ends
+/// there, and the direction leading away from their body.
+#[derive(Debug, Clone)]
+struct PowerPoint {
+    pins: Vec<(String, String)>,
+    endpoint: (f64, f64),
+    outward: f64,
+}
+
+impl PowerPoint {
+    /// Distance along the outward axis, and across it.
+    fn depth_and_cross(&self) -> (f64, f64) {
+        let (x, y) = self.endpoint;
+        if self.outward == 0.0 || self.outward == 180.0 {
+            (x, y)
+        } else {
+            (y, x)
+        }
+    }
+
+    fn pins_json(&self) -> serde_json::Value {
+        json!(self
+            .pins
+            .iter()
+            .map(|(r, n)| json!({"reference": r, "pin_number": n}))
+            .collect::<Vec<_>>())
+    }
+}
+
+/// Split points into rows that can share one bar: same outward direction, same
+/// depth, and no gap wider than `max_gap` between neighbours. Order follows the
+/// first point of each row, and each row runs along its cross axis.
+fn group_power_points(points: Vec<PowerPoint>, max_gap: f64) -> Vec<Vec<PowerPoint>> {
+    let tol = 0.01;
+    let mut rows: Vec<Vec<PowerPoint>> = Vec::new();
+    for point in points {
+        let (depth, _) = point.depth_and_cross();
+        match rows.iter_mut().find(|row| {
+            row[0].outward == point.outward && (row[0].depth_and_cross().0 - depth).abs() <= tol
+        }) {
+            Some(row) => row.push(point),
+            None => rows.push(vec![point]),
+        }
+    }
+    let mut groups = Vec::new();
+    for mut row in rows {
+        row.sort_by(|a, b| a.depth_and_cross().1.total_cmp(&b.depth_and_cross().1));
+        let mut current: Vec<PowerPoint> = Vec::new();
+        for point in row {
+            if let Some(last) = current.last() {
+                if point.depth_and_cross().1 - last.depth_and_cross().1 > max_gap + tol {
+                    groups.push(std::mem::take(&mut current));
+                }
+            }
+            current.push(point);
+        }
+        groups.push(current);
+    }
+    groups
+}
+
+type Segment = ((f64, f64), (f64, f64));
+
+/// The wires joining a group and where its one power pin goes: a stub out of
+/// each pin, a bar across the stub ends, and the symbol on the middle stub's end.
+fn power_bar(group: &[PowerPoint], stub_length: f64) -> (Vec<Segment>, (f64, f64)) {
+    let dir = crate::tools::stub_direction("auto", Some(group[0].outward));
+    let ends: Vec<(f64, f64)> = group
+        .iter()
+        .map(|p| {
+            let (x, y) = dir.end(p.endpoint, stub_length);
+            (round6(x), round6(y))
+        })
+        .collect();
+    let mut wires: Vec<Segment> = group
+        .iter()
+        .zip(&ends)
+        .map(|(p, e)| (p.endpoint, *e))
+        .collect();
+    wires.push((ends[0], ends[ends.len() - 1]));
+    (wires, ends[(ends.len() - 1) / 2])
+}
+
+/// Everything already on the sheet that a new wire must not touch.
+struct PowerObstacles {
+    points: Vec<((f64, f64), &'static str)>,
+    wires: Vec<Segment>,
+}
+
+impl PowerObstacles {
+    fn from_tree(tree: &konnect_sexp::SexpNode) -> Self {
+        use konnect_sexp::schematic as ks;
+        let mut points: Vec<((f64, f64), &'static str)> = Vec::new();
+        points.extend(
+            crate::tools::all_pin_endpoints(tree)
+                .into_iter()
+                .map(|p| (p, "pin")),
+        );
+        points.extend(
+            ks::extract_labels(tree)
+                .into_iter()
+                .map(|l| ((l.x, l.y), "label")),
+        );
+        points.extend(
+            ks::extract_junctions(tree)
+                .into_iter()
+                .map(|p| (p, "junction")),
+        );
+        points.extend(
+            ks::extract_no_connects(tree)
+                .into_iter()
+                .map(|p| (p, "no-connect flag")),
+        );
+        points.extend(
+            ks::extract_sheet_pins(tree)
+                .into_iter()
+                .map(|p| (p, "sheet pin")),
+        );
+        let wires = extract_wires(tree)
+            .into_iter()
+            .chain(ks::extract_buses(tree))
+            .map(|w| ((w.x1, w.y1), (w.x2, w.y2)))
+            .collect();
+        Self { points, wires }
+    }
+
+    /// Why `segments` cannot be drawn, or `None` when they touch nothing but
+    /// the group's own pin endpoints.
+    fn blocking(&self, segments: &[Segment], own: &[(f64, f64)]) -> Option<String> {
+        use konnect_sexp::geometry::{point_on_segment, points_coincident};
+        let tol = 0.01;
+        let is_own = |p: (f64, f64)| {
+            own.iter()
+                .any(|o| points_coincident(p.0, p.1, o.0, o.1, tol))
+        };
+        let on =
+            |p: (f64, f64), (a, b): Segment| point_on_segment(p.0, p.1, a.0, a.1, b.0, b.1, tol);
+        let at = |p: (f64, f64)| format!("({}, {})", fmt_f64(p.0), fmt_f64(p.1));
+        for &segment in segments {
+            if let Some((p, kind)) = self
+                .points
+                .iter()
+                .find(|(p, _)| on(*p, segment) && !is_own(*p))
+            {
+                return Some(format!("a wire would touch a {kind} at {}", at(*p)));
+            }
+            for &wire in &self.wires {
+                let touch = [segment.0, segment.1]
+                    .into_iter()
+                    .find(|p| on(*p, wire) && !is_own(*p))
+                    .or_else(|| {
+                        [wire.0, wire.1]
+                            .into_iter()
+                            .find(|p| on(*p, segment) && !is_own(*p))
+                    });
+                if let Some(p) = touch {
+                    return Some(format!("a wire would touch an existing wire at {}", at(p)));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// One power symbol the batch will place, and the points it serves.
+struct PlannedPower {
+    points: Vec<PowerPoint>,
+    pin_at: (f64, f64),
+    outward: f64,
+    wires: Vec<Segment>,
+    not_joined_reason: Option<String>,
+}
+
+pub(crate) async fn handle_batch_add_power_symbol(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_sexp::geometry::{point_on_segment, points_coincident};
+    let sch_path = get_path(args, "schematic")?;
+    let power_net = match require_str(args, "power_net") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let requested = match require_array(args, "pins") {
+        Ok(v) => v.clone(),
+        Err(e) => return Ok(e),
+    };
+    if requested.is_empty() {
+        return Ok(crate::tools::invalid_arg("pins", "give at least one pin"));
+    }
+    let max_gap = match &args["max_gap"] {
+        serde_json::Value::Null => 10.16,
+        v => match v.as_f64() {
+            Some(gap) if gap >= 0.0 => gap,
+            _ => {
+                return Ok(crate::tools::invalid_arg(
+                    "max_gap",
+                    "must be a number of mm, 0 or more",
+                ))
+            }
+        },
+    };
+    let stub_length = match crate::tools::opt_positive_f64(args, "stub_length") {
+        Ok(v) => v.unwrap_or(2.54),
+        Err(e) => return Ok(e),
+    };
+    // Off-grid bars cannot be reached by later wires drawn on the grid.
+    if ((stub_length / 1.27).round() * 1.27 - stub_length).abs() > 1e-6 {
+        return Ok(crate::tools::invalid_arg(
+            "stub_length",
+            "must be a multiple of 1.27 mm",
+        ));
+    }
+
+    let content = read_consistent(&sch_path)?;
+    let tree = parse_sexp(&content)?;
+    // Ownership first, like the other placers: an unowned sheet is a
+    // conflict whatever pins were named.
+    let mut sch = cse::Schematic::from_source(&sch_path, content)?;
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
+
+    // Resolve every pin before anything is planned: one bad pin refuses the call.
+    let mut points: Vec<PowerPoint> = Vec::new();
+    for (index, pin) in requested.iter().enumerate() {
+        let field = |key: &str| {
+            pin[key].as_str().map(str::to_owned).ok_or_else(|| {
+                crate::tools::invalid_arg(
+                    &format!("pins[{index}].{key}"),
+                    "missing or not a string",
+                )
+            })
+        };
+        let (reference, pin_number) = match (field("reference"), field("pin_number")) {
+            (Ok(r), Ok(n)) => (r, n),
+            (Err(e), _) | (_, Err(e)) => return Ok(e),
+        };
+        let PowerSite::Pin { endpoint, outward } =
+            (match resolve_power_pin(&tree, &reference, &pin_number) {
+                Ok(site) => site,
+                Err(e) => return Ok(e),
+            })
+        else {
+            unreachable!("resolve_power_pin returns a pin site");
+        };
+        let pin = (reference, pin_number);
+        match points
+            .iter_mut()
+            .find(|p| points_coincident(p.endpoint.0, p.endpoint.1, endpoint.0, endpoint.1, 0.01))
+        {
+            Some(point) => {
+                if !point.pins.contains(&pin) {
+                    point.pins.push(pin);
+                }
+            }
+            None => points.push(PowerPoint {
+                pins: vec![pin],
+                endpoint,
+                outward,
+            }),
+        }
+    }
+
+    let mut existing = ExistingPower::new(&tree, &power_net);
+    let mut already_connected = Vec::new();
+    points.retain(|point| match existing.at(point.endpoint) {
+        Some(existing) => {
+            already_connected.push(json!({
+                "pins": point.pins_json(),
+                "existing_reference": existing,
+                "x": round6(point.endpoint.0),
+                "y": round6(point.endpoint.1),
+            }));
+            false
+        }
+        None => true,
+    });
+
+    let mut obstacles = PowerObstacles::from_tree(&tree);
+    let mut plans: Vec<PlannedPower> = Vec::new();
+    for group in group_power_points(points, max_gap) {
+        let single = |point: PowerPoint, reason: Option<String>| PlannedPower {
+            pin_at: point.endpoint,
+            outward: point.outward,
+            points: vec![point],
+            wires: Vec::new(),
+            not_joined_reason: reason,
+        };
+        if group.len() == 1 {
+            plans.extend(group.into_iter().map(|p| single(p, None)));
+            continue;
+        }
+        let (wires, pin_at) = power_bar(&group, stub_length);
+        let own: Vec<(f64, f64)> = group.iter().map(|p| p.endpoint).collect();
+        if let Some(reason) = obstacles.blocking(&wires, &own) {
+            plans.extend(group.into_iter().map(|p| single(p, Some(reason.clone()))));
+            continue;
+        }
+        // Later groups in this call must not run into this one.
+        obstacles.wires.extend(wires.iter().copied());
+        obstacles.points.push((pin_at, "pin"));
+        plans.push(PlannedPower {
+            outward: group[0].outward,
+            points: group,
+            pin_at,
+            wires,
+            not_joined_reason: None,
+        });
+    }
+
+    if plans.is_empty() {
+        return Ok(CallToolResult::json(&json!({
+            "power_net": power_net,
+            "groups": [],
+            "already_connected": already_connected,
+            "placed_count": 0,
+            "wires_added_count": 0,
+            "junctions_added": [],
+        })));
+    }
+
+    let lib_id = format!("power:{power_net}");
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
+    }
+    let Some(power_pin) = power_symbol_pin(&sch, &lib_id) else {
+        return Ok(crate::tools::invalid_arg(
+            "power_net",
+            &format!("'{lib_id}' does not have exactly one pin"),
+        ));
+    };
+
+    let existing_wires = cse_wires_to_sexp(&sch);
+    let mut placed = Vec::new();
+    let mut new_wires: Vec<konnect_sexp::schematic::Wire> = Vec::new();
+    for plan in &plans {
+        let mut wire_uuids = Vec::new();
+        for &((x1, y1), (x2, y2)) in &plan.wires {
+            let wire = sch.add_wire(x1, y1, x2, y2);
+            wire_uuids.push(wire.uuid.clone());
+            new_wires.push(Wire {
+                x1,
+                y1,
+                x2,
+                y2,
+                uuid: Some(wire.uuid.clone()),
+            });
+        }
+        let (x, y, rotation) = power_symbol_on_point(&power_pin, plan.pin_at, plan.outward, None);
+        let (_, placement) =
+            add_power_symbol_to(&mut sch, &context, &lib_id, &power_net, x, y, rotation);
+        placed.push((placement, wire_uuids));
+    }
+
+    // Dots where a stub meets the bar mid-span, and where a new power pin
+    // lands mid-wire; KiCad connects neither without one.
+    let all_wires: Vec<Wire> = existing_wires.iter().chain(&new_wires).cloned().collect();
+    let on_new = |(x, y): (f64, f64)| {
+        new_wires
+            .iter()
+            .any(|w| point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, 0.01))
+    };
+    let mut junctions: Vec<(f64, f64)> = find_t_junctions(&all_wires, 0.01)
+        .into_iter()
+        .filter(|p| on_new(*p))
+        .collect();
+    let power_pins: Vec<(f64, f64)> = plans.iter().map(|p| p.pin_at).collect();
+    for w in &all_wires {
+        junctions.extend(pins_mid_segment(&power_pins, w.x1, w.y1, w.x2, w.y2));
+    }
+    let mut junctions_added: Vec<(f64, f64)> = Vec::new();
+    for (x, y) in junctions {
+        let present = sch
+            .junctions
+            .iter()
+            .map(|j| (j.x, j.y))
+            .chain(junctions_added.iter().copied())
+            .any(|(jx, jy)| points_coincident(x, y, jx, jy, 0.01));
+        if !present {
+            sch.add_junction(x, y);
+            junctions_added.push((x, y));
+        }
+    }
+    sch.overwrite()?;
+
+    let uncertain = |reason: String| {
+        Ok(super::mutation_outcome_uncertain(
+            &sch_path,
+            "batch_add_power_symbol",
+            reason,
+        ))
+    };
+    let committed = match super::sch_components::load_committed_component_schematic(&sch_path) {
+        Ok(committed) => committed,
+        Err(error) => return uncertain(format!("saved schematic could not be reloaded: {error}")),
+    };
+    let committed_tree = parse_sexp(&std::fs::read_to_string(&sch_path)?)?;
+    let committed_wires = extract_wires(&committed_tree);
+    let committed_junctions = konnect_sexp::schematic::extract_junctions(&committed_tree);
+    for w in &new_wires {
+        let found = committed_wires.iter().any(|c| {
+            c.uuid == w.uuid
+                && points_coincident(c.x1, c.y1, w.x1, w.y1, 0.01)
+                && points_coincident(c.x2, c.y2, w.x2, w.y2, 0.01)
+        });
+        if !found {
+            return uncertain(format!(
+                "wire {} is not in the saved file",
+                w.uuid.as_deref().unwrap_or("")
+            ));
+        }
+    }
+    for &(x, y) in &junctions_added {
+        if !committed_junctions
+            .iter()
+            .any(|&(jx, jy)| points_coincident(x, y, jx, jy, 0.01))
+        {
+            return uncertain(format!(
+                "junction at ({}, {}) is not in the saved file",
+                fmt_f64(x),
+                fmt_f64(y)
+            ));
+        }
+    }
+
+    let mut groups = Vec::new();
+    for (plan, (placement, wire_uuids)) in plans.iter().zip(&placed) {
+        let observed = match super::sch_components::placed_component_readback(
+            &sch_path, &committed, placement, &context,
+        ) {
+            Ok(observed) => observed,
+            Err(error) => {
+                return uncertain(format!(
+                    "saved power symbol readback failed: {}",
+                    super::sch_batch::error_text(&error)
+                ))
+            }
+        };
+        let pins: Vec<serde_json::Value> = plan
+            .points
+            .iter()
+            .flat_map(|p| p.pins_json().as_array().cloned().unwrap_or_default())
+            .collect();
+        let mut group = json!({
+            "pins": pins,
+            "joined": !plan.wires.is_empty(),
+            "symbol": {
+                "reference": observed["reference"],
+                "uuid": observed["uuid"],
+                "x": observed["x"],
+                "y": observed["y"],
+                "rotation": observed["rotation"],
+            },
+            "wire_uuids": wire_uuids,
+        });
+        if let Some(reason) = &plan.not_joined_reason {
+            group["not_joined_reason"] = json!(reason);
+        }
+        groups.push(group);
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "power_net": power_net,
+        "groups": groups,
+        "already_connected": already_connected,
+        "placed_count": placed.len(),
+        "wires_added_count": new_wires.len(),
+        "junctions_added": junctions_added
+            .iter()
+            .map(|(x, y)| json!({"x": round6(*x), "y": round6(*y)}))
+            .collect::<Vec<_>>(),
+    })))
 }
 
 async fn handle_add_no_connect(
@@ -5322,5 +5896,449 @@ mod batch_no_connect_tests {
         let (out, body) = run(json!([])).await;
         assert_eq!(body["added_count"], 0);
         assert_eq!(out.matches("(no_connect").count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod batch_power_tests {
+    //! `batch_add_power_symbol`, and `add_power_symbol` declining a pin already
+    //! on its rail (#856). Pin points are KiCad's ERC positions; see
+    //! `tests/fixtures/power_rows_kicad10.README.md`.
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/power_rows_kicad10.kicad_sch");
+
+    type Seg = ((f64, f64), (f64, f64));
+
+    fn sheet(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("power_rows_kicad10.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        path
+    }
+
+    async fn handler() -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn serve(
+        handler: &crate::mcp::handler::McpHandler,
+        tool: &str,
+        path: &std::path::Path,
+        mut arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        arguments["schematic"] = json!(path.display().to_string());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 856,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        let mut body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        body["is_error"] = json!(result["isError"] == json!(true));
+        body
+    }
+
+    fn pins(list: &[&str]) -> serde_json::Value {
+        json!(list
+            .iter()
+            .map(|p| {
+                let (reference, pin) = p.split_once('.').unwrap();
+                json!({"reference": reference, "pin_number": pin})
+            })
+            .collect::<Vec<_>>())
+    }
+
+    /// Each group's pins as `REF.PIN`, sorted and comma-joined, with the
+    /// committed point and rotation of its symbol and whether it was joined.
+    fn groups(
+        path: &std::path::Path,
+        body: &serde_json::Value,
+    ) -> Vec<(String, bool, (f64, f64, f64))> {
+        let sch = cse::Schematic::load(path).unwrap();
+        let mut out: Vec<_> = body["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                let mut names: Vec<String> = g["pins"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}.{}",
+                            p["reference"].as_str().unwrap(),
+                            p["pin_number"].as_str().unwrap()
+                        )
+                    })
+                    .collect();
+                names.sort();
+                let symbol = sch
+                    .symbols
+                    .iter()
+                    .find(|s| Some(s.uuid.as_str()) == g["symbol"]["uuid"].as_str())
+                    .expect("the group's symbol is in the committed file");
+                (
+                    names.join(","),
+                    g["joined"].as_bool().unwrap(),
+                    (symbol.at.x, symbol.at.y, symbol.at.rotation.unwrap_or(0.0)),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn sorted_groups(
+        mut expected: Vec<(&str, bool, (f64, f64, f64))>,
+    ) -> Vec<(String, bool, (f64, f64, f64))> {
+        expected.sort_by(|a, b| a.0.cmp(b.0));
+        expected
+            .into_iter()
+            .map(|(n, j, s)| (n.to_owned(), j, s))
+            .collect()
+    }
+
+    /// Committed wires, each written low end first, sorted.
+    fn wires_in(path: &std::path::Path) -> Vec<Seg> {
+        let tree = parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        sorted_segs(
+            extract_wires(&tree)
+                .into_iter()
+                .map(|w| ((w.x1, w.y1), (w.x2, w.y2)))
+                .collect(),
+        )
+    }
+
+    fn sorted_segs(segs: Vec<Seg>) -> Vec<Seg> {
+        let mut segs: Vec<Seg> = segs
+            .into_iter()
+            .map(|(a, b)| {
+                if (a.0, a.1) <= (b.0, b.1) {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            })
+            .collect();
+        segs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        segs
+    }
+
+    fn junctions_in(path: &std::path::Path) -> Vec<(f64, f64)> {
+        let tree = parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut j = konnect_sexp::schematic::extract_junctions(&tree);
+        j.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        j
+    }
+
+    #[tokio::test]
+    async fn a_row_shares_one_symbol_and_every_other_pin_keeps_its_own() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path());
+        let body = serve(
+            &handler,
+            "batch_add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "pins": pins(&[
+                "U1.23", "U1.35", "U1.47", "U1.8", "C1.2", "C2.2", "C3.2", "C4.2",
+                "C7.2", "C8.2", "R1.1", "R1.2", "C5.2", "C6.2",
+            ])}),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        // The README's case table: (pins, joined, symbol point and rotation).
+        let expected = sorted_groups(vec![
+            // Stacked VSS pins and VSSA 2.54 mm away: one bar.
+            ("U1.23,U1.35,U1.47,U1.8", true, (101.6, 132.08, 0.0)),
+            ("C1.2,C2.2,C3.2", true, (147.32, 146.05, 0.0)),
+            // 20.32 mm from C3, past max_gap.
+            ("C4.2", false, (175.26, 143.51, 0.0)),
+            // Same row as C8.2, facing the other way.
+            ("C7.2", false, (195.58, 143.51, 0.0)),
+            ("C8.2", false, (203.2, 143.51, 180.0)),
+            ("R1.1", false, (135.89, 63.5, 270.0)),
+            ("R1.2", false, (143.51, 63.5, 90.0)),
+            // Their bar would run through the BLOCK label.
+            ("C5.2", false, (139.7, 173.99, 0.0)),
+            ("C6.2", false, (147.32, 173.99, 0.0)),
+        ]);
+        assert_eq!(groups(&path, &body), expected, "{body}");
+        assert_eq!(
+            wires_in(&path),
+            sorted_segs(vec![
+                ((101.6, 129.54), (101.6, 132.08)),
+                ((104.14, 129.54), (104.14, 132.08)),
+                ((101.6, 132.08), (104.14, 132.08)),
+                ((139.7, 143.51), (139.7, 146.05)),
+                ((147.32, 143.51), (147.32, 146.05)),
+                ((154.94, 143.51), (154.94, 146.05)),
+                ((139.7, 146.05), (154.94, 146.05)),
+            ])
+        );
+        // The middle cap's stub meets the bar mid-span; the U1 bar has no T.
+        assert_eq!(junctions_in(&path), vec![(147.32, 146.05)]);
+    }
+
+    #[tokio::test]
+    async fn an_ic_supply_row_gets_a_dot_at_every_inner_stub() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path());
+        let body = serve(
+            &handler,
+            "batch_add_power_symbol",
+            &path,
+            json!({"power_net": "+3V3", "pins": pins(&["U1.1", "U1.24", "U1.36", "U1.48", "U1.9"])}),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        assert_eq!(
+            groups(&path, &body),
+            sorted_groups(vec![(
+                "U1.1,U1.24,U1.36,U1.48,U1.9",
+                true,
+                (101.6, 45.72, 0.0)
+            )])
+        );
+        let mut expected: Vec<Seg> = [96.52, 99.06, 101.6, 104.14, 106.68]
+            .into_iter()
+            .map(|x| ((x, 45.72), (x, 48.26)))
+            .collect();
+        expected.push(((96.52, 45.72), (106.68, 45.72)));
+        assert_eq!(wires_in(&path), sorted_segs(expected));
+        assert_eq!(
+            junctions_in(&path),
+            vec![(99.06, 45.72), (101.6, 45.72), (104.14, 45.72)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bar_that_would_touch_a_label_is_not_drawn() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path());
+        let body = serve(
+            &handler,
+            "batch_add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "pins": pins(&["C5.2", "C6.2"])}),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        for group in body["groups"].as_array().unwrap() {
+            assert_eq!(
+                group["not_joined_reason"], "a wire would touch a label at (143.51, 176.53)",
+                "{body}"
+            );
+        }
+        assert_eq!(
+            groups(&path, &body),
+            sorted_groups(vec![
+                ("C5.2", false, (139.7, 173.99, 0.0)),
+                ("C6.2", false, (147.32, 173.99, 0.0)),
+            ])
+        );
+        assert!(wires_in(&path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_gap_decides_who_joins() {
+        let handler = handler().await;
+        // (max_gap, groups). C1..C3 are 7.62 mm apart and C4 20.32 from C3.
+        let cases = [
+            (
+                7.62,
+                vec![
+                    ("C1.2,C2.2,C3.2", true, (147.32, 146.05, 0.0)),
+                    ("C4.2", false, (175.26, 143.51, 0.0)),
+                ],
+            ),
+            (
+                7.6,
+                vec![
+                    ("C1.2", false, (139.7, 143.51, 0.0)),
+                    ("C2.2", false, (147.32, 143.51, 0.0)),
+                    ("C3.2", false, (154.94, 143.51, 0.0)),
+                    ("C4.2", false, (175.26, 143.51, 0.0)),
+                ],
+            ),
+            // Four stubs: the symbol takes the second, nearest the middle.
+            (
+                20.32,
+                vec![("C1.2,C2.2,C3.2,C4.2", true, (147.32, 146.05, 0.0))],
+            ),
+        ];
+        for (max_gap, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path());
+            let body = serve(
+                &handler,
+                "batch_add_power_symbol",
+                &path,
+                json!({"power_net": "GND", "max_gap": max_gap,
+                       "pins": pins(&["C1.2", "C2.2", "C3.2", "C4.2"])}),
+            )
+            .await;
+            assert_eq!(body["is_error"], json!(false), "{max_gap}: {body}");
+            assert_eq!(
+                groups(&path, &body),
+                sorted_groups(expected),
+                "max_gap {max_gap}"
+            );
+        }
+    }
+
+    /// The case #856 was filed for: VSS pins 23, 35 and 47 are stacked.
+    #[tokio::test]
+    async fn a_stacked_pin_already_on_the_rail_gets_no_second_symbol() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path());
+        let first = serve(
+            &handler,
+            "add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "reference": "U1", "pin_number": "23"}),
+        )
+        .await;
+        assert_eq!(first["is_error"], json!(false), "{first}");
+        let after_first = std::fs::read_to_string(&path).unwrap();
+
+        let again = serve(
+            &handler,
+            "add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "reference": "U1", "pin_number": "35"}),
+        )
+        .await;
+        assert_eq!(again["is_error"], json!(false), "{again}");
+        assert_eq!(again["already_connected"], json!(true), "{again}");
+        assert_eq!(again["existing_reference"], first["reference"], "{again}");
+        assert_eq!(
+            (again["x"].as_f64(), again["y"].as_f64()),
+            (Some(101.6), Some(129.54))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+
+        // The batch skips it too, and still serves the pin beside it.
+        let body = serve(
+            &handler,
+            "batch_add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "pins": pins(&["U1.47", "U1.8"])}),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        assert_eq!(
+            body["already_connected"][0]["pins"],
+            pins(&["U1.47"]),
+            "{body}"
+        );
+        assert_eq!(
+            body["already_connected"][0]["existing_reference"],
+            first["reference"]
+        );
+        assert_eq!(
+            groups(&path, &body),
+            sorted_groups(vec![("U1.8", false, (104.14, 129.54, 0.0))])
+        );
+    }
+
+    /// C2 reaches the rail through the bar, not through a symbol on its pin.
+    #[tokio::test]
+    async fn a_pin_wired_to_the_rail_gets_no_second_symbol() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = sheet(dir.path());
+        let body = serve(
+            &handler,
+            "batch_add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "pins": pins(&["C1.2", "C2.2", "C3.2"])}),
+        )
+        .await;
+        assert_eq!(body["is_error"], json!(false), "{body}");
+        let bar_symbol = body["groups"][0]["symbol"]["reference"].clone();
+        let after_batch = std::fs::read_to_string(&path).unwrap();
+
+        let again = serve(
+            &handler,
+            "add_power_symbol",
+            &path,
+            json!({"power_net": "GND", "reference": "C1", "pin_number": "2"}),
+        )
+        .await;
+        assert_eq!(again["already_connected"], json!(true), "{again}");
+        // The nearest GND symbol, not the one placed elsewhere on the sheet.
+        assert_eq!(again["existing_reference"], bar_symbol, "{again}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_batch);
+
+        // A different rail is not "already connected".
+        let other = serve(
+            &handler,
+            "add_power_symbol",
+            &path,
+            json!({"power_net": "+3V3", "reference": "C1", "pin_number": "2"}),
+        )
+        .await;
+        assert_eq!(other["is_error"], json!(false), "{other}");
+        assert!(other["already_connected"].is_null(), "{other}");
+    }
+
+    #[tokio::test]
+    async fn refusals_write_nothing() {
+        let handler = handler().await;
+        // (arguments, kind, field or target)
+        let cases = [
+            (
+                json!({"pins": pins(&["C1.2", "C9.2"])}),
+                "stale_target",
+                "C9 pin 2",
+            ),
+            (
+                json!({"pins": pins(&["C1.2", "C1.7"])}),
+                "stale_target",
+                "C1 pin 7",
+            ),
+            (
+                json!({"pins": pins(&["C1.2", "C2.2"]), "stub_length": 1.0}),
+                "invalid_argument",
+                "stub_length",
+            ),
+            (json!({"pins": []}), "invalid_argument", "pins"),
+        ];
+        for (mut arguments, kind, subject) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = sheet(dir.path());
+            arguments["power_net"] = json!("GND");
+            let refused = serve(&handler, "batch_add_power_symbol", &path, arguments.clone()).await;
+            assert_eq!(refused["is_error"], json!(true), "{arguments}: {refused}");
+            let error = &refused["error"];
+            assert_eq!(error["kind"], kind, "{arguments}: {refused}");
+            let named = if kind == "invalid_argument" {
+                &error["field"]
+            } else {
+                &error["target"]
+            };
+            assert_eq!(named, subject, "{arguments}: {refused}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                SHEET,
+                "{arguments} wrote"
+            );
+        }
     }
 }
