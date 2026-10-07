@@ -278,9 +278,21 @@ async fn handle_get_net_connections(
         .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
         .collect();
     let mut g = net_graph_for(&tree, &wires, &labels);
-    let pts = g.points_on_net(&net).len();
+    let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
+    let on_net = &net_pts;
+    let pins: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
+        .into_iter()
+        .flat_map(|(instance, pins)| {
+            pins.into_iter().filter_map(move |(pin, transform)| {
+                let (px, py) = konnect_sexp::schematic::pin_endpoint(&pin, transform);
+                on_net.contains(&pt_key(px, py)).then(|| {
+                    json!({ "reference": instance.reference, "pin": pin.number, "x": px, "y": py })
+                })
+            })
+        })
+        .collect();
     Ok(CallToolResult::json(
-        &json!({ "net": net, "label_count": matching.len(), "labels": matching, "connected_points": pts }),
+        &json!({ "net": net, "label_count": matching.len(), "labels": matching, "pins": pins, "connected_points": net_pts.len() }),
     ))
 }
 
@@ -1441,6 +1453,18 @@ mod power_symbol_net_tests {
             .map(|c| c["reference"].as_str().unwrap())
             .collect();
         assert!(refs.contains(&"R1"), "R1 is on GND, got {refs:?}");
+    }
+
+    #[tokio::test]
+    async fn net_connections_names_the_pins_on_the_net() {
+        let s = call(SCH, "get_net_connections", json!({ "net": "GND" })).await;
+        let pins = s["pins"].as_array().expect("pins array");
+        assert!(
+            pins.iter()
+                .any(|p| p["reference"] == "R1" && p["pin"] == "2"),
+            "R1 pin 2 is on GND, got {pins:?}"
+        );
+        assert!(pins[0]["x"].is_number() && pins[0]["y"].is_number());
     }
 
     #[tokio::test]
