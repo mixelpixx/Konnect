@@ -8,7 +8,8 @@ use crate::tool;
 use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
     get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
-    require_f64, require_str, ToolContext, ToolDef,
+    require_f64, require_str, resolved_placed_pins_by_reference, ToolContext, ToolDef,
+    UNRESOLVED_PIN_GEOMETRY,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -270,23 +271,41 @@ async fn handle_get_net_connections(
         Err(e) => return Ok(e),
     };
     let (_, tree) = read_schematic(&sch_path)?;
+    // Every placed symbol, or a refusal: a symbol whose library entry is
+    // missing contributes no pins, and the list would come back short.
+    let Some(placed) = resolved_placed_pins_by_reference(&tree) else {
+        return Ok(CallToolResult::error(format!(
+            "Cannot list the pins on net '{net}': {UNRESOLVED_PIN_GEOMETRY}"
+        )));
+    };
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let matching: Vec<_> = labels
-        .iter()
-        .filter(|l| l.net == net)
-        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
-        .collect();
     let mut g = net_graph_for(&tree, &wires, &labels);
-    let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
+    // The net is its roots, not its name: one net can carry several names, and
+    // its labels are every label on those roots, whichever name each spells.
+    let by_root = label_roots(&mut g, &labels);
+    let net_roots: HashSet<(i64, i64)> = by_root
+        .iter()
+        .filter(|(_, l)| l.net == net)
+        .map(|(root, _)| *root)
+        .collect();
+    let matching: Vec<_> = by_root
+        .iter()
+        .filter(|(root, _)| net_roots.contains(root))
+        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .collect();
+    let net_pts: HashSet<(i64, i64)> = g.points_on_roots(&net_roots).into_iter().collect();
     let on_net = &net_pts;
-    let pins: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
+    // Power symbols and PWR_FLAGs name a net but are not nodes on it; KiCad's
+    // netlist leaves them out.
+    let pins: Vec<serde_json::Value> = placed
         .into_iter()
+        .filter(|(instance, _)| !is_power_symbol_reference(&instance.reference))
         .flat_map(|(instance, pins)| {
             pins.into_iter().filter_map(move |(pin, transform)| {
                 let (px, py) = konnect_sexp::schematic::pin_endpoint(&pin, transform);
                 on_net.contains(&pt_key(px, py)).then(|| {
-                    json!({ "reference": instance.reference, "pin": pin.number, "x": px, "y": py })
+                    json!({ "reference": instance.reference, "pin": pin.number, "name": pin.name, "x": px, "y": py })
                 })
             })
         })
@@ -1419,11 +1438,30 @@ mod tool_call_support {
         };
         serde_json::from_str(text).unwrap()
     }
+
+    /// The `pins` of a `get_net_connections` answer as sorted `REF.pin`
+    /// strings, the form `kicad-cli sch export netlist` lists a net's nodes in.
+    pub(super) fn net_pins(body: &serde_json::Value) -> Vec<String> {
+        let mut pins: Vec<String> = body["pins"]
+            .as_array()
+            .unwrap_or_else(|| panic!("pins array: {body}"))
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}.{}",
+                    p["reference"].as_str().unwrap(),
+                    p["pin"].as_str().unwrap()
+                )
+            })
+            .collect();
+        pins.sort_unstable();
+        pins
+    }
 }
 
 #[cfg(test)]
 mod power_symbol_net_tests {
-    use super::tool_call_support::call;
+    use super::tool_call_support::{call, call_result, net_pins};
     use super::*;
 
     /// R1 with pin 1 on a `SIG` label and pin 2 wired down to a `power:GND`
@@ -1455,16 +1493,27 @@ mod power_symbol_net_tests {
         assert!(refs.contains(&"R1"), "R1 is on GND, got {refs:?}");
     }
 
+    /// KiCad's netlist puts only `R1.2` on GND: the `#PWR01` symbol names the
+    /// net but is not a node on it, and `R1.1` is on `SIG`.
     #[tokio::test]
-    async fn net_connections_names_the_pins_on_the_net() {
+    async fn net_connections_lists_exactly_the_pins_kicad_nets() {
         let s = call(SCH, "get_net_connections", json!({ "net": "GND" })).await;
-        let pins = s["pins"].as_array().expect("pins array");
-        assert!(
-            pins.iter()
-                .any(|p| p["reference"] == "R1" && p["pin"] == "2"),
-            "R1 pin 2 is on GND, got {pins:?}"
+        assert_eq!(net_pins(&s), ["R1.2"], "{s}");
+        let pin = &s["pins"][0];
+        assert_eq!(pin["name"], "~", "{s}");
+        assert_eq!(
+            (pin["x"].as_f64(), pin["y"].as_f64()),
+            (Some(100.0), Some(103.81))
         );
-        assert!(pins[0]["x"].is_number() && pins[0]["y"].is_number());
+    }
+
+    /// A symbol whose library entry is missing contributes no pins, so the
+    /// answer would come back short with nothing to say so. It is refused.
+    #[tokio::test]
+    async fn net_connections_refuse_a_symbol_with_no_library_entry() {
+        let stale = SCH.replace("(lib_id \"Device:R\")", "(lib_id \"Device:Missing\")");
+        let result = call_result(&stale, "get_net_connections", json!({ "net": "GND" })).await;
+        assert!(result.is_error, "a short pin list was answered as complete");
     }
 
     #[tokio::test]
@@ -1858,7 +1907,7 @@ mod multi_unit_tool_tests {
 /// `two_name_nets.README.md`; every expectation below is that table.
 #[cfg(test)]
 mod two_name_net_tests {
-    use super::tool_call_support::call;
+    use super::tool_call_support::{call, net_pins};
     use super::*;
 
     const SCH: &str = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
@@ -1938,6 +1987,67 @@ mod two_name_net_tests {
         for alias in ["VCC", "ALT", "GND"] {
             assert!(labels.contains(&alias), "alias {alias} dropped: {items}");
         }
+    }
+
+    /// `/SDA` is joined only by its two labels: `U1.5` and `R1.2` sit on wire
+    /// segments that never meet. KiCad's netlist (`two_name_nets.README.md`)
+    /// puts exactly those two pins on it; `U1.6` and `R2.2` are on `/SCL`
+    /// beside it, and `R1.1` is on the pull-up rail.
+    #[tokio::test]
+    async fn net_connections_follow_a_net_joined_only_by_labels() {
+        let s = call(SCH, "get_net_connections", json!({ "net": "SDA" })).await;
+        assert_eq!(net_pins(&s), ["R1.2", "U1.5"], "{s}");
+        assert_eq!(s["label_count"], 2, "{s}");
+    }
+
+    /// The rail KiCad calls `+3V3` carries the `VCC` and `ALT` labels too. Its
+    /// pins are KiCad's five, without the two `+3V3` power symbols, and asking
+    /// by any of its names lists every label on it, not only the ones spelling
+    /// the name asked for.
+    #[tokio::test]
+    async fn net_connections_answer_for_the_whole_net_under_any_of_its_names() {
+        for name in ["+3V3", "VCC", "ALT"] {
+            let s = call(SCH, "get_net_connections", json!({ "net": name })).await;
+            assert_eq!(
+                net_pins(&s),
+                ["C1.1", "C2.1", "TP1.1", "TP7.1", "U1.8"],
+                "{name}: {s}"
+            );
+            let mut labels: Vec<String> = s["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{} {}",
+                        l["type"].as_str().unwrap(),
+                        l["net"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            labels.sort_unstable();
+            assert_eq!(
+                labels,
+                [
+                    "NetLabel ALT",
+                    "NetLabel ALT",
+                    "NetLabel VCC",
+                    "PowerSymbol +3V3",
+                    "PowerSymbol +3V3"
+                ],
+                "{name}: {s}"
+            );
+            assert_eq!(s["label_count"], 5, "{name}: {s}");
+        }
+    }
+
+    /// Ground here is named by a `RETURN` global label over `GND` symbols.
+    /// Asked for as `GND`, it is still KiCad's four pins and none of the
+    /// `#PWR` symbols that name it.
+    #[tokio::test]
+    async fn net_connections_leave_out_the_power_symbols_naming_a_net() {
+        let s = call(SCH, "get_net_connections", json!({ "net": "GND" })).await;
+        assert_eq!(net_pins(&s), ["C1.2", "C2.2", "C3.2", "U1.4"], "{s}");
     }
 
     /// A net with no label at all is still a net. Collecting by name left it
