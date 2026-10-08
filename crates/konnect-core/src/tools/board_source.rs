@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use konnect_sexp::paths::display_path;
 use serde_json::{json, Value};
 
 use crate::mcp::error::ToolErrorKind;
@@ -211,7 +212,7 @@ where
             BoardRead::Refused(not_live_enough(what, message))
         }
         LiveBoard::NeverReached(_) => BoardRead::Saved(no_live_board(
-            board_path,
+            live_board::editor_lock(board_path),
             "kicad_ipc_unreachable",
             "KiCad IPC is unreachable",
         )),
@@ -241,7 +242,7 @@ where
             BoardRead::Refused(not_live_enough(what, message))
         }
         LiveBoard::Unserved { absence, .. } => BoardRead::Saved(no_live_board(
-            board_path,
+            live_board::editor_lock(board_path),
             absence.reason_code(),
             &format!("KiCad is running but {}", absence.observed()),
         )),
@@ -299,8 +300,8 @@ fn explicitly_requested(ctx: &ToolContext, board_path: &Path) -> SavedBoard {
 /// or its endpoint serves no board editor; a standalone pcbnew on its own
 /// socket looks the same from here. The sibling lock is the only evidence
 /// either way, so both go through this and report it in `reason`.
-fn no_live_board(board_path: &Path, base: &'static str, observed: &str) -> SavedBoard {
-    match live_board::editor_lock(board_path) {
+fn no_live_board(lock: live_board::EditorLock, base: &'static str, observed: &str) -> SavedBoard {
+    match lock {
         live_board::EditorLock::Absent => SavedBoard {
             reason: base,
             detail: format!(
@@ -313,7 +314,7 @@ fn no_live_board(board_path: &Path, base: &'static str, observed: &str) -> Saved
             detail: format!(
                 "{observed}, and the sibling lock '{}' is present; its contents cannot prove \
                  whether an editor still holds newer unsaved state.",
-                path.display()
+                display_path(&path)
             ),
         },
         // An inspection that failed is not an absence, and saying "no lock was
@@ -323,7 +324,7 @@ fn no_live_board(board_path: &Path, base: &'static str, observed: &str) -> Saved
             detail: format!(
                 "{observed}, and the sibling lock '{}' could not be inspected ({error}), so its \
                  absence cannot be established.",
-                path.display()
+                display_path(&path)
             ),
         },
     }
@@ -370,6 +371,34 @@ fn lost_live_board(board_path: &Path, situation: &str) -> CallToolResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Windows resolves a network share's lock path to `\\?\UNC\…`. The
+    /// detail names it as `\\server\share\…`, the form a user can paste
+    /// back (#673).
+    #[test]
+    fn a_lock_detail_names_the_lock_without_the_verbatim_prefix() {
+        let lock = std::path::PathBuf::from(r"\\?\UNC\server\share\proj\~board.kicad_pcb.lck");
+        let denied = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        for observed in [
+            live_board::EditorLock::Present(lock.clone()),
+            live_board::EditorLock::Unreadable(lock.clone(), denied()),
+        ] {
+            let saved = no_live_board(
+                observed,
+                "kicad_ipc_unreachable",
+                "KiCad IPC is unreachable",
+            );
+            assert!(
+                saved
+                    .detail
+                    .contains(r"'\\server\share\proj\~board.kicad_pcb.lck'"),
+                "{}",
+                saved.detail
+            );
+            assert!(!saved.detail.contains(r"\\?\"), "{}", saved.detail);
+        }
+    }
 
     #[test]
     fn an_absent_selector_is_auto() {

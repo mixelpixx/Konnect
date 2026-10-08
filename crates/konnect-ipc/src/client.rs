@@ -11,6 +11,7 @@
 use crate::gen::kiapi;
 use crate::types::*;
 use anyhow::{Context, Result};
+use konnect_sexp::paths::display_path;
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
 use std::collections::BTreeSet;
@@ -1835,7 +1836,7 @@ impl KiCadIpcClient {
                     | BoardTargetError::UnresolvedDocumentIdentities { .. }),
                 ) => Err(anyhow::Error::new(error)),
                 Err(_) => Err(anyhow::Error::new(BoardTargetError::StaleDocument {
-                    requested: bound.requested.display().to_string(),
+                    requested: display_path(&bound.requested),
                     previously_bound: board_document_label(&bound.document),
                     open_documents: board_document_labels(&docs),
                 })),
@@ -1891,7 +1892,7 @@ impl KiCadIpcClient {
         if let Some(previous) = bound.as_ref() {
             if previous.document != document {
                 return Err(anyhow::Error::new(BoardTargetError::StaleDocument {
-                    requested: requested.display().to_string(),
+                    requested: display_path(&requested),
                     previously_bound: board_document_label(&previous.document),
                     open_documents: vec![board_document_label(&document)],
                 }));
@@ -5248,7 +5249,7 @@ fn editor_capabilities(
 
 fn board_document_label(document: &kiapi::common::types::DocumentSpecifier) -> String {
     board_document_identity(document)
-        .map(|path| path.display().to_string())
+        .map(|path| display_path(&path))
         .unwrap_or_else(|reason| format!("<unidentified PCB document: {reason}>"))
 }
 
@@ -5262,7 +5263,7 @@ fn select_requested_board(
     documents: &[kiapi::common::types::DocumentSpecifier],
     requested: &Path,
 ) -> std::result::Result<kiapi::common::types::DocumentSpecifier, BoardTargetError> {
-    let requested_label = requested.display().to_string();
+    let requested_label = display_path(requested);
     if documents.is_empty() {
         return Err(BoardTargetError::NoOpenDocuments {
             requested: requested_label,
@@ -5326,14 +5327,14 @@ fn select_requested_board(
             requested: requested_label,
             reasons: vec![format!(
                 "KiCad reports '{}' open more than once",
-                duplicated.display()
+                display_path(duplicated)
             )],
         });
     }
 
     Err(BoardTargetError::WrongDocument {
         requested: requested_label,
-        open_documents: open.iter().map(|path| path.display().to_string()).collect(),
+        open_documents: open.iter().map(|path| display_path(path)).collect(),
     })
 }
 
@@ -6084,6 +6085,51 @@ mod document_path_tests {
             comparable_identity(&real).unwrap(),
             comparable_identity(&link).unwrap()
         );
+    }
+
+    /// Every message that names an open board names it as a user can paste
+    /// it back. On Windows `canonicalize` returns `\\?\C:\…`, which this
+    /// rejects (#673); the match itself still runs on the resolved form.
+    #[test]
+    fn open_boards_are_named_without_the_verbatim_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join("open.kicad_pcb");
+        std::fs::write(&open, "(kicad_pcb)").unwrap();
+        let requested = dir.path().join("requested.kicad_pcb");
+        let document = board_document(open.to_str().unwrap(), None);
+        let resolved = open.canonicalize().unwrap();
+        let assert_pasteable = |shown: &str| {
+            assert!(!shown.starts_with(r"\\?\"), "{shown}");
+            assert_eq!(Path::new(shown).canonicalize().unwrap(), resolved);
+        };
+
+        let Err(BoardTargetError::WrongDocument { open_documents, .. }) =
+            select_requested_board(std::slice::from_ref(&document), &requested)
+        else {
+            panic!("a different open board is the wrong document");
+        };
+        assert_eq!(open_documents.len(), 1);
+        assert_pasteable(&open_documents[0]);
+
+        let twice = [document.clone(), document.clone()];
+        let Err(BoardTargetError::AmbiguousDocument { candidates, .. }) =
+            select_requested_board(&twice, &open)
+        else {
+            panic!("one board open twice is ambiguous");
+        };
+        assert_eq!(candidates.len(), 2);
+        candidates.iter().for_each(|shown| assert_pasteable(shown));
+
+        let Err(BoardTargetError::UnresolvedDocumentIdentities { reasons, .. }) =
+            select_requested_board(&twice, &requested)
+        else {
+            panic!("a board open twice is not a list absence can be read from");
+        };
+        let [reason] = reasons.as_slice() else {
+            panic!("{reasons:?}");
+        };
+        assert!(!reason.contains(r"\\?\"), "{reason}");
+        assert!(reason.contains(&display_path(&resolved)), "{reason}");
     }
 
     #[test]
