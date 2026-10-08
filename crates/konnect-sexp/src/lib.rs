@@ -6,6 +6,7 @@ pub mod geometry;
 pub mod layers;
 pub mod net;
 pub mod parser;
+pub mod paths;
 pub mod schematic;
 pub mod transaction;
 pub mod writer;
