@@ -3,6 +3,17 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a copper zone blocks pad-net changes only on its own net (patch release)
+
+`update_pcb_from_schematic` refuses to move a pad between nets while copper
+on the old or new net is routed (`routed_pad_net_change`). On a board with any
+zone, it used to count every board net as routed, so no pad on such a board
+could change net. A board-level copper zone now counts as copper on its own net
+only, as KiCad reports it in `Zone.copper_settings.net`, and a rule area counts
+as none. A plan that conflicted only because of a pour on another net is now
+`ready`. A zone whose net KiCad does not report still blocks every net.
+Response shapes are unchanged (#779).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
