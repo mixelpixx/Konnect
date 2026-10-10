@@ -22,7 +22,7 @@ fn builtin_templates() -> Vec<serde_json::Value> {
             "category": "connectivity/usb",
             "tags": ["usb-c", "power", "5v", "sink"],
             "components": [
-                {"ref_prefix": "J", "lib_id": "Connector:USB_C_Receptacle_USB2.0", "value": "USB_C", "notes": "USB-C receptacle, 16-pin or 6-pin mid-mount"},
+                {"ref_prefix": "J", "lib_id": "Connector:USB_C_Receptacle_USB2.0_16P", "value": "USB_C", "notes": "USB-C receptacle, 16-pin USB 2.0"},
                 {"ref_prefix": "R", "lib_id": "Device:R", "value": "5.1k", "quantity": 2, "package": "0402", "notes": "CC1 and CC2 pull-down — required for 5V default current"},
                 {"ref_prefix": "D", "lib_id": "Device:D_TVS", "value": "PRTR5V0U2X", "quantity": 1, "notes": "ESD protection on D+/D-"},
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 1, "package": "0402", "notes": "VBUS decoupling"}
@@ -45,48 +45,90 @@ fn builtin_templates() -> Vec<serde_json::Value> {
             "category": "power/regulator",
             "tags": ["ldo", "3v3", "regulator", "power"],
             "components": [
-                {"ref_prefix": "U", "lib_id": "Regulator_Linear:AMS1117-3.3", "value": "AMS1117-3.3", "notes": "3.3V 1A LDO — substitute AP2112, MCP1700, etc."},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "10uF", "quantity": 1, "package": "0805", "notes": "Input capacitor — ceramic X5R or X7R"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "10uF", "quantity": 1, "package": "0805", "notes": "Output capacitor — ceramic, check ESR requirements in datasheet"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 2, "package": "0402", "notes": "Bypass caps on input and output"}
+                {"ref_prefix": "U", "lib_id": "Regulator_Linear:AP2112K-3.3", "value": "AP2112K-3.3", "notes": "3.3V 600mA LDO, stable with 1uF ceramic capacitors"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "1uF", "quantity": 1, "package": "0402", "notes": "C1: input capacitor — ceramic X5R or X7R"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "1uF", "quantity": 1, "package": "0402", "notes": "C2: output capacitor — ceramic X5R or X7R"}
             ],
             "connections": [
-                {"from": "U.VIN", "to_net": "VIN", "notes": "Input voltage (check max Vin for chosen LDO)"},
+                {"from": "U.VIN", "to_net": "VIN", "notes": "Input voltage, 6V max (6.5V absolute)"},
+                {"from": "U.EN", "to_net": "VIN", "notes": "EN has an internal 3M pull-down: left open, the regulator stays off"},
                 {"from": "U.VOUT", "to_net": "VCC_3V3", "notes": "3.3V regulated output"},
-                {"from": "U.GND", "to_net": "GND", "notes": "Ground — ensure low-impedance path"}
+                {"from": "U.GND", "to_net": "GND", "notes": "Ground — ensure low-impedance path"},
+                {"from": "C1.1", "to_net": "VIN", "notes": "Input capacitor at the VIN pin"},
+                {"from": "C1.2", "to_net": "GND"},
+                {"from": "C2.1", "to_net": "VCC_3V3", "notes": "Output capacitor at the VOUT pin"},
+                {"from": "C2.2", "to_net": "GND"}
             ],
-            "design_notes": "Place input and output caps within 5mm of regulator pins. AMS1117 needs >10uF output for stability. For low-noise applications, consider ADP151 or TPS7A20.",
-            "references": ["AMS1117 datasheet, Section 8.2"]
+            "design_notes": "C1 and C2 in the connections are the first and second capacitor in the component list; apply_template numbers them from the schematic's next free reference. AP2112K-3.3 is stable with 1uF ceramic capacitors on input and output; place both within 5mm of the pins. Dropout is 250mV typical / 400mV max at 600mA, so a 5V rail keeps regulating down to USB's 4.4V minimum. Pin 4 is NC. The absolute maximum input is 6.5V: on a hot-plugged USB VBUS input, cable inductance rings with small input capacitance and can overshoot that — clamp it with a TVS or choose a regulator rated for a higher input (e.g. LP38693, 10V). AMS1117-class LDOs are a poor default here: ~1.1V dropout, and they need an output capacitor with controlled ESR (tantalum) rather than ceramic.",
+            "references": ["Diodes AP2112 datasheet DS39724 Rev. 2-2"]
         }),
         json!({
             "id": "stm32_minimal",
             "name": "STM32 Minimal System",
-            "description": "STM32 MCU with HSE crystal, decoupling caps, reset circuit, and SWD debug header.",
+            "description": "STM32 MCU with HSE crystal, decoupling caps, reset circuit, boot-mode pull-downs and SWD debug header.",
             "category": "mcu/stm32",
             "tags": ["stm32", "mcu", "minimal", "crystal", "swd"],
             "components": [
-                {"ref_prefix": "U", "lib_id": "MCU_ST_STM32F4:STM32F411CEUx", "value": "STM32F411CEU6", "notes": "48-pin UFQFPN — substitute any STM32 in same package"},
-                {"ref_prefix": "Y", "lib_id": "Device:Crystal", "value": "8MHz", "quantity": 1, "notes": "HSE crystal — check MCU datasheet for supported range"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "20pF", "quantity": 2, "package": "0402", "notes": "Crystal load caps — calculate from datasheet CL spec"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 5, "package": "0402", "notes": "Decoupling caps — one per VDD/VDDA pin"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "4.7uF", "quantity": 1, "package": "0402", "notes": "Bulk decoupling on VDD"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "1uF", "quantity": 1, "package": "0402", "notes": "VCAP pin — required for internal regulator"},
-                {"ref_prefix": "R", "lib_id": "Device:R", "value": "10k", "quantity": 1, "package": "0402", "notes": "NRST pull-up"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 1, "package": "0402", "notes": "NRST filter cap to GND"},
-                {"ref_prefix": "J", "lib_id": "Connector:Conn_ARM_SWD_10", "value": "SWD", "notes": "10-pin ARM SWD debug header"}
+                {"ref_prefix": "U", "lib_id": "MCU_ST_STM32F4:STM32F411CEUx", "value": "STM32F411CEU6", "notes": "48-pin UFQFPN"},
+                {"ref_prefix": "Y", "lib_id": "Device:Crystal", "value": "8MHz", "quantity": 1, "notes": "HSE crystal — STM32F411 accepts 4-26MHz"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "20pF", "quantity": 2, "package": "0402", "notes": "C1, C2: crystal load caps — calculate from the crystal's CL"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 4, "package": "0402", "notes": "C3-C5: one per VDD pin (3); C6: VDDA"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "4.7uF", "quantity": 1, "package": "0603", "notes": "C7: bulk decoupling on VDD"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "4.7uF", "quantity": 1, "package": "0603", "notes": "C8: VCAP1 — internal regulator, ESR < 1 ohm"},
+                {"ref_prefix": "R", "lib_id": "Device:R", "value": "10k", "quantity": 1, "package": "0402", "notes": "R1: NRST pull-up"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 1, "package": "0402", "notes": "C9: NRST filter cap to GND"},
+                {"ref_prefix": "R", "lib_id": "Device:R", "value": "10k", "quantity": 2, "package": "0402", "notes": "R2: BOOT0 pull-down; R3: PB2 (BOOT1) pull-down"},
+                {"ref_prefix": "J", "lib_id": "Connector:Conn_ARM_JTAG_SWD_10", "value": "SWD", "notes": "10-pin Cortex debug header"}
             ],
             "connections": [
-                {"from": "U.VDD", "to_net": "VCC_3V3", "notes": "All VDD pins to 3.3V"},
+                {"from": "U.VDD", "to_net": "VCC_3V3", "notes": "All three VDD pins to 3.3V"},
                 {"from": "U.VDDA", "to_net": "VCC_3V3", "notes": "Analog supply — add ferrite bead for sensitive analog work"},
+                {"from": "U.VBAT", "to_net": "VCC_3V3", "notes": "No backup battery: tie VBAT to VDD"},
                 {"from": "U.VSS", "to_net": "GND", "notes": "All VSS pins to ground"},
+                {"from": "U.VSSA", "to_net": "GND", "notes": "Analog ground"},
+                {"from": "U.VCAP1", "to_net": "VCAP1", "notes": "Internal regulator output — only C8 on this net"},
+                {"from": "C8.1", "to_net": "VCAP1"},
+                {"from": "C8.2", "to_net": "GND"},
                 {"from": "U.NRST", "to_net": "NRST", "notes": "Reset with 10k pull-up + 100nF cap"},
-                {"from": "U.OSC_IN", "to_net": "HSE_IN", "notes": "Crystal input"},
-                {"from": "U.OSC_OUT", "to_net": "HSE_OUT", "notes": "Crystal output"},
-                {"from": "U.SWDIO", "to_net": "SWDIO", "notes": "SWD data to debug header"},
-                {"from": "U.SWCLK", "to_net": "SWCLK", "notes": "SWD clock to debug header"}
+                {"from": "R1.1", "to_net": "NRST"},
+                {"from": "R1.2", "to_net": "VCC_3V3"},
+                {"from": "C9.1", "to_net": "NRST"},
+                {"from": "C9.2", "to_net": "GND"},
+                {"from": "U.BOOT0", "to_net": "BOOT0", "notes": "Low: boot from flash. Pull high to enter the system bootloader"},
+                {"from": "R2.1", "to_net": "BOOT0"},
+                {"from": "R2.2", "to_net": "GND"},
+                {"from": "U.PB2", "to_net": "BOOT1", "notes": "PB2 is BOOT1: it must be low for the system bootloader"},
+                {"from": "R3.1", "to_net": "BOOT1"},
+                {"from": "R3.2", "to_net": "GND"},
+                {"from": "U.PH0", "to_net": "HSE_IN", "notes": "PH0 = RCC_OSC_IN, crystal input"},
+                {"from": "Y.1", "to_net": "HSE_IN"},
+                {"from": "C1.1", "to_net": "HSE_IN"},
+                {"from": "C1.2", "to_net": "GND"},
+                {"from": "U.PH1", "to_net": "HSE_OUT", "notes": "PH1 = RCC_OSC_OUT, crystal output"},
+                {"from": "Y.2", "to_net": "HSE_OUT"},
+                {"from": "C2.1", "to_net": "HSE_OUT"},
+                {"from": "C2.2", "to_net": "GND"},
+                {"from": "C3.1", "to_net": "VCC_3V3", "notes": "C3-C5 each at one VDD pin"},
+                {"from": "C3.2", "to_net": "GND"},
+                {"from": "C4.1", "to_net": "VCC_3V3"},
+                {"from": "C4.2", "to_net": "GND"},
+                {"from": "C5.1", "to_net": "VCC_3V3"},
+                {"from": "C5.2", "to_net": "GND"},
+                {"from": "C6.1", "to_net": "VCC_3V3", "notes": "At the VDDA pin"},
+                {"from": "C6.2", "to_net": "GND"},
+                {"from": "C7.1", "to_net": "VCC_3V3"},
+                {"from": "C7.2", "to_net": "GND"},
+                {"from": "U.PA13", "to_net": "SWDIO", "notes": "PA13 = SYS_JTMS-SWDIO"},
+                {"from": "J.SWDIO/TMS", "to_net": "SWDIO"},
+                {"from": "U.PA14", "to_net": "SWCLK", "notes": "PA14 = SYS_JTCK-SWCLK"},
+                {"from": "J.SWCLK/TCK", "to_net": "SWCLK"},
+                {"from": "J.~{RESET}", "to_net": "NRST", "notes": "Lets the debugger reset the MCU"},
+                {"from": "J.VTref", "to_net": "VCC_3V3", "notes": "Target voltage reference for the probe"},
+                {"from": "J.GND", "to_net": "GND"},
+                {"from": "J.GNDDetect", "to_net": "GND"}
             ],
-            "design_notes": "Crystal load cap formula: CL = (C1*C2)/(C1+C2) + Cstray, where Cstray ≈ 3-5pF. Place all decoupling caps within 3mm of their VDD pin. VCAP capacitor value is critical — check your specific STM32 variant's datasheet.",
-            "references": ["AN4488: Getting started with STM32F4 MCU hardware development"]
+            "design_notes": "C1-C9 and R1-R3 in the connections count each prefix's parts in component-list order; apply_template numbers them from the schematic's next free reference. Crystal load cap formula: CL = (C1*C2)/(C1+C2) + Cstray; ST suggests 10pF as a rough estimate of pin plus board capacitance. Place all decoupling caps within 3mm of their pin. VCAP1: STM32F411 has a single VCAP pin, which needs 4.7uF with ESR < 1 ohm; parts with two VCAP pins (e.g. STM32F407) use 2.2uF on each — check your variant. SWO (PB3) can be routed to the header's SWO/TDO pin for trace output.",
+            "references": ["ST DS10314: STM32F411xC/xE datasheet", "AN4488: Getting started with STM32F4 MCU hardware development"]
         }),
         json!({
             "id": "i2c_pullups",
@@ -143,8 +185,8 @@ fn builtin_templates() -> Vec<serde_json::Value> {
                 {"from": "U.VIN", "to_net": "VIN", "notes": "Input power"},
                 {"from": "U.SW", "to": "L1.1", "notes": "Switch node to inductor"},
                 {"from": "L1.2", "to_net": "VOUT", "notes": "Inductor output"},
-                {"from": "U.FB", "via": "voltage divider R_top/R_bot", "to_net": "VOUT", "notes": "Feedback voltage divider"},
-                {"from": "U.BOOT", "notes": "Bootstrap cap from BOOT to SW"},
+                {"from": "U.VFB", "via": "voltage divider R_top/R_bot", "to_net": "VOUT", "notes": "Feedback voltage divider"},
+                {"from": "U.VBST", "notes": "Bootstrap cap from VBST to SW"},
                 {"from": "U.GND", "to_net": "GND", "notes": "Power ground — kelvin sense to output cap GND"}
             ],
             "design_notes": "Layout is critical: keep input caps close to VIN/GND pins, keep SW trace short and wide (high di/dt), keep feedback divider close to FB pin away from SW node. Ground plane under inductor improves EMI. Calculate passives from datasheet — do NOT guess values.",
@@ -636,6 +678,7 @@ mod tests {
     use super::*;
     use crate::router::ToolRouter;
     use crate::tools::{ServerConfig, KICAD_ENV_LOCK};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     struct TemplateEnvironment {
@@ -831,5 +874,120 @@ mod tests {
             Some("stale_target")
         );
         assert_eq!(std::fs::read(&schematic).unwrap(), before);
+    }
+
+    /// Every name a pin answers to: its number, its name and its alternate
+    /// functions (`(alternate "SYS_JTMS-SWDIO" …)`).
+    fn pin_names(symbol: &konnect_schematic_editor::sexp::SexpNode, out: &mut BTreeSet<String>) {
+        for child in symbol.args() {
+            if child.tag() == Some("pin") {
+                for tag in ["name", "number", "alternate"] {
+                    for node in child.find_all(tag) {
+                        if let Some(value) = node.value() {
+                            out.insert(value.to_string());
+                        }
+                    }
+                }
+            } else {
+                pin_names(child, out);
+            }
+        }
+    }
+
+    /// `"U.VIN"` → (`"U"`, `None`, `"VIN"`); `"C2.1"` → (`"C"`, `Some(2)`, `"1"`).
+    /// Endpoints without a pin (`"GPIO"`) are not pin references.
+    fn split_endpoint(endpoint: &str) -> Option<(&str, Option<usize>, &str)> {
+        let (designator, pin) = endpoint.split_once('.')?;
+        let digits = designator.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        let prefix = &designator[..designator.len() - digits.len()];
+        let index = if digits.is_empty() {
+            None
+        } else {
+            Some(digits.parse().ok()?)
+        };
+        Some((prefix, index, pin))
+    }
+
+    /// The bundled templates name real KiCad symbols and real pins (#783).
+    ///
+    /// Templates are hand-written JSON that nothing compiles: `Conn_ARM_SWD_10`
+    /// and `USB_C_Receptacle_USB2.0` are not in KiCad 10's library, so
+    /// `apply_template` refused both templates outright, and maps such as
+    /// `U.VIN` on AMS1117 (whose pins are `VI`/`VO`) sent the agent to pins
+    /// that do not exist. Checked against the installed library, so the next
+    /// KiCad rename fails here rather than in a user's schematic. Skips when
+    /// no KiCad symbol library is installed.
+    #[test]
+    fn builtin_templates_name_symbols_and_pins_that_exist_in_kicad() {
+        let _guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::tools::find_kicad_library_dirs("symbols").is_empty() {
+            // The E2E workflow installs KiCad and exports KICAD_CLI; a skip
+            // there would mean the check never runs anywhere.
+            assert!(
+                std::env::var_os("KICAD_CLI").is_none(),
+                "KICAD_CLI is set but no KiCad symbol library was found"
+            );
+            eprintln!("skipped: no installed KiCad symbol library");
+            return;
+        }
+        let source = crate::tools::library::KiCadSymbolSource::new(None);
+        let mut problems = Vec::new();
+
+        for template in builtin_templates() {
+            let id = template["id"].as_str().unwrap();
+            // Expand quantities so `C2` means the template's second capacitor.
+            let mut parts: Vec<(String, String, BTreeSet<String>)> = Vec::new();
+            for component in template["components"].as_array().unwrap() {
+                let prefix = component["ref_prefix"].as_str().unwrap().to_string();
+                let lib_id = component["lib_id"].as_str().unwrap().to_string();
+                let mut pins = BTreeSet::new();
+                match konnect_schematic_editor::library::resolve_lib_symbol_flattened_node(
+                    &lib_id, &source,
+                ) {
+                    Some(symbol) => {
+                        pin_names(&symbol, &mut pins);
+                        if pins.is_empty() {
+                            problems.push(format!("{id}: read no pins from {lib_id}"));
+                        }
+                    }
+                    None => problems.push(format!("{id}: {lib_id} is not in the KiCad library")),
+                }
+                for _ in 0..component["quantity"].as_u64().unwrap_or(1) {
+                    parts.push((prefix.clone(), lib_id.clone(), pins.clone()));
+                }
+            }
+
+            for connection in template["connections"].as_array().unwrap() {
+                for key in ["from", "to"] {
+                    let Some(endpoint) = connection[key].as_str() else {
+                        continue;
+                    };
+                    let Some((prefix, index, pin)) = split_endpoint(endpoint) else {
+                        continue;
+                    };
+                    let candidates: Vec<_> = parts.iter().filter(|p| p.0 == prefix).collect();
+                    let part = match index {
+                        Some(n) => candidates.get(n.wrapping_sub(1)).copied(),
+                        None if candidates.iter().all(|p| p.1 == candidates[0].1) => {
+                            candidates.first().copied()
+                        }
+                        None => None,
+                    };
+                    match part {
+                        None => problems.push(format!("{id}: {endpoint} names no single part")),
+                        Some((_, lib_id, pins)) if !pins.is_empty() && !pins.contains(pin) => {
+                            problems.push(format!("{id}: {endpoint} — {lib_id} has no pin {pin}"))
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "templates disagree with the KiCad library:\n  {}",
+            problems.join("\n  ")
+        );
     }
 }
