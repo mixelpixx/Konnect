@@ -28,7 +28,7 @@ The chain, in `common/project/net_settings.cpp` unless noted:
 | 3 | `net_settings.cpp:168` | `wire_width` is applied only `if` the key is present. |
 | 4 | `net_settings.cpp:216` | A parsed class that `IsDefault()` **replaces** the seeded default outright. |
 | 4a | `netclass.h:96` | `IsDefault()` reads `m_isDefault`, which `SetName` sets only on an exact `aName == "Default"`. |
-| 5 | `net_settings.cpp:1320` | `addMissingDefaults()` backfills other classes *from* the Default. Nothing backfills the Default itself. |
+| 5 | `net_settings.cpp:1048` | `addMissingDefaults()` backfills other classes *from* the Default. Nothing backfills the Default itself. |
 
 ## It Is The Name, Not The Position
 
@@ -47,10 +47,13 @@ class comes first fixes the common case and leaves the bug live.
 
 ## Only The Default Class Must Be Complete
 
-`addMissingDefaults()` fills any field a netclass omits from the Default class, so
-a non-Default class legitimately omitting fields simply inherits. The
-completeness requirement applies **only to the class named `Default`**, because it
-is the root of that inheritance.
+`addMissingDefaults()` fills the fields a netclass omits from the Default class, so
+a non-Default class legitimately omitting fields simply inherits. In KiCad 10.0.6
+it never fills two of the twelve below: `diff_pair_via_gap`, whose block is commented out
+(`net_settings.cpp:1108-1114`), and `line_style`, which has no block. A class
+without its own via gap has none, and one without a line style reads as solid
+(`netclass.h:234`). The completeness requirement applies **only to the class named
+`Default`**, because it is the root of that inheritance.
 
 A writer therefore needs to emit a full field set for `Default`, but may leave a
 named class partial. A reader must not treat absence on a non-Default class as
@@ -157,7 +160,7 @@ assertion than any literal. Both rows measured on KiCad 10.0.5.
 - `common/netclass.cpp:52-80` — `NETCLASS::NETCLASS`, and what `aInitWithDefaults` gates
 - `common/project/net_settings.cpp:71` — `saveNetclass`, including the unit split
 - `common/project/net_settings.cpp:128` — `readNetClass`
-- `common/project/net_settings.cpp:1252` — `addMissingDefaults`
+- `common/project/net_settings.cpp:1048` — `addMissingDefaults`
 
 Read from the GitHub mirror `KiCad/kicad-source-mirror`; upstream is GitLab at
 `kicad/code/kicad`.
