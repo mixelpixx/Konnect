@@ -363,7 +363,7 @@ fn is_footprint_item(tag: &str) -> bool {
         )
 }
 
-fn indent_before(source: &str, offset: usize) -> Option<String> {
+pub(super) fn indent_before(source: &str, offset: usize) -> Option<String> {
     let line_start = source[..offset]
         .rfind('\n')
         .map(|index| index + 1)
@@ -375,7 +375,7 @@ fn indent_before(source: &str, offset: usize) -> Option<String> {
         .then(|| indent.to_string())
 }
 
-fn quote_string(value: &str) -> String {
+pub(super) fn quote_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
     escaped.push('"');
     for character in value.chars() {

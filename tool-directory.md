@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
+- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -340,7 +340,7 @@ and Windows servers do not.
 
 ## Library
 
-### `library` · 17 tools
+### `library` · 18 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -353,8 +353,9 @@ and Windows servers do not.
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. Set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
-| `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
+| `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library, with optional footprint, description, keywords, footprint filters and custom fields. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
+| `set_symbol_properties` | Set the Footprint, Description, keywords, footprint filters or custom fields of an existing library symbol with a revision-checked write, reporting each field's previous and current value. Empty keywords or filters remove their property. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |

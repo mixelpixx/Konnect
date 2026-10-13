@@ -48,6 +48,7 @@ pub mod schematic_builder;
 #[cfg(test)]
 mod schematic_placement_tests;
 pub mod svg_import;
+mod symbol_fields;
 pub mod templates;
 pub mod verification;
 

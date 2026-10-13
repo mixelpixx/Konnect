@@ -6,6 +6,7 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::footprint_metadata::quote_string;
 use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
@@ -231,7 +232,7 @@ pub fn tools() -> Vec<ToolDef> {
              unit) to draw a conventional op-amp triangle or logic-gate body instead. With a \
              glyph, pins auto-place by their `type` (inputs left in the order listed top-to- \
              bottom, output right, power top/bottom) and their x/y are ignored.",
-            json!({
+            super::symbol_fields::with_field_schema(json!({
                 "type": "object",
                 "properties": {
                     "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
@@ -280,7 +281,7 @@ pub fn tools() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["library_path", "name", "reference_prefix"]
-            }),
+            })),
             |args, ctx| async move { handle_create_symbol(args, ctx).await }
         ),
         tool!(
@@ -296,6 +297,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_delete_symbol(args, ctx).await }
         ),
+        super::symbol_fields::tool(),
         tool!(
             "list_symbols_in_library",
             "List all symbol names defined in a .kicad_sym library file.",
@@ -1215,7 +1217,7 @@ fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolR
     )
 }
 
-fn skip_pad_header_token(source: &str, mut index: usize) -> Option<(usize, usize)> {
+pub(super) fn skip_sexp_token(source: &str, mut index: usize) -> Option<(usize, usize)> {
     let bytes = source.as_bytes();
     while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
         index += 1;
@@ -1245,13 +1247,13 @@ fn skip_pad_header_token(source: &str, mut index: usize) -> Option<(usize, usize
 
 fn pad_shape_range(pad_block: &str) -> Option<(usize, usize)> {
     let open = pad_block.find('(')? + 1;
-    let (_, pad_end) = skip_pad_header_token(pad_block, open)?;
+    let (_, pad_end) = skip_sexp_token(pad_block, open)?;
     if &pad_block[open..pad_end] != "pad" {
         return None;
     }
-    let (_, number_end) = skip_pad_header_token(pad_block, pad_end)?;
-    let (_, type_end) = skip_pad_header_token(pad_block, number_end)?;
-    skip_pad_header_token(pad_block, type_end)
+    let (_, number_end) = skip_sexp_token(pad_block, pad_end)?;
+    let (_, type_end) = skip_sexp_token(pad_block, number_end)?;
+    skip_sexp_token(pad_block, type_end)
 }
 
 fn remove_pad_shape_children(pad_block: String, keep_roundrect_ratio: bool) -> String {
@@ -4213,6 +4215,10 @@ async fn handle_create_symbol(
     };
     let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
     let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
+    let fields = match super::symbol_fields::parse_symbol_fields(args) {
+        Ok(fields) => fields,
+        Err(error) => return Ok(error),
+    };
 
     let SymbolItems {
         pins,
@@ -4471,29 +4477,39 @@ async fn handle_create_symbol(
     };
     let visible_property = |name: &str, value: &str, y: f64| {
         format!(
-            "\n    (property \"{name}\" \"{value}\" (at 0 {y:.4} 0) \
+            "\n    (property {} {} (at 0 {y:.4} 0) \
              (show_name no) (do_not_autoplace no) \
-             (effects (font (size 1.27 1.27))))"
+             (effects (font (size 1.27 1.27))))",
+            quote_string(name),
+            quote_string(value)
         )
     };
     let hidden_property = |name: &str, value: &str| {
         format!(
-            "\n    (property \"{name}\" \"{value}\" (at 0 0 0) \
+            "\n    (property {} {} (at 0 0 0) \
              (show_name no) (do_not_autoplace no) (hide yes) \
-             (effects (font (size 1.27 1.27))))"
+             (effects (font (size 1.27 1.27))))",
+            quote_string(name),
+            quote_string(value)
         )
     };
+    let custom_properties: String = fields
+        .created_after_description()
+        .into_iter()
+        .map(|(name, value)| hidden_property(name, value))
+        .collect();
 
     let symbol_sexp = format!(
-        "\n  (symbol \"{}\"{}{}\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (in_pos_files yes)\n    (duplicate_pin_numbers_are_jumpers no){}{}{}{}{}{}\n    (embedded_fonts no)\n  )",
+        "\n  (symbol \"{}\"{}{}\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (in_pos_files yes)\n    (duplicate_pin_numbers_are_jumpers no){}{}{}{}{}{}{}\n    (embedded_fonts no)\n  )",
         name,
         numbers,
         names,
         visible_property("Reference", ref_prefix, ref_y),
         visible_property("Value", value_str, value_y),
-        hidden_property("Footprint", ""),
+        hidden_property("Footprint", fields.footprint.as_deref().unwrap_or("")),
         hidden_property("Datasheet", datasheet),
-        hidden_property("Description", ""),
+        hidden_property("Description", fields.description.as_deref().unwrap_or("")),
+        custom_properties,
         units_sexp
     );
 
