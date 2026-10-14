@@ -3071,3 +3071,1131 @@ mod label_children_dispatch_tests {
         assert!(after(&written, "(at 394.97 69.85 0)").starts_with("(fields_autoplaced)"));
     }
 }
+
+#[cfg(test)]
+mod zone_deletion_dispatch_tests {
+    use super::*;
+    use crate::test_support::MockIpcServer;
+    use crate::tools::pcb_board::board_mock::board_document;
+    use crate::tools::ServerConfig;
+    use konnect_ipc::{builders::pack_any, gen::kiapi};
+    use prost::Message;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    const ZONE_FIXTURE: &[u8] =
+        include_bytes!("../../../konnect-sexp/tests/fixtures/zone_outline_elements.kicad_pcb");
+    const ZONE_IDS: [&str; 3] = [
+        "9a05f3f6-3b48-4653-80ad-b87c8f0311e2",
+        "5735a8ec-4c09-4701-8363-571f8dfc4353",
+        "3fbf99d0-27e9-4110-a352-2139dde74d30",
+    ];
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn call(handler: &McpHandler, id: u64, name: &str, arguments: Value) -> CallToolResult {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }))
+            .await
+            .expect("request returns a response");
+        assert!(response.error.is_none(), "tool errors are MCP results");
+        serde_json::from_value(response.result.expect("tools/call returns a result"))
+            .expect("result uses the advertised MCP shape")
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text,
+            other => panic!("expected JSON text, got {other:?}"),
+        };
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("{error}: {text}"))
+    }
+
+    const LIVE_BOARD_FIXTURE: &[u8] =
+        include_bytes!("../../../konnect-sexp/tests/fixtures/ecc83-pp.kicad_pcb");
+    const LIVE_ZONE_PAYLOAD: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin");
+    const LIVE_ZONE_UUID: &str = "00000000-0000-0000-0000-00004eed97a2";
+    const RULE_AREA_PAYLOAD: &[u8] =
+        include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin");
+    const RULE_AREA_BOARD_FIXTURE: &[u8] =
+        include_bytes!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb");
+
+    #[derive(Clone)]
+    struct MockBoard {
+        path: String,
+        original: String,
+        after_delete: String,
+        zones: Vec<prost_types::Any>,
+    }
+
+    struct LiveMockState {
+        boards: Vec<MockBoard>,
+        deleted: std::collections::HashSet<String>,
+        deleted_zone_ids: HashMap<String, std::collections::HashSet<String>>,
+        delete_ids: Vec<String>,
+        requests: Vec<String>,
+        get_items_reads: HashMap<String, usize>,
+        wrong_type_after_list: bool,
+        fail_postdelete_get_items: bool,
+        postdelete_busy_reads: usize,
+        reject_refill: bool,
+        empty_items: bool,
+        change_snapshot_during_next_inventory: bool,
+        snapshot_change_save_reads: HashMap<String, usize>,
+        no_open_documents: bool,
+        change_revision_on_begin_commit: bool,
+        revision_changed: bool,
+        fail_rollback: bool,
+        end_commit_actions: Vec<i32>,
+        refill_targets: Vec<String>,
+    }
+
+    fn board_path(document: &kiapi::common::types::DocumentSpecifier) -> String {
+        match document.identifier.as_ref() {
+            Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(path)) => {
+                path.clone()
+            }
+            other => panic!("expected a board document identifier, got {other:?}"),
+        }
+    }
+
+    fn live_fixture_board(path: &std::path::Path) -> MockBoard {
+        live_fixture_board_with(
+            path,
+            LIVE_BOARD_FIXTURE,
+            vec![live_zone_payload()],
+            LIVE_ZONE_UUID,
+        )
+    }
+
+    fn live_zone_payload() -> prost_types::Any {
+        prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+            value: LIVE_ZONE_PAYLOAD.to_vec(),
+        }
+    }
+
+    fn rule_area_payload() -> prost_types::Any {
+        prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+            value: RULE_AREA_PAYLOAD.to_vec(),
+        }
+    }
+
+    fn captured_zone_uuid(payload: &[u8]) -> String {
+        kiapi::board::types::Zone::decode(payload)
+            .expect("captured zone payload decodes")
+            .id
+            .expect("captured zone has a UUID")
+            .value
+    }
+
+    fn native_fixture_with_copper_and_rule_area() -> String {
+        let rule_uuid = captured_zone_uuid(RULE_AREA_PAYLOAD);
+        let rule_board = String::from_utf8_lossy(RULE_AREA_BOARD_FIXTURE);
+        let marker = format!("(uuid \"{rule_uuid}\")");
+        let uuid_offset = rule_board
+            .find(&marker)
+            .expect("captured rule-area UUID exists in its native fixture");
+        let zone_start = rule_board[..uuid_offset]
+            .rfind("(zone")
+            .expect("captured UUID belongs to a native zone");
+        let (start, end) =
+            konnect_sexp::writer::find_block_with_leading_whitespace(&rule_board, zone_start)
+                .expect("captured rule area has a complete native source span");
+        let rule_block = &rule_board[start..end];
+
+        let mut combined = String::from_utf8_lossy(LIVE_BOARD_FIXTURE).into_owned();
+        let root_close = combined
+            .rfind(')')
+            .expect("native copper fixture has a root closing delimiter");
+        combined.insert_str(root_close, &format!("\n{rule_block}\n"));
+        combined
+    }
+
+    fn live_fixture_board_with(
+        path: &std::path::Path,
+        fixture: &[u8],
+        zones: Vec<prost_types::Any>,
+        delete_uuid: &str,
+    ) -> MockBoard {
+        let original = String::from_utf8_lossy(fixture).into_owned();
+        let uuid_marker = format!("(uuid \"{delete_uuid}\")");
+        let uuid_offset = original
+            .find(&uuid_marker)
+            .expect("target UUID exists in the native fixture");
+        let start = original[..uuid_offset]
+            .rfind("(zone")
+            .expect("target UUID belongs to a native zone");
+        let (start, end) =
+            konnect_sexp::writer::find_block_with_leading_whitespace(&original, start)
+                .expect("native fixture zone has a complete source span");
+        let after_delete = konnect_sexp::writer::apply_edits(
+            original.clone(),
+            vec![konnect_sexp::writer::SexpEdit::delete(start, end)],
+        );
+        MockBoard {
+            path: path.to_string_lossy().into_owned(),
+            original,
+            after_delete,
+            zones,
+        }
+    }
+
+    fn live_mock(boards: Vec<MockBoard>) -> (MockIpcServer, Arc<Mutex<LiveMockState>>) {
+        let state = Arc::new(Mutex::new(LiveMockState {
+            boards: boards.clone(),
+            deleted: Default::default(),
+            deleted_zone_ids: HashMap::new(),
+            delete_ids: Vec::new(),
+            requests: Vec::new(),
+            get_items_reads: HashMap::new(),
+            wrong_type_after_list: false,
+            fail_postdelete_get_items: false,
+            postdelete_busy_reads: 0,
+            reject_refill: false,
+            empty_items: false,
+            change_snapshot_during_next_inventory: false,
+            snapshot_change_save_reads: HashMap::new(),
+            no_open_documents: false,
+            change_revision_on_begin_commit: false,
+            revision_changed: false,
+            fail_rollback: false,
+            end_commit_actions: Vec::new(),
+            refill_targets: Vec::new(),
+        }));
+        let shared = state.clone();
+        let documents = boards
+            .iter()
+            .map(|board| board_document(&board.path))
+            .collect::<Vec<_>>();
+        let server = MockIpcServer::spawn("served-zone-delete", move |request| {
+            let command = request.message.expect("IPC request has a command");
+            let command_name = command.type_url.rsplit('.').next().unwrap_or_default();
+            let mut state = shared.lock().unwrap();
+            let ok = |message| kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    error_message: String::new(),
+                }),
+                header: None,
+                message,
+            };
+            let refused =
+                |status: kiapi::common::ApiStatusCode, error: &str| kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: status as i32,
+                        error_message: error.to_string(),
+                    }),
+                    header: None,
+                    message: None,
+                };
+
+            match command_name {
+                "GetOpenDocuments" => ok(Some(pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: if state.no_open_documents {
+                            Vec::new()
+                        } else {
+                            documents.clone()
+                        },
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))),
+                "SaveDocumentToString" => {
+                    let query = kiapi::common::commands::SaveDocumentToString::decode(
+                        command.value.as_slice(),
+                    )
+                    .expect("SaveDocumentToString request");
+                    let document = query.document.expect("document target");
+                    let path = board_path(&document);
+                    state.requests.push(format!("save:{path}"));
+                    let board = state
+                        .boards
+                        .iter()
+                        .find(|board| board.path == path)
+                        .expect("target board is among open documents");
+                    let mut contents = if state.deleted.contains(&path) {
+                        board.after_delete.clone()
+                    } else {
+                        board.original.clone()
+                    };
+                    if state.change_snapshot_during_next_inventory {
+                        let count = state
+                            .snapshot_change_save_reads
+                            .entry(path.clone())
+                            .or_default();
+                        *count += 1;
+                        if *count == 2 {
+                            contents.push('\n');
+                            state.change_snapshot_during_next_inventory = false;
+                        }
+                    }
+                    if state.revision_changed && !state.deleted.contains(&path) {
+                        contents.push('\n');
+                    }
+                    ok(Some(pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            document: Some(document),
+                            contents,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    )))
+                }
+                "GetItems" => {
+                    let query = kiapi::common::commands::GetItems::decode(command.value.as_slice())
+                        .expect("GetItems request");
+                    let document = query
+                        .header
+                        .and_then(|header| header.document)
+                        .expect("GetItems document target");
+                    let path = board_path(&document);
+                    state.requests.push(format!("items:{path}"));
+                    let count = {
+                        let count = state.get_items_reads.entry(path.clone()).or_default();
+                        *count += 1;
+                        *count
+                    };
+                    if state.deleted.contains(&path) && state.postdelete_busy_reads > 0 {
+                        state.postdelete_busy_reads -= 1;
+                        return refused(
+                            kiapi::common::ApiStatusCode::AsBusy,
+                            "native refill still running",
+                        );
+                    }
+                    if state.deleted.contains(&path) && state.fail_postdelete_get_items {
+                        return refused(
+                            kiapi::common::ApiStatusCode::AsBadRequest,
+                            "post-delete item read failed",
+                        );
+                    }
+                    let board = state
+                        .boards
+                        .iter()
+                        .find(|board| board.path == path)
+                        .expect("target board is among open documents");
+                    let deleted_ids = state.deleted_zone_ids.get(&path);
+                    let mut items = board
+                        .zones
+                        .iter()
+                        .filter(|item| {
+                            let decoded = kiapi::board::types::Zone::decode(item.value.as_slice())
+                                .expect("mock zone payload decodes");
+                            let id = decoded.id.map(|id| id.value).unwrap_or_default();
+                            !deleted_ids.is_some_and(|ids| ids.contains(&id))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if state.empty_items && !state.deleted.contains(&path) {
+                        items.clear();
+                    }
+                    if state.wrong_type_after_list && count > 1 {
+                        for item in &mut items {
+                            item.type_url =
+                                "type.googleapis.com/kiapi.board.types.Track".to_string();
+                        }
+                    }
+                    ok(Some(pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items,
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )))
+                }
+                "BeginCommit" => {
+                    state.requests.push("begin_commit".into());
+                    if state.change_revision_on_begin_commit {
+                        state.revision_changed = true;
+                    }
+                    ok(Some(pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "zone-test-commit".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    )))
+                }
+                "DeleteItems" => {
+                    let delete =
+                        kiapi::common::commands::DeleteItems::decode(command.value.as_slice())
+                            .expect("DeleteItems request");
+                    let path = board_path(
+                        &delete
+                            .header
+                            .expect("DeleteItems header")
+                            .document
+                            .expect("document"),
+                    );
+                    state.requests.push(format!("delete:{path}"));
+                    state
+                        .delete_ids
+                        .extend(delete.item_ids.iter().map(|id| id.value.clone()));
+                    state
+                        .deleted_zone_ids
+                        .entry(path.clone())
+                        .or_default()
+                        .extend(delete.item_ids.iter().map(|id| id.value.clone()));
+                    state.deleted.insert(path);
+                    ok(Some(pack_any(
+                        &kiapi::common::commands::DeleteItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            deleted_items: Vec::new(),
+                        },
+                        "kiapi.common.commands.DeleteItemsResponse",
+                    )))
+                }
+                "EndCommit" => {
+                    let end = kiapi::common::commands::EndCommit::decode(command.value.as_slice())
+                        .expect("EndCommit request");
+                    state.end_commit_actions.push(end.action);
+                    if state.fail_rollback
+                        && end.action == kiapi::common::commands::CommitAction::CmaDrop as i32
+                    {
+                        return refused(
+                            kiapi::common::ApiStatusCode::AsBadRequest,
+                            "rollback rejected",
+                        );
+                    }
+                    ok(Some(pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )))
+                }
+                "RefillZones" if state.reject_refill => refused(
+                    kiapi::common::ApiStatusCode::AsBadRequest,
+                    "zone refill rejected",
+                ),
+                "RefillZones" => {
+                    let refill =
+                        kiapi::board::commands::RefillZones::decode(command.value.as_slice())
+                            .expect("RefillZones request");
+                    let document = refill.board.expect("RefillZones board target");
+                    state.refill_targets.push(board_path(&document));
+                    ok(None)
+                }
+                other => panic!("unexpected IPC command in zone test: {other}"),
+            }
+        });
+        (server, state)
+    }
+
+    async fn handler_at(ipc_address: String) -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address,
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    #[tokio::test]
+    async fn served_zone_saved_delete_removes_exactly_one_observed_zone() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("zones.kicad_pcb");
+        std::fs::write(&board, ZONE_FIXTURE).unwrap();
+        let path = board.display().to_string();
+        let before = std::fs::read(&board).unwrap();
+
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "saved"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        assert_eq!(observed["source"], "saved_board");
+        let zones = observed["zones"].as_array().unwrap();
+        assert_eq!(zones.len(), 3);
+        let observed_ids = zones
+            .iter()
+            .map(|zone| zone["uuid"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        for expected in ZONE_IDS {
+            assert!(
+                observed_ids.contains(&expected),
+                "fixture zone {expected} must be listed"
+            );
+        }
+        let target = zones[0]["uuid"].as_str().unwrap();
+        let revision = observed["revision"].as_str().unwrap();
+
+        let deleted = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": path,
+                "uuid": target,
+                "revision": revision,
+                "source": "saved_board"
+            }),
+        )
+        .await;
+        assert!(!deleted.is_error, "{}", body(&deleted));
+        assert_eq!(body(&deleted)["outcome"]["status"], "complete");
+
+        let after = call(
+            &handler,
+            3,
+            "list_zones",
+            json!({"board": path, "board_source": "saved"}),
+        )
+        .await;
+        assert!(!after.is_error, "{}", body(&after));
+        let remaining = body(&after)["zones"].as_array().unwrap().clone();
+        assert_eq!(remaining.len(), 2);
+        assert!(!remaining.iter().any(|zone| zone["uuid"] == target));
+        for zone in &zones[1..] {
+            assert!(remaining.contains(zone), "unrelated zone changed: {zone}");
+        }
+
+        let written = std::fs::read(&board).unwrap();
+        let prefix = before
+            .iter()
+            .zip(&written)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = before[prefix..]
+            .iter()
+            .rev()
+            .zip(written[prefix..].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let removed = String::from_utf8_lossy(&before[prefix..before.len() - suffix]);
+        let inserted = &written[prefix..written.len() - suffix];
+        assert!(
+            inserted.is_empty(),
+            "zone deletion inserted or rewrote bytes"
+        );
+        assert_eq!(removed.matches("(zone").count(), 1);
+        assert!(removed.contains(&format!("(uuid \"{target}\")")));
+        for zone in &remaining {
+            assert!(String::from_utf8_lossy(&written).contains(zone["uuid"].as_str().unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn served_zone_saved_observation_refuses_when_same_board_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("zones.kicad_pcb");
+        std::fs::write(&board, ZONE_FIXTURE).unwrap();
+        let mock_board = live_fixture_board(&board);
+        let (server, state) = live_mock(vec![mock_board]);
+        let handler = handler_at(server.address().to_string()).await;
+        let path = board.to_string_lossy().to_string();
+
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "saved"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        assert_eq!(observed["source"], "saved_board");
+        let before_requests = state.lock().unwrap().requests.len();
+        let before = std::fs::read(&board).unwrap();
+
+        let result = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": path,
+                "uuid": observed["zones"][0]["uuid"],
+                "revision": observed["revision"],
+                "source": "saved_board"
+            }),
+        )
+        .await;
+        assert!(result.is_error, "saved observation must not switch to live");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+        let state = state.lock().unwrap();
+        let delete_requests = &state.requests[before_requests..];
+        assert!(
+            !delete_requests
+                .iter()
+                .any(|request| request.starts_with("items:")),
+            "source-switch refusal must precede live zone inventory: {delete_requests:?}"
+        );
+        assert!(!delete_requests
+            .iter()
+            .any(|request| request == "begin_commit"));
+        assert!(!delete_requests
+            .iter()
+            .any(|request| request.starts_with("delete:")));
+        assert!(state.delete_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn served_zone_stale_revision_and_unknown_uuid_refuse_without_writing() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("zones.kicad_pcb");
+        std::fs::write(&board, ZONE_FIXTURE).unwrap();
+        let path = board.display().to_string();
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "saved"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        let uuid = observed["zones"][0]["uuid"].clone();
+        let revision = observed["revision"].as_str().unwrap();
+        for (id, candidate_uuid, candidate_revision) in [
+            ("stale", uuid, json!(format!("{revision}-stale"))),
+            (
+                "unknown",
+                json!("00000000-0000-0000-0000-000000000000"),
+                observed["revision"].clone(),
+            ),
+        ] {
+            let before = std::fs::read(&board).unwrap();
+            let result = call(
+                &handler,
+                if id == "stale" { 2 } else { 3 },
+                "delete_zone",
+                json!({
+                    "board": path,
+                    "uuid": candidate_uuid,
+                    "revision": candidate_revision,
+                    "source": "saved_board"
+                }),
+            )
+            .await;
+            assert!(result.is_error, "{id} observation must be refused");
+            assert_eq!(
+                std::fs::read(&board).unwrap(),
+                before,
+                "{id} refusal wrote the board"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn served_zone_delete_refuses_track_uuid_without_writing() {
+        const BOARD_FIXTURE: &[u8] =
+            include_bytes!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb");
+        const TRACK_UUID: &str = "b1f4c0de-0000-4000-8000-00000000ad01";
+
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("live-ipc-fixture.kicad_pcb");
+        std::fs::write(&board, BOARD_FIXTURE).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let fixture = String::from_utf8_lossy(&before).replace("\r\n", "\n");
+        let uuid_marker = format!("(uuid \"{TRACK_UUID}\")");
+        let uuid_offset = fixture
+            .find(&uuid_marker)
+            .expect("hardcoded UUID exists in fixture");
+        let segment_start = fixture[..uuid_offset]
+            .rfind("(segment")
+            .expect("UUID belongs to a preceding segment record");
+        let segment_end = fixture[uuid_offset..]
+            .find("\n\t)")
+            .map(|offset| uuid_offset + offset)
+            .expect("segment record has a closing delimiter");
+        let segment = &fixture[segment_start..segment_end];
+        assert!(segment.contains(&uuid_marker));
+        assert!(segment.contains("(start 145 105)"));
+        assert!(segment.contains("(end 195 105)"));
+        let path = board.display().to_string();
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "saved"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        assert_eq!(observed["source"], "saved_board");
+        assert_eq!(observed["zones"].as_array().unwrap().len(), 2);
+        assert!(!observed["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|zone| zone["uuid"] == TRACK_UUID));
+
+        let result = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": path,
+                "uuid": TRACK_UUID,
+                "revision": observed["revision"],
+                "source": "saved_board"
+            }),
+        )
+        .await;
+        assert!(
+            result.is_error,
+            "a track UUID must not be accepted as a zone"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn served_zone_schema_rejects_invalid_delete_arguments_before_file_write() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("zones.kicad_pcb");
+        std::fs::write(&board, ZONE_FIXTURE).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = call(
+            &handler,
+            1,
+            "delete_zone",
+            json!({
+                "board": board.display().to_string(),
+                "uuid": "9a05f3f6-3b48-4653-80ad-b87c8f0311e2",
+                "revision": 4,
+                "source": "saved_board"
+            }),
+        )
+        .await;
+        assert!(result.is_error);
+        let error = body(&result);
+        assert_eq!(error["error"]["field"], "revision");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_inventory_uses_native_snapshot_and_stale_revision_never_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("live.kicad_pcb");
+        std::fs::write(&board, LIVE_BOARD_FIXTURE).unwrap();
+        let mock_board = live_fixture_board(&board);
+        let (server, state) = live_mock(vec![mock_board]);
+        let handler = handler_at(server.address().to_string()).await;
+        let path = board.to_string_lossy().to_string();
+
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "live"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        assert_eq!(observed["source"], "ipc");
+        assert_eq!(observed["zones"].as_array().unwrap().len(), 1);
+        assert_eq!(observed["zones"][0]["uuid"], LIVE_ZONE_UUID);
+        assert_eq!(observed["zones"][0]["kind"], "copper");
+
+        let stale = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": path,
+                "uuid": LIVE_ZONE_UUID,
+                "revision": "stale-observation",
+                "source": "ipc"
+            }),
+        )
+        .await;
+        assert!(stale.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&stale).as_deref(),
+            Some("stale_target")
+        );
+        let state = state.lock().unwrap();
+        assert!(
+            state.delete_ids.is_empty(),
+            "stale revision reached DeleteItems"
+        );
+        assert!(!state
+            .requests
+            .iter()
+            .any(|request| request.starts_with("delete:")));
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_observation_refuses_if_board_closes_before_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("live.kicad_pcb");
+        std::fs::write(&board, LIVE_BOARD_FIXTURE).unwrap();
+        let (server, state) = live_mock(vec![live_fixture_board(&board)]);
+        let handler = handler_at(server.address().to_string()).await;
+        let path = board.to_string_lossy().to_string();
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "live"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        let before_requests = state.lock().unwrap().requests.len();
+        state.lock().unwrap().no_open_documents = true;
+
+        let result = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": path,
+                "uuid": LIVE_ZONE_UUID,
+                "revision": observed["revision"],
+                "source": "ipc"
+            }),
+        )
+        .await;
+        assert!(result.is_error, "closed-board observation must be refused");
+        let state = state.lock().unwrap();
+        let delete_requests = &state.requests[before_requests..];
+        assert!(!delete_requests
+            .iter()
+            .any(|request| request.starts_with("items:")));
+        assert!(!delete_requests
+            .iter()
+            .any(|request| request == "begin_commit"));
+        assert!(!delete_requests
+            .iter()
+            .any(|request| request.starts_with("delete:")));
+        assert!(state.delete_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_inconsistent_inventory_and_snapshot_race_refuse_before_commit() {
+        for fault in ["empty_items", "changing_snapshot"] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("live.kicad_pcb");
+            std::fs::write(&board, LIVE_BOARD_FIXTURE).unwrap();
+            let (server, state) = live_mock(vec![live_fixture_board(&board)]);
+            let handler = handler_at(server.address().to_string()).await;
+            let path = board.to_string_lossy().to_string();
+            let listing = call(
+                &handler,
+                1,
+                "list_zones",
+                json!({"board": path, "board_source": "live"}),
+            )
+            .await;
+            assert!(!listing.is_error, "{}", body(&listing));
+            let observed = body(&listing);
+            {
+                let mut state = state.lock().unwrap();
+                state.empty_items = fault == "empty_items";
+                state.change_snapshot_during_next_inventory = fault == "changing_snapshot";
+            }
+
+            let result = call(
+                &handler,
+                2,
+                "delete_zone",
+                json!({
+                    "board": path,
+                    "uuid": LIVE_ZONE_UUID,
+                    "revision": observed["revision"],
+                    "source": "ipc"
+                }),
+            )
+            .await;
+            assert!(result.is_error, "{fault} must refuse deletion");
+            let state = state.lock().unwrap();
+            assert!(
+                !state
+                    .requests
+                    .iter()
+                    .any(|request| request == "begin_commit"),
+                "{fault} passed the complete inventory/snapshot guard"
+            );
+            assert!(!state
+                .requests
+                .iter()
+                .any(|request| request.starts_with("delete:")));
+            assert!(state.delete_ids.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_revision_change_inside_commit_skips_delete_and_failed_rollback_is_uncertain(
+    ) {
+        for fail_rollback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("live.kicad_pcb");
+            std::fs::write(&board, LIVE_BOARD_FIXTURE).unwrap();
+            let (server, state) = live_mock(vec![live_fixture_board(&board)]);
+            let handler = handler_at(server.address().to_string()).await;
+            let path = board.to_string_lossy().to_string();
+            let listing = call(
+                &handler,
+                1,
+                "list_zones",
+                json!({"board": path, "board_source": "live"}),
+            )
+            .await;
+            assert!(!listing.is_error, "{}", body(&listing));
+            let observed = body(&listing);
+            {
+                let mut state = state.lock().unwrap();
+                state.change_revision_on_begin_commit = true;
+                state.fail_rollback = fail_rollback;
+            }
+
+            let result = call(
+                &handler,
+                2,
+                "delete_zone",
+                json!({
+                    "board": path,
+                    "uuid": LIVE_ZONE_UUID,
+                    "revision": observed["revision"],
+                    "source": "ipc"
+                }),
+            )
+            .await;
+            assert!(result.is_error, "changed in-commit revision must fail");
+            let outcome = body(&result);
+            assert_eq!(
+                outcome["outcome"]["status"],
+                if fail_rollback { "uncertain" } else { "failed" }
+            );
+            let state = state.lock().unwrap();
+            assert!(state
+                .requests
+                .iter()
+                .any(|request| request == "begin_commit"));
+            assert_eq!(
+                state.end_commit_actions,
+                vec![kiapi::common::commands::CommitAction::CmaDrop as i32],
+                "failed prewrite validation attempts rollback"
+            );
+            assert!(!state
+                .requests
+                .iter()
+                .any(|request| request.starts_with("delete:")));
+            assert!(state.delete_ids.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_wrong_any_type_refuses_without_delete_or_file_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("live.kicad_pcb");
+        std::fs::write(&board, LIVE_BOARD_FIXTURE).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let mock_board = live_fixture_board(&board);
+        let (server, state) = live_mock(vec![mock_board]);
+        let handler = handler_at(server.address().to_string()).await;
+        let path = board.to_string_lossy().to_string();
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "live"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        state.lock().unwrap().wrong_type_after_list = true;
+
+        let result = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": path,
+                "uuid": LIVE_ZONE_UUID,
+                "revision": observed["revision"],
+                "source": "ipc"
+            }),
+        )
+        .await;
+        assert!(result.is_error, "wrong Any.type_url must refuse deletion");
+        assert!(state.lock().unwrap().delete_ids.is_empty());
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_binds_rule_area_refill_and_remaining_copper_to_exact_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.kicad_pcb");
+        let second = dir.path().join("second.kicad_pcb");
+        std::fs::write(&first, LIVE_BOARD_FIXTURE).unwrap();
+        let combined_fixture = native_fixture_with_copper_and_rule_area();
+        std::fs::write(&second, combined_fixture.as_bytes()).unwrap();
+        let rule_uuid = captured_zone_uuid(RULE_AREA_PAYLOAD);
+        let (server, state) = live_mock(vec![
+            live_fixture_board(&first),
+            live_fixture_board_with(
+                &second,
+                combined_fixture.as_bytes(),
+                vec![live_zone_payload(), rule_area_payload()],
+                &rule_uuid,
+            ),
+        ]);
+        let handler = handler_at(server.address().to_string()).await;
+        let first_path = first.to_string_lossy().to_string();
+        let second_path = second.to_string_lossy().to_string();
+
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": second_path, "board_source": "live"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        assert_eq!(observed["source"], "ipc");
+        assert_eq!(observed["zones"].as_array().unwrap().len(), 2);
+        let rule_area = observed["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|zone| zone["uuid"] == rule_uuid)
+            .expect("captured rule area is inventoried");
+        assert_eq!(rule_area["kind"], "rule_area");
+        let before_first = std::fs::read(&first).unwrap();
+        let before_second = std::fs::read(&second).unwrap();
+        let deleted = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": second_path,
+                "uuid": rule_uuid,
+                "revision": observed["revision"],
+                "source": "ipc"
+            }),
+        )
+        .await;
+        assert!(!deleted.is_error, "{}", body(&deleted));
+        assert_eq!(body(&deleted)["outcome"]["status"], "complete");
+        assert_eq!(body(&deleted)["deleted"], true);
+        assert_eq!(body(&deleted)["unrelated_zones_preserved"], true);
+        assert_eq!(body(&deleted)["remaining_copper_filled"], true);
+        assert_eq!(std::fs::read(&first).unwrap(), before_first);
+        assert_eq!(std::fs::read(&second).unwrap(), before_second);
+        let state = state.lock().unwrap();
+        let requests = &state.requests;
+        assert!(requests
+            .iter()
+            .any(|request| request == &format!("items:{second_path}")));
+        assert!(requests
+            .iter()
+            .any(|request| request == &format!("save:{second_path}")));
+        assert!(requests
+            .iter()
+            .any(|request| request == &format!("delete:{second_path}")));
+        assert!(!requests
+            .iter()
+            .any(|request| request.ends_with(&first_path)));
+        assert!(!state.deleted.contains(&first_path));
+        assert!(state.deleted.contains(&second_path));
+        assert_eq!(state.delete_ids, vec![rule_uuid]);
+        assert_eq!(state.refill_targets, vec![second_path]);
+    }
+
+    async fn served_live_delete_result(reject_refill: bool, fail_postdelete_read: bool) -> Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("live.kicad_pcb");
+        std::fs::write(&board, LIVE_BOARD_FIXTURE).unwrap();
+        let mock_board = live_fixture_board(&board);
+        let (server, state) = live_mock(vec![mock_board]);
+        {
+            let mut state = state.lock().unwrap();
+            state.reject_refill = reject_refill;
+            state.postdelete_busy_reads = if reject_refill { 0 } else { 2 };
+            state.fail_postdelete_get_items = fail_postdelete_read;
+        }
+        let handler = handler_at(server.address().to_string()).await;
+        let path = board.to_string_lossy().to_string();
+        let listing = call(
+            &handler,
+            1,
+            "list_zones",
+            json!({"board": path, "board_source": "live"}),
+        )
+        .await;
+        assert!(!listing.is_error, "{}", body(&listing));
+        let observed = body(&listing);
+        let result = call(
+            &handler,
+            2,
+            "delete_zone",
+            json!({
+                "board": path,
+                "uuid": LIVE_ZONE_UUID,
+                "revision": observed["revision"],
+                "source": "ipc"
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", body(&result));
+        let outcome = body(&result);
+        assert_eq!(
+            state.lock().unwrap().delete_ids,
+            vec![LIVE_ZONE_UUID.to_string()]
+        );
+        outcome
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_failed_refill_with_verified_delete_reports_partial() {
+        let outcome = served_live_delete_result(true, false).await;
+        assert_eq!(outcome["outcome"]["status"], "partial");
+        assert_eq!(outcome["deleted"], true);
+        assert_eq!(outcome["readback_verified"], true);
+        assert_eq!(outcome["refill_request_accepted"], false);
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_waits_for_busy_item_reads_before_reporting_refill_complete() {
+        let outcome = served_live_delete_result(false, false).await;
+        assert_eq!(outcome["outcome"]["status"], "complete");
+        assert_eq!(outcome["deleted"], true);
+        assert_eq!(outcome["readback_verified"], true);
+        assert_eq!(outcome["refill_request_accepted"], true);
+        assert_eq!(outcome["refill_completed"], true);
+    }
+
+    #[tokio::test]
+    async fn served_zone_live_failed_readback_after_refill_rejection_reports_uncertain() {
+        let outcome = served_live_delete_result(true, true).await;
+        assert_eq!(outcome["outcome"]["status"], "uncertain");
+        assert!(outcome["deleted"].is_null());
+        assert_eq!(outcome["readback_verified"], false);
+        assert_eq!(outcome["refill_request_accepted"], false);
+    }
+}

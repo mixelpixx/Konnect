@@ -71,6 +71,25 @@ cargo test -p konnect-core --locked one_undo_restores_the_exact_pre_import_board
 When the test prints `LIVE_UNDO_READY`, press Ctrl+Z once in PCB Editor. The
 test passes only when the exact pre-import IPC snapshot returns.
 
+## Zone deletion live check
+
+Open a disposable board with at least two copper zones in KiCad and enable its
+IPC API. Set `KONNECT_ZONE_TEST_BOARD` to that copy and
+`KONNECT_ZONE_TEST_IPC_ADDRESS` to the endpoint serving it, then run:
+
+```text
+cargo test -p konnect-core --locked live_zone_delete_on_configured_disposable_board --lib -- --ignored --nocapture
+```
+
+This deletes one observed zone, waits through KiCad's asynchronous refill, and
+requires stable live readback with the target absent, other zones preserved,
+and remaining copper reported filled. It does not invoke Undo. On KiCad 10.0.5,
+refill and deletion produce separate undo entries: undo the refill, then the
+deletion. Verify that the pre-delete board state returns, save the disposable
+board, and check native readback. The Windows acceptance run also compared the
+complete pre-delete and post-Undo IPC snapshot hashes and independently checked
+saved zones, footprints/pads, tracks/vias, and drawing identities with pcbnew.
+
 ## CI And Live Validation
 
 `.github/workflows/ci.yml` covers the Rust workspace, formatting, clippy,
