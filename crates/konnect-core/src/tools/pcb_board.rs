@@ -1293,6 +1293,7 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         super::board_stackup::tool(),
+        super::footprint_fields::tool(),
     ]
 }
 
@@ -3036,6 +3037,203 @@ pub(crate) mod board_mock {
                 header: None,
                 message: body,
             }
+        })
+    }
+
+    /// Every item a [`spawn_kicad_holding_items`] board holds, and how many of
+    /// each mutating command it received.
+    #[derive(Default)]
+    pub struct ItemStore {
+        pub items: Vec<prost_types::Any>,
+        pub creates: usize,
+        pub updates: usize,
+        pub deletes: usize,
+        /// The last KIID number `CreateItems` handed out.
+        pub next_id: usize,
+    }
+
+    /// The KIID of a via, track or footprint message.
+    pub fn item_kiid(item: &prost_types::Any) -> Option<String> {
+        use kiapi::board::types as board;
+        use prost::Message;
+        let id = if konnect_ipc::builders::any_is(item, "kiapi.board.types.Via") {
+            board::Via::decode(item.value.as_slice()).ok()?.id
+        } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.Track") {
+            board::Track::decode(item.value.as_slice()).ok()?.id
+        } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+            board::FootprintInstance::decode(item.value.as_slice())
+                .ok()?
+                .id
+        } else {
+            None
+        };
+        id.map(|id| id.value)
+    }
+
+    /// A KiCad holding `board` whose items live in `store`: `GetItems` lists
+    /// them by class, `CreateItems` gives each new item a KIID and keeps it,
+    /// `UpdateItems` replaces by KIID, `DeleteItems` removes, and commits
+    /// succeed. `GetNets` names `nets`. `settle` runs on every created or
+    /// updated item before it is stored, standing in for what KiCad does on
+    /// commit — re-netting a via that landed on another net's copper, say.
+    /// `extra` is asked first and answers any other command it knows, such as
+    /// `FlipItems`, against the same store.
+    pub fn spawn_kicad_holding_items(
+        board: &std::path::Path,
+        nets: Vec<&'static str>,
+        store: std::sync::Arc<std::sync::Mutex<ItemStore>>,
+        settle: impl Fn(&mut prost_types::Any) + Send + 'static,
+        extra: impl Fn(&prost_types::Any, &mut ItemStore) -> Option<prost_types::Any> + Send + 'static,
+    ) -> MockIpcServer {
+        use kiapi::common::commands;
+        use kiapi::common::types::KiCadObjectType as Kot;
+        use konnect_ipc::builders::{any_is, pack_any};
+        use prost::Message;
+
+        let with_id = move |item: &mut prost_types::Any, id: String| {
+            use kiapi::board::types as board;
+            let kiid = Some(kiapi::common::types::Kiid { value: id });
+            if any_is(item, "kiapi.board.types.Via") {
+                let mut via = board::Via::decode(item.value.as_slice()).unwrap();
+                via.id = kiid;
+                *item = pack_any(&via, "kiapi.board.types.Via");
+            } else if any_is(item, "kiapi.board.types.FootprintInstance") {
+                let mut fp = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                fp.id = kiid;
+                *item = pack_any(&fp, "kiapi.board.types.FootprintInstance");
+            }
+        };
+        let ok_status = || {
+            Some(commands::ItemStatus {
+                code: commands::ItemStatusCode::IscOk as i32,
+                error_message: String::new(),
+            })
+        };
+        spawn_kicad_holding_board(board, move |command| {
+            let mut held = store.lock().unwrap();
+            if let Some(answer) = extra(command, &mut held) {
+                return Some(answer);
+            }
+            let url = command.type_url.as_str();
+            if url.ends_with("GetNets") {
+                return Some(pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: nets
+                            .iter()
+                            .enumerate()
+                            .map(|(code, name)| konnect_ipc::builders::net(name, code as i32))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ));
+            }
+            if url.ends_with("BeginCommit") {
+                return Some(pack_any(
+                    &commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "mock-commit".to_string(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ));
+            }
+            if url.ends_with("EndCommit") {
+                return Some(pack_any(
+                    &commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ));
+            }
+            if url.ends_with("GetItems") {
+                let request = commands::GetItems::decode(command.value.as_slice()).unwrap();
+                let wants = |kind: Kot| request.types.contains(&(kind as i32));
+                let items = held
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        (wants(Kot::KotPcbVia) && any_is(item, "kiapi.board.types.Via"))
+                            || (wants(Kot::KotPcbTrace) && any_is(item, "kiapi.board.types.Track"))
+                            || (wants(Kot::KotPcbFootprint)
+                                && any_is(item, "kiapi.board.types.FootprintInstance"))
+                    })
+                    .cloned()
+                    .collect();
+                return Some(pack_any(
+                    &commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if url.ends_with("CreateItems") {
+                let request = commands::CreateItems::decode(command.value.as_slice()).unwrap();
+                held.creates += 1;
+                let mut created = Vec::new();
+                for mut item in request.items {
+                    held.next_id += 1;
+                    with_id(&mut item, format!("created-{}", held.next_id));
+                    let reply = item.clone();
+                    settle(&mut item);
+                    held.items.push(item);
+                    created.push(commands::ItemCreationResult {
+                        status: ok_status(),
+                        item: Some(reply),
+                    });
+                }
+                return Some(pack_any(
+                    &commands::CreateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        created_items: created,
+                    },
+                    "kiapi.common.commands.CreateItemsResponse",
+                ));
+            }
+            if url.ends_with("UpdateItems") {
+                let request = commands::UpdateItems::decode(command.value.as_slice()).unwrap();
+                held.updates += 1;
+                let mut updated = Vec::new();
+                for mut item in request.items {
+                    let id = item_kiid(&item);
+                    settle(&mut item);
+                    if let Some(slot) = held
+                        .items
+                        .iter_mut()
+                        .find(|existing| item_kiid(existing) == id)
+                    {
+                        *slot = item.clone();
+                    }
+                    updated.push(commands::ItemUpdateResult {
+                        status: ok_status(),
+                        item: Some(item),
+                    });
+                }
+                return Some(pack_any(
+                    &commands::UpdateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        updated_items: updated,
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                ));
+            }
+            if url.ends_with("DeleteItems") {
+                let request = commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                held.deletes += 1;
+                let ids: Vec<String> = request.item_ids.into_iter().map(|id| id.value).collect();
+                held.items
+                    .retain(|item| !item_kiid(item).is_some_and(|id| ids.contains(&id)));
+                return Some(pack_any(
+                    &commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
         })
     }
 }

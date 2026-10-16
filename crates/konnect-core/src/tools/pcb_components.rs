@@ -569,20 +569,23 @@ fn extract_graphic_definitions_with_properties(
 ///
 /// KiCAD's own parser then handles the pads and graphics, which is why the
 /// whole definition is forwarded rather than reconstructed.
+///
+/// `content` is the library text the caller already prepared — for a pre-6.0
+/// file, the copy `kicad-cli fp upgrade` has just modernised, which must not
+/// be read from disk again in its original form. `path` is where the text
+/// came from, used only to name the placed part's library.
+#[allow(clippy::too_many_arguments)]
 fn board_footprint_sexp(
+    content: &str,
+    path: &Path,
     lib_id: &str,
     x: f64,
     y: f64,
     rotation: f64,
     layer: &str,
     reference: Option<&str>,
-    project_dir: Option<&Path>,
 ) -> Result<String, String> {
-    let path = resolve_footprint_path(lib_id, project_dir)?;
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Cannot read footprint {}: {}", path.display(), e))?;
-
-    let name_span = footprint_name_span(&content).ok_or_else(|| {
+    let name_span = footprint_name_span(content).ok_or_else(|| {
         format!(
             "{} does not start with a (footprint \"NAME\" …) block",
             path.display()
@@ -594,7 +597,7 @@ fn board_footprint_sexp(
     let declared = &content[name_span.start + 1..name_span.end - 1];
     let mut out = String::with_capacity(content.len() + 128);
     out.push_str(&content[..name_span.start]);
-    out.push_str(&quote_sexp_string(&board_lib_id(lib_id, &path, declared)));
+    out.push_str(&quote_sexp_string(&board_lib_id(lib_id, path, declared)));
     out.push_str(&format!(
         "\n\t(at {x} {y} {rotation})\n\t(uuid \"{}\")",
         new_uuid()
@@ -891,10 +894,40 @@ pub(crate) struct PreparedFootprintPlacement {
     pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
     pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     pub(crate) fields: konnect_ipc::IpcFieldPlacement,
+    /// What the library carries besides pads, drawings and fields — 3D
+    /// models, mounting attributes, description and keywords. `None` for
+    /// inline geometry, which has no library behind it.
+    library: Option<LibraryFootprintData>,
+    /// The orientation the footprint is built with on F.Cu. For a back-side
+    /// placement it is the negation of the requested orientation, because
+    /// KiCad's top-bottom flip negates it again.
+    front_rotation: f64,
+    /// Whether the part belongs on B.Cu: flipped by KiCad over IPC, mirrored
+    /// by [`Self::file_block`] for the closed board.
+    on_back: bool,
+    /// The F.Cu board block for the closed-board path.
     board_sexp: String,
 }
 
+/// The library data `update_pcb_from_schematic` already puts on the footprints
+/// it places (#789), read with the same readers so that `place_component`
+/// gives a part the same 3D models, attributes and description.
+#[derive(Clone)]
+struct LibraryFootprintData {
+    attributes: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
+    description_and_keywords: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
+    models: Vec<konnect_ipc::gen::kiapi::board::types::Footprint3DModel>,
+}
+
 impl PreparedFootprintPlacement {
+    /// Prepare `source` for placement on `layer`, which must be F.Cu or B.Cu.
+    ///
+    /// A back-side footprint is prepared on F.Cu at the negated rotation and
+    /// then flipped: over IPC by KiCad's own `FlipItems`, and in the closed
+    /// file by the same mirror `flip_component` uses. Neither path invents
+    /// its own back-side geometry. The file mirror is only attempted when the
+    /// file path runs, so geometry it refuses — a 3D model a flip would have
+    /// to move — never stops the live path, where KiCad flips it natively.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_library(
         source: &str,
@@ -907,14 +940,48 @@ impl PreparedFootprintPlacement {
         layer: &str,
         project_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        let prepared =
-            prepare_footprint_source(source, lib_id, reference, value, x, y, rotation, layer)?;
+        let on_back = match layer {
+            "F.Cu" => false,
+            "B.Cu" => true,
+            other => anyhow::bail!("footprints are placed on F.Cu or B.Cu, got '{other}'"),
+        };
+        let front_rotation = if on_back {
+            normalize_root_angle(-rotation)
+        } else {
+            rotation
+        };
+        let prepared = prepare_footprint_source(
+            source,
+            lib_id,
+            reference,
+            value,
+            x,
+            y,
+            front_rotation,
+            "F.Cu",
+        )?;
         let pads = extract_pad_definitions(&prepared)?;
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
-        let board_sexp =
-            board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
-                .map_err(anyhow::Error::msg)?;
+        let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+        let library = LibraryFootprintData {
+            attributes: super::library_footprint::attributes(&root)?,
+            description_and_keywords: super::library_footprint::description_and_keywords(&root),
+            models: super::library_footprint::models(&root)?,
+        };
+        let library_path =
+            resolve_footprint_path(lib_id, project_dir).map_err(anyhow::Error::msg)?;
+        let board_sexp = board_footprint_sexp(
+            source,
+            &library_path,
+            lib_id,
+            x,
+            y,
+            front_rotation,
+            "F.Cu",
+            Some(reference),
+        )
+        .map_err(anyhow::Error::msg)?;
         let value = value.map(str::to_string).unwrap_or_else(|| {
             lib_id
                 .split_once(':')
@@ -926,6 +993,9 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            library: Some(library),
+            front_rotation,
+            on_back,
             board_sexp,
         })
     }
@@ -942,14 +1012,72 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            library: None,
+            front_rotation: 0.0,
+            on_back: false,
             board_sexp,
         }
+    }
+
+    /// The F.Cu `FootprintInstance` the IPC path creates, with the library's
+    /// 3D models, attributes, description and keywords on it, so the part
+    /// arrives complete rather than as pads and drawings alone.
+    fn ipc_item(
+        &self,
+        lib_id: &str,
+        reference: &str,
+        x: f64,
+        y: f64,
+    ) -> anyhow::Result<prost_types::Any> {
+        let item = KiCadIpcClient::build_footprint_item(
+            lib_id,
+            reference,
+            &self.value,
+            &self.pads,
+            &self.graphics,
+            &self.fields,
+            x,
+            y,
+            self.front_rotation,
+            "F.Cu",
+        )?;
+        let Some(library) = &self.library else {
+            return Ok(item);
+        };
+        let mut footprint = konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+            item.value.as_slice(),
+        )?;
+        footprint.attributes = Some(library.attributes.clone());
+        let definition = footprint
+            .definition
+            .as_mut()
+            .context("built footprint has no definition")?;
+        definition.attributes = Some(library.description_and_keywords.clone());
+        definition.items.extend(library.models.iter().map(|model| {
+            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }));
+        Ok(konnect_ipc::builders::pack_any(
+            &footprint,
+            "kiapi.board.types.FootprintInstance",
+        ))
+    }
+
+    /// The block the closed-board path inserts: the prepared F.Cu block, or
+    /// that block mirrored to B.Cu by the closed-board flip.
+    fn file_block(&self) -> anyhow::Result<String> {
+        if !self.on_back {
+            return Ok(self.board_sexp.clone());
+        }
+        flip_footprint_block(&self.board_sexp).context(
+            "the footprint cannot be mirrored to B.Cu in the closed board file; place it while \
+             the board is open in KiCad 10.0.6 or newer, which flips it natively",
+        )
     }
 
     /// Insert exactly this footprint through the same atomic, duplicate-safe
     /// path used by ordinary library placement.
     pub(crate) fn insert_into_board(&self, board_path: &Path) -> anyhow::Result<()> {
-        insert_into_board(board_path, std::slice::from_ref(&self.board_sexp))
+        insert_into_board(board_path, &[self.file_block()?])
     }
 }
 
@@ -2182,6 +2310,77 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+/// Whether `source` is a pre-6.0 `(module …)` footprint. KiCad 6 renamed the
+/// root to `footprint` and began quoting every string; generators such as
+/// easyeda2kicad still write the old form.
+fn is_legacy_module_footprint(source: &str) -> bool {
+    konnect_sexp::parse_sexp(source)
+        .ok()
+        .is_some_and(|root| root.head() == Some("module"))
+}
+
+/// Flip a footprint `place_component` has just created on F.Cu over to B.Cu
+/// with KiCad's native `FlipItems` — the transform the GUI's F key performs,
+/// 3D models included.
+///
+/// The flip keeps the anchor and negates the orientation, which is why the
+/// footprint was built at the negated rotation. When the flip cannot be made
+/// the new footprint is deleted again, so a refusal does not leave a part on
+/// the wrong side of the board; `Ok(Err(…))` carries that refusal.
+fn flip_new_footprint_to_back(
+    client: &KiCadIpcClient,
+    reference: &str,
+) -> anyhow::Result<Result<konnect_ipc::IpcFootprint, CallToolResult>> {
+    use konnect_ipc::IpcFlipOutcome;
+    let removal_note = |removed: bool| {
+        if removed {
+            "The footprint created on F.Cu was removed again."
+        } else {
+            "Removing the footprint created on F.Cu could not be confirmed; inspect the board."
+        }
+    };
+    let outcome = match client.flip_footprint(reference, "B.Cu") {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let removed = client.delete_footprint(reference).is_ok();
+            return Err(error.context(format!(
+                "flipping new footprint '{reference}' to B.Cu failed. {}",
+                removal_note(removed)
+            )));
+        }
+    };
+    match outcome {
+        IpcFlipOutcome::Flipped { .. } => {
+            let placed = client.get_footprint(reference)?.with_context(|| {
+                format!("footprint '{reference}' is missing from the read-back after its flip")
+            })?;
+            if placed.layer != "B.Cu" {
+                return Ok(Err(crate::tools::ipc_uncertain_result(&format!(
+                    "footprint '{reference}' reads back on {} after KiCad reported flipping it \
+                     to B.Cu",
+                    placed.layer
+                ))));
+            }
+            Ok(Ok(placed))
+        }
+        IpcFlipOutcome::Unsupported { kicad_version } => {
+            let removed = client.delete_footprint(reference).is_ok();
+            Ok(Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::UnsupportedCapability {
+                    capability: "place_component on B.Cu".to_string(),
+                    kicad_version: kicad_version.map(|version| version.full_version),
+                },
+                format!(
+                    "Placing on B.Cu over IPC uses KiCad's native footprint flip, which needs \
+                     KiCad {FLIP_ITEMS_MIN_KICAD_VERSION} or newer. {}",
+                    removal_note(removed)
+                ),
+            )))
+        }
+        uncertain @ IpcFlipOutcome::Uncertain { .. } => Ok(Err(flip_outcome_result(uncertain))),
+    }
+}
+
 async fn handle_place_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -2205,12 +2404,49 @@ async fn handle_place_component(
     };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
-    if let Some(rejection) = back_side_layer_error(&layer) {
-        return Ok(rejection);
-    }
-    let source = match resolve_footprint_source(&footprint, &board) {
-        Ok(source) => source,
+    let on_back = match layer.as_str() {
+        "F.Cu" => false,
+        "B.Cu" => true,
+        other => {
+            return Ok(crate::tools::invalid_arg(
+                "layer",
+                &format!("footprints are placed on F.Cu or B.Cu, got '{other}'"),
+            ))
+        }
+    };
+    let library_path = match resolve_footprint_file(&footprint, &board) {
+        Ok(path) => path,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    let source = match std::fs::read_to_string(&library_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "failed to read {}: {error}",
+                library_path.display()
+            )))
+        }
+    };
+    // A pre-6.0 `(module …)` file — what easyeda2kicad and many vendor
+    // downloads still write — is modernised by KiCad's own converter in a
+    // private copy, so the library on disk is left exactly as it was.
+    let source = if is_legacy_module_footprint(&source) {
+        let entry = footprint
+            .split_once(':')
+            .map_or(footprint.as_str(), |(_, entry)| entry);
+        match super::cli::upgrade_legacy_footprint(&ctx.config.kicad_cli, &source, entry).await {
+            Ok(upgraded) => upgraded,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "{} is a pre-6.0 (module …) footprint and kicad-cli could not upgrade a \
+                     copy of it: {error:#}. Convert the library with `kicad-cli fp upgrade \
+                     <dir-or-file>`, then retry.",
+                    library_path.display()
+                )))
+            }
+        }
+    } else {
+        source
     };
     let prepared = match PreparedFootprintPlacement::from_library(
         &source,
@@ -2233,34 +2469,40 @@ async fn handle_place_component(
     // A KiCad that answered — even with an error — fails closed.
     let footprint_ipc = footprint.clone();
     let reference_ipc = reference.clone();
-    let layer_ipc = layer.clone();
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
-        c.place_footprint(
-            &requested_board,
-            &footprint_ipc,
-            &reference_ipc,
-            &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
-            x,
-            y,
-            rotation,
-            &layer_ipc,
-        )
+        let item = prepared_ipc.ipc_item(&footprint_ipc, &reference_ipc, x, y)?;
+        let placed = c.place_footprint_item(&requested_board, &reference_ipc, item)?;
+        let placed = if on_back {
+            match flip_new_footprint_to_back(c, &reference_ipc)? {
+                Ok(placed) => placed,
+                Err(refusal) => return Ok(Err(refusal)),
+            }
+        } else {
+            placed
+        };
+        let document = c.find_open_board(&requested_board)?;
+        let models = c.footprint_3d_model_snapshot_in(document, &reference_ipc)?;
+        Ok(Ok((placed, models.models)))
     })
     .await?;
 
     match attempt {
-        BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(Ok((fp, models))) => Ok(CallToolResult::json(&json!({
             "placed": fp.reference,
             "footprint": fp.footprint,
             "x": fp.position.x, "y": fp.position.y,
             "rotation": fp.rotation, "layer": fp.layer,
-            "source": "ipc"
+            "models": models,
+            "source": "ipc",
+            "undo": if on_back {
+                "Two KiCad undo steps: the placement on F.Cu, then KiCad's native flip to B.Cu."
+            } else {
+                "One KiCad undo step reverses the placement."
+            }
         }))),
+        BoardWrite::Ipc(Err(refusal)) => Ok(refusal),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) => {
             // No live KiCad on the other end of this transport: fall back to
@@ -2275,6 +2517,11 @@ async fn handle_place_component(
                     },
                     format!("Footprint reference '{reference}' already exists on the board"),
                 ));
+            }
+            if let Err(error) = prepared.file_block() {
+                return Ok(CallToolResult::error(format!(
+                    "{error:#}. The board file was not modified."
+                )));
             }
             prepared.insert_into_board(&board)?;
             Ok(CallToolResult::json(&json!({
@@ -6978,47 +7225,333 @@ mod tests {
         assert!(!out.contains("REF**"));
     }
 
-    #[tokio::test]
-    async fn place_component_rejects_back_copper_and_creates_nothing() {
+    /// KiCad 10's own `Capacitor_SMD:C_0603_1608Metric`, byte for byte: a
+    /// mounting attribute, description, keywords and a 3D model — everything
+    /// `place_component` used to drop on the way to the board.
+    const C_0603: &str = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+
+    /// The same footprint with a non-trivial model transform, to prove the
+    /// transform is carried rather than defaulted.
+    fn c_0603_with_moved_model() -> String {
+        C_0603.replacen("(xyz 0 0 0)", "(xyz 0.1 0 0)", 1).replacen(
+            "\t\t(rotate\n\t\t\t(xyz 0 0 0)",
+            "\t\t(rotate\n\t\t\t(xyz 0 0 270)",
+            1,
+        )
+    }
+
+    /// A project registering `Capacitor_SMD` with `footprint` as its
+    /// `C_0603_1608Metric`, plus an empty board.
+    fn capacitor_fixture(dir: &Path, footprint: &str) -> std::path::PathBuf {
+        let pretty = dir.join("Capacitor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join("C_0603_1608Metric.kicad_mod"), footprint).unwrap();
+        std::fs::write(
+            dir.join("fp-lib-table"),
+            format!(
+                "(fp_lib_table\n\t(version 7)\n\t(lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                pretty.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let board = dir.join("b.kicad_pcb");
+        std::fs::write(&board, EMPTY_BOARD).unwrap();
+        board
+    }
+
+    #[test]
+    fn the_ipc_item_carries_the_librarys_models_attributes_and_description() {
+        use konnect_ipc::gen::kiapi::board::types as board;
         let tmp = tempfile::tempdir().unwrap();
-        let board = tmp.path().join("b.kicad_pcb");
-        let board_content = "(kicad_pcb\n\t(version 20240108)\n\t(generator \"pcbnew\")\n)\n";
-        std::fs::write(&board, board_content).unwrap();
+        let source = c_0603_with_moved_model();
+        capacitor_fixture(tmp.path(), &source);
+        let prepared = PreparedFootprintPlacement::from_library(
+            &source,
+            "Capacitor_SMD:C_0603_1608Metric",
+            "C1",
+            None,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+            Some(tmp.path()),
+        )
+        .unwrap();
+        let item = prepared
+            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0)
+            .unwrap();
+        let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        assert_eq!(
+            footprint.attributes.unwrap().mounting_style,
+            board::FootprintMountingStyle::FmsSmd as i32
+        );
+        let definition = footprint.definition.unwrap();
+        let described = definition.attributes.unwrap();
+        assert!(described.description.starts_with("Capacitor SMD 0603"));
+        assert_eq!(described.keywords, "capacitor");
+        let models: Vec<board::Footprint3DModel> = definition
+            .items
+            .iter()
+            .filter(|item| {
+                konnect_ipc::builders::any_is(item, "kiapi.board.types.Footprint3DModel")
+            })
+            .map(|item| board::Footprint3DModel::decode(item.value.as_slice()).unwrap())
+            .collect();
+        assert_eq!(models.len(), 1, "the library's model must reach the board");
+        assert_eq!(
+            models[0].filename,
+            "${KICAD10_3DMODEL_DIR}/Capacitor_SMD.3dshapes/C_0603_1608Metric.step"
+        );
+        assert_eq!(models[0].offset.unwrap().x_nm, 0.1);
+        assert_eq!(models[0].rotation.unwrap().z_nm, 270.0);
+    }
+
+    #[test]
+    fn a_back_side_part_is_built_on_the_front_at_the_negated_rotation() {
+        use konnect_ipc::gen::kiapi::board::types as board;
+        let tmp = tempfile::tempdir().unwrap();
+        capacitor_fixture(tmp.path(), C_0603);
+        let prepared = PreparedFootprintPlacement::from_library(
+            C_0603,
+            "Capacitor_SMD:C_0603_1608Metric",
+            "C1",
+            None,
+            10.0,
+            20.0,
+            30.0,
+            "B.Cu",
+            Some(tmp.path()),
+        )
+        .unwrap();
+        // KiCad's top-bottom flip negates the orientation about the anchor,
+        // so the F.Cu copy is built at -30 to land at 30 on B.Cu.
+        let item = prepared
+            .ipc_item("Capacitor_SMD:C_0603_1608Metric", "C1", 10.0, 20.0)
+            .unwrap();
+        let footprint = board::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        assert_eq!(footprint.layer, board::BoardLayer::BlFCu as i32);
+        assert_eq!(footprint.orientation.unwrap().value_degrees, -30.0);
+        // The closed-board copy is mirrored by the flip_component code path.
+        let block = prepared.file_block().unwrap();
+        assert!(block.contains("(layer \"B.Cu\")"), "{block}");
+        assert!(block.contains("(at 10 20 30)"), "{block}");
+    }
+
+    #[tokio::test]
+    async fn place_component_mirrors_a_back_side_part_into_a_closed_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = capacitor_fixture(tmp.path(), C_0603);
 
         let args = json!({
             "board": board.to_string_lossy(),
-            "footprint": "Resistor_SMD:R_0402",
-            "reference": "R1",
-            "x": 10.0, "y": 20.0,
+            "footprint": "Capacitor_SMD:C_0603_1608Metric",
+            "reference": "C1",
+            "x": 50.0, "y": 60.0, "rotation": 90.0,
             "layer": "B.Cu",
         });
         let res = handle_place_component(&args, &test_ctx()).await.unwrap();
-        assert!(res.is_error, "B.Cu placement must be refused");
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["source"], "file");
+        assert_eq!(out["layer"], "B.Cu");
+
+        let written = std::fs::read_to_string(&board).unwrap();
+        let block = &written[written.find("(footprint \"").unwrap()..];
+        assert!(
+            block.contains("(at 50 60 90)"),
+            "placement missing:\n{block}"
+        );
+        assert!(
+            block.contains("(layers \"B.Cu\" \"B.Mask\" \"B.Paste\")"),
+            "pads must be on the back:\n{block}"
+        );
+        assert!(
+            !block.contains("\"F.Cu\""),
+            "nothing may stay on the front:\n{block}"
+        );
+        assert!(
+            block.contains("(model \""),
+            "the model must be carried:\n{block}"
+        );
+        assert_eq!(count_parens(&written), 0, "board is no longer balanced");
+    }
+
+    #[tokio::test]
+    async fn a_back_side_mirror_the_closed_board_cannot_make_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // offset.y is negated by a real flip; the closed-board mirror does not
+        // reproduce KiCad's model transform, so it must refuse, not guess.
+        let source = C_0603.replacen("(xyz 0 0 0)", "(xyz 0 0.2 0)", 1);
+        let board = capacitor_fixture(tmp.path(), &source);
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Capacitor_SMD:C_0603_1608Metric",
+            "reference": "C1",
+            "x": 50.0, "y": 60.0,
+            "layer": "B.Cu",
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(res.is_error, "the mirror must be refused");
+        let text = result_text(&res);
+        assert!(text.contains("not modified"), "{text}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), EMPTY_BOARD);
+    }
+
+    #[tokio::test]
+    async fn place_component_refuses_a_side_that_is_not_f_cu_or_b_cu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(tmp.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Resistor_SMD:R_0805_2012Metric",
+            "reference": "R1",
+            "x": 10.0, "y": 20.0,
+            "layer": "In1.Cu",
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
         assert_eq!(
             crate::mcp::error::extract_error_kind(&res).as_deref(),
-            Some("invalid_argument"),
-            "rejection should be a structured invalid_argument error"
+            Some("invalid_argument")
         );
-        let text = result_text(&res);
-        assert!(
-            text.contains("back-side placement is not yet supported"),
-            "must say why: {text}"
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn place_component_reaches_b_cu_through_kicads_native_flip() {
+        use crate::tools::pcb_board::board_mock::{
+            ctx_talking_to, item_kiid, spawn_kicad_holding_items, ItemStore,
+        };
+        use konnect_ipc::gen::kiapi;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A model a flip would have to move: the closed-board mirror refuses
+        // it, and the live path must not care, because KiCad flips natively.
+        let source = C_0603.replacen("(xyz 0 0 0)", "(xyz 0 0.2 0)", 1);
+        let board = capacitor_fixture(tmp.path(), &source);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let flips = Arc::new(Mutex::new(0usize));
+        let flips_in_mock = flips.clone();
+        // KiCad's FOOTPRINT::Flip about its own anchor, reduced to what the
+        // read-back checks: the side and the negated orientation.
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            |_| {},
+            move |command, held| {
+                if !command.type_url.ends_with("kiapi.board.commands.FlipItems") {
+                    return None;
+                }
+                *flips_in_mock.lock().unwrap() += 1;
+                let request =
+                    kiapi::board::commands::FlipItems::decode(command.value.as_slice()).unwrap();
+                let mut flipped_items = Vec::new();
+                for id in request.items {
+                    let slot = held
+                        .items
+                        .iter_mut()
+                        .find(|item| item_kiid(item).as_deref() == Some(id.value.as_str()))
+                        .unwrap();
+                    let mut fp =
+                        kiapi::board::types::FootprintInstance::decode(slot.value.as_slice())
+                            .unwrap();
+                    fp.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+                    let angle = fp.orientation.unwrap_or_default().value_degrees;
+                    fp.orientation = Some(kiapi::common::types::Angle {
+                        value_degrees: -angle,
+                    });
+                    *slot =
+                        konnect_ipc::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+                    flipped_items.push(kiapi::board::commands::ItemFlipResult {
+                        status: Some(kiapi::common::commands::ItemStatus {
+                            code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                            error_message: String::new(),
+                        }),
+                        item: Some(slot.clone()),
+                    });
+                }
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::FlipItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        flipped_items,
+                    },
+                    "kiapi.board.commands.FlipItemsResponse",
+                ))
+            },
         );
-        assert!(
-            text.contains("F.Cu") && text.contains("flip"),
-            "must suggest the workaround: {text}"
-        );
-        // Rejection happens before any resolution, IPC round-trip, or file
-        // write — the board is untouched and no IPC error ever surfaced.
-        assert!(
-            !text.contains("socket path not configured"),
-            "the handler must not have reached the IPC layer: {text}"
-        );
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Capacitor_SMD:C_0603_1608Metric",
+            "reference": "C1",
+            "x": 50.0, "y": 60.0, "rotation": 90.0,
+            "layer": "B.Cu",
+        });
+        let res = handle_place_component(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["source"], "ipc");
+        assert_eq!(out["layer"], "B.Cu");
+        assert_eq!(out["rotation"], 90.0);
+        assert_eq!(out["models"].as_array().map(Vec::len), Some(1));
+        assert_eq!(*flips.lock().unwrap(), 1, "exactly one native flip");
+        assert_eq!(store.lock().unwrap().creates, 1);
         assert_eq!(
             std::fs::read_to_string(&board).unwrap(),
-            board_content,
-            "board file must be left untouched"
+            EMPTY_BOARD,
+            "a live placement must never touch the board file"
         );
+    }
+
+    #[test]
+    fn a_pre_6_0_module_footprint_is_recognised() {
+        // easyeda2kicad output, verbatim apart from its model path.
+        let legacy = "(module easyeda2kicad:C0603 (layer F.Cu) (tedit 5DC5F6A4)\n\
+                      \t(attr smd)\n\
+                      \t(fp_text reference REF** (at 0.000 -4.000) (layer F.SilkS)\n\
+                      \t\t(effects (font (size 1 1) (thickness 0.15)))\n\
+                      \t)\n\
+                      \t(pad 1 smd rect (at -0.70 0.00 0.00) (size 0.800 0.900) (layers F.Cu F.Paste F.Mask))\n\
+                      )";
+        assert!(is_legacy_module_footprint(legacy));
+        assert!(!is_legacy_module_footprint(&library_footprint()));
+        assert!(!is_legacy_module_footprint("not a footprint"));
+    }
+
+    /// Live: needs `kicad-cli` on PATH. Run with
+    /// `cargo test -p konnect-core -- --ignored legacy_footprint_is_upgraded_by_kicad_cli`.
+    #[tokio::test]
+    #[ignore = "needs kicad-cli on PATH"]
+    async fn legacy_footprint_is_upgraded_by_kicad_cli() {
+        let legacy = "(module easyeda2kicad:C0603 (layer F.Cu) (tedit 5DC5F6A4)\n\
+                      \t(attr smd)\n\
+                      \t(fp_text reference REF** (at 0.000 -4.000) (layer F.SilkS)\n\
+                      \t\t(effects (font (size 1 1) (thickness 0.15)))\n\
+                      \t)\n\
+                      \t(fp_text value C0603 (at 0.000 4.000) (layer F.Fab)\n\
+                      \t\t(effects (font (size 1 1) (thickness 0.15)))\n\
+                      \t)\n\
+                      \t(pad 1 smd rect (at -0.70 0.00 0.00) (size 0.800 0.900) (layers F.Cu F.Paste F.Mask))\n\
+                      \t(fp_arc (start 1.08 -0.40) (end 1.39 -0.40) (angle -90.00) (layer F.SilkS) (width 0.25))\n\
+                      )";
+        let upgraded = super::super::cli::upgrade_legacy_footprint("kicad-cli", legacy, "C0603")
+            .await
+            .unwrap();
+        assert!(upgraded.starts_with("(footprint "), "{upgraded}");
+        assert!(
+            upgraded.contains("(mid "),
+            "the legacy arc must be converted:\n{upgraded}"
+        );
+        let pads = extract_pad_definitions(&upgraded).unwrap();
+        assert_eq!(pads.len(), 1);
+        assert!(!extract_graphic_definitions(&upgraded).unwrap().is_empty());
     }
 }
 

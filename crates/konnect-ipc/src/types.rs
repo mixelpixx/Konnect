@@ -456,6 +456,122 @@ pub struct IpcTrack {
     pub end: IpcVector2,
 }
 
+/// A via read back from the live board.
+///
+/// Every field is what KiCad returned, never what a request asked for: a via
+/// created on one net can be stored on another when it lands on copper that
+/// already carries a net, and only a read-back shows that.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcVia {
+    /// KIID of the via. Empty only if KiCad returned a via without an id.
+    pub uuid: String,
+    /// Net name, empty when the via carries no net.
+    pub net_name: String,
+    pub position: IpcVector2,
+    /// Drill diameter in millimetres, when the pad stack carries a drill.
+    pub drill_mm: Option<f64>,
+    /// Copper diameter in millimetres of the first copper-layer entry.
+    pub pad_size_mm: Option<f64>,
+    /// `through`, `blind_buried` or `micro`; `None` for a type this build
+    /// does not know.
+    pub via_type: Option<String>,
+    /// First and last copper layers the drill spans.
+    pub start_layer: Option<String>,
+    pub end_layer: Option<String>,
+    pub locked: bool,
+}
+
+/// One pad's net before and after a pad-net assignment, read back from KiCad.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcPadNetChange {
+    pub uuid: Option<String>,
+    pub number: String,
+    /// Net before the edit; empty for an unconnected pad.
+    pub previous_net: String,
+    /// Net KiCad holds after the edit; empty for an unconnected pad.
+    pub net: String,
+}
+
+/// A custom (user) field on a placed footprint, after `set_footprint_field`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprintFieldChange {
+    pub reference: String,
+    pub kiid: String,
+    pub name: String,
+    /// The field's text before the edit; `None` when the field did not exist.
+    pub previous_value: Option<String>,
+    /// The field's text read back after the edit.
+    pub value: String,
+    pub visible: bool,
+    /// True when the field was added rather than updated.
+    pub created: bool,
+    /// False when the footprint already held exactly this field, so nothing
+    /// was sent to KiCad.
+    pub changed: bool,
+}
+
+/// What a pad-net assignment did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcPadNetOutcome {
+    /// A fresh read-back shows every pad with the requested number on the
+    /// requested net. `changed` is false when they already were, in which
+    /// case nothing was sent.
+    Applied {
+        kiid: String,
+        changes: Vec<IpcPadNetChange>,
+        changed: bool,
+    },
+    /// The footprint has no pad with that number. Nothing was sent.
+    NoSuchPad { available: Vec<String> },
+    /// The update was sent but a fresh read-back did not confirm it. The
+    /// board may or may not have changed.
+    Uncertain { reason: String },
+}
+
+/// What `add_via` stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcViaPlacement {
+    /// A fresh read-back shows the via on the requested net.
+    Placed(IpcVia),
+    /// KiCad stored the via on a different net from the one requested,
+    /// typically because it landed on copper that already carries a net.
+    /// The via was deleted again when `removed` is true; `stored` is what
+    /// KiCad had made of it.
+    NetMismatch {
+        requested_net: String,
+        stored: IpcVia,
+        removed: bool,
+    },
+}
+
+/// What `move_via` did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcViaMove {
+    /// No via with that KIID is on the requested board. Nothing was sent.
+    NotFound,
+    /// A fresh read-back shows the via at the new position, still on its net.
+    Moved { before: IpcVia, after: IpcVia },
+    /// At the new position KiCad put the via on a different net. It was
+    /// moved back when `restored` is true; `moved` is what KiCad had made of
+    /// it.
+    NetChanged {
+        before: IpcVia,
+        moved: IpcVia,
+        restored: bool,
+    },
+}
+
+/// What `set_footprint_field` did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprintFieldOutcome {
+    Applied(IpcFootprintFieldChange),
+    /// The update was sent but a fresh read-back did not confirm it. The
+    /// board may or may not have changed.
+    Uncertain {
+        reason: String,
+    },
+}
+
 /// A graphic item inside a placed footprint — silkscreen, fabrication, or
 /// courtyard artwork, not a pad.
 ///

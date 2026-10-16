@@ -13,6 +13,7 @@ pub(crate) mod cross_probe;
 pub mod design_review;
 pub(crate) mod drc;
 pub mod editor_navigation;
+mod footprint_fields;
 mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
@@ -24,6 +25,7 @@ mod library_footprint;
 pub(crate) mod live_board;
 pub mod manufacturing;
 pub(crate) mod navigation_target;
+mod pad_nets;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
@@ -570,6 +572,21 @@ pub(crate) fn ipc_recovered_result(message: &str) -> CallToolResult {
         },
         format!("{message}. The apply was aborted, not published. Run a fresh dry run before deciding whether to apply again; no automatic retry or file fallback was attempted."),
     )
+}
+
+/// The result for an IPC failure, classified exactly as the `ipc!` macros in
+/// the toolset modules classify it: only an unreachable transport says KiCad
+/// must be running, because only that one is evidence it is not.
+pub(crate) fn ipc_failure_result(failure: konnect_ipc::IpcFailure) -> CallToolResult {
+    match failure {
+        konnect_ipc::IpcFailure::Unreachable(message) => CallToolResult::error(format!(
+            "KiCAD must be running with the board loaded (IPC error: {message})"
+        )),
+        konnect_ipc::IpcFailure::Target { error, .. } => ipc_target_error_result(&error),
+        konnect_ipc::IpcFailure::Rejected(message) => CallToolResult::error(message),
+        konnect_ipc::IpcFailure::Recovered(message) => ipc_recovered_result(&message),
+        konnect_ipc::IpcFailure::Uncertain(message) => ipc_uncertain_result(&message),
+    }
 }
 
 pub(crate) fn ipc_uncertain_result(message: &str) -> CallToolResult {

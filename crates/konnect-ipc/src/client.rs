@@ -4221,6 +4221,39 @@ impl KiCadIpcClient {
         let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
+        self.create_placed_footprint_in(document, reference, item)
+    }
+
+    /// Place an already-built `FootprintInstance` on the open `board` and
+    /// verify it by reference.
+    ///
+    /// For a caller that adds library data [`Self::build_footprint_item`]
+    /// does not carry — 3D models, attributes, description — to the item
+    /// before it is sent, so that the part arrives complete in one creation
+    /// rather than being patched afterwards.
+    pub fn place_footprint_item(
+        &self,
+        board: &Path,
+        reference: &str,
+        item: prost_types::Any,
+    ) -> Result<IpcFootprint> {
+        let document = self.find_open_board(board)?;
+        if self
+            .list_footprints_in(document.clone())?
+            .iter()
+            .any(|footprint| footprint.reference == reference)
+        {
+            anyhow::bail!("footprint reference '{reference}' already exists on the board");
+        }
+        self.create_placed_footprint_in(document, reference, item)
+    }
+
+    fn create_placed_footprint_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        item: prost_types::Any,
+    ) -> Result<IpcFootprint> {
         self.create_items_in(document.clone(), vec![item])?;
         let footprints = self.list_footprints_in(document)?;
         footprints
@@ -4658,6 +4691,588 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.RunAction")?;
         Ok(())
+    }
+}
+
+// ─── Pad nets, vias and custom footprint fields ─────────────────────────────
+
+/// The fields every KiCad footprint carries. A custom field may not take one
+/// of these names: the footprint would then hold two fields called, say,
+/// "Value", and each reader would see whichever it found first.
+pub const MANDATORY_FOOTPRINT_FIELDS: &[&str] = &[
+    "Reference",
+    "Value",
+    "Footprint",
+    "Datasheet",
+    "Description",
+];
+
+impl KiCadIpcClient {
+    /// Every via on one exact open board, as KiCad holds it.
+    pub fn get_vias_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcVia>> {
+        let items =
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        items
+            .iter()
+            // Type-check before decoding, as `get_tracks_in` does: protobuf
+            // decoding accepts compatible bytes under the wrong declared type.
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
+            .map(|item| {
+                kiapi::board::types::Via::decode(item.value.as_slice())
+                    .map(|via| ipc_via(&via))
+                    .context("KiCad returned an unreadable via")
+            })
+            .collect()
+    }
+
+    /// The via carrying `uuid` on one exact open board, as KiCad's message.
+    fn find_via_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+    ) -> Result<Option<kiapi::board::types::Via>> {
+        let items =
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.Via") {
+                continue;
+            }
+            let via = kiapi::board::types::Via::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable via")?;
+            if via.id.as_ref().map(|id| id.value.as_str()) == Some(uuid) {
+                return Ok(Some(via));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Add a through via on `net_name` to an exact open board, then report
+    /// the net KiCad actually stored.
+    ///
+    /// KiCad resolves the net by name on creation, but a via that lands on
+    /// copper already carrying another net can be stored on that net instead.
+    /// The create response is serialized before KiCad recomputes
+    /// connectivity, so only a fresh read-back shows it. A via on the wrong
+    /// net is a short the caller never asked for; it is deleted again and
+    /// reported rather than left on the board.
+    pub fn add_via_verified_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_name: &str,
+        x: f64,
+        y: f64,
+        drill: f64,
+        pad_size: f64,
+    ) -> Result<IpcViaPlacement> {
+        let net_code = self.resolve_net_code_in(document.clone(), net_name)?;
+        let via = crate::builders::build_via(net_name, net_code, x, y, drill, pad_size);
+        let created = self.create_items_in_returning(
+            document.clone(),
+            vec![crate::builders::pack_any(&via, "kiapi.board.types.Via")],
+        )?;
+        let kiid = created
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
+            .find_map(|item| kiapi::board::types::Via::decode(item.value.as_slice()).ok())
+            .and_then(|via| via.id)
+            .map(|id| id.value)
+            .filter(|id| !id.is_empty())
+            .context(
+                "KiCad created the via but did not report its KIID, so the net it stored \
+                 cannot be read back",
+            )?;
+        let stored = self
+            .find_via_in(document.clone(), &kiid)?
+            .map(|via| ipc_via(&via))
+            .with_context(|| {
+                format!("KiCad created via '{kiid}' but read-back does not list it")
+            })?;
+        if stored.net_name == net_name {
+            return Ok(IpcViaPlacement::Placed(stored));
+        }
+        let removed = self
+            .delete_items_in(document.clone(), vec![kiid.clone()])
+            .is_ok()
+            && matches!(self.find_via_in(document, &kiid), Ok(None));
+        Ok(IpcViaPlacement::NetMismatch {
+            requested_net: net_name.to_string(),
+            stored,
+            removed,
+        })
+    }
+
+    /// Delete one observed via from the requested board.
+    ///
+    /// As [`Self::delete_trace_segment_verified`]: `DeleteItems` accepts any
+    /// KIID, so the item is first proven to be a via on this board, and a
+    /// second read proves it is gone. `None` means no via carries `uuid`, and
+    /// nothing was sent.
+    pub fn delete_via_verified(&self, requested: &Path, uuid: &str) -> Result<Option<IpcVia>> {
+        let document = self.find_open_board(requested)?;
+        let Some(via) = self.find_via_in(document.clone(), uuid)? else {
+            return Ok(None);
+        };
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = self
+            .find_via_in(document, uuid)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted deletion of via '{uuid}' but post-delete read-back failed; \
+                     the deletion may have committed"
+                )
+            })?
+            .is_some();
+        if remains {
+            anyhow::bail!("KiCad accepted deletion of via '{uuid}' but read-back still lists it");
+        }
+        Ok(Some(ipc_via(&via)))
+    }
+
+    /// Move one observed via to `(x, y)` on the requested board.
+    ///
+    /// Only the position changes; drill, size, layers and net are carried
+    /// over from KiCad's own message. Moving a via onto copper of another net
+    /// can make KiCad store it on that net, so the net is read back too, and
+    /// a via that changed net is moved back rather than left shorting.
+    pub fn move_via_verified(
+        &self,
+        requested: &Path,
+        uuid: &str,
+        x: f64,
+        y: f64,
+    ) -> Result<IpcViaMove> {
+        let document = self.find_open_board(requested)?;
+        let Some(original) = self.find_via_in(document.clone(), uuid)? else {
+            return Ok(IpcViaMove::NotFound);
+        };
+        let before = ipc_via(&original);
+        let mut moved = original.clone();
+        moved.position = Some(crate::builders::vec2(x, y));
+        self.update_items_in(
+            document.clone(),
+            vec![crate::builders::pack_any(&moved, "kiapi.board.types.Via")],
+        )?;
+        let after = self
+            .find_via_in(document.clone(), uuid)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted the move of via '{uuid}' but read-back failed; the move \
+                     may have committed"
+                )
+            })?
+            .map(|via| ipc_via(&via))
+            .with_context(|| {
+                format!("KiCad accepted the move of via '{uuid}' but read-back no longer lists it")
+            })?;
+        let target = crate::builders::vec2(x, y);
+        let held = &after.position;
+        if crate::builders::vec2(held.x, held.y) != target {
+            anyhow::bail!(
+                "KiCad accepted the move of via '{uuid}' but read-back places it at ({}, {}), \
+                 not ({x}, {y})",
+                held.x,
+                held.y
+            );
+        }
+        if after.net_name == before.net_name {
+            return Ok(IpcViaMove::Moved { before, after });
+        }
+        let restored = self
+            .update_items_in(
+                document.clone(),
+                vec![crate::builders::pack_any(
+                    &original,
+                    "kiapi.board.types.Via",
+                )],
+            )
+            .is_ok()
+            && self
+                .find_via_in(document, uuid)
+                .ok()
+                .flatten()
+                .map(|via| ipc_via(&via))
+                .as_ref()
+                == Some(&before);
+        Ok(IpcViaMove::NetChanged {
+            before,
+            moved: after,
+            restored,
+        })
+    }
+
+    /// Assign `net_name` to every pad numbered `pad_number` on one placed
+    /// footprint; an empty name leaves the pads unconnected.
+    ///
+    /// On a KiCad 10 board without a schematic this is how the netlist is
+    /// edited. KiCad resolves the net by name and creates it when the board
+    /// has none of that name, which is the same rule copper items follow.
+    /// Pads sharing a number are one pin to KiCad, so all of them move
+    /// together. The whole footprint is sent back in one undo step and a
+    /// fresh read-back is the only evidence of the result.
+    pub fn set_pad_net_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        pad_number: &str,
+        net_name: &str,
+    ) -> Result<IpcPadNetOutcome> {
+        let mut footprint = self.find_footprint_instance_in(document.clone(), reference)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
+        let definition = footprint
+            .definition
+            .as_mut()
+            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+        let item_count = definition.items.len();
+        let mut available = BTreeSet::new();
+        let mut changes = Vec::new();
+        for item in definition.items.iter_mut() {
+            if !crate::builders::any_is(item, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())
+                .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
+            available.insert(pad.number.clone());
+            if pad.number != pad_number {
+                continue;
+            }
+            let uuid = kiid_value(pad.id.clone());
+            changes.push(IpcPadNetChange {
+                uuid: (!uuid.is_empty()).then_some(uuid),
+                number: pad.number.clone(),
+                previous_net: pad
+                    .net
+                    .as_ref()
+                    .map(|net| net.name.clone())
+                    .unwrap_or_default(),
+                net: net_name.to_string(),
+            });
+            // Net codes are deprecated in KiCad 10's API: the name is what
+            // `BOARD_CONNECTED_ITEM::UnpackNet` reads.
+            pad.net = Some(kiapi::board::types::Net {
+                code: None,
+                name: net_name.to_string(),
+            });
+            *item = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+        if changes.is_empty() {
+            return Ok(IpcPadNetOutcome::NoSuchPad {
+                available: available.into_iter().collect(),
+            });
+        }
+        if changes.iter().all(|change| change.previous_net == net_name) {
+            return Ok(IpcPadNetOutcome::Applied {
+                kiid,
+                changes,
+                changed: false,
+            });
+        }
+
+        let packed = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let update_document = document.clone();
+        self.run_commit("Set pad net", move |client| {
+            client.update_items_in(update_document, vec![packed])
+        })?;
+
+        let after = match self.find_footprint_instance_in(document, reference) {
+            Ok(after) => after,
+            Err(error) => {
+                return Ok(IpcPadNetOutcome::Uncertain {
+                    reason: format!(
+                        "post-update read-back could not resolve '{reference}': {error:#}"
+                    ),
+                })
+            }
+        };
+        if after.id.as_ref().map(|id| id.value.as_str()) != Some(kiid.as_str()) {
+            return Ok(IpcPadNetOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' carries a different KIID"),
+            });
+        }
+        let Some(definition) = after.definition.as_ref() else {
+            return Ok(IpcPadNetOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' has no definition"),
+            });
+        };
+        // The update replaces the whole footprint. A child that did not come
+        // back would be a silent loss, so the count is part of the evidence.
+        if definition.items.len() != item_count {
+            return Ok(IpcPadNetOutcome::Uncertain {
+                reason: format!(
+                    "'{reference}' held {item_count} items before the update and {} after",
+                    definition.items.len()
+                ),
+            });
+        }
+        let pads = definition
+            .items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Pad"))
+            .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+            .collect::<Vec<_>>();
+        for change in &mut changes {
+            let held = pads.iter().find(|pad| match &change.uuid {
+                Some(uuid) => kiid_value(pad.id.clone()) == *uuid,
+                None => pad.number == change.number,
+            });
+            let Some(held) = held else {
+                return Ok(IpcPadNetOutcome::Uncertain {
+                    reason: format!(
+                        "pad '{}' of '{reference}' is missing from the post-update read-back",
+                        change.number
+                    ),
+                });
+            };
+            change.net = held
+                .net
+                .as_ref()
+                .map(|net| net.name.clone())
+                .unwrap_or_default();
+            if change.net != net_name {
+                return Ok(IpcPadNetOutcome::Uncertain {
+                    reason: format!(
+                        "pad '{}' of '{reference}' reads back on net '{}', not '{net_name}'",
+                        change.number, change.net
+                    ),
+                });
+            }
+        }
+        Ok(IpcPadNetOutcome::Applied {
+            kiid,
+            changes,
+            changed: true,
+        })
+    }
+
+    /// Add or update one custom field — `LCSC`, `MPN`, anything that is not
+    /// a mandatory field — on a placed footprint.
+    ///
+    /// KiCad's `CreateItems` cannot do the add: a field created with the
+    /// footprint as its container is handed to `BOARD::Add`, which files a
+    /// `PCB_FIELD` as a board-level drawing rather than a footprint child.
+    /// `FOOTPRINT::Deserialize` does read user fields from
+    /// `definition.items`, so the footprint is sent back whole with the field
+    /// in it, in one undo step. A new field is hidden unless `visible` says
+    /// otherwise, sits on the footprint's own Fab layer at its anchor, and is
+    /// mirrored on the back like every other back-side text.
+    pub fn set_footprint_field_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        name: &str,
+        value: &str,
+        visible: Option<bool>,
+    ) -> Result<IpcFootprintFieldOutcome> {
+        if name.trim().is_empty() {
+            anyhow::bail!("a footprint field needs a non-empty name");
+        }
+        if let Some(mandatory) = MANDATORY_FOOTPRINT_FIELDS
+            .iter()
+            .find(|mandatory| mandatory.eq_ignore_ascii_case(name))
+        {
+            anyhow::bail!(
+                "'{mandatory}' is a mandatory footprint field, not a custom one; edit it with \
+                 the tool that owns it"
+            );
+        }
+        let mut footprint = self.find_footprint_instance_in(document.clone(), reference)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
+        let anchor = footprint.position.unwrap_or_default();
+        let on_back = footprint.layer == kiapi::board::types::BoardLayer::BlBCu as i32;
+        let definition = footprint
+            .definition
+            .as_mut()
+            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+        let item_count = definition.items.len();
+
+        let mut previous: Option<(String, bool)> = None;
+        for item in definition.items.iter_mut() {
+            if !crate::builders::any_is(item, "kiapi.board.types.Field") {
+                continue;
+            }
+            let mut field = kiapi::board::types::Field::decode(item.value.as_slice())
+                .with_context(|| format!("footprint '{reference}' has an unreadable field"))?;
+            if field.name != name {
+                continue;
+            }
+            if previous.is_some() {
+                anyhow::bail!("footprint '{reference}' carries more than one field named '{name}'");
+            }
+            let text = field
+                .text
+                .as_mut()
+                .and_then(|board_text| board_text.text.as_mut())
+                .with_context(|| format!("field '{name}' of '{reference}' carries no text"))?;
+            previous = Some((text.text.clone(), field.visible));
+            text.text = value.to_string();
+            if let Some(visible) = visible {
+                field.visible = visible;
+            }
+            *item = crate::builders::pack_any(&field, "kiapi.board.types.Field");
+        }
+        let created = previous.is_none();
+        if let Some((old_value, old_visible)) = &previous {
+            if old_value == value && visible.is_none_or(|visible| visible == *old_visible) {
+                return Ok(IpcFootprintFieldOutcome::Applied(IpcFootprintFieldChange {
+                    reference: reference.to_string(),
+                    kiid,
+                    name: name.to_string(),
+                    previous_value: Some(old_value.clone()),
+                    value: old_value.clone(),
+                    visible: *old_visible,
+                    created: false,
+                    changed: false,
+                }));
+            }
+        } else {
+            let layer = if on_back { "B.Fab" } else { "F.Fab" };
+            let field = kiapi::board::types::Field {
+                id: None,
+                name: name.to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    id: None,
+                    text: Some(kiapi::common::types::Text {
+                        position: Some(anchor),
+                        attributes: Some(kiapi::common::types::TextAttributes {
+                            size: Some(crate::builders::vec2(1.0, 1.0)),
+                            stroke_width: Some(crate::builders::distance(0.15)),
+                            angle: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
+                            mirrored: on_back,
+                            ..Default::default()
+                        }),
+                        text: value.to_string(),
+                        hyperlink: String::new(),
+                    }),
+                    layer: crate::builders::layer_from_name(layer) as i32,
+                    knockout: false,
+                    locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                    parent: None,
+                }),
+                visible: visible.unwrap_or(false),
+            };
+            definition
+                .items
+                .push(crate::builders::pack_any(&field, "kiapi.board.types.Field"));
+        }
+
+        let packed = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let update_document = document.clone();
+        self.run_commit("Set footprint field", move |client| {
+            client.update_items_in(update_document, vec![packed])
+        })?;
+
+        let after = match self.find_footprint_instance_in(document, reference) {
+            Ok(after) => after,
+            Err(error) => {
+                return Ok(IpcFootprintFieldOutcome::Uncertain {
+                    reason: format!(
+                        "post-update read-back could not resolve '{reference}': {error:#}"
+                    ),
+                })
+            }
+        };
+        if after.id.as_ref().map(|id| id.value.as_str()) != Some(kiid.as_str()) {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' carries a different KIID"),
+            });
+        }
+        let Some(definition) = after.definition.as_ref() else {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!("post-update read-back of '{reference}' has no definition"),
+            });
+        };
+        let expected_count = item_count + usize::from(created);
+        if definition.items.len() != expected_count {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!(
+                    "'{reference}' should hold {expected_count} items after the update but read \
+                     back {}",
+                    definition.items.len()
+                ),
+            });
+        }
+        let held = definition
+            .items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Field"))
+            .filter_map(|item| kiapi::board::types::Field::decode(item.value.as_slice()).ok())
+            .find(|field| field.name == name);
+        let Some(held) = held else {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!(
+                    "KiCad accepted the update but '{reference}' reads back with no field '{name}'"
+                ),
+            });
+        };
+        let held_value = held
+            .text
+            .as_ref()
+            .and_then(|board_text| board_text.text.as_ref())
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        if held_value != value {
+            return Ok(IpcFootprintFieldOutcome::Uncertain {
+                reason: format!(
+                    "field '{name}' of '{reference}' reads back as '{held_value}', not '{value}'"
+                ),
+            });
+        }
+        Ok(IpcFootprintFieldOutcome::Applied(IpcFootprintFieldChange {
+            reference: reference.to_string(),
+            kiid,
+            name: name.to_string(),
+            previous_value: previous.map(|(value, _)| value),
+            value: held_value,
+            visible: held.visible,
+            created,
+            changed: true,
+        }))
+    }
+}
+
+/// A via message as the read-back type, with every field taken from KiCad.
+fn ipc_via(via: &kiapi::board::types::Via) -> IpcVia {
+    use kiapi::board::types::ViaType;
+    let stack = via.pad_stack.as_ref();
+    let drill = stack.and_then(|stack| stack.drill.as_ref());
+    IpcVia {
+        uuid: kiid_value(via.id.clone()),
+        net_name: via
+            .net
+            .as_ref()
+            .map(|net| net.name.clone())
+            .unwrap_or_default(),
+        position: point_in_mm(via.position.unwrap_or_default()),
+        drill_mm: drill
+            .and_then(|drill| drill.diameter)
+            .map(|diameter| nm_to_mm(diameter.x_nm)),
+        pad_size_mm: stack
+            .and_then(|stack| stack.copper_layers.first())
+            .and_then(|layer| layer.size)
+            .map(|size| nm_to_mm(size.x_nm)),
+        via_type: match ViaType::try_from(via.r#type).ok() {
+            Some(ViaType::VtThrough) => Some("through".to_string()),
+            Some(ViaType::VtBlindBuried) => Some("blind_buried".to_string()),
+            Some(ViaType::VtMicro) => Some("micro".to_string()),
+            Some(ViaType::VtBlind) => Some("blind".to_string()),
+            Some(ViaType::VtBuried) => Some("buried".to_string()),
+            Some(ViaType::VtUnknown) | None => None,
+        },
+        start_layer: drill.map(|drill| layer_enum_to_name(drill.start_layer).to_string()),
+        end_layer: drill.map(|drill| layer_enum_to_name(drill.end_layer).to_string()),
+        locked: via.locked == kiapi::common::types::LockedState::LsLocked as i32,
     }
 }
 
