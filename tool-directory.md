@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
+- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -232,7 +232,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 13 tools
+### `pcb_board` · 14 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -240,6 +240,7 @@ and Windows servers do not.
 |------|-------------|
 | `set_board_size` | Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. Appends — clear the old edges with `delete_graphics` first. |
 | `get_board_info` | Return metadata about the PCB: title, revision, company, paper size (with `paper_size_mm` dimensions on a custom User size), `layer_count`, `copper_layer_count`, and `net_count` (IPC, falls back to a file parse that counts from the tree, so KiCad 10 boards report real numbers instead of 0). |
+| `set_board_title_block` | Set any of the board's title-block fields — `title`, `date`, `revision`, `company`, `comment_1`..`comment_9`, which `${TITLE}`, `${REVISION}`, `${COMMENT1}` and the like resolve from. An omitted field is kept and an empty string clears it. Writes the open board over IPC (KiCad 10.0.1+, else `unsupported_capability`, never a file fallback), unsaved and without an undo step, or the saved file when KiCad does not hold it. Returns the block read back, `changed` and `source`. |
 | `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer names each item class KiCad would not list (tables and generators on KiCad 10). |
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
 | `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
