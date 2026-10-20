@@ -969,16 +969,8 @@ pub(crate) fn reserved_on_other_sheets(
             }
         };
         let directory = file.parent().unwrap_or_else(|| Path::new("."));
-        for sheet in tree.find_all("sheet") {
-            let child = sheet
-                .find_all("property")
-                .into_iter()
-                .find(|property| property.get(1).and_then(SexpNode::as_str) == Some("Sheetfile"))
-                .and_then(|property| property.get(2))
-                .and_then(SexpNode::as_str);
-            if let Some(child) = child {
-                stack.push((directory.join(child), depth + 1));
-            }
+        for child in konnect_sexp::schematic::sheet_files(&tree) {
+            stack.push((directory.join(child), depth + 1));
         }
         if canonical(&file) == target_canonical {
             continue;

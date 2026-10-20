@@ -7,6 +7,7 @@ pub mod layers;
 pub mod net;
 pub mod parser;
 pub mod schematic;
+pub mod title_block;
 pub mod transaction;
 pub mod writer;
 

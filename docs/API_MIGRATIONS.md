@@ -3,6 +3,47 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: setting a schematic sheet's title block (minor release)
+
+New `sch_hierarchy` tool `set_schematic_title_block` sets the same fields as
+`set_board_title_block` (`title`, `date`, `revision`, `company`,
+`comment_1`..`comment_9`) on a schematic sheet file, whose sheets resolve
+`${REVISION}`, `${ISSUE_DATE}` and the rest from it. `scope` is `sheet` (the
+default) or `hierarchy`, which also sets every sheet file below the given one,
+each shared file once, and commits them in one journaled file transaction.
+An omitted field keeps its value, an empty string clears it, and a call that
+supplies none is refused as `invalid_argument`.
+
+The tool refuses before writing while KiCad's lock is beside any target or
+beside the owning project's root schematic (`conflict`), when a placed sheet
+file is missing (`file_not_found`), when a sheet lies outside the project
+directory or the hierarchy is deeper than 20 sheets
+(`unsupported_capability`), and when a sheet changed after it was read
+(`conflict`). A title block holding something the model cannot represent is
+refused as `unsupported_capability` with `capability:
+"unrepresentable_title_block"`, by this tool and by `set_board_title_block`.
+It returns each sheet's block read back after the write and `changed`; a
+readback that differs is `mutation_outcome_uncertain`, naming every file the
+transaction replaced. The `sch_hierarchy` toolset description now mentions
+title blocks. Existing tools are unchanged (#714).
+
+## Unreleased: setting the board's title block (minor release)
+
+New `pcb_board` tool `set_board_title_block` sets any of `title`, `date`,
+`revision`, `company` and `comment_1` to `comment_9`, the fields that
+`${TITLE}`, `${ISSUE_DATE}`, `${REVISION}`, `${COMPANY}` and
+`${COMMENT1}`..`${COMMENT9}` resolve from on the board. An omitted field keeps
+its value, an empty string clears it, and a call that supplies none is refused
+as `invalid_argument`. Values are stored verbatim.
+
+When KiCad holds the board, the write goes through `SetTitleBlockInfo`, which
+the PCB editor handles from KiCad 10.0.1. The change is unsaved and has no undo
+step. An older KiCad answers `unsupported_capability`, and the file is not
+touched. Otherwise the saved file's `(title_block …)` node is rewritten as KiCad
+writes it, and nothing else in the file changes. Both paths return the block
+read back after the write, `changed`, `source` and `saved` (`false` for the
+live board); a readback that differs is `mutation_outcome_uncertain`. Existing tools are unchanged (#714, board half).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

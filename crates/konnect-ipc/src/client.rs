@@ -11,6 +11,7 @@
 use crate::gen::kiapi;
 use crate::types::*;
 use anyhow::{Context, Result};
+use konnect_sexp::title_block::TitleBlock;
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
 use std::collections::BTreeSet;
@@ -2780,19 +2781,64 @@ impl KiCadIpcClient {
     pub fn get_title_block_in(
         &self,
         document: kiapi::common::types::DocumentSpecifier,
-    ) -> Result<IpcTitleBlock> {
+    ) -> Result<TitleBlock> {
         let cmd = kiapi::common::commands::GetTitleBlockInfo {
             document: Some(document),
         };
         let response = self.send_command(&cmd, "kiapi.common.commands.GetTitleBlockInfo")?;
         let info: kiapi::common::types::TitleBlockInfo =
             unpack_required(response, "GetTitleBlockInfo")?;
-        Ok(IpcTitleBlock {
+        Ok(TitleBlock {
             title: info.title,
             date: info.date,
             revision: info.revision,
             company: info.company,
+            comments: [
+                info.comment1,
+                info.comment2,
+                info.comment3,
+                info.comment4,
+                info.comment5,
+                info.comment6,
+                info.comment7,
+                info.comment8,
+                info.comment9,
+            ],
         })
+    }
+
+    /// Replace every field of a specific open document's title block.
+    ///
+    /// The PCB editor handles `SetTitleBlockInfo` from KiCad 10.0.1 on and
+    /// answers `AS_UNHANDLED` before that. It marks the board modified, does
+    /// not save it, and records no undo step.
+    pub fn set_title_block_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        block: &TitleBlock,
+    ) -> Result<()> {
+        let [comment1, comment2, comment3, comment4, comment5, comment6, comment7, comment8, comment9] =
+            block.comments.clone();
+        let cmd = kiapi::common::commands::SetTitleBlockInfo {
+            document: Some(document),
+            title_block: Some(kiapi::common::types::TitleBlockInfo {
+                title: block.title.clone(),
+                date: block.date.clone(),
+                revision: block.revision.clone(),
+                company: block.company.clone(),
+                comment1,
+                comment2,
+                comment3,
+                comment4,
+                comment5,
+                comment6,
+                comment7,
+                comment8,
+                comment9,
+            }),
+        };
+        self.send_command(&cmd, "kiapi.common.commands.SetTitleBlockInfo")?;
+        Ok(())
     }
 
     /// Find a footprint's KIID by reference.
