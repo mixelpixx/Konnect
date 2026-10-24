@@ -3080,12 +3080,14 @@ mod tests {
                     end: (2.0, -2.5),
                     layer: silk(),
                     width: 0.12,
+                    line_style: konnect_ipc::IpcLineStyle::Solid,
                 },
                 konnect_ipc::IpcGraphicDefinition::Rect {
                     start: (-2.6, -3.0),
                     end: (2.6, 3.0),
                     layer: "F.CrtYd".to_string(),
                     width: 0.05,
+                    line_style: konnect_ipc::IpcLineStyle::Solid,
                     filled: false,
                 },
                 konnect_ipc::IpcGraphicDefinition::Circle {
@@ -3093,6 +3095,7 @@ mod tests {
                     end: (-1.6, -1.8),
                     layer: silk(),
                     width: 0.12,
+                    line_style: konnect_ipc::IpcLineStyle::Solid,
                     filled: true,
                 },
                 konnect_ipc::IpcGraphicDefinition::Arc {
@@ -3101,11 +3104,13 @@ mod tests {
                     end: (1.0, -2.5),
                     layer: "F.Fab".to_string(),
                     width: 0.1,
+                    line_style: konnect_ipc::IpcLineStyle::Solid,
                 },
                 konnect_ipc::IpcGraphicDefinition::Poly {
                     points: vec![(-1.0, 2.0), (1.0, 2.0), (0.0, 2.8)],
                     layer: "F.Fab".to_string(),
                     width: 0.1,
+                    line_style: konnect_ipc::IpcLineStyle::Solid,
                     filled: true,
                 },
                 konnect_ipc::IpcGraphicDefinition::Text {
@@ -3115,6 +3120,7 @@ mod tests {
                     layer: silk(),
                     size: 1.0,
                     stroke_width_mm: 0.15,
+                    keep_upright: true,
                 },
             ],
             &konnect_ipc::IpcFieldPlacement::default(),
