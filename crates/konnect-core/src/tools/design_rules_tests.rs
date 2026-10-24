@@ -1,9 +1,11 @@
 //! `set_design_rules` / `get_design_rules` for the copper-to-edge clearance and
-//! silkscreen text minima (#960).
+//! silkscreen text minima (#960), and the via annular width and hole clearance
+//! minima (#776).
 //!
 //! Driven through served `tools/call` against a copy of the KiCad-written
-//! placement project, with no KiCad reachable. Its rules hold KiCad's own
-//! defaults for all three: 0.5, 0.8 and 0.08 mm.
+//! placement project, with no KiCad reachable. KiCad wrote its rules as 0.5,
+//! 0.8 and 0.08 mm for the #960 three, 0.1 mm annular width and 0.25 mm hole
+//! clearance.
 
 use super::project_file_writer_tests::{call, handler_talking_to, project, text_of, Project};
 use crate::mcp::protocol::CallToolResult;
@@ -14,7 +16,9 @@ use std::time::{Duration, SystemTime};
 /// KiCad 10.0.6 loads these ranges and resets anything outside them to the
 /// default (measured with pcbnew's loader, see the PR). They are the promise,
 /// not a mirror of the code.
-const RANGES: [(&str, f64, f64); 3] = [
+pub(super) const RANGES: [(&str, f64, f64); 5] = [
+    ("min_via_annular_width", 0.0, 25.0),
+    ("min_hole_clearance", 0.0, 100.0),
     ("min_copper_edge_clearance", -0.01, 25.0),
     ("min_text_height", 0.0, 100.0),
     ("min_text_thickness", 0.0, 25.0),
@@ -88,6 +92,8 @@ async fn sets_all_three_minima_and_reads_them_back() {
         "min_via_drill": 0.3,
         "min_via_size": 0.5,
         "min_hole_to_hole": 0.25,
+        "min_via_annular_width": 0.1,
+        "min_hole_clearance": 0.25,
         "min_copper_edge_clearance": 0.2,
         "min_text_height": 1.0,
         "min_text_thickness": 0.15
@@ -100,9 +106,68 @@ async fn sets_all_three_minima_and_reads_them_back() {
     assert_eq!(
         without_rules(read_json(&project.project_file), &keys),
         without_rules(before, &keys),
-        "only the three named rules may change"
+        "only the named rules may change"
     );
     assert_eq!(std::fs::read(&project.board).unwrap(), board_before);
+}
+
+#[tokio::test]
+async fn sets_annular_width_and_hole_clearance_and_reads_them_back() {
+    let project = project();
+    let before = read_json(&project.project_file);
+    let board_before = std::fs::read(&project.board).unwrap();
+    let handler = handler_talking_to("").await;
+
+    let result = call(
+        &handler,
+        "set_design_rules",
+        &project.board,
+        &json!({ "min_via_annular_width": 0.13, "min_hole_clearance": 0.3 }),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    assert_eq!(
+        body(&result)["changed"],
+        json!(["min_via_annular_width = 0.13", "min_hole_clearance = 0.3"])
+    );
+
+    // The fixture's other minima, as KiCad wrote them, are unchanged.
+    let expected = json!({
+        "min_clearance": 0.0,
+        "min_trace_width": 0.2,
+        "min_via_drill": 0.3,
+        "min_via_size": 0.5,
+        "min_hole_to_hole": 0.25,
+        "min_via_annular_width": 0.13,
+        "min_hole_clearance": 0.3,
+        "min_copper_edge_clearance": 0.5,
+        "min_text_height": 0.8,
+        "min_text_thickness": 0.08
+    });
+    assert_eq!(body(&result)["rules"], expected);
+    let read = call(&handler, "get_design_rules", &project.board, &json!({})).await;
+    assert_eq!(body(&read)["rules"], expected);
+
+    let keys = ["min_via_annular_width", "min_hole_clearance"];
+    assert_eq!(
+        without_rules(read_json(&project.project_file), &keys),
+        without_rules(before, &keys),
+        "only the two named rules may change"
+    );
+    assert_eq!(std::fs::read(&project.board).unwrap(), board_before);
+
+    // Updating one leaves the other as written.
+    let result = call(
+        &handler,
+        "set_design_rules",
+        &project.board,
+        &json!({ "min_hole_clearance": 0.28 }),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let rules = &body(&result)["rules"];
+    assert_eq!(rules["min_hole_clearance"], json!(0.28));
+    assert_eq!(rules["min_via_annular_width"], json!(0.13));
 }
 
 #[tokio::test]
@@ -158,6 +223,8 @@ async fn naming_only_saved_values_does_not_rewrite_the_project() {
         "set_design_rules",
         &project.board,
         &json!({
+            "min_via_annular_width": 0.1,
+            "min_hole_clearance": 0.25,
             "min_copper_edge_clearance": 0.5,
             "min_text_height": 0.8,
             "min_text_thickness": 0.08
@@ -172,16 +239,16 @@ async fn naming_only_saved_values_does_not_rewrite_the_project() {
 
 #[tokio::test]
 async fn an_out_of_range_or_mistyped_minimum_is_refused_before_writing() {
-    let cases = [
-        ("min_copper_edge_clearance", json!(-0.02)),
-        ("min_copper_edge_clearance", json!(25.01)),
-        ("min_text_height", json!(-1)),
-        ("min_text_height", json!(100.01)),
+    let mistyped = [
+        ("min_via_annular_width", json!("0.1")),
+        ("min_hole_clearance", json!([0.3])),
         ("min_text_height", json!("1.0")),
-        ("min_text_thickness", json!(-0.02)),
-        ("min_text_thickness", json!(25.01)),
         ("min_text_thickness", json!(true)),
     ];
+    let out_of_range = RANGES
+        .iter()
+        .flat_map(|&(field, min, max)| [(field, json!(min - 0.01)), (field, json!(max + 0.01))]);
+    let cases: Vec<_> = out_of_range.chain(mistyped).collect();
     let Project {
         board,
         project_file,

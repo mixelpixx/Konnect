@@ -48,8 +48,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size, copper-to-edge \
-             clearance, silkscreen text minima) in the sibling KiCAD project file. Refuses while KiCad holds the board open, because KiCad's next save \
+            "Set board-level design rules (clearance, trace width, via size, via annular width, \
+             hole clearance, copper-to-edge clearance, silkscreen text minima) in the sibling KiCAD project file. Refuses while KiCad holds the board open, because KiCad's next save \
              rewrites the project file from its own copy.",
             json!({
                 "type": "object",
@@ -60,6 +60,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
                     "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
                     "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" },
+                    "min_via_annular_width": { "type": "number", "minimum": 0, "maximum": 25, "description": "Board-wide minimum annular ring width in mm for vias and plated through-hole pads (0 to 25, the range KiCad loads). A DRC limit only: it resizes no via or pad and does not prove a fab accepts the board." },
+                    "min_hole_clearance": { "type": "number", "minimum": 0, "maximum": 100, "description": "Board-wide minimum hole-to-copper clearance in mm (0 to 100, the range KiCad loads). A DRC limit only: it moves no item and does not prove a fab accepts the board." },
                     "min_copper_edge_clearance": { "type": "number", "minimum": -0.01, "maximum": 25, "description": "Board-wide minimum copper-to-board-edge clearance in mm (-0.01 to 25, the range KiCad loads)" },
                     "min_text_height": { "type": "number", "minimum": 0, "maximum": 100, "description": "Board-wide minimum silkscreen text height in mm (0 to 100, the range KiCad loads)" },
                     "min_text_thickness": { "type": "number", "minimum": 0, "maximum": 25, "description": "Board-wide minimum silkscreen text stroke thickness in mm (0 to 25, the range KiCad loads). These minima are DRC limits only: they change no item on the board and do not prove a fab accepts it." }
@@ -406,6 +408,16 @@ fn design_rules() -> &'static [DesignRule] {
             arg: "min_hole_to_hole",
             key: "min_hole_to_hole",
             range_mm: None,
+        },
+        DesignRule {
+            arg: "min_via_annular_width",
+            key: "min_via_annular_width",
+            range_mm: Some((0.0, 25.0)),
+        },
+        DesignRule {
+            arg: "min_hole_clearance",
+            key: "min_hole_clearance",
+            range_mm: Some((0.0, 100.0)),
         },
         DesignRule {
             arg: "min_copper_edge_clearance",
@@ -1766,7 +1778,7 @@ mod tests {
     /// that skips dispatch.
     #[tokio::test]
     async fn set_design_rules_refuses_out_of_range_without_dispatch() {
-        use crate::tools::design_rules_tests::{assert_untouched, backdate};
+        use crate::tools::design_rules_tests::{assert_untouched, backdate, RANGES};
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("board.kicad_pcb");
         let project = dir.path().join("board.kicad_pro");
@@ -1775,11 +1787,7 @@ mod tests {
         let bytes = std::fs::read(&project).unwrap();
         let mtime = backdate(&project);
         let ctx = test_ctx();
-        for (field, min, max) in [
-            ("min_copper_edge_clearance", -0.01, 25.0),
-            ("min_text_height", 0.0, 100.0),
-            ("min_text_thickness", 0.0, 25.0),
-        ] {
+        for (field, min, max) in RANGES {
             for value in [json!(min - 0.01), json!(max + 0.01), json!("1.0")] {
                 let result =
                     handle_set_design_rules(&json!({ "board": board, field: value }), &ctx)
