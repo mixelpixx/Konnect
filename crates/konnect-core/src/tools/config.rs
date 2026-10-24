@@ -209,22 +209,6 @@ fn unusable_config(path: &Path, which: &str, reason: String) -> CallToolResult {
     )
 }
 
-/// A persistence step whose result cannot say what is on disk.
-fn config_outcome_uncertain(path: &Path, operation: &str, reason: String) -> CallToolResult {
-    CallToolResult::error_kind(
-        ToolErrorKind::MutationOutcomeUncertain {
-            operation: operation.to_string(),
-            path: path.display().to_string(),
-            reason: reason.clone(),
-        },
-        format!(
-            "{operation} could not prove what is now on disk at '{}': {reason}. The file may or \
-             may not have been replaced; read it before retrying.",
-            path.display()
-        ),
-    )
-}
-
 /// Create the file when none was read, replace it only if it still holds the
 /// text that was read.
 fn persist_config(path: &Path, expected: Option<&str>, content: &str) -> Result<(), SexpError> {
@@ -284,7 +268,13 @@ fn update_config(
         // Everything else proves nothing about the disk: the conditional
         // writer returns `Conflict` both before a replacement and after one
         // whose readback differs (#579), and an I/O error can follow either.
-        Err(error) => return Err(config_outcome_uncertain(path, operation, error.to_string())),
+        Err(error) => {
+            return Err(super::file_outcome_uncertain(
+                path,
+                operation,
+                error.to_string(),
+            ))
+        }
     }
 
     match read_config(path) {
@@ -294,7 +284,7 @@ fn update_config(
             value: observed,
             created,
         }),
-        other => Err(config_outcome_uncertain(
+        other => Err(super::file_outcome_uncertain(
             path,
             operation,
             format!("the saved file did not read back as written ({other:?})"),
