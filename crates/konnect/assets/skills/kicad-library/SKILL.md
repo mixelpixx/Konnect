@@ -50,6 +50,8 @@ update_footprints_from_library(
   board,
   references?,
   library_ids?,
+  reset_text_sizes_and_styles?,
+  reset_text_positions?,
   dry_run,
   expected_plan_revision?
 )
@@ -61,6 +63,10 @@ update_footprints_from_library(
 - Keep the requested board open in live KiCad; there is no closed-board file
   fallback.
 - One successful apply is one KiCad undo entry.
+- Reference and Value keep their placed text unless you ask otherwise:
+  `reset_text_sizes_and_styles` takes the library's size, thickness and style
+  (for example to meet a fab's silkscreen minimum), `reset_text_positions` its
+  position. Each planned change lists the fields it resets, before and after.
 - A stale plan, unresolved library, removed connected pad, or unsupported
   library content returns a non-mutating conflict for the whole selection.
 
