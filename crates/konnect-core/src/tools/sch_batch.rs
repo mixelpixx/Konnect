@@ -13,10 +13,11 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::{points_coincident, snap_point},
+    geometry::{points_coincident, round6, snap_point},
+    parser::parse_sexp,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
+        extract_wires, find_lib_symbol, format_net_label, format_wire, parse_at, pin_endpoint,
         pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
@@ -1698,8 +1699,20 @@ async fn handle_add_schematic_text(
         .replace('\n', "\\n")
         .replace('\t', "\\t");
 
+    // Rounded to the six decimals KiCad writes: a caller passing back a
+    // coordinate an older response reported (54.60999999999999, #747) would
+    // otherwise write that noise into the file (#828).
+    let at = [round6(x), round6(y), round6(rotation)];
+    // Rounding scales by 1e6, so a value near f64::MAX becomes `inf`, which
+    // KiCad cannot load.
+    for (field, value) in ["x", "y", "rotation"].into_iter().zip(at) {
+        if !value.is_finite() {
+            return Ok(invalid_arg(field, "must be a finite number of millimetres"));
+        }
+    }
+    let [at_x, at_y, at_rotation] = at;
     let text_sexp = format!(
-        "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
+        "\n  (text \"{escaped}\"\n    (at {at_x} {at_y} {at_rotation})\n    \
          (effects {font_sexp}{justify_sexp})\n    (uuid \"{uuid}\")\n  )"
     );
 
@@ -1711,6 +1724,17 @@ async fn handle_add_schematic_text(
     let new_content = crate::tools::sch_wiring::insert_before_close(&content, &text_sexp);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
+    let landed = read_consistent(&sch_path)
+        .map_err(|e| format!("the saved schematic could not be re-read: {e}"))
+        .and_then(|content| text_landed(&content, &uuid, at));
+    if let Err(reason) = landed {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "add_schematic_text",
+            reason,
+        ));
+    }
+
     Ok(CallToolResult::json(&json!({
         "added": text,
         "x": x, "y": y,
@@ -1720,6 +1744,24 @@ async fn handle_add_schematic_text(
         "font": font_sexp,
         "uuid": uuid
     })))
+}
+
+/// Confirm `content` holds the text `uuid` at its own `(at x y rotation)`, or
+/// say why not.
+fn text_landed(content: &str, uuid: &str, at: [f64; 3]) -> Result<(), String> {
+    let tree =
+        parse_sexp(content).map_err(|e| format!("the saved schematic cannot be parsed: {e}"))?;
+    let written = tree
+        .find_all("text")
+        .into_iter()
+        .find(|text| text.find_str("uuid") == Some(uuid))
+        .ok_or_else(|| format!("the saved schematic has no text {uuid}"))?;
+    match parse_at(written) {
+        Some((x, y, rotation)) if [x, y, rotation] == at => Ok(()),
+        found => Err(format!(
+            "text {uuid} is at {found:?} in the saved schematic, not at {at:?}"
+        )),
+    }
 }
 
 async fn handle_get_layout(
@@ -3758,6 +3800,99 @@ mod add_text_placement_tests {
         );
         assert!(schematic_text_justify("sideways").is_err());
         assert!(schematic_text_justify("top bottom").is_err());
+    }
+
+    /// KiCad's own serialization, from `batch_connect_kicad10.README.md`.
+    const KICAD_SHEET: &str = include_str!("../../tests/fixtures/batch_connect_kicad10.kicad_sch");
+
+    /// #828 through the served dispatch. The coordinates are the float noise
+    /// older responses reported (#747); KiCad 10.0.6 resaves them, and a
+    /// rotation of `90.00000000000001`, as `(at 54.61 27.94 90)` (see the
+    /// README). Nothing else in KiCad's file changes.
+    #[tokio::test]
+    async fn the_served_dispatch_writes_the_coordinates_kicad_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheet.kicad_sch");
+        std::fs::write(&path, KICAD_SHEET).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 828,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_schematic_text",
+                    "arguments": {
+                        "schematic": path.display().to_string(),
+                        "text": "hi",
+                        "x": 54.60999999999999,
+                        "y": 27.939999999999998,
+                        "rotation": 90.00000000000001
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        // The response echoes the caller's values, as #807 left them.
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["x"], json!(54.60999999999999), "{body}");
+        assert_eq!(body["rotation"], json!(90.00000000000001), "{body}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let start = after.find("(text \"hi\"").expect("text written");
+        let (_, end) = konnect_sexp::writer::find_balanced_block(&after, start).unwrap();
+        assert!(
+            after[start..end].contains("(at 54.61 27.94 90)"),
+            "{}",
+            &after[start..end]
+        );
+        // The splice adds a newline and indent before the block.
+        let rest = format!("{}{}", &after[..start - "\n  ".len()], &after[end..]);
+        assert_eq!(rest, KICAD_SHEET, "KiCad's own content is unchanged");
+    }
+
+    /// `1.8e303` is finite, but rounding scales it past `f64::MAX`, and the
+    /// `inf` it becomes is not a number KiCad can load. Refused unwritten.
+    #[tokio::test]
+    async fn a_coordinate_rounding_cannot_represent_is_refused() {
+        let (out, result) = add_text_formatted("hi", json!({ "x": 1.8e303 })).await;
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(out, SCH, "nothing is written");
+    }
+
+    /// The readback against the file the bug wrote: the noisy `(at …)` is not
+    /// the position requested, and KiCad's resave of it is.
+    #[test]
+    fn text_landed_reads_the_written_position() {
+        let block = |at: &str| {
+            format!("(kicad_sch (text \"hi\" (at {at}) (effects (font (size 1.27 1.27))) (uuid \"t1\")))")
+        };
+        let at = [54.61, 27.94, 0.0];
+        let noisy = block("54.60999999999999 27.939999999999998 0");
+        assert!(super::text_landed(&noisy, "t1", at).is_err());
+        assert_eq!(
+            super::text_landed(&block("54.61 27.94 0"), "t1", at),
+            Ok(())
+        );
+        assert!(super::text_landed(&block("54.61 27.94 0"), "t2", at).is_err());
     }
 }
 

@@ -82,3 +82,18 @@ The fixture itself reports 18 `pin_not_connected`, 4 `power_pin_not_driven`,
 1 `wire_dangling` and 2 `unconnected_wire_endpoint` from
 `kicad-cli sch erc --severity-all`. No pin is wired and the wire touches
 nothing, so this is expected.
+
+## `add_schematic_text` coordinates (#828)
+
+`sch_batch.rs`'s `the_served_dispatch_writes_the_coordinates_kicad_writes` adds
+text `"hi"` to a copy of this sheet. The oracle is KiCad 10.0.6 resaving the
+text an unfixed build wrote:
+
+```text
+kicad-cli sch upgrade --force <copy>.kicad_sch
+```
+
+| Written by the unfixed build | KiCad's resave |
+|---|---|
+| `(at 54.60999999999999 27.939999999999998 0)` | `(at 54.61 27.94 0)` |
+| `(at 54.61 27.94 90.00000000000001)` | `(at 54.61 27.94 90)` |

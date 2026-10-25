@@ -3,6 +3,17 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `add_schematic_text` writes coordinates as KiCad writes them (patch release)
+
+`add_schematic_text` wrote the caller's `x`, `y` and `rotation` into the file
+as given, so a value carrying float noise, such as `54.60999999999999` from an
+older response (#747), was written that way. Each is now rounded to the six
+decimals KiCad writes, moving the text by less than 1e-6 mm. The response still
+echoes the caller's values. When the saved file does not hold the text at the
+rounded position, the call returns `mutation_outcome_uncertain`. A value so
+large that rounding makes it infinite, such as `1.8e303`, is refused as
+`invalid_argument` before anything is written. Arguments are unchanged (#828).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
