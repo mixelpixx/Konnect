@@ -1520,3 +1520,118 @@ mod fabrication_option_tests {
         assert_eq!(error["error"]["field"], "layers[1]");
     }
 }
+
+/// `export_specctra_dsn` served end to end against a KiCad holding a board of
+/// footprints at 0°, 45° and 90°, one with pads turned inside it (#840).
+#[cfg(test)]
+mod specctra_rotation_served_tests {
+    use crate::mcp::handler::McpHandler;
+    use crate::specctra::tests::pin_rotations;
+    use crate::tools::pcb_board::board_mock::spawn_kicad_holding_board;
+    use crate::tools::ServerConfig;
+    use konnect_ipc::builders::{distance, pack_any, vec2};
+    use konnect_ipc::gen::kiapi;
+    use serde_json::{json, Value};
+
+    const ROTATED: &str =
+        include_str!("../../tests/fixtures/specctra_rotated_footprints_45.kicad_pcb");
+    const ROTATED_NATIVE: &str =
+        include_str!("../../tests/fixtures/specctra_rotated_footprints_45.native-kicad-10.dsn");
+
+    /// KiCad's default netclass: 0.2 mm track and clearance, 0.6/0.3 mm via.
+    fn default_class() -> kiapi::common::project::NetClass {
+        kiapi::common::project::NetClass {
+            name: "Default".to_string(),
+            board: Some(kiapi::common::project::NetClassBoardSettings {
+                clearance: Some(distance(0.2)),
+                track_width: Some(distance(0.2)),
+                via_stack: Some(kiapi::board::types::PadStack {
+                    drill: Some(kiapi::board::types::DrillProperties {
+                        diameter: Some(vec2(0.3, 0.3)),
+                        ..Default::default()
+                    }),
+                    copper_layers: vec![kiapi::board::types::PadStackLayer {
+                        size: Some(vec2(0.6, 0.6)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn served_export_turns_only_pins_turned_inside_their_footprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("specctra_rotated_footprints_45.kicad_pcb");
+        std::fs::write(&board, ROTATED).unwrap();
+        let output = dir.path().join("board.dsn");
+        let nets = ["GND", "VCC"];
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            let name = command.type_url.rsplit('.').next().unwrap();
+            Some(match name {
+                "SaveDocumentToString" => pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        contents: ROTATED.to_string(),
+                        document: None,
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ),
+                "GetNets" => pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: (1..)
+                            .zip(nets)
+                            .map(|(code, net)| konnect_ipc::builders::net(net, code))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ),
+                "GetNetClassForNets" => pack_any(
+                    &kiapi::board::commands::NetClassForNetsResponse {
+                        classes: nets
+                            .iter()
+                            .map(|net| (net.to_string(), default_class()))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetClassForNetsResponse",
+                ),
+                _ => return None,
+            })
+        });
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 840, "method": "tools/call",
+                "params": {"name": "export_specctra_dsn",
+                    "arguments": {"board": board, "output": output}}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result["isError"], false, "{text}");
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["method"], "kicad_ipc_snapshot");
+        assert_eq!(body["pad_count"], 8);
+        let dsn = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(pin_rotations(&dsn), pin_rotations(ROTATED_NATIVE), "{dsn}");
+        assert!(dsn.contains("(place R3 120000 -40000 front 45)"), "{dsn}");
+    }
+}

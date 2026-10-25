@@ -52,6 +52,7 @@ struct PadModel {
     number: String,
     x_um: i64,
     y_um: i64,
+    /// Relative to the footprint, like `x_um`/`y_um`.
     rotation_degrees: f64,
     net: Option<String>,
     padstack: PadstackKey,
@@ -362,6 +363,7 @@ struct DsnPlacementIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DsnPinIdentity {
     padstack: String,
+    rotation: OrderedF64,
     x: i64,
     y: i64,
 }
@@ -456,11 +458,19 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
         let mut pins = BTreeMap::new();
         for pin in image.find_all("pin") {
             let padstack = dsn_atom(pin, 1, "pin padstack")?.to_string();
-            let number = dsn_atom(pin, 2, "pin number")?.to_string();
+            // `(pin <padstack> [(rotate <degrees>)] <number> <x> <y>)`
+            let (rotation, at) = match pin.get(2) {
+                Some(rotate) if rotate.head() == Some("rotate") => {
+                    (dsn_number(rotate, 1, "pin rotation")?, 3)
+                }
+                _ => (0.0, 2),
+            };
+            let number = dsn_atom(pin, at, "pin number")?.to_string();
             let identity = DsnPinIdentity {
                 padstack,
-                x: dsn_integer(pin, 3, "pin x")?,
-                y: dsn_integer(pin, 4, "pin y")?,
+                rotation: OrderedF64::new(rotation)?,
+                x: dsn_integer(pin, at + 1, "pin x")?,
+                y: dsn_integer(pin, at + 2, "pin y")?,
             };
             if pins.insert(number, identity).is_some() {
                 bail!("DSN image '{name}' repeats a pin number");
@@ -653,6 +663,9 @@ fn correlate_components(
             let native_pin = native_component.pins.get(pin).unwrap();
             if baseline_pin.x != native_pin.x || baseline_pin.y != native_pin.y {
                 bail!("native DSN changed pin position for component '{reference}' pin '{pin}'");
+            }
+            if baseline_pin.rotation != native_pin.rotation {
+                bail!("native DSN changed pin rotation for component '{reference}' pin '{pin}'");
             }
             let baseline_shape = baseline
                 .padstacks
@@ -1053,7 +1066,10 @@ fn footprints(
             let at = pad.find("at").context("pad has no position")?;
             let x_um = finite_um(at.get_f64(1), "pad x")?;
             let y_um = -finite_um(at.get_f64(2), "pad y")?;
-            let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
+            let pin_degrees = pin_rotation(
+                finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?,
+                rotation_degrees,
+            );
             let size = pad.find("size").context("pad has no size")?;
             let size_x_um = positive_um(size.get_f64(1), "pad width")?;
             let size_y_um = positive_um(size.get_f64(2), "pad height")?;
@@ -1125,7 +1141,7 @@ fn footprints(
                 number,
                 x_um,
                 y_um,
-                rotation_degrees,
+                rotation_degrees: pin_degrees,
                 net,
                 padstack: PadstackKey {
                     shape,
@@ -1152,6 +1168,17 @@ fn footprints(
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
     Ok(output)
+}
+
+/// A pad's file angle includes its footprint's, which `(place ...)` applies
+/// again, so a pin turns by the difference. In [0, 360) and to six significant
+/// digits, as KiCad writes it with `%.6g`.
+fn pin_rotation(pad_degrees: f64, footprint_degrees: f64) -> f64 {
+    let turn = (pad_degrees - footprint_degrees).rem_euclid(360.0);
+    format!("{turn:.5e}")
+        .parse::<f64>()
+        .expect("a formatted finite number parses")
+        % 360.0
 }
 
 fn normalize_rules(
@@ -1639,7 +1666,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use konnect_ipc::IpcRoutingRules;
 
@@ -1668,6 +1695,15 @@ mod tests {
             rule.track_width_mm = Some(0.2);
         }
         rules
+    }
+
+    fn native_baseline(source: &str) -> ExportBundle {
+        export_dsn(
+            Path::new("board.kicad_pcb"),
+            source,
+            &native_fixture_rules(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1705,12 +1741,7 @@ mod tests {
     fn native_kicad_dsn_rewrites_manifest_identifiers_without_changing_semantics() {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
         let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
-        let baseline = export_dsn(
-            Path::new("board.kicad_pcb"),
-            source,
-            &native_fixture_rules(),
-        )
-        .unwrap();
+        let baseline = native_baseline(source);
         let adopted = adopt_native_dsn(baseline, native.to_string()).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
 
@@ -1908,5 +1939,96 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("shape offset"), "{error}");
+    }
+
+    const ROTATED: &str = include_str!("../tests/fixtures/specctra_rotated_footprints.kicad_pcb");
+    const ROTATED_NATIVE: &str =
+        include_str!("../tests/fixtures/specctra_rotated_footprints.native-kicad-10.dsn");
+
+    /// Each placed pin's `(rotate ...)`, keyed by reference and pin number,
+    /// with an absent rotate read as 0. Read straight off the S-expression so
+    /// KiCad's sub-micrometre pin positions (#841) don't stop the comparison.
+    pub(crate) fn pin_rotations(dsn: &str) -> BTreeMap<(String, String), String> {
+        let root = parse_dsn_sexp(dsn).unwrap();
+        let library = root.find("library").unwrap();
+        let mut rotations = BTreeMap::new();
+        for component in root.find("placement").unwrap().find_all("component") {
+            let image_name = component.get(1).and_then(SexpNode::as_str).unwrap();
+            let image = library
+                .find_all("image")
+                .into_iter()
+                .find(|image| image.get(1).and_then(SexpNode::as_str) == Some(image_name))
+                .unwrap();
+            for place in component.find_all("place") {
+                let reference = place.get(1).and_then(SexpNode::as_str).unwrap();
+                for pin in image.find_all("pin") {
+                    let number = pin.children().unwrap()[2..]
+                        .iter()
+                        .find_map(SexpNode::as_str)
+                        .unwrap();
+                    let rotate = pin
+                        .find("rotate")
+                        .and_then(|rotate| rotate.get(1))
+                        .and_then(SexpNode::as_str)
+                        .unwrap_or("0");
+                    rotations.insert(
+                        (reference.to_string(), number.to_string()),
+                        rotate.to_string(),
+                    );
+                }
+            }
+        }
+        rotations
+    }
+
+    /// A pad's file angle includes its footprint's, and `(place ...)` turns
+    /// the image again, so a pin's `(rotate ...)` must be the pad's angle
+    /// within the footprint: what KiCad's own exporter writes (#840).
+    #[test]
+    fn rotated_footprint_pins_carry_the_rotation_kicad_writes() {
+        let source = include_str!("../tests/fixtures/specctra_rotated_footprints_45.kicad_pcb");
+        let native =
+            include_str!("../tests/fixtures/specctra_rotated_footprints_45.native-kicad-10.dsn");
+        let baseline = native_baseline(source);
+
+        let expected = [
+            ("R1", "1", "12.3457"),
+            ("R1", "2", "12.3457"),
+            ("R2", "1", "0"),
+            ("R2", "2", "0"),
+            ("R3", "1", "0"),
+            ("R3", "2", "0"),
+            ("R4", "1", "90"),
+            ("R4", "2", "270"),
+        ]
+        .into_iter()
+        .map(|(reference, pin, rotate)| {
+            ((reference.to_string(), pin.to_string()), rotate.to_string())
+        })
+        .collect::<BTreeMap<_, _>>();
+        assert_eq!(pin_rotations(native), expected);
+        assert_eq!(pin_rotations(&baseline.dsn), expected);
+    }
+
+    /// `12.3 - 12.2` is `0.10000000000000142` in f64.
+    #[test]
+    fn pin_rotation_drops_float_noise() {
+        assert_eq!(pin_rotation(12.3, 12.2), 0.1);
+    }
+
+    #[test]
+    fn native_dsn_of_rotated_footprints_is_adopted() {
+        let adopted =
+            adopt_native_dsn(native_baseline(ROTATED), ROTATED_NATIVE.to_string()).unwrap();
+        assert_eq!(adopted.dsn, ROTATED_NATIVE);
+    }
+
+    #[test]
+    fn native_dsn_that_turns_a_pin_is_refused() {
+        let native = ROTATED_NATIVE.replacen("(rotate 270) ", "", 1);
+        let error = adopt_native_dsn(native_baseline(ROTATED), native)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pin rotation"), "{error}");
     }
 }

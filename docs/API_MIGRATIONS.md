@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `export_specctra_dsn` turns rotated footprints' pins once (patch release)
+
+A pad's angle in a `.kicad_pcb` already includes its footprint's rotation. The
+Rust exporter wrote that angle as the pin's `(rotate ...)`, and the
+footprint's `(place ...)` rotation turned the pin again, so Freerouting routed
+around every rotated footprint's pads at the wrong orientation. A pin's
+`(rotate ...)` is now the pad's angle within its footprint, normalized to
+[0, 360), kept to six significant digits and omitted when 0, as KiCad's own
+exporter writes it. A footprint at 0° whose pad angles have at most six
+significant digits exports as before.
+
+KiCad's native DSN of a board whose pins carry a `(rotate ...)` could not be
+read, so `native_bridge_mode` `prefer` fell back to the Rust export and
+`require` refused. Both now read it, and treat a native pin rotation that
+differs from the Rust export's like any other mismatch. Arguments, response
+fields and the manifest are unchanged (#840).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
