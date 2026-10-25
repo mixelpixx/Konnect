@@ -3,6 +3,29 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: KiCad 10's schematic editor is reported as unsupported, not stale (minor release)
+
+KiCad 10.x reports an open schematic by its file name alone, with no project
+and no sheet path; KiCad 11 adds the schematic editor to its IPC API and
+reports both. The editor-navigation tools used to call that a malformed
+identity and refuse with `stale_target`, which read as a Konnect-side race.
+
+- `get_editor_state` now succeeds on KiCad 10 with a schematic editor open.
+  The schematic editor is reported with `addressable: false`, no documents,
+  its document, selection and cross-probe capabilities `unsupported`, and an
+  `unavailable_reason` naming the KiCad version. The PCB editor is observed as
+  before. The call used to fail as a whole.
+- `get_editor_selection`, `mutate_editor_selection`,
+  `resolve_navigation_target` and `resolve_cross_probe_target` refuse a
+  schematic request on KiCad 10 with `unsupported_capability`,
+  `capability: "schematic_editor_document_identity"`, and `kicad_version`
+  where KiCad reports it. They used to return `stale_target`.
+- A malformed identity on a supported path is still `stale_target`, now with
+  the identity's own reason in every one of these tools.
+
+No argument changed, and no identity is taken from the saved file, the board
+or the caller in place of KiCad's (#771).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

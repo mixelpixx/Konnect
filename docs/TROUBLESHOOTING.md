@@ -247,6 +247,29 @@ warning. `check_kicad_ui` and `open_project` also say why in `ipc_failure`
 (previous section). A KiCad that *answered and refused* is not warned about anywhere; that
 is a tool error, and it says so.
 
+## Live schematic navigation on KiCad 10: `schematic_editor_document_identity`
+
+KiCad 10.x's IPC API covers the PCB editor; the schematic editor arrives with
+KiCad 11. A KiCad 10 schematic editor still answers the open-documents query,
+but with the sheet's file name only: no project and no sheet path. Konnect
+cannot address a schematic without both and does not guess them from the
+saved file, the board or your arguments. So on KiCad 10:
+
+- `get_editor_state` reports the schematic editor with `addressable: false`,
+  no documents, and an `unavailable_reason` naming your KiCad version. The PCB
+  editor is reported as usual.
+- `get_editor_selection`, `mutate_editor_selection`,
+  `resolve_navigation_target` and `resolve_cross_probe_target` refuse a
+  schematic request with `unsupported_capability`,
+  `capability: "schematic_editor_document_identity"`, and your KiCad version
+  in `kicad_version`. That field is `null` from KiCad 10's standalone
+  schematic editor, which does not report its version.
+
+This is a limit of the KiCad version, not a stale or changed document, so
+retrying will not help. PCB navigation works on KiCad 10. Every file-based
+schematic tool is unaffected. Live schematic navigation needs KiCad 11 or
+later; KiCad's 10.99 development builds already report the identity.
+
 ## "layer 'X' has no KiCAD board layer this build can represent"
 
 The footprint or request names a layer this build cannot map, so the request was
