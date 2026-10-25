@@ -406,7 +406,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |
 | `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout; when it does not, `ipc_failure` names why. |
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
-| `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
+| `copy_routing_pattern` | Copy the segments, arcs and vias inside a source region of a board KiCad is not holding, shifted by (dest_x - src_x1, dest_y - src_y1). An item is copied when all of its points (segment start/end, arc start/mid/end, via position) are inside the region, edges included; one that crosses the edge is listed in `excluded_crossing` and not copied. Copies keep every attribute and get fresh UUIDs. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
 | `check_clearance` | Measure footprint spacing from the live KiCad board when open, otherwise the saved file. `mode: "anchor"` (default) preserves placement-origin distance and its deprecated `distance_mm` alias. `mode: "courtyard"` measures transformed authored-courtyard bbox edge distance, reports overlap, and refuses absent/unreadable courtyards or opposite-side comparisons. Neither mode measures copper clearance; use `run_drc` for that. |
 

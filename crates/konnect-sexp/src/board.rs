@@ -604,7 +604,7 @@ fn coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
 }
 
 /// A coordinate pair with no omitted or trailing fields.
-fn exact_coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
+pub fn exact_coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
     (node.children()?.len() == 3)
         .then(|| coordinate_pair(node))
         .flatten()
