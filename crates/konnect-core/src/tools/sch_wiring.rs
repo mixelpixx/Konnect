@@ -368,7 +368,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_pins",
             "Connect two component pins by reference and pin number. \
-             Looks up pin coordinates automatically and routes a wire between them.",
+             Looks up pin coordinates automatically and routes a wire between them, \
+             horizontal leg first, or vertical first when that would join another net's \
+             pin, label or sheet pin. Refuses with plan_blocked when both would. Reports \
+             the drawn path, corner included.",
             json!({
                 "type": "object",
                 "properties": {
@@ -384,8 +387,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_schematic_connection",
-            "Connect two schematic points directly with a wire (auto-routes H+V segments). \
-             Use connect_pins if you have component references instead of coordinates.",
+            "Connect two schematic points directly with a wire (auto-routes H+V segments, \
+             or V+H when H+V would join another net's pin, label or sheet pin; refuses with \
+             plan_blocked when both would). Use connect_pins if you have component \
+             references instead of coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -519,7 +524,12 @@ pub(crate) fn insert_wire_with_junctions(
     };
     existing_wires.push(new_wire);
 
-    let mut junctions = find_t_junctions(&existing_wires, 0.01);
+    // Only the T's this wire forms. A dot-less T elsewhere on the sheet is two
+    // nets to KiCad, and dotting it would join them unasked (#887).
+    let mut junctions: Vec<(f64, f64)> = find_t_junctions(&existing_wires, 0.01)
+        .into_iter()
+        .filter(|&(jx, jy)| konnect_sexp::geometry::point_on_segment(jx, jy, x1, y1, x2, y2, 0.01))
+        .collect();
     // Existing pins the new wire passes over also need junction dots.
     let pins = tree
         .as_ref()
@@ -548,16 +558,181 @@ pub(crate) fn insert_wire_with_junctions(
     c
 }
 
+/// A route [`route_between`] drew: the new content, and the points the wire
+/// runs through, corner included.
+pub(crate) struct Routed {
+    pub(crate) content: String,
+    pub(crate) path: Vec<(f64, f64)>,
+}
+
 /// Route a wire between two points: a single straight wire when axis-aligned,
-/// otherwise an H-then-V L-bend, each leg going through T-junction detection.
-pub(crate) fn route_between(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        insert_wire_with_junctions(content, x1, y1, x2, y2)
+/// otherwise an H-then-V L-bend, or V-then-H when the first would join another
+/// net. Each leg goes through T-junction detection, which dots every pin and
+/// wire end the leg meets, so a route is kept only if it joins nothing beyond
+/// the two endpoints' own nets (#887).
+///
+/// The inner `Err` holds one reason per bend tried, or why none could be checked.
+pub(crate) fn route_between(
+    content: &str,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> anyhow::Result<Result<Routed, Vec<String>>> {
+    let before = parse_sexp(content)?;
+    let Some(guard) = RouteGuard::new(&before, (x1, y1), (x2, y2)) else {
+        return Ok(Err(vec![format!(
+            "cannot check what the route would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]));
+    };
+    let bends: &[(&str, &[(f64, f64)])] = if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
+        &[("straight", &[(x1, y1), (x2, y2)])]
     } else {
-        let mid_x = x2;
-        let mid_y = y1;
-        let content = insert_wire_with_junctions(content, x1, y1, mid_x, mid_y);
-        insert_wire_with_junctions(content, mid_x, mid_y, x2, y2)
+        &[
+            ("horizontal-first", &[(x1, y1), (x2, y1), (x2, y2)]),
+            ("vertical-first", &[(x1, y1), (x1, y2), (x2, y2)]),
+        ]
+    };
+    let mut refused = Vec::new();
+    for &(bend, points) in bends {
+        let routed = points.windows(2).fold(content.to_owned(), |c, leg| {
+            insert_wire_with_junctions(c, leg[0].0, leg[0].1, leg[1].0, leg[1].1)
+        });
+        let joined = guard.foreign_joins(&parse_sexp(&routed)?);
+        if joined.is_empty() {
+            return Ok(Ok(Routed {
+                content: routed,
+                path: points.to_vec(),
+            }));
+        }
+        refused.push(format!("the {bend} route would join {}", joined.join(", ")));
+    }
+    Ok(Err(refused))
+}
+
+/// The refusal for a route that [`route_between`] could not draw.
+pub(crate) fn route_blocked(operation: &str, reasons: Vec<String>) -> CallToolResult {
+    let message = format!(
+        "{operation} refuses to draw a wire that joins another net: {}",
+        reasons.join("; ")
+    );
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::PlanBlocked {
+            operation: operation.into(),
+            reasons,
+        },
+        message,
+    )
+}
+
+/// What a sheet held before a route from `a` to `b`, built once for every bend
+/// tried. Wire ends are not terminals: a net is joined through what it carries,
+/// and a net of bare wires has nothing to short.
+struct RouteGuard {
+    /// The endpoints' nets, and those of any wire an endpoint lies on: a route
+    /// ending mid-span is dotted there, so tapping a wire is the caller's ask.
+    allowed: Vec<crate::tools::sch_connectivity::NetRoot>,
+    a: (f64, f64),
+    /// What sits at each point, in sheet order, so one join is reported once.
+    terminals: Vec<Terminal>,
+}
+
+struct Terminal {
+    at: (f64, f64),
+    descs: Vec<String>,
+    root: crate::tools::sch_connectivity::NetRoot,
+    /// ` on net X`, or empty when nothing names the net.
+    net: String,
+}
+
+impl RouteGuard {
+    /// `None` when a placed symbol's pins cannot be resolved: the guard would
+    /// not see them, and a route over them would join them unchecked.
+    fn new(before: &konnect_sexp::SexpNode, a: (f64, f64), b: (f64, f64)) -> Option<Self> {
+        use crate::tools::sch_connectivity::pt_key;
+        use konnect_sexp::geometry::point_on_segment;
+        use konnect_sexp::schematic::{extract_sheet_pins, LabelKind};
+        let labels = konnect_sexp::schematic::extract_all_net_labels(before);
+        let wires = extract_wires(before);
+        let mut graph = crate::tools::sch_connectivity::net_graph_for(before, &wires, &labels);
+
+        let mut terminals: Vec<Terminal> = Vec::new();
+        let mut index: std::collections::HashMap<(i64, i64), usize> = Default::default();
+        let mut push = |at: (f64, f64), desc: String| match index.get(&pt_key(at.0, at.1)) {
+            Some(&i) => terminals[i].descs.push(desc),
+            None => {
+                let root = graph.root_at(at.0, at.1);
+                let net = graph
+                    .name_of_root(root)
+                    .map(|n| format!(" on net {n}"))
+                    .unwrap_or_default();
+                index.insert(pt_key(at.0, at.1), terminals.len());
+                terminals.push(Terminal {
+                    at,
+                    descs: vec![desc],
+                    root,
+                    net,
+                });
+            }
+        };
+        for (inst, pins) in crate::tools::resolved_placed_pins_by_reference(before)? {
+            for (pin, t) in pins {
+                push(
+                    pin_endpoint(&pin, t),
+                    format!("{} pin {}", inst.reference, pin.number),
+                );
+            }
+        }
+        for label in &labels {
+            let kind = match label.kind {
+                LabelKind::NetLabel => "label",
+                LabelKind::GlobalLabel => "global label",
+                LabelKind::HierarchicalLabel => "hierarchical label",
+                LabelKind::PowerSymbol => "power symbol",
+            };
+            push((label.x, label.y), format!("{kind} {}", label.net));
+        }
+        for at in extract_sheet_pins(before) {
+            push(at, "a sheet pin".into());
+        }
+
+        let mut allowed = vec![graph.root_at(a.0, a.1), graph.root_at(b.0, b.1)];
+        for w in &wires {
+            if [a, b]
+                .iter()
+                .any(|p| point_on_segment(p.0, p.1, w.x1, w.y1, w.x2, w.y2, 0.01))
+            {
+                allowed.push(graph.root_at(w.x1, w.y1));
+            }
+        }
+        Some(RouteGuard {
+            allowed,
+            a,
+            terminals,
+        })
+    }
+
+    /// Each point whose items `after` puts on `a`'s net although they were on
+    /// no allowed net before.
+    fn foreign_joins(&self, after: &konnect_sexp::SexpNode) -> Vec<String> {
+        let labels = konnect_sexp::schematic::extract_all_net_labels(after);
+        let mut graph =
+            crate::tools::sch_connectivity::net_graph_for(after, &extract_wires(after), &labels);
+        let routed = graph.root_at(self.a.0, self.a.1);
+        self.terminals
+            .iter()
+            .filter(|t| !self.allowed.contains(&t.root) && graph.root_at(t.at.0, t.at.1) == routed)
+            .map(|t| {
+                format!(
+                    "{} at ({}, {}){}",
+                    t.descs.join(" and "),
+                    fmt_f64(t.at.0),
+                    fmt_f64(t.at.1),
+                    t.net
+                )
+            })
+            .collect()
     }
 }
 
@@ -2663,7 +2838,6 @@ async fn handle_connect_pins(
 
     // Parse the schematic tree
     let (content, tree) = read_schematic(&sch_path)?;
-    let expected = content.clone();
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
         .find("lib_symbols")
@@ -2676,15 +2850,19 @@ async fn handle_connect_pins(
     let (x2, y2) = resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2)?;
 
     // Route wire(s) between the two pin endpoints
-    let new_content = route_between(content, x1, y1, x2, y2);
+    let routed = match route_between(&content, x1, y1, x2, y2)? {
+        Ok(routed) => routed,
+        Err(reasons) => return Ok(route_blocked("connect_pins", reasons)),
+    };
 
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &content, &routed.content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected": {
             "from": { "ref": ref1, "pin": pin1, "x": x1, "y": y1 },
             "to":   { "ref": ref2, "pin": pin2, "x": x2, "y": y2 }
-        }
+        },
+        "path": routed.path
     })))
 }
 
@@ -2784,12 +2962,15 @@ async fn handle_add_schematic_connection(
     };
 
     let content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    let content = route_between(content, x1, y1, x2, y2);
+    let routed = match route_between(&content, x1, y1, x2, y2)? {
+        Ok(routed) => routed,
+        Err(reasons) => return Ok(route_blocked("add_schematic_connection", reasons)),
+    };
 
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    write_atomic_if_unchanged(&sch_path, &content, &routed.content)?;
     Ok(CallToolResult::json(&json!({
-        "connected": { "from": [x1, y1], "to": [x2, y2] }
+        "connected": { "from": [x1, y1], "to": [x2, y2] },
+        "path": routed.path
     })))
 }
 
