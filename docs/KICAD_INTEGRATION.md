@@ -57,7 +57,9 @@ the file — the file fallback only ever fires when no live KiCad holds the name
 board at all. The closed-board file-fallback path is unchanged and keeps
 refusing any footprint whose 3D model has a non-zero `offset.y`/`rotate.x`/
 `rotate.y`, since reproducing KiCad's own 3D-model flip math for that path
-remains out of scope (issue #604).
+remains out of scope (issue #604). It mirrors inner copper through the board's
+`(layers …)` table as KiCad's `FlipLayer` does, refuses per-layer padstacks, and
+returns `plan_blocked` for an inner layer the board lacks (#831).
 
 ### Editor observation
 

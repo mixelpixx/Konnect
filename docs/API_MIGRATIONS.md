@@ -3,6 +3,32 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: footprint flips mirror inner copper layers (patch release)
+
+A footprint that changes sides now moves its inner copper items the way KiCad's
+`FlipLayer` does. On N copper layers, `In<k>.Cu` goes to `In<N-1-k>.Cu`, so
+`In2.Cu` and `In5.Cu` swap on an 8-layer board. Both side changes are covered:
+`flip_component` on a closed board, and `update_footprints_from_library` on a
+back-side footprint. Both used to leave inner layers where they were. The
+refresh now also mirrors text on inner copper, as KiCad does. Wildcard, user
+and other non-copper layers are unchanged, and so are a pad's
+`zone_layer_connections`, which KiCad's own flip also leaves alone.
+
+When an inner layer the footprint uses is not on the board (`In5.Cu` on a
+4-layer board), both refuse instead of following KiCad, which clamps it to
+`In1.Cu`. `flip_component` returns `plan_blocked` with `operation:
+"flip_component"` and leaves the file unchanged. The library refresh reports a
+`footprint_update_conflict` diagnostic for that reference.
+
+The file flip reads the stack from the board's `(layers …)` table, or assumes
+KiCad's two-layer default when there is none. It returns `plan_blocked` for a
+table whose copper layers are not `F.Cu`, `In1.Cu`..`In<N-2>.Cu` and `B.Cu`,
+and refuses a board with two tables or a pad with a per-layer `(padstack …)`,
+whose inner entries KiCad would also move. The refresh takes KiCad's
+copper-layer count, and its `plan_revision` now includes that count, so a
+revision from an earlier build needs a new dry run. The native IPC flip is
+unchanged (#831).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

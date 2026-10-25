@@ -16,6 +16,7 @@
 //! ```
 
 use crate::parser::SexpNode;
+use std::collections::BTreeSet;
 
 /// One entry of the board stackup.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,9 +52,11 @@ pub fn is_copper_name(name: &str) -> bool {
 
 /// Read the stackup from a parsed board. Empty if there is no `(layers …)`.
 pub fn layers(board: &SexpNode) -> Vec<Layer> {
-    let Some(node) = board.find("layers") else {
-        return Vec::new();
-    };
+    board.find("layers").map(table_layers).unwrap_or_default()
+}
+
+/// The entries of a parsed `(layers …)` table itself.
+pub fn table_layers(node: &SexpNode) -> Vec<Layer> {
     node.children()
         .unwrap_or(&[])
         .iter()
@@ -128,15 +131,121 @@ pub fn is_canonical_name(name: &str) -> bool {
     if FIXED_NAMES.contains(&name) {
         return true;
     }
-    if let Some(n) = name.strip_prefix("In").and_then(|s| s.strip_suffix(".Cu")) {
-        return matches!(n.parse::<u32>(), Ok(n) if (1..=MAX_INNER_COPPER).contains(&n))
-            && !n.starts_with('0');
+    if inner_copper_index(name).is_some() {
+        return true;
     }
     if let Some(n) = name.strip_prefix("User.") {
         return matches!(n.parse::<u32>(), Ok(n) if (1..=MAX_USER).contains(&n))
             && !n.starts_with('0');
     }
     false
+}
+
+/// The copper stack a footprint flips through: `F.Cu`, `In1.Cu`..`In<N-2>.Cu`
+/// and `B.Cu`, which is the only shape KiCad gives a board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopperStack {
+    count: u32,
+}
+
+impl CopperStack {
+    /// The stack of a board with `count` copper layers: even, 2 to 32, as
+    /// KiCad allows.
+    pub fn new(count: u32) -> Result<Self, FlipLayerError> {
+        if !count.is_multiple_of(2) || !(2..=MAX_INNER_COPPER + 2).contains(&count) {
+            return Err(FlipLayerError::IrregularStack(format!(
+                "{count} copper layers"
+            )));
+        }
+        Ok(Self { count })
+    }
+
+    /// Build the stack from a board's layer names; non-copper names are
+    /// ignored. Any other copper set is refused, since mirroring through it
+    /// would be a guess.
+    pub fn from_layer_names<'a>(
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, FlipLayerError> {
+        let copper = names
+            .into_iter()
+            .filter(|name| is_copper_name(name))
+            .collect::<BTreeSet<_>>();
+        let count = copper.len() as u32;
+        let regular = copper.iter().all(|name| {
+            matches!(*name, "F.Cu" | "B.Cu")
+                || inner_copper_index(name).is_some_and(|k| k + 1 < count)
+        });
+        if !regular || !copper.contains("F.Cu") || !copper.contains("B.Cu") {
+            let names = copper.into_iter().collect::<Vec<_>>().join(", ");
+            return Err(FlipLayerError::IrregularStack(format!(
+                "copper layers [{names}]"
+            )));
+        }
+        Self::new(count)
+    }
+
+    /// How many copper layers the board has.
+    pub fn count(self) -> u32 {
+        self.count
+    }
+}
+
+/// Why a layer has no place on the other side of the board.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FlipLayerError {
+    #[error("unsupported side-specific layer '{0}'")]
+    UnsupportedSideLayer(String),
+    #[error("layer '{layer}' is not on this {copper_layers}-copper-layer board")]
+    InnerLayerNotOnBoard { layer: String, copper_layers: u32 },
+    #[error("{0} are not F.Cu, In1.Cu..In<N-2>.Cu and B.Cu")]
+    IrregularStack(String),
+}
+
+/// The layer an item moves to when its footprint changes sides, as KiCad's
+/// `FlipLayer` computes it: front and back pairs swap, and on N copper layers
+/// `In<k>.Cu` mirrors to `In<N-1-k>.Cu`. Wildcards and layers with no side
+/// stay where they are.
+///
+/// Where KiCad clamps an inner layer the board lacks to `In1.Cu`, or leaves it
+/// in place on two layers, this refuses.
+pub fn flip_layer(layer: &str, stack: CopperStack) -> Result<String, FlipLayerError> {
+    let flipped = match layer {
+        "F.Cu" => "B.Cu",
+        "B.Cu" => "F.Cu",
+        "F.Adhes" => "B.Adhes",
+        "B.Adhes" => "F.Adhes",
+        "F.Paste" => "B.Paste",
+        "B.Paste" => "F.Paste",
+        "F.SilkS" | "F.Silkscreen" => "B.SilkS",
+        "B.SilkS" | "B.Silkscreen" => "F.SilkS",
+        "F.Mask" => "B.Mask",
+        "B.Mask" => "F.Mask",
+        "F.CrtYd" | "F.Courtyard" => "B.CrtYd",
+        "B.CrtYd" | "B.Courtyard" => "F.CrtYd",
+        "F.Fab" => "B.Fab",
+        "B.Fab" => "F.Fab",
+        other if other.starts_with("F.") || other.starts_with("B.") => {
+            return Err(FlipLayerError::UnsupportedSideLayer(other.to_string()))
+        }
+        other if other.starts_with("In") && other.ends_with(".Cu") => {
+            return match inner_copper_index(other) {
+                Some(k) if k + 1 < stack.count => Ok(format!("In{}.Cu", stack.count - 1 - k)),
+                _ => Err(FlipLayerError::InnerLayerNotOnBoard {
+                    layer: other.to_string(),
+                    copper_layers: stack.count,
+                }),
+            };
+        }
+        other => other,
+    };
+    Ok(flipped.to_string())
+}
+
+/// `k` for a canonical `In<k>.Cu`.
+fn inner_copper_index(name: &str) -> Option<u32> {
+    let n = name.strip_prefix("In")?.strip_suffix(".Cu")?;
+    let k = n.parse::<u32>().ok()?;
+    ((1..=MAX_INNER_COPPER).contains(&k) && !n.starts_with('0')).then_some(k)
 }
 
 fn layer_from(node: &SexpNode) -> Option<Layer> {
@@ -294,6 +403,110 @@ mod tests {
         // KiCad stops at In30.Cu / User.45, and does not zero-pad.
         for name in ["In31.Cu", "User.46", "In01.Cu", "User.01", "In.Cu", "User."] {
             assert!(!is_canonical_name(name), "{name} should not be canonical");
+        }
+    }
+
+    fn stack(count: u32) -> CopperStack {
+        CopperStack::new(count).unwrap()
+    }
+
+    /// #831: the in-range rows of KiCad 10.0.6's `pcbnew.FlipLayer(layer, N)`.
+    #[test]
+    fn inner_copper_mirrors_as_kicads_flip_layer() {
+        for (count, rows) in [
+            (2, &[("F.Cu", "B.Cu"), ("B.Cu", "F.Cu")][..]),
+            (4, &[("In1.Cu", "In2.Cu"), ("In2.Cu", "In1.Cu")][..]),
+            (
+                6,
+                &[
+                    ("In1.Cu", "In4.Cu"),
+                    ("In2.Cu", "In3.Cu"),
+                    ("In4.Cu", "In1.Cu"),
+                ][..],
+            ),
+            (
+                8,
+                &[
+                    ("In1.Cu", "In6.Cu"),
+                    ("In2.Cu", "In5.Cu"),
+                    ("In3.Cu", "In4.Cu"),
+                    ("In5.Cu", "In2.Cu"),
+                    ("In6.Cu", "In1.Cu"),
+                ][..],
+            ),
+            (
+                32,
+                &[
+                    ("In1.Cu", "In30.Cu"),
+                    ("In8.Cu", "In23.Cu"),
+                    ("In30.Cu", "In1.Cu"),
+                ][..],
+            ),
+        ] {
+            for (from, to) in rows {
+                assert_eq!(
+                    flip_layer(from, stack(count)).unwrap(),
+                    *to,
+                    "{from} on {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sideless_layers_and_wildcards_stay_put() {
+        for layer in [
+            "*.Cu",
+            "*.Mask",
+            "*.Paste",
+            "F&B.Cu",
+            "Edge.Cuts",
+            "User.3",
+            "Dwgs.User",
+        ] {
+            assert_eq!(flip_layer(layer, stack(8)).unwrap(), layer);
+        }
+        assert_eq!(flip_layer("F.SilkS", stack(8)).unwrap(), "B.SilkS");
+        assert_eq!(flip_layer("B.Courtyard", stack(8)).unwrap(), "F.CrtYd");
+    }
+
+    /// Where KiCad clamps to In1.Cu (or keeps the layer on two layers), the
+    /// flip refuses.
+    #[test]
+    fn an_inner_layer_the_board_lacks_is_refused() {
+        for (layer, count) in [("In5.Cu", 4), ("In1.Cu", 2), ("In7.Cu", 8), ("In0.Cu", 8)] {
+            assert_eq!(
+                flip_layer(layer, stack(count)),
+                Err(FlipLayerError::InnerLayerNotOnBoard {
+                    layer: layer.to_string(),
+                    copper_layers: count,
+                })
+            );
+        }
+        assert!(matches!(
+            flip_layer("F.Bogus", stack(2)),
+            Err(FlipLayerError::UnsupportedSideLayer(_))
+        ));
+    }
+
+    #[test]
+    fn the_stack_is_read_from_the_board_layer_names() {
+        let names = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu", "Edge.Cuts", "User.1"];
+        assert_eq!(CopperStack::from_layer_names(names).unwrap().count(), 4);
+        for names in [
+            &[][..],
+            &["F.Cu"][..],
+            &["F.Cu", "In1.Cu", "B.Cu"][..],
+            &["F.Cu", "In2.Cu", "In3.Cu", "B.Cu"][..],
+            &["F.Cu", "In1.Cu", "In2.Cu", "In4.Cu", "B.Cu", "In01.Cu"][..],
+        ] {
+            assert!(matches!(
+                CopperStack::from_layer_names(names.iter().copied()),
+                Err(FlipLayerError::IrregularStack(_))
+            ));
+        }
+        for count in [0, 3, 34] {
+            assert!(CopperStack::new(count).is_err(), "{count}");
         }
     }
 
