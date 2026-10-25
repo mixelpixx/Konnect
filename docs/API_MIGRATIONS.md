@@ -3,6 +3,16 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: batch_delete says where reference designators go (patch release)
+
+`batch_delete` deletes components by `references` and other items by `uuids`.
+A reference passed in `uuids` is still not deleted, but its error now names the
+right argument: `UUID 'J3' not found; 'J3' is a component reference, pass it in
+references`. Other unknown UUIDs, and a reference also passed in
+`references`, keep `UUID '<id>' not found`. The tool description and the
+`uuids` property description now name both arguments. Argument types and
+response shapes are unchanged.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
