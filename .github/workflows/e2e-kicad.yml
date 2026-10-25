@@ -71,6 +71,11 @@ jobs:
           KONNECT_E2E_KEEP_DIR: ${{ github.workspace }}/e2e-artifacts
         run: cargo test -p konnect --test e2e_kicad -- --ignored --nocapture
 
+      # Bundled templates are hand-written JSON naming KiCad symbols and pins;
+      # this is the only job with a symbol library to check them against (#783).
+      - name: Bundled templates name real KiCad symbols and pins
+        run: cargo test -p konnect-core --lib builtin_templates_name_symbols_and_pins_that_exist_in_kicad -- --nocapture
+
       - name: Demo-corpus conformance (115+ eeschema-authored schematics)
         run: cargo test -p konnect-core --test conformance_test -- --nocapture
 
