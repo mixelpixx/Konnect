@@ -1754,12 +1754,17 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             record_routed_net(&mut routed_nets, via.net.as_ref());
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
-        // reassignment on a zoned board therefore fails closed.
+    let mut unreadable_zone = false;
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        match zone_net(item.value.as_slice()) {
+            ZoneNet::Copper(net) => record_routed_net(&mut routed_nets, Some(&net)),
+            ZoneNet::RuleArea => {}
+            ZoneNet::Unreadable => unreadable_zone = true,
+        }
+    }
+    if unreadable_zone {
+        // A zone whose net cannot be read could pour any net, so every pad-net
+        // reassignment fails closed.
         for net in net_codes.keys() {
             *routed_nets.entry(net.clone()).or_insert(0) += 1;
         }
@@ -1932,6 +1937,26 @@ fn board_layer_name(layer: i32) -> String {
         Some(BoardLayer::BlBCu) => "B.Cu".to_string(),
         Some(layer) => layer.as_str_name().to_string(),
         None => format!("layer_{layer}"),
+    }
+}
+
+/// What a zone pours: a copper zone its own net (`Zone.copper_settings.net`,
+/// empty for a zone on no net), a rule area nothing (#779).
+#[derive(Debug, PartialEq)]
+enum ZoneNet {
+    Copper(konnect_ipc::gen::kiapi::board::types::Net),
+    RuleArea,
+    Unreadable,
+}
+
+fn zone_net(bytes: &[u8]) -> ZoneNet {
+    use konnect_ipc::gen::kiapi::board::types::{zone::Settings, Zone};
+    match Zone::decode(bytes).map(|zone| zone.settings) {
+        Ok(Some(Settings::CopperSettings(copper))) => {
+            copper.net.map_or(ZoneNet::Unreadable, ZoneNet::Copper)
+        }
+        Ok(Some(Settings::RuleAreaSettings(_))) => ZoneNet::RuleArea,
+        _ => ZoneNet::Unreadable,
     }
 }
 
@@ -4123,6 +4148,53 @@ mod tests {
         );
     }
 
+    /// KiCad's own `R1` (`issue_474_r1.ipc.bin`: pad 1 on `VCC`, pad 2 on
+    /// `GND`), bound to the `/Power/` symbol that [`ONE_RESISTOR`] exports.
+    fn schematic_backed_resistor() -> prost_types::Any {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+        const CAPTURE: &[u8] = include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin");
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(CAPTURE)
+            .expect("the checked-in KiCad IPC capture must decode");
+        footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: vec![
+                kiapi::common::types::Kiid {
+                    value: "sheet-uuid".to_string(),
+                },
+                kiapi::common::types::Kiid {
+                    value: "symbol-uuid".to_string(),
+                },
+            ],
+            path_human_readable: "/Power/".to_string(),
+        });
+        set_field_text(&mut footprint.value_field, "Value", "1k");
+        konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    /// KiCad's captured `GND` copper pour and a rule area (`issue_474_ipc.README.md`).
+    const GND_POUR: &[u8] = include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin");
+    const RULE_AREA: &[u8] = include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin");
+
+    /// A zone as KiCad lists it: `bytes` is the `Zone` message.
+    fn zone_item(bytes: &[u8]) -> prost_types::Any {
+        prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+            value: bytes.to_vec(),
+        }
+    }
+
+    /// The captured pour with its net taken out.
+    fn pour_without_a_net() -> prost_types::Any {
+        use konnect_ipc::gen::kiapi::board::types::{zone::Settings, Zone};
+        use prost::Message;
+        let mut zone = Zone::decode(GND_POUR).expect("the captured pour decodes");
+        let Some(Settings::CopperSettings(copper)) = zone.settings.as_mut() else {
+            panic!("the captured pour is a copper zone");
+        };
+        copper.net = None;
+        konnect_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone")
+    }
+
     /// A complete #474 sync through the registered tool, not just the pure
     /// planner. The mock speaks KiCad's real protobuf protocol and retains the
     /// live board between requests, so the assertions below are an independent
@@ -4147,25 +4219,6 @@ mod tests {
                 code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
                 error_message: String::new(),
             }
-        }
-
-        fn schematic_backed_resistor() -> prost_types::Any {
-            const CAPTURE: &[u8] = include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin");
-            let mut footprint = kiapi::board::types::FootprintInstance::decode(CAPTURE)
-                .expect("the checked-in KiCad IPC capture must decode");
-            footprint.symbol_path = Some(kiapi::common::types::SheetPath {
-                path: vec![
-                    kiapi::common::types::Kiid {
-                        value: "sheet-uuid".to_string(),
-                    },
-                    kiapi::common::types::Kiid {
-                        value: "symbol-uuid".to_string(),
-                    },
-                ],
-                path_human_readable: "/Power/".to_string(),
-            });
-            set_field_text(&mut footprint.value_field, "Value", "1k");
-            konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
         }
 
         let directory = tempfile::tempdir().unwrap();
@@ -4212,14 +4265,8 @@ mod tests {
             &board_only_instance("fiducial-live", "REF**"),
             "kiapi.board.types.FootprintInstance",
         );
-        let copper_zone = prost_types::Any {
-            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
-            value: include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin").to_vec(),
-        };
-        let keepout = prost_types::Any {
-            type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
-            value: include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin").to_vec(),
-        };
+        let copper_zone = zone_item(GND_POUR);
+        let keepout = zone_item(RULE_AREA);
         let copper_kind = kiapi::board::types::Zone::decode(copper_zone.value.as_slice())
             .expect("captured copper zone");
         let keepout_kind = kiapi::board::types::Zone::decode(keepout.value.as_slice())
@@ -4766,6 +4813,26 @@ mod tests {
         board: PathBuf,
         exported: PathBuf,
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+        /// The held footprints as the mock's board now has them.
+        held: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+    }
+
+    /// A listed footprint's KIID.
+    fn footprint_kiid(item: &prost_types::Any) -> String {
+        use prost::Message;
+        konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .ok()
+            .and_then(|footprint| footprint.id)
+            .map(|id| id.value)
+            .unwrap_or_default()
+    }
+
+    /// What the mock's board holds before the sync touches it.
+    #[derive(Clone, Default)]
+    struct HeldBoard {
+        footprints: Vec<prost_types::Any>,
+        zones: Vec<prost_types::Any>,
+        nets: Vec<&'static str>,
     }
 
     /// What the mock's board holds after `CreateItems`.
@@ -4789,7 +4856,7 @@ mod tests {
         /// As [`Self::new`], with KiCad also holding one board graphic whose
         /// box is `outline`, `(x, y, width, height)` in mm.
         async fn holding_outline(outline: Option<(f64, f64, f64, f64)>) -> Self {
-            Self::build(outline, Vec::new(), Readback::AsSent).await
+            Self::build(outline, Vec::new(), Readback::AsSent, HeldBoard::default()).await
         }
 
         /// As [`Self::holding_outline`], with KiCad refusing to list each class
@@ -4798,18 +4865,24 @@ mod tests {
             outline: Option<(f64, f64, f64, f64)>,
             refused: Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType>,
         ) -> Self {
-            Self::build(outline, refused, Readback::AsSent).await
+            Self::build(outline, refused, Readback::AsSent, HeldBoard::default()).await
         }
 
         /// As [`Self::new`], with the board read back as `readback` says.
         async fn reading_back(readback: Readback) -> Self {
-            Self::build(None, Vec::new(), readback).await
+            Self::build(None, Vec::new(), readback, HeldBoard::default()).await
+        }
+
+        /// As [`Self::new`], with KiCad already holding `held`.
+        async fn holding(held: HeldBoard) -> Self {
+            Self::build(None, Vec::new(), Readback::AsSent, held).await
         }
 
         async fn build(
             outline: Option<(f64, f64, f64, f64)>,
             refused: Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType>,
             readback: Readback,
+            held: HeldBoard,
         ) -> Self {
             use crate::tools::cli::test_support::write_script;
             use konnect_ipc::gen::kiapi;
@@ -4817,6 +4890,22 @@ mod tests {
             let created =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::<prost_types::Any>::new()));
             let board_items = created.clone();
+            let held_kiids = held
+                .footprints
+                .iter()
+                .map(footprint_kiid)
+                .chain(held.zones.iter().map(|item| {
+                    kiapi::board::types::Zone::decode(item.value.as_slice())
+                        .ok()
+                        .and_then(|zone| zone.id)
+                        .map(|id| id.value)
+                        .unwrap_or_default()
+                }))
+                .collect::<Vec<_>>();
+            let held_footprints = std::sync::Arc::new(std::sync::Mutex::new(held.footprints));
+            let board_held = held_footprints.clone();
+            let held_zones = held.zones;
+            let held_nets = held.nets;
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -4849,6 +4938,7 @@ mod tests {
                         let shapes = kiapi::common::types::KiCadObjectType::KotPcbShape as i32;
                         let footprints =
                             kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32;
+                        let zones = kiapi::common::types::KiCadObjectType::KotPcbZone as i32;
                         let items = match outline {
                             Some(_) if request.types.contains(&shapes) => {
                                 vec![crate::tools::pcb_board::board_mock::listed_item(
@@ -4856,12 +4946,20 @@ mod tests {
                                     "outline",
                                 )]
                             }
-                            _ if request.types.contains(&footprints) => board_items
+                            _ if request.types.contains(&footprints) => board_held
                                 .lock()
                                 .unwrap()
                                 .iter()
-                                .map(|item| read_back(item, readback))
+                                .cloned()
+                                .chain(
+                                    board_items
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|item| read_back(item, readback)),
+                                )
                                 .collect(),
+                            _ if request.types.contains(&zones) => held_zones.clone(),
                             _ => Vec::new(),
                         };
                         return Some(konnect_ipc::builders::pack_any(
@@ -4875,7 +4973,16 @@ mod tests {
                     }
                     if command.type_url.ends_with("GetNets") {
                         return Some(konnect_ipc::builders::pack_any(
-                            &kiapi::board::commands::NetsResponse { nets: Vec::new() },
+                            &kiapi::board::commands::NetsResponse {
+                                nets: held_nets
+                                    .iter()
+                                    .zip(1..)
+                                    .map(|(name, code)| kiapi::board::types::Net {
+                                        code: Some(kiapi::board::types::NetCode { value: code }),
+                                        name: name.to_string(),
+                                    })
+                                    .collect(),
+                            },
                             "kiapi.board.commands.NetsResponse",
                         ));
                     }
@@ -4883,8 +4990,14 @@ mod tests {
                         return Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
                             command,
                             |kiid| {
-                                assert_eq!(kiid, "outline", "only the outline is listed");
-                                outline.expect("an outline to measure")
+                                if kiid == "outline" {
+                                    return outline.expect("an outline to measure");
+                                }
+                                assert!(
+                                    held_kiids.iter().any(|held| held == kiid),
+                                    "only the outline and held items are listed, not {kiid}"
+                                );
+                                (0.0, 0.0, 10.0, 10.0)
                             },
                         ));
                     }
@@ -4948,6 +5061,15 @@ mod tests {
                         let request =
                             kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
                                 .expect("UpdateItems request");
+                        let mut held = board_held.lock().unwrap();
+                        for updated in &request.items {
+                            for footprint in held.iter_mut() {
+                                if footprint_kiid(footprint) == footprint_kiid(updated) {
+                                    *footprint = updated.clone();
+                                }
+                            }
+                        }
+                        drop(held);
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::UpdateItemsResponse {
                                 header: None,
@@ -4996,6 +5118,7 @@ mod tests {
                 board,
                 exported,
                 created,
+                held: held_footprints,
             }
         }
 
@@ -5154,6 +5277,139 @@ mod tests {
         assert!(x > 155.0 && x < 165.0, "staged at x = {x}: {plan:#}");
         // Stacked down from the board's top edge (80 mm), not from y = 0.
         assert!(y > 80.0 && y < 90.0, "staged at y = {y}: {plan:#}");
+    }
+
+    /// Served dry run of `R1` ([`schematic_backed_resistor`]) on a board
+    /// that also holds `zones`, after the schematic moves its pad on `net`
+    /// to the copper-less `NEW_NET`.
+    async fn plan_moving_off(net: &str, zones: Vec<prost_types::Any>) -> serde_json::Value {
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones,
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        served.dry_run(&netlist_moving_off(net)).await
+    }
+
+    /// [`ONE_RESISTOR`] for the captured `R1`, with its pad on `net` moved to
+    /// the copper-less `NEW_NET`.
+    fn netlist_moving_off(net: &str) -> String {
+        ONE_RESISTOR
+            .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
+            .replace("/Power/VCC", "VCC")
+            .replace(&format!("(name \"{net}\")"), "(name \"NEW_NET\")")
+    }
+
+    /// The messages of a served dry run's `routed_pad_net_change` conflicts.
+    fn routed_pad_conflicts(plan: &serde_json::Value) -> Vec<String> {
+        plan["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|diagnostic| diagnostic["code"] == "routed_pad_net_change")
+            .map(|diagnostic| diagnostic["message"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #779: a copper zone counts as copper on its own net only. KiCad's
+    /// captured messages carry the pour's net and the rule area's lack of one.
+    #[test]
+    fn a_zone_pours_only_its_own_net() {
+        let ZoneNet::Copper(net) = zone_net(GND_POUR) else {
+            panic!("the captured pour is a copper zone");
+        };
+        assert_eq!(net.name, "GND");
+        assert_eq!(zone_net(RULE_AREA), ZoneNet::RuleArea);
+        assert_eq!(zone_net(&pour_without_a_net().value), ZoneNet::Unreadable);
+        assert_eq!(zone_net(&[0xff, 0xff]), ZoneNet::Unreadable);
+    }
+
+    /// #779 through `tools/call`: a `GND` pour and a rule area on the board
+    /// leave a pad on `VCC`, which has no copper, free to change net.
+    #[tokio::test]
+    async fn a_pour_does_not_block_a_net_it_does_not_carry() {
+        let plan = plan_moving_off("VCC", vec![zone_item(GND_POUR), zone_item(RULE_AREA)]).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(routed_pad_conflicts(&plan), Vec::<String>::new());
+        let update = &plan["changes"][0];
+        assert_eq!(update["kind"], "update", "{plan:#}");
+        assert_eq!(update["reference"], "R1", "{plan:#}");
+    }
+
+    /// The pour's own net still conflicts: moving `R1`'s `GND` pad would
+    /// leave it under copper KiCad pours as `GND`.
+    #[tokio::test]
+    async fn a_pour_still_blocks_its_own_net() {
+        let plan = plan_moving_off("GND", vec![zone_item(GND_POUR)]).await;
+
+        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(
+            routed_pad_conflicts(&plan),
+            vec!["R1 pad 2 would change from 'GND' to 'NEW_NET' while routed copper uses that net"],
+        );
+    }
+
+    /// Moving a pad onto the pour's net conflicts too: the check covers the
+    /// new net as well as the old one.
+    #[tokio::test]
+    async fn a_pour_blocks_a_pad_moving_onto_its_net() {
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: vec![zone_item(GND_POUR)],
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+        let netlist = ONE_RESISTOR
+            .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
+            .replace("(name \"/Power/VCC\")", "(name \"GND\")");
+
+        let plan = served.dry_run(&netlist).await;
+
+        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(
+            routed_pad_conflicts(&plan),
+            vec!["R1 pad 1 would change from 'VCC' to 'GND' while routed copper uses that net"],
+        );
+    }
+
+    /// The plan #779 unblocks applies: KiCad's board ends with `R1` pad 1 on
+    /// `NEW_NET` under the `GND` pour it was refused for before.
+    #[tokio::test]
+    async fn a_pad_under_a_pour_on_another_net_is_reassigned() {
+        let served = ServedSync::holding(HeldBoard {
+            footprints: vec![schematic_backed_resistor()],
+            zones: vec![zone_item(GND_POUR), zone_item(RULE_AREA)],
+            nets: vec!["VCC", "GND"],
+        })
+        .await;
+
+        let applied = served.apply(&netlist_moving_off("VCC")).await;
+
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let held = served.held.lock().unwrap();
+        let footprint = konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+            held[0].value.as_slice(),
+        )
+        .expect("the board's R1");
+        let r1 = board_footprint_from_instance(&footprint).expect("R1 identity");
+        assert_eq!(r1.pad_nets.get("1").map(String::as_str), Some("NEW_NET"));
+        assert_eq!(r1.pad_nets.get("2").map(String::as_str), Some("GND"));
+    }
+
+    /// A copper zone whose net cannot be read could pour any net, so the
+    /// board still fails closed for every one of them.
+    #[tokio::test]
+    async fn a_pour_without_a_net_blocks_every_net() {
+        let plan = plan_moving_off("VCC", vec![zone_item(GND_POUR), pour_without_a_net()]).await;
+
+        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(
+            routed_pad_conflicts(&plan),
+            vec!["R1 pad 1 would change from 'VCC' to 'NEW_NET' while routed copper uses that net"],
+            "{plan:#}"
+        );
     }
 
     /// The classes KiCad 10.0.5 refuses to list on every board.
