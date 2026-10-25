@@ -2018,6 +2018,7 @@ pub struct SheetInstanceContext {
 pub(crate) struct SchematicOwnership {
     pub project_file: std::path::PathBuf,
     pub root_schematic: std::path::PathBuf,
+    pub root_uuid: String,
     pub instance_paths: Vec<String>,
 }
 
@@ -2175,28 +2176,18 @@ pub(crate) fn resolve_schematic_ownership(
             continue;
         };
 
-        let mut instance_paths = Vec::new();
-        if same_schematic_document(&root_schematic, target) {
-            instance_paths.push(format!("/{root_uuid}"));
+        let instance_paths = if same_schematic_document(&root_schematic, target) {
+            vec![format!("/{root_uuid}")]
         } else {
-            let mut suffix = Vec::new();
-            let mut stack = std::collections::HashSet::new();
-            complete &= collect_sheet_instance_paths(
-                &root_schematic,
-                target,
-                &mut suffix,
-                &mut stack,
-                0,
-                &root_uuid,
-                &mut instance_paths,
-            );
-        }
-        instance_paths.sort();
-        instance_paths.dedup();
+            let found = sheet_file_instance_paths(&root_schematic, &root_uuid, target);
+            complete &= found.is_some();
+            found.unwrap_or_default()
+        };
         if !instance_paths.is_empty() {
             owners.push(SchematicOwnership {
                 project_file,
                 root_schematic,
+                root_uuid,
                 instance_paths,
             });
         }
@@ -2265,7 +2256,30 @@ fn collect_sheet_instance_paths(
     complete
 }
 
-fn same_schematic_document(left: &std::path::Path, right: &std::path::Path) -> bool {
+/// Every hierarchy path at which the root `root_schematic` instantiates
+/// `target`, sorted. `None` when a sheet on the way cannot be read, so the
+/// set is not known to be complete.
+pub(crate) fn sheet_file_instance_paths(
+    root_schematic: &std::path::Path,
+    root_uuid: &str,
+    target: &std::path::Path,
+) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    let complete = collect_sheet_instance_paths(
+        root_schematic,
+        target,
+        &mut Vec::new(),
+        &mut std::collections::HashSet::new(),
+        0,
+        root_uuid,
+        &mut found,
+    );
+    found.sort();
+    found.dedup();
+    complete.then_some(found)
+}
+
+pub(crate) fn same_schematic_document(left: &std::path::Path, right: &std::path::Path) -> bool {
     canonical_schematic_path(left) == canonical_schematic_path(right)
 }
 

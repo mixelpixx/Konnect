@@ -279,6 +279,64 @@ impl SchematicCommand {
         path: &str,
         label: impl Into<String>,
     ) -> Result<Option<Self>, SexpError> {
+        Self::patch_placed_symbols(source, label, |symbol, node, reference, unit| {
+            if symbol_instance_paths(node, project_name)
+                .iter()
+                .any(|p| p == path)
+            {
+                return Ok(None);
+            }
+            insert_symbol_instance_path(symbol, project_name, path, reference, unit).map(Some)
+        })
+    }
+
+    /// Make every placed symbol record exactly `paths` under `project_name`.
+    ///
+    /// Paths of that project which are not in `paths` are removed, missing
+    /// ones are added, and every other project's instances are left as they
+    /// are. Returns `None` when every symbol already matches.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `paths` is empty, a placed symbol lacks a UUID or has
+    /// malformed instance data, or the replacements fail command validation.
+    pub fn set_symbol_instance_paths(
+        source: &str,
+        project_name: &str,
+        paths: &[String],
+        label: impl Into<String>,
+    ) -> Result<Option<Self>, SexpError> {
+        if paths.is_empty() {
+            return Err(SexpError::InvalidValue(
+                "a symbol instance set needs at least one path".to_owned(),
+            ));
+        }
+        let mut wanted = paths.to_vec();
+        wanted.sort();
+        wanted.dedup();
+        Self::patch_placed_symbols(source, label, |symbol, node, reference, unit| {
+            let mut recorded = symbol_instance_paths(node, project_name);
+            recorded.sort();
+            if recorded == wanted {
+                return Ok(None);
+            }
+            let (mut replacement, kept) =
+                remove_symbol_instance_paths(symbol, project_name, &wanted)?;
+            for path in wanted.iter().filter(|path| !kept.contains(path)) {
+                replacement =
+                    insert_symbol_instance_path(&replacement, project_name, path, reference, unit)?;
+            }
+            Ok(Some(replacement))
+        })
+    }
+
+    /// Replace each placed symbol for which `patch` returns new source, given
+    /// the symbol's source, parsed node, Reference and unit.
+    fn patch_placed_symbols(
+        source: &str,
+        label: impl Into<String>,
+        mut patch: impl FnMut(&str, &SexpNode, &str, u32) -> Result<Option<String>, SexpError>,
+    ) -> Result<Option<Self>, SexpError> {
         let items = document_items(source)?;
         let mut changes = Vec::new();
         for item in items
@@ -286,13 +344,9 @@ impl SchematicCommand {
             .filter(|item| item.kind.as_deref() == Some("symbol"))
         {
             let node = parse_sexp(item.source)?;
-            if node.find("lib_id").is_none() || symbol_has_instance_path(&node, project_name, path)
-            {
+            if node.find("lib_id").is_none() {
                 continue;
             }
-            let id = item.id.clone().ok_or_else(|| {
-                SexpError::MissingNode("placed symbol UUID for instance patch".to_owned())
-            })?;
             let reference = symbol_property(&node, "Reference").unwrap_or_default();
             let unit = node
                 .find("unit")
@@ -300,8 +354,12 @@ impl SchematicCommand {
                 .and_then(SexpNode::as_str)
                 .and_then(|unit| unit.parse::<u32>().ok())
                 .unwrap_or(1);
-            let replacement =
-                insert_symbol_instance_path(item.source, project_name, path, reference, unit)?;
+            let Some(replacement) = patch(item.source, &node, reference, unit)? else {
+                continue;
+            };
+            let id = item.id.clone().ok_or_else(|| {
+                SexpError::MissingNode("placed symbol UUID for instance patch".to_owned())
+            })?;
             changes.push(ItemChange {
                 id,
                 before: Some(item.source.to_owned()),
@@ -927,15 +985,66 @@ fn item_conflict(path: &Path, id: &ItemId, reason: &str) -> SexpError {
     }
 }
 
-fn symbol_has_instance_path(node: &SexpNode, project_name: &str, path: &str) -> bool {
-    node.find("instances").is_some_and(|instances| {
-        instances.find_all("project").iter().any(|project| {
-            project.get(1).and_then(SexpNode::as_str) == Some(project_name)
-                && project.find_all("path").iter().any(|instance_path| {
-                    instance_path.get(1).and_then(SexpNode::as_str) == Some(path)
-                })
+fn symbol_instance_paths(node: &SexpNode, project_name: &str) -> Vec<String> {
+    node.find("instances")
+        .map(|instances| {
+            instances
+                .find_all("project")
+                .into_iter()
+                .filter(|project| project.get(1).and_then(SexpNode::as_str) == Some(project_name))
+                .flat_map(|project| project.find_all("path"))
+                .filter_map(|path| path.get(1).and_then(SexpNode::as_str).map(str::to_owned))
+                .collect()
         })
-    })
+        .unwrap_or_default()
+}
+
+/// Remove each `project_name` path of `symbol` that is not in `keep`, or that
+/// repeats one already kept, line and all. Returns the edited symbol and the
+/// paths it still records.
+fn remove_symbol_instance_paths(
+    symbol: &str,
+    project_name: &str,
+    keep: &[String],
+) -> Result<(String, Vec<String>), SexpError> {
+    let mut kept = Vec::new();
+    let mut edits = Vec::new();
+    let Some((instances_start, instances_end)) = find_direct_child_blocks(symbol, "symbol")
+        .into_iter()
+        .find(|(start, end)| {
+            parse_sexp(&symbol[*start..*end]).is_ok_and(|node| node.head() == Some("instances"))
+        })
+    else {
+        return Ok((symbol.to_owned(), kept));
+    };
+    let instances = &symbol[instances_start..instances_end];
+    for (project_start, project_end) in find_direct_child_blocks(instances, "instances") {
+        let project = &instances[project_start..project_end];
+        let project_node = parse_sexp(project)?;
+        if project_node.head() != Some("project")
+            || project_node.get(1).and_then(SexpNode::as_str) != Some(project_name)
+        {
+            continue;
+        }
+        for (path_start, path_end) in find_direct_child_blocks(project, "project") {
+            let path_node = parse_sexp(&project[path_start..path_end])?;
+            if path_node.head() != Some("path") {
+                continue;
+            }
+            let path = path_node
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .ok_or_else(|| SexpError::MissingNode("symbol instance path string".to_owned()))?;
+            if keep.iter().any(|wanted| wanted == path) && !kept.iter().any(|seen| seen == path) {
+                kept.push(path.to_owned());
+                continue;
+            }
+            let offset = instances_start + project_start;
+            let (start, end) = deletion_span(symbol, offset + path_start, offset + path_end);
+            edits.push(SexpEdit::delete(start, end));
+        }
+    }
+    Ok((apply_edits(symbol.to_owned(), edits), kept))
 }
 
 fn symbol_property<'a>(node: &'a SexpNode, name: &str) -> Option<&'a str> {
@@ -1449,6 +1558,72 @@ mod tests {
         )
         .expect("idempotence check succeeds")
         .is_none());
+    }
+
+    #[test]
+    fn symbol_instance_set_prunes_only_the_named_project() {
+        let source = r#"(kicad_sch
+	(symbol
+		(lib_id "Device:R")
+		(at 10 20 0)
+		(unit 1)
+		(property "Reference" "R1" (at 10 20 0))
+		(uuid "symbol-a")
+		(instances
+			(project "demo"
+				(path "/root/gone"
+					(reference "R1")
+					(unit 1)
+				)
+				(path "/root/live"
+					(reference "R7")
+					(unit 1)
+				)
+				(path "/root/live"
+					(reference "R1")
+					(unit 1)
+				)
+			)
+			(project "child"
+				(path "/fossil"
+					(reference "R1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(sheet_instances (path "/" (page "1")))
+)"#;
+        let wanted = ["/root/live".to_owned(), "/root/new".to_owned()];
+        let command =
+            SchematicCommand::set_symbol_instance_paths(source, "demo", &wanted, "Reconcile")
+                .expect("reconcile prepares")
+                .expect("the symbol needs reconciling");
+        let (patched, _) =
+            prepare_command(Path::new("child.kicad_sch"), source, &command).expect("applies");
+        parse_sexp(&patched).expect("reconciled schematic parses");
+
+        assert!(!patched.contains("/root/gone"));
+        assert_eq!(patched.matches("(path \"/root/live\"").count(), 1);
+        // The first kept entry keeps its own reference.
+        assert!(patched.contains("(path \"/root/live\"\n\t\t\t\t\t(reference \"R7\")"));
+        assert_eq!(patched.matches("(path \"/root/new\"").count(), 1);
+        assert!(patched.contains("(project \"child\"\n\t\t\t\t(path \"/fossil\""));
+        assert!(
+            !patched.contains("\n\n"),
+            "removed paths leave no blank lines"
+        );
+        assert!(SchematicCommand::set_symbol_instance_paths(
+            &patched,
+            "demo",
+            &wanted,
+            "Reconcile"
+        )
+        .expect("idempotence check succeeds")
+        .is_none());
+        assert!(
+            SchematicCommand::set_symbol_instance_paths(source, "demo", &[], "Reconcile").is_err()
+        );
     }
 
     #[test]

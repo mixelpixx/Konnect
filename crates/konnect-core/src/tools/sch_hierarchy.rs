@@ -86,7 +86,10 @@ pub fn tools() -> Vec<ToolDef> {
              links to it as-is if it does — reusing an existing file places the *same* \
              sub-circuit at a second location (KiCAD's multi-instance sheet pattern) rather \
              than duplicating it. If the linked file already has symbols in it, their \
-             hierarchical instance paths are patched immediately so ERC resolves them.",
+             hierarchical instance paths are patched immediately so ERC resolves them, and \
+             paths naming a sheet that no longer exists are dropped. A sheet added inside a \
+             child sheet is keyed from the project root through that sheet; a child sheet \
+             placed more than once cannot take a new sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -97,7 +100,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Top-left Y in mm. Default: 50" },
                     "width": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box width in mm. Default: 80" },
                     "height": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box height in mm. Default: 50" },
-                    "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Default: the schematic file's stem (matching eeschema)" }
+                    "project_name": { "type": "string", "description": PLACED_PROJECT_NAME_DESC }
                 },
                 "required": ["schematic", "sheet_file"]
             }),
@@ -141,8 +144,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "delete_sheet",
             "Remove a sheet reference from the parent schematic. Does NOT delete the child \
-             .kicad_sch file on disk. Remaining sheets' page numbers may now have a gap — \
-             call renumber_sheet_pages afterward if that matters.",
+             .kicad_sch file on disk. When other sheets still place that file, its symbols \
+             drop the deleted sheet's instance path. Remaining sheets' page numbers may now \
+             have a gap — call renumber_sheet_pages afterward if that matters.",
             json!({
                 "type": "object",
                 "properties": {
@@ -167,7 +171,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "source_sheet_name": { "type": "string" },
                     "new_sheet_name": { "type": "string" },
                     "new_file": { "type": "string", "description": "Filename for the copy, resolved relative to the parent's directory. Must not already exist." },
-                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
+                    "project_name": { "type": "string", "description": PLACED_PROJECT_NAME_DESC }
                 },
                 "required": ["schematic", "source_sheet_name", "new_sheet_name", "new_file"]
             }),
@@ -444,6 +448,9 @@ const SHEET_PIN_SIDE_DESC: &str =
 
 const PROJECT_NAME_DESC: &str =
     "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)";
+const PLACED_PROJECT_NAME_DESC: &str = "Project name key for instance entries. Default: the \
+     project that owns the schematic, or the schematic file's stem when none does. A name \
+     other than the owning project's is refused";
 
 fn validate_pin_type(pin_type: &str) -> Result<(), CallToolResult> {
     if ALLOWED_PIN_TYPES.contains(&pin_type) {
@@ -1025,14 +1032,18 @@ fn apply_hierarchy_prospective_fault(source: String) -> String {
     })
 }
 
+/// Commit `command`, together with `child` when given, after validating the
+/// exact prospective text, then independently verify the saved document.
 fn commit_verified_sheet_mutation(
     path: &Path,
     before: &str,
     command: &SchematicCommand,
     intent: &SheetMutationIntent,
     operation: &str,
+    child: Option<FileTransition>,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    let (prospective_source, _) = prepare_command(path, before, command)?;
+    let (prepared, _) = prepare_command(path, before, command)?;
+    let prospective_source = prepared.clone();
     #[cfg(test)]
     let prospective_source = apply_hierarchy_prospective_fault(prospective_source);
     let prospective = match cse::Schematic::from_source(path, prospective_source) {
@@ -1048,7 +1059,20 @@ fn commit_verified_sheet_mutation(
         return Ok(Some(sheet_precommit_refusal(path, reason)));
     }
 
-    commit_command(path, command)?;
+    match child {
+        None => {
+            commit_command(path, command)?;
+        }
+        Some(child) => {
+            commit_file_transaction(
+                parent_dir(path),
+                vec![
+                    FileTransition::replace(path, before.to_owned(), prepared),
+                    child,
+                ],
+            )?;
+        }
+    }
     let committed = match cse::Schematic::load(path) {
         Ok(schematic) => schematic,
         Err(error) => {
@@ -1090,7 +1114,7 @@ fn commit_edited_sheet_item(
         uuid: uuid.to_owned(),
         expected: intended.to_sexp(),
     };
-    commit_verified_sheet_mutation(path, before, &command, &intent, label)
+    commit_verified_sheet_mutation(path, before, &command, &intent, label, None)
 }
 
 /// Read one sheet pin back off the file a write has just committed, so a
@@ -1121,6 +1145,234 @@ fn read_back_sheet_pin(
     })
 }
 
+/// Where a sheet added to, or deleted from, a parent file sits in its project.
+struct SheetParent {
+    project_name: String,
+    root_schematic: PathBuf,
+    root_uuid: String,
+    /// The parent's hierarchy paths, which the sheets inside it key to.
+    instance_paths: Vec<String>,
+    /// Whether the parent is the root, which alone carries `sheet_instances`.
+    is_root: bool,
+}
+
+impl SheetParent {
+    /// The one path a new sheet keys to. A parent placed more than once would
+    /// need a page and an instance per placement, which nothing writes yet.
+    fn single_instance_path(&self, parent_path: &Path) -> Result<String, CallToolResult> {
+        match self.instance_paths.as_slice() {
+            [path] => Ok(path.clone()),
+            paths => Err(invalid_arg(
+                "schematic",
+                &format!(
+                    "'{}' is placed {} times in its hierarchy; adding a sheet inside a reused \
+                     sheet is not supported",
+                    parent_path.display(),
+                    paths.len()
+                ),
+            )),
+        }
+    }
+
+    /// Every hierarchy path at which the root instantiates `file`, or `None`
+    /// when a sheet on the way cannot be read.
+    fn live_paths_of(&self, file: &Path) -> Option<Vec<String>> {
+        super::sheet_file_instance_paths(&self.root_schematic, &self.root_uuid, file)
+    }
+}
+
+/// Place `parent_path` in its project, as `validate_sheet_instance_state`
+/// will: keyed from the owning project's root and named after it, so a sheet
+/// nested in a child sheet is keyed through that sheet (#478). A project root
+/// or a loose file is its own root. A `project_name` other than the owning
+/// project's is refused, since symbols keyed to it would fail every later
+/// write.
+fn locate_sheet_parent(
+    parent_path: &Path,
+    parent_uuid: &str,
+    project_name: Option<&str>,
+) -> Result<SheetParent, CallToolResult> {
+    let own_root = |project_name: String| SheetParent {
+        project_name,
+        root_schematic: parent_path.to_path_buf(),
+        root_uuid: parent_uuid.to_owned(),
+        instance_paths: vec![format!("/{parent_uuid}")],
+        is_root: true,
+    };
+    let owned_by = |owner_name: String| {
+        if project_name.is_some_and(|name| name != owner_name) {
+            return Err(invalid_arg(
+                "project_name",
+                &format!(
+                    "'{}' belongs to project '{owner_name}'; omit project_name or pass that name",
+                    parent_path.display()
+                ),
+            ));
+        }
+        Ok(owner_name)
+    };
+    // A root needs no hierarchy walk, which would refuse one that predates
+    // root UUIDs before this write could add it.
+    if parent_path.with_extension("kicad_pro").is_file() {
+        return owned_by(project_name_for(parent_path)).map(own_root);
+    }
+    let owner = super::resolve_schematic_ownership(parent_path)
+        .map_err(|error| error.into_tool_result())?;
+    let Some(owner) = owner else {
+        return Ok(own_root(
+            project_name
+                .map(str::to_owned)
+                .unwrap_or_else(|| project_name_for(parent_path)),
+        ));
+    };
+    Ok(SheetParent {
+        project_name: owned_by(project_name_for(&owner.project_file))?,
+        is_root: super::same_schematic_document(&owner.root_schematic, parent_path),
+        root_schematic: owner.root_schematic,
+        root_uuid: owner.root_uuid,
+        instance_paths: owner.instance_paths,
+    })
+}
+
+/// What a child file's symbols must record for one project once a sheet
+/// naming it is added or removed.
+enum ChildLink {
+    /// Exactly these paths: the hierarchy was read in full, so any other path
+    /// names a sheet that is gone.
+    Exact(Vec<String>),
+    /// This path besides the recorded ones, which cannot be proven stale.
+    Added(String),
+}
+
+impl ChildLink {
+    fn command(
+        &self,
+        source: &str,
+        project_name: &str,
+        label: &str,
+    ) -> Result<Option<SchematicCommand>, konnect_sexp::SexpError> {
+        match self {
+            Self::Exact(paths) => {
+                SchematicCommand::set_symbol_instance_paths(source, project_name, paths, label)
+            }
+            Self::Added(path) => {
+                SchematicCommand::ensure_symbol_instance_path(source, project_name, path, label)
+            }
+        }
+    }
+
+    /// The child's replacement source and how many symbols it changes, or
+    /// `None` when every symbol already records the wanted paths.
+    fn prepare(
+        &self,
+        child_path: &Path,
+        child_before: &str,
+        project_name: &str,
+        label: &str,
+    ) -> anyhow::Result<Option<(String, usize)>> {
+        let Some(command) = self.command(child_before, project_name, label)? else {
+            return Ok(None);
+        };
+        let (after, _) = prepare_command(child_path, child_before, &command)?;
+        Ok(Some((after, command.changes.len())))
+    }
+
+    /// `mutation_outcome_uncertain` when the committed child does not hold
+    /// this link. An exact set must also be the one the project's hierarchy
+    /// now gives the file, which is what later writes check.
+    fn verify(
+        &self,
+        child_path: &Path,
+        project_name: &str,
+        operation: &str,
+    ) -> Option<CallToolResult> {
+        let reason = match read_consistent(child_path) {
+            Err(error) => format!("the child file could not be read back: {error}"),
+            Ok(committed) => match self.command(&committed, project_name, "readback") {
+                Err(error) => format!("the child file's instances could not be read: {error}"),
+                Ok(Some(_)) => format!(
+                    "the child file's symbols do not record the expected instance paths for \
+                     project '{project_name}'"
+                ),
+                Ok(None) => {
+                    let Self::Exact(paths) = self else {
+                        return None;
+                    };
+                    let mut wanted = paths.clone();
+                    wanted.sort();
+                    wanted.dedup();
+                    match super::resolve_schematic_ownership(child_path) {
+                        Ok(Some(owner)) if owner.instance_paths != wanted => format!(
+                            "the project's hierarchy places the child at [{}], not at the \
+                             recorded [{}]",
+                            owner.instance_paths.join(", "),
+                            wanted.join(", ")
+                        ),
+                        _ => return None,
+                    }
+                }
+            },
+        };
+        Some(super::mutation_outcome_uncertain(
+            child_path, operation, reason,
+        ))
+    }
+}
+
+/// The edit that drops a deleted sheet's path from its file's symbols.
+struct ChildUnlink {
+    project_name: String,
+    link: ChildLink,
+    transition: FileTransition,
+    changed: usize,
+}
+
+/// Unlink a deleted sheet's file when other sheets still place it. `None`
+/// when nothing changes, nothing else places the file, the hierarchy cannot
+/// be read in full to prove which of its paths are gone, or the file cannot
+/// be patched; none of these stops the sheet itself being deleted. An
+/// unplaced file keeps its paths, so adding the sheet back reconciles them.
+fn remaining_child_link(
+    parent_path: &Path,
+    parent_uuid: &str,
+    child_path: &Path,
+    sheet_uuid: &str,
+) -> Option<ChildUnlink> {
+    if !child_path.is_file() {
+        return None;
+    }
+    let located = locate_sheet_parent(parent_path, parent_uuid, None).ok()?;
+    let live = located.live_paths_of(child_path)?;
+    let deleted: Vec<String> = located
+        .instance_paths
+        .iter()
+        .map(|path| format!("{path}/{sheet_uuid}"))
+        .collect();
+    let remaining: Vec<String> = live
+        .into_iter()
+        .filter(|path| !deleted.contains(path))
+        .collect();
+    if remaining.is_empty() {
+        return None;
+    }
+    let link = ChildLink::Exact(remaining);
+    let child_before = read_consistent(child_path).ok()?;
+    let (child_after, changed) = link
+        .prepare(
+            child_path,
+            &child_before,
+            &located.project_name,
+            "Unlink deleted sheet's symbols",
+        )
+        .ok()??;
+    Some(ChildUnlink {
+        project_name: located.project_name,
+        link,
+        transition: FileTransition::replace(child_path, child_before, child_after),
+        changed,
+    })
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 async fn handle_add_hierarchical_sheet(
@@ -1143,10 +1395,6 @@ async fn handle_add_hierarchical_sheet(
         Ok(height) => height.unwrap_or(50.0),
         Err(error) => return Ok(error),
     };
-    let project_name = opt_str(args, "project_name")
-        .map(str::to_string)
-        .unwrap_or_else(|| project_name_for(&parent_path));
-
     let dir = parent_dir(&parent_path);
     let child_path = dir.join(&sheet_file);
 
@@ -1191,10 +1439,23 @@ async fn handle_add_hierarchical_sheet(
             "The child schematic path exists but is not a regular file",
         ));
     }
+    let (parent_base, parent_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let located =
+        match locate_sheet_parent(&parent_path, &parent_uuid, opt_str(args, "project_name")) {
+            Ok(located) => located,
+            Err(error) => return Ok(error),
+        };
+    let parent_instance_path = match located.single_instance_path(&parent_path) {
+        Ok(path) => path,
+        Err(error) => return Ok(error),
+    };
+    let project_name = located.project_name.clone();
     let page = next_free_page(&parent, &project_name).to_string();
-    let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
-    let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
-    let root_path = format!("/{root_uuid}");
+    let parent_base = if located.is_root {
+        ensure_hierarchy_root_footer(&parent_base)?
+    } else {
+        parent_base
+    };
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &sheet_name,
         file: &sheet_file,
@@ -1203,7 +1464,7 @@ async fn handle_add_hierarchical_sheet(
         width,
         height,
         project_name: &project_name,
-        parent_instance_path: &root_path,
+        parent_instance_path: &parent_instance_path,
         page: &page,
     });
     let parent_command = SchematicCommand::insert_item(
@@ -1230,21 +1491,32 @@ async fn handle_add_hierarchical_sheet(
         parent_after,
     )];
     let mut patched = 0usize;
+    let mut child_link = None;
     if let Some(child_before) = child_before {
-        let hierarchy_path = format!("{root_path}/{sheet_uuid}");
-        if let Some(child_command) = SchematicCommand::ensure_symbol_instance_path(
+        // The child keeps the paths its other sheets still give it and gains
+        // the new one. Paths naming a deleted sheet are dropped, but only when
+        // the whole hierarchy could be read to prove they are gone.
+        let hierarchy_path = format!("{parent_instance_path}/{sheet_uuid}");
+        let link = match located.live_paths_of(&child_path) {
+            Some(mut live) => {
+                live.push(hierarchy_path);
+                ChildLink::Exact(live)
+            }
+            None => ChildLink::Added(hierarchy_path),
+        };
+        if let Some((child_after, changed)) = link.prepare(
+            &child_path,
             &child_before,
             &project_name,
-            &hierarchy_path,
             "Link hierarchical child symbols",
         )? {
-            patched = child_command.changes.len();
-            let (child_after, _) = prepare_command(&child_path, &child_before, &child_command)?;
+            patched = changed;
             transitions.push(FileTransition::replace(
                 &child_path,
                 child_before,
                 child_after,
             ));
+            child_link = Some(link);
         }
     } else {
         transitions.push(FileTransition::create(
@@ -1254,6 +1526,11 @@ async fn handle_add_hierarchical_sheet(
     }
     commit_file_transaction(&dir, transitions)?;
 
+    if let Some(error) = child_link
+        .and_then(|link| link.verify(&child_path, &project_name, "add_hierarchical_sheet"))
+    {
+        return Ok(error);
+    }
     let committed = cse::Schematic::load(&parent_path)?;
     let sheet_ref = committed
         .sheets
@@ -1414,19 +1691,40 @@ async fn handle_delete_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result
             let uuid = removed.uuid.clone();
             let command =
                 SchematicCommand::delete_item(&before, ItemId::new(uuid.clone())?, "Delete sheet")?;
-            let intent = SheetMutationIntent::Absent { uuid };
+            let intent = SheetMutationIntent::Absent { uuid: uuid.clone() };
+            let child_path = parent_dir(&sch_path).join(&child_file);
+            let unlink = sch.uuid.as_deref().and_then(|parent_uuid| {
+                remaining_child_link(&sch_path, parent_uuid, &child_path, &uuid)
+            });
+            let (transition, unlinked) = match unlink {
+                Some(ChildUnlink {
+                    project_name,
+                    link,
+                    transition,
+                    changed,
+                }) => (Some(transition), Some((link, project_name, changed))),
+                None => (None, None),
+            };
             if let Some(error) = commit_verified_sheet_mutation(
                 &sch_path,
                 &before,
                 &command,
                 &intent,
                 "delete_sheet",
+                transition,
             )? {
                 return Ok(error);
             }
+            if let Some(error) = unlinked.as_ref().and_then(|(link, project_name, _)| {
+                link.verify(&child_path, project_name, "delete_sheet")
+            }) {
+                return Ok(error);
+            }
+            let unlinked = unlinked.map_or(0, |(_, _, changed)| changed);
             Ok(CallToolResult::json(&json!({
                 "deleted": sheet_name,
                 "child_file_preserved": child_file,
+                "unlinked_symbol_instances": unlinked,
                 "note": "The child schematic file was not deleted. Remaining sheets' page \
                          numbers may now have a gap — call renumber_sheet_pages if needed."
             })))
@@ -1455,10 +1753,6 @@ async fn handle_duplicate_sheet(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let project_name = opt_str(args, "project_name")
-        .map(str::to_string)
-        .unwrap_or_else(|| project_name_for(&sch_path));
-
     let parent_before = read_consistent(&sch_path)?;
     let parent = cse::Schematic::load(&sch_path)?;
 
@@ -1515,10 +1809,23 @@ async fn handle_duplicate_sheet(
     }
 
     const DUPLICATE_OFFSET_MM: f64 = 20.0;
+    let (parent_base, parent_uuid) = ensure_source_root_uuid(&parent_before)?;
+    let located = match locate_sheet_parent(&sch_path, &parent_uuid, opt_str(args, "project_name"))
+    {
+        Ok(located) => located,
+        Err(error) => return Ok(error),
+    };
+    let parent_instance_path = match located.single_instance_path(&sch_path) {
+        Ok(path) => path,
+        Err(error) => return Ok(error),
+    };
+    let project_name = located.project_name;
     let page = next_free_page(&parent, &project_name).to_string();
-    let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
-    let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
-    let root_path = format!("/{root_uuid}");
+    let parent_base = if located.is_root {
+        ensure_hierarchy_root_footer(&parent_base)?
+    } else {
+        parent_base
+    };
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &new_name,
         file: &new_file,
@@ -1527,7 +1834,7 @@ async fn handle_duplicate_sheet(
         width: src_w,
         height: src_h,
         project_name: &project_name,
-        parent_instance_path: &root_path,
+        parent_instance_path: &parent_instance_path,
         page: &page,
     });
     let parent_command = SchematicCommand::insert_item(
@@ -1550,19 +1857,16 @@ async fn handle_duplicate_sheet(
     let refreshed_child = regenerate_item_uuids(&source_child_content);
     let duplicated_uuid = uuid::Uuid::new_v4().to_string();
     let duplicated_base = replace_source_root_uuid(&refreshed_child, &duplicated_uuid)?;
-    let hierarchy_path = format!("{root_path}/{sheet_uuid}");
-    let (duplicated_after, patched) = if let Some(command) =
-        SchematicCommand::ensure_symbol_instance_path(
-            &duplicated_base,
-            &project_name,
-            &hierarchy_path,
-            "Link duplicated child symbols",
-        )? {
-        let count = command.changes.len();
-        let (after, _) = prepare_command(&new_child, &duplicated_base, &command)?;
-        (after, count)
-    } else {
-        (duplicated_base, 0)
+    // The copy is placed once, so it drops the source's paths in this project.
+    let link = ChildLink::Exact(vec![format!("{parent_instance_path}/{sheet_uuid}")]);
+    let (duplicated_after, patched) = match link.prepare(
+        &new_child,
+        &duplicated_base,
+        &project_name,
+        "Link duplicated child symbols",
+    )? {
+        Some(prepared) => prepared,
+        None => (duplicated_base, 0),
     };
     commit_file_transaction(
         &dir,
@@ -1571,6 +1875,9 @@ async fn handle_duplicate_sheet(
             FileTransition::create(&new_child, duplicated_after),
         ],
     )?;
+    if let Some(error) = link.verify(&new_child, &project_name, "duplicate_sheet") {
+        return Ok(error);
+    }
 
     let committed = cse::Schematic::load(&sch_path)?;
     let sheet_ref = committed
@@ -5116,5 +5423,433 @@ mod page_tests {
         for (n, w, h) in PAPER_SIZES {
             assert!(w > h, "{n} is listed portrait; the table is landscape");
         }
+    }
+}
+
+/// Sheet add, delete and duplicate keep each symbol's instance paths to the
+/// sheets that place it (#478). The fixture and its KiCad netlist oracle are
+/// described in `tests/fixtures/sheet_instance_paths/README.md`.
+#[cfg(test)]
+mod instance_path_lifecycle_tests {
+    use crate::tools::{sheet_instance_context, validate_sheet_instance_state, ServerConfig};
+    use konnect_schematic_editor as cse;
+    use konnect_sexp::{parse_sexp, SexpNode};
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    // Identities from the fixture, as KiCad 10.0.6's netlist reports them.
+    const ROOT: &str = "d0dc0cde-fd00-4536-b512-b225e546d529";
+    const SHARED_B: &str = "960dfe25-e6b4-4474-bf97-e779fae4b5e1";
+    const MID: &str = "5c0eb261-ed77-46f8-b89a-8b0c68833e04";
+    /// Sheets the fixture deleted; paths naming them are stale.
+    const DELETED_CHILD: &str = "8cfbc41c-1769-4f0e-a76a-3a88df1bb62b";
+    const DELETED_LEAF: &str = "824b7475-7b88-4c1b-8c63-e9c488733098";
+
+    fn project() -> (TempDir, PathBuf) {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sheet_instance_paths");
+        let tmp = TempDir::new().unwrap();
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".md") {
+                continue;
+            }
+            std::fs::copy(entry.path(), tmp.path().join(name)).unwrap();
+        }
+        let root = tmp.path().join("demo.kicad_sch");
+        (tmp, root)
+    }
+
+    async fn served(tool: &str, arguments: Value) -> (bool, Value) {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 478, "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
+        (result["isError"] == json!(true), body)
+    }
+
+    /// Every `(project, path)` each placed symbol records, sorted, by
+    /// reference. Read from the raw file rather than the editor model the
+    /// code under test uses.
+    fn recorded(file: &Path) -> Vec<(String, Vec<(String, String)>)> {
+        let tree = parse_sexp(&std::fs::read_to_string(file).unwrap()).unwrap();
+        tree.find_all("symbol")
+            .into_iter()
+            .filter(|symbol| symbol.find("lib_id").is_some())
+            .map(|symbol| {
+                let reference = symbol
+                    .find_all("property")
+                    .into_iter()
+                    .find(|property| {
+                        property.get(1).and_then(SexpNode::as_str) == Some("Reference")
+                    })
+                    .and_then(|property| property.get(2).and_then(SexpNode::as_str))
+                    .unwrap()
+                    .to_owned();
+                let mut paths = Vec::new();
+                for project in symbol.find("instances").unwrap().find_all("project") {
+                    let name = project.get(1).and_then(SexpNode::as_str).unwrap();
+                    for path in project.find_all("path") {
+                        let path = path.get(1).and_then(SexpNode::as_str).unwrap();
+                        paths.push((name.to_owned(), path.to_owned()));
+                    }
+                }
+                paths.sort();
+                (reference, paths)
+            })
+            .collect()
+    }
+
+    fn demo(paths: &[String]) -> Vec<(String, String)> {
+        let mut paths: Vec<_> = paths
+            .iter()
+            .map(|path| ("demo".to_owned(), path.clone()))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn sheet_uuid(file: &Path, name: &str) -> String {
+        cse::Schematic::load(file)
+            .unwrap()
+            .sheets
+            .by_name(name)
+            .unwrap()
+            .uuid
+            .clone()
+    }
+
+    /// The precondition every later Konnect write to `file` checks.
+    fn writable(file: &Path) -> Result<(), String> {
+        let mut schematic = cse::Schematic::load(file).unwrap();
+        let context = sheet_instance_context(file, &mut schematic).map_err(|e| e.to_string())?;
+        validate_sheet_instance_state(file, &schematic, &context).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_fixture_starts_stale_where_the_readme_says() {
+        let (tmp, _root) = project();
+        let child = tmp.path().join("child.kicad_sch");
+        let paths = &recorded(&child)[0].1;
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|(_, path)| path.ends_with(DELETED_CHILD)));
+        assert!(writable(&child).unwrap_err().contains("stale"));
+        assert!(writable(&tmp.path().join("shared.kicad_sch")).is_ok());
+    }
+
+    /// The readback a relink ends with, run against the file #478 wrote.
+    #[test]
+    fn readback_flags_a_child_the_hierarchy_does_not_place_as_recorded() {
+        let (tmp, _root) = project();
+        let child = tmp.path().join("child.kicad_sch");
+        let live = format!("/{ROOT}/a92b6a1a-7166-40e6-b18f-7a9e05809f8e");
+        let stale = format!("/{ROOT}/{DELETED_CHILD}");
+        let verify = |link: super::ChildLink| {
+            link.verify(&child, "demo", "add_hierarchical_sheet")
+                .map(|error| match &error.content[0] {
+                    crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+                    _ => panic!("expected text content"),
+                })
+        };
+
+        // The file records exactly this set, but the hierarchy gives it only `live`.
+        let error = verify(super::ChildLink::Exact(vec![live.clone(), stale])).unwrap();
+        assert!(error.contains("mutation_outcome_uncertain"), "{error}");
+        assert!(error.contains("hierarchy places the child"), "{error}");
+        // The file does not record exactly the live set.
+        let error = verify(super::ChildLink::Exact(vec![live.clone()])).unwrap();
+        assert!(error.contains("do not record the expected"), "{error}");
+        // An added path only has to be present.
+        assert!(verify(super::ChildLink::Added(live)).is_none());
+    }
+
+    #[tokio::test]
+    async fn re_adding_a_sheet_keys_its_symbols_to_the_new_sheet_only() {
+        let (tmp, root) = project();
+        let child = tmp.path().join("child.kicad_sch");
+        let schematic = root.display().to_string();
+
+        let (failed, _) = served(
+            "delete_sheet",
+            json!({"schematic": schematic, "sheet_name": "Child"}),
+        )
+        .await;
+        assert!(!failed);
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": schematic, "sheet_file": "child.kicad_sch", "sheet_name": "Child"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        let live = format!("/{ROOT}/{}", sheet_uuid(&root, "Child"));
+        assert_eq!(recorded(&child), vec![("R1".to_owned(), demo(&[live]))]);
+        assert_eq!(body["patched_symbol_instances"], json!(1));
+        writable(&child).unwrap();
+    }
+
+    #[tokio::test]
+    async fn linking_a_file_drops_the_path_of_its_deleted_sheet() {
+        let (tmp, root) = project();
+        let leaf = tmp.path().join("leaf.kicad_sch");
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_file": "leaf.kicad_sch",
+                   "sheet_name": "Leaf"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        let live = format!("/{ROOT}/{}", sheet_uuid(&root, "Leaf"));
+        assert_eq!(recorded(&leaf), vec![("R3".to_owned(), demo(&[live]))]);
+        assert!(!std::fs::read_to_string(&leaf)
+            .unwrap()
+            .contains(DELETED_LEAF));
+        writable(&leaf).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_placement_keeps_the_first() {
+        let (tmp, root) = project();
+        let leaf = tmp.path().join("leaf.kicad_sch");
+        let schematic = root.display().to_string();
+        for name in ["Leaf A", "Leaf B"] {
+            let (failed, body) = served(
+                "add_hierarchical_sheet",
+                json!({"schematic": schematic, "sheet_file": "leaf.kicad_sch", "sheet_name": name}),
+            )
+            .await;
+            assert!(!failed, "{body}");
+        }
+
+        let live = [
+            format!("/{ROOT}/{}", sheet_uuid(&root, "Leaf A")),
+            format!("/{ROOT}/{}", sheet_uuid(&root, "Leaf B")),
+        ];
+        assert_eq!(recorded(&leaf), vec![("R3".to_owned(), demo(&live))]);
+        writable(&leaf).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_one_placement_of_a_shared_file_unlinks_only_that_one() {
+        let (tmp, root) = project();
+        let shared = tmp.path().join("shared.kicad_sch");
+
+        let (failed, body) = served(
+            "delete_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_name": "Shared A"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        let live = format!("/{ROOT}/{SHARED_B}");
+        assert_eq!(recorded(&shared), vec![("R2".to_owned(), demo(&[live]))]);
+        assert_eq!(body["unlinked_symbol_instances"], json!(1));
+        writable(&shared).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_the_only_placement_leaves_the_file_untouched() {
+        let (tmp, root) = project();
+        let child = tmp.path().join("child.kicad_sch");
+        let before = std::fs::read(&child).unwrap();
+
+        let (failed, body) = served(
+            "delete_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_name": "Child"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        assert_eq!(std::fs::read(&child).unwrap(), before);
+        assert_eq!(body["unlinked_symbol_instances"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn a_nested_sheet_is_keyed_from_the_root_through_its_parent() {
+        let (tmp, _root) = project();
+        let mid = tmp.path().join("mid.kicad_sch");
+        let leaf = tmp.path().join("leaf.kicad_sch");
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": mid.display().to_string(), "sheet_file": "leaf.kicad_sch",
+                   "sheet_name": "Leaf"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        let nested = sheet_uuid(&mid, "Leaf");
+        let live = format!("/{ROOT}/{MID}/{nested}");
+        assert_eq!(recorded(&leaf), vec![("R3".to_owned(), demo(&[live]))]);
+        // The sheet itself is keyed to its parent's place, in the project.
+        let sheet = cse::Schematic::load(&mid).unwrap();
+        let sheet = sheet.sheets.by_name("Leaf").unwrap();
+        assert_eq!(sheet.page("demo"), body["sheet"]["page"].as_str());
+        let mid_source = std::fs::read_to_string(&mid).unwrap();
+        assert!(mid_source.contains(&format!("(path \"/{ROOT}/{MID}\"")));
+        assert!(!mid_source.contains("(project \"mid\""));
+        // Only the root carries the hierarchy's page-1 footer.
+        assert!(!mid_source.contains("(sheet_instances"));
+        writable(&leaf).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sheet_inside_a_reused_sheet_is_refused_before_writing() {
+        let (tmp, _root) = project();
+        let before: Vec<_> = ["demo", "shared", "leaf"]
+            .iter()
+            .map(|stem| std::fs::read(tmp.path().join(format!("{stem}.kicad_sch"))).unwrap())
+            .collect();
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": tmp.path().join("shared.kicad_sch").display().to_string(),
+                   "sheet_file": "leaf.kicad_sch", "sheet_name": "Leaf"}),
+        )
+        .await;
+
+        assert!(failed);
+        assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+        assert!(body.to_string().contains("placed 2 times"), "{body}");
+        for (stem, bytes) in ["demo", "shared", "leaf"].iter().zip(before) {
+            assert_eq!(
+                std::fs::read(tmp.path().join(format!("{stem}.kicad_sch"))).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_root_without_a_uuid_still_takes_a_sheet() {
+        let (tmp, root) = project();
+        let source = std::fs::read_to_string(&root).unwrap();
+        let line = format!("\t(uuid \"{ROOT}\")\n");
+        assert!(source.contains(&line));
+        std::fs::write(&root, source.replacen(&line, "", 1)).unwrap();
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_file": "leaf.kicad_sch",
+                   "sheet_name": "Leaf"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        let added = cse::Schematic::load(&root).unwrap().uuid.unwrap();
+        let live = format!("/{added}/{}", sheet_uuid(&root, "Leaf"));
+        let leaf = tmp.path().join("leaf.kicad_sch");
+        assert_eq!(recorded(&leaf), vec![("R3".to_owned(), demo(&[live]))]);
+    }
+
+    #[tokio::test]
+    async fn a_child_that_cannot_be_unlinked_does_not_block_the_delete() {
+        let (tmp, root) = project();
+        let shared = tmp.path().join("shared.kicad_sch");
+        // A placed symbol without a UUID cannot be patched as an item.
+        let source = std::fs::read_to_string(&shared).unwrap();
+        let line = "\t\t(uuid \"8c85d931-4026-450e-8014-055842798091\")\n";
+        assert!(source.contains(line));
+        std::fs::write(&shared, source.replacen(line, "", 1)).unwrap();
+        let before = std::fs::read(&shared).unwrap();
+
+        let (failed, body) = served(
+            "delete_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_name": "Shared A"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        assert!(cse::Schematic::load(&root)
+            .unwrap()
+            .sheets
+            .by_name("Shared A")
+            .is_none());
+        assert_eq!(std::fs::read(&shared).unwrap(), before);
+        assert_eq!(body["unlinked_symbol_instances"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn a_project_name_naming_another_project_is_refused_before_writing() {
+        let (tmp, root) = project();
+        let before: Vec<_> = ["demo", "leaf"]
+            .iter()
+            .map(|stem| std::fs::read(tmp.path().join(format!("{stem}.kicad_sch"))).unwrap())
+            .collect();
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_file": "leaf.kicad_sch",
+                   "sheet_name": "Leaf", "project_name": "other"}),
+        )
+        .await;
+
+        assert!(failed);
+        assert_eq!(body["error"]["kind"], json!("invalid_argument"), "{body}");
+        assert_eq!(body["error"]["field"], json!("project_name"));
+        for (stem, bytes) in ["demo", "leaf"].iter().zip(before) {
+            assert_eq!(
+                std::fs::read(tmp.path().join(format!("{stem}.kicad_sch"))).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_sheet_keeps_paths_that_cannot_be_proven_stale() {
+        let (tmp, root) = project();
+        std::fs::remove_file(tmp.path().join("mid.kicad_sch")).unwrap();
+        let leaf = tmp.path().join("leaf.kicad_sch");
+
+        let (failed, body) = served(
+            "add_hierarchical_sheet",
+            json!({"schematic": root.display().to_string(), "sheet_file": "leaf.kicad_sch",
+                   "sheet_name": "Leaf"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        let kept = [
+            format!("/{ROOT}/{DELETED_LEAF}"),
+            format!("/{ROOT}/{}", sheet_uuid(&root, "Leaf")),
+        ];
+        assert_eq!(recorded(&leaf), vec![("R3".to_owned(), demo(&kept))]);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_is_keyed_to_its_own_sheet_only() {
+        let (tmp, root) = project();
+
+        let (failed, body) = served(
+            "duplicate_sheet",
+            json!({"schematic": root.display().to_string(), "source_sheet_name": "Child",
+                   "new_sheet_name": "Copy", "new_file": "copy.kicad_sch"}),
+        )
+        .await;
+        assert!(!failed, "{body}");
+
+        let copy = tmp.path().join("copy.kicad_sch");
+        let live = format!("/{ROOT}/{}", sheet_uuid(&root, "Copy"));
+        assert_eq!(recorded(&copy), vec![("R1".to_owned(), demo(&[live]))]);
+        writable(&copy).unwrap();
     }
 }
