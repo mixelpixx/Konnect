@@ -1005,6 +1005,52 @@ pub fn find_t_junctions(wires: &[Wire], tol: f64) -> Vec<(f64, f64)> {
     junctions
 }
 
+/// Whether a junction dot belongs at `(px, py)`, a point where a wire, pin,
+/// sheet pin or bus entry ends.
+///
+/// eeschema's `JUNCTION_HELPERS::AnalyzePoint` asks for one at three or more
+/// distinct wire exits. A wire ending there is one exit, a wire passing
+/// through is two, and each of `others` at the point is one more: a symbol's
+/// pin tip, a sheet pin, a bus entry's wire end. Collinear wires leaving the
+/// same way count once. [`find_t_junctions`] only finds a wire end landing
+/// mid-span, so three wire ends meeting at a T got no dot from it (#897), and
+/// it dots a collinear overlap that has only two exits.
+pub fn wire_end_needs_junction(
+    wires: &[Wire],
+    others: &[(f64, f64)],
+    px: f64,
+    py: f64,
+    tol: f64,
+) -> bool {
+    use crate::geometry::points_coincident;
+    // Tenths of a degree in [0, 3600), so the set compares exactly: atan2
+    // gives +180 or -180 for the same leftward exit by the sign of a tiny dy.
+    let angle = |x: f64, y: f64| {
+        (((y - py).atan2(x - px).to_degrees() * 10.0).round() as i64).rem_euclid(3600)
+    };
+    let mut exits: Vec<i64> = Vec::new();
+    for w in wires {
+        if points_coincident(w.x1, w.y1, w.x2, w.y2, tol) {
+            continue;
+        }
+        if points_coincident(px, py, w.x1, w.y1, tol) {
+            exits.push(angle(w.x2, w.y2));
+        } else if points_coincident(px, py, w.x2, w.y2, tol) {
+            exits.push(angle(w.x1, w.y1));
+        } else if point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol) {
+            exits.push(angle(w.x1, w.y1));
+            exits.push(angle(w.x2, w.y2));
+        }
+    }
+    exits.sort_unstable();
+    exits.dedup();
+    let other_exits = others
+        .iter()
+        .filter(|&&(x, y)| points_coincident(px, py, x, y, tol))
+        .count();
+    exits.len() + other_exits >= 3
+}
+
 // ─── S-expression formatters for new elements ─────────────────────────────────
 
 pub fn format_wire(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
@@ -1207,6 +1253,29 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     (uuid "{uuid}")
   )"#
     )
+}
+
+#[cfg(test)]
+mod wire_end_junction_tests {
+    use super::*;
+
+    fn wire(x2: f64, y2: f64) -> Wire {
+        Wire {
+            x1: 0.0,
+            y1: 0.0,
+            x2,
+            y2,
+            uuid: None,
+        }
+    }
+
+    /// Two wires leaving left, one a hair above the axis and one below,
+    /// are one exit. atan2 calls them +180 and -180.
+    #[test]
+    fn a_leftward_exit_is_one_exit_whichever_side_of_the_axis() {
+        let wires = [wire(-10.0, 1e-9), wire(-10.0, -1e-9), wire(10.0, 0.0)];
+        assert!(!wire_end_needs_junction(&wires, &[], 0.0, 0.0, 0.01));
+    }
 }
 
 #[cfg(test)]

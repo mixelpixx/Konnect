@@ -3,6 +3,26 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: wire tools dot a T built from wire ends (patch release)
+
+`add_wire`, `batch_add_wire`, `connect_to_net`, `batch_connect_to_net`,
+`connect_pins`, `batch_connect_pins` and `add_schematic_connection` used to add a
+junction dot only where a wire end landed mid-span on another wire, or where a
+wire passed over a pin. When three or more wire ends met at one point, they
+wrote no dot. KiCad still connected the ends, but the sheet showed a T that
+looked like a crossing.
+
+Now every point a new wire touches is judged by how many distinct exits meet
+there, counted as eeschema's `JUNCTION_HELPERS::AnalyzePoint` counts them. A
+wire ending there is one exit, and a wire passing through is two. Each symbol
+with a pin tip there is one more, and so are a sheet pin and the wire side of a
+bus entry. Three or more exits get a dot. So two wire ends meeting at a pin
+tip, a sheet pin or a bus entry also get one. A plain corner, or two wires that
+overlap and leave in the same direction, gets none. That includes a collinear
+overlap whose end lands mid-span, which used to get a dot. Pins that one symbol
+stacks on a point, or that two body styles put there, count once.
+Connectivity, schemas and response shapes are unchanged (#897).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

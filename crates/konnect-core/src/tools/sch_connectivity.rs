@@ -568,6 +568,33 @@ pub(crate) struct ConnectivityIndex<'a> {
     placed_pins: Vec<PlacedPin>,
 }
 
+/// The wire-side end of each bus entry on the sheet.
+///
+/// An entry terminates a wire only when saved geometry proves exactly one
+/// corner lies on a bus. Zero matches are detached; two matches are ambiguous
+/// between buses. Neither case licenses a guessed wire side.
+pub(crate) fn bus_entry_wire_ends(
+    tree: &SexpNode,
+    buses: &[Wire],
+    tolerance: f64,
+) -> Vec<(f64, f64)> {
+    bus_entry_wire_ends_on(tree, &WireIndex::build(buses, tolerance))
+}
+
+fn bus_entry_wire_ends_on(tree: &SexpNode, on_bus: &WireIndex) -> Vec<(f64, f64)> {
+    extract_bus_entries(tree)
+        .into_iter()
+        .filter_map(|entry| entry.endpoints())
+        .filter_map(
+            |(at, far)| match (on_bus.covers(at.0, at.1), on_bus.covers(far.0, far.1)) {
+                (true, false) => Some(far),
+                (false, true) => Some(at),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
 impl<'a> ConnectivityIndex<'a> {
     /// `labels` should be `extract_all_net_labels`: a power symbol names a net
     /// exactly as a label does, and [`net_graph`](Self::net_graph) needs both.
@@ -594,20 +621,7 @@ impl<'a> ConnectivityIndex<'a> {
         let junctions = extract_junctions(tree);
         let sheet_pins = extract_sheet_pins(tree);
         let on_bus = WireIndex::build(buses, tolerance);
-        // An entry terminates a wire only when saved geometry proves exactly
-        // one corner lies on a bus. Zero matches are detached; two matches are
-        // ambiguous between buses. Neither case licenses a guessed wire side.
-        let bus_entry_wire_points = extract_bus_entries(tree)
-            .into_iter()
-            .filter_map(|entry| entry.endpoints())
-            .filter_map(|(at, far)| {
-                match (on_bus.covers(at.0, at.1), on_bus.covers(far.0, far.1)) {
-                    (true, false) => Some(far),
-                    (false, true) => Some(at),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
+        let bus_entry_wire_points = bus_entry_wire_ends_on(tree, &on_bus);
 
         ConnectivityIndex {
             wires,
