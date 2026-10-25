@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `get_net_connections` lists the net's pins and all its labels (minor release)
+
+`get_net_connections` was described as returning a net's pins and labels but
+returned only the labels and a `connected_points` count. It now adds `pins`,
+one `{reference, pin, name, x, y}` entry per component pin on the net. As in
+`kicad-cli sch export netlist`, power symbols and `PWR_FLAG`s (`#` references)
+name a net but are not listed as its pins.
+
+`labels` is now chosen by net rather than by name, and each entry carries the
+`net` it spells. A net with several names (a `+3V3` power symbol beside a `VCC`
+label) used to list only the labels spelling the requested name, while
+`connected_points` covered the whole net; asked by any of its names, it now
+lists every label on it, and `label_count` counts them all. A net with one name
+answers as before, apart from the added `net` field.
+
+A schematic where a placed symbol's library entry cannot be found is refused
+with an error instead of answering with that symbol's pins missing (#853).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
