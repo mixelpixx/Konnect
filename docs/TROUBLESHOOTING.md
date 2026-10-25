@@ -530,6 +530,25 @@ A native compact tool-surface mode and MCP tool-directory resource are planned
 in the [client compatibility roadmap](../ROADMAP.md#4-client-compatibility),
 but are not available yet.
 
+## Muse (Meta) never sees tools loaded after startup
+
+Muse reads `tools/list` once at session start and does not act on
+`notifications/tools/list_changed`. The symptom is the same class as
+[#134](https://github.com/mixelpixx/Konnect/issues/134) and
+[#169](https://github.com/mixelpixx/Konnect/issues/169): `load_toolset`
+reports success, but every tool outside the starter kit stays uncallable,
+persistently across restarts.
+
+Unlike VS Code Copilot ([#325](https://github.com/mixelpixx/Konnect/issues/325)),
+no client-side tool cap has been observed, so `eager_toolsets = true` fully
+resolves it: the first listing carries the whole catalog (223 tools measured
+on Konnect v0.11.0) and every tool resolves with no further loading. Prefer
+`settings.json` beside the binary — a harness-spawned server may run with a
+redirected environment that never sees a user-profile config file. Then
+restart the Muse session: Muse does not respawn a running MCP server, so the
+setting takes effect on the next session start. Cost is the usual ~25K tokens
+per listing instead of ~2K.
+
 ## Plugin doesn't appear in KiCAD
 
 Install via **Plugin and Content Manager → Install from File** with the
