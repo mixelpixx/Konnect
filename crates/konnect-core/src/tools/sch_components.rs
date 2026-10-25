@@ -10,8 +10,9 @@ use crate::mcp::{
 };
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
-    require_array, require_f64, require_str,
+    find_all_symbol_instance_blocks, get_path, invalid_arg, opt_f64, opt_str, opt_u32,
+    reembed_lib_symbols, require_array, require_f64, require_str,
+    sch_block_move::{misplaced_item, pin_net_changes, translate_block, Region},
     sch_wiring::{
         apply_no_connect_carries, carry_no_connects, no_connect_carry_unwritable,
         observed_no_connect_moves, plan_no_connect_carry_for_replacement,
@@ -201,11 +202,18 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "move_region",
             "Move all symbol units whose origins are within a bounding box by a given offset. \
-             Does NOT adjust connected wires. Junction dots are re-judged once for the whole \
-             region where its pins moved, reported as junctions_pruned_count and \
-             junctions_added_count. No-connect flags travel with the pins they protect, \
-             reported as no_connects_moved; the move is refused before writing when a pin \
-             cannot be followed one-to-one.",
+             With include 'symbols' (the default) only symbols move, snapped to the 1.27 mm \
+             grid, and connected wires are NOT adjusted. With include 'all' the block moves \
+             rigidly by exactly (dx, dy): symbols, wires, buses, bus entries, junctions, labels, \
+             no-connects, texts, text boxes, directive labels and sheets inside the box, counted \
+             by kind in items_moved (no-connects in no_connects_moved); graphic shapes and \
+             images stay. It is refused before writing (plan_blocked) when a wire, \
+             bus, bus entry, symbol or sheet crosses the box edge, or when any pin's net would \
+             change. \
+             Junction dots are re-judged once for the whole region where its pins moved, \
+             reported as junctions_pruned_count and junctions_added_count. No-connect flags \
+             travel with the pins they protect, reported as no_connects_moved; the move is \
+             refused before writing when a pin cannot be followed one-to-one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -215,7 +223,13 @@ pub fn tools() -> Vec<ToolDef> {
                     "x2": { "type": "number", "description": "Region bounding box max X" },
                     "y2": { "type": "number", "description": "Region bounding box max Y" },
                     "dx": { "type": "number", "description": "X offset to move by" },
-                    "dy": { "type": "number", "description": "Y offset to move by" }
+                    "dy": { "type": "number", "description": "Y offset to move by" },
+                    "include": {
+                        "type": "string",
+                        "enum": ["symbols", "all"],
+                        "default": "symbols",
+                        "description": "'symbols' moves symbol units only; 'all' moves everything inside the box as one rigid block"
+                    }
                 },
                 "required": ["schematic", "x1", "y1", "x2", "y2", "dx", "dy"]
             }),
@@ -3246,7 +3260,7 @@ async fn handle_move_connected(
     ))
 }
 
-async fn handle_move_region(
+pub(crate) async fn handle_move_region(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -3275,6 +3289,11 @@ async fn handle_move_region(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let rigid = match opt_str(args, "include") {
+        None | Some("symbols") => false,
+        Some("all") => true,
+        Some(_) => return Ok(invalid_arg("include", "must be 'symbols' or 'all'")),
+    };
 
     let before_source = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
@@ -3295,25 +3314,70 @@ async fn handle_move_region(
     for symbol in sch.symbols.iter_mut() {
         if uuids_to_move.contains(&symbol.uuid) {
             let (old_x, old_y) = symbol.position();
-            let (new_x, new_y) = snap_point(old_x + dx, old_y + dy, 1.27);
+            // A rigid block keeps its own geometry, on grid or not: snapping
+            // each symbol alone would pull its pins off the wires that moved
+            // with it.
+            let (new_x, new_y) = if rigid {
+                (old_x + dx, old_y + dy)
+            } else {
+                snap_point(old_x + dx, old_y + dy, 1.27)
+            };
             symbol.move_to(new_x, new_y);
             moved_uuids.push(symbol.uuid.clone());
             expected_positions.insert(symbol.uuid.clone(), (new_x, new_y));
         }
     }
+    // The sheet as loaded, beside everything else the rigid move translated.
+    let block = if rigid {
+        let before_tree = parse_sexp(&before_source)?;
+        let Some(placed) = crate::tools::resolved_placed_pins_by_reference(&before_tree) else {
+            return Ok(move_region_blocked(vec![
+                crate::tools::UNRESOLVED_PIN_GEOMETRY.to_owned(),
+            ]));
+        };
+        let region = Region::new(x1, y1, x2, y2);
+        match translate_block(&mut sch, region, dx, dy, &placed) {
+            Ok(block) => Some((before_tree, block)),
+            Err(reasons) => return Ok(move_region_blocked(reasons)),
+        }
+    } else {
+        None
+    };
 
     // Region movement is one placement change, not a series of independent
     // moves. Carry marker intent and reconcile the whole-sheet symmetric pin
     // difference once so pins that swap coordinates do not manufacture or
     // remove a junction between the per-symbol steps (#623, #626).
-    let carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
+    let mut carried = match carry_no_connects(&sch_path, &before_source, &mut sch) {
         Ok(carried) => carried,
         Err(error) => return Ok(error),
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    // Checked after the junction pass, so a dot it adds where a moved pin lands
+    // on a wire outside the box counts as the net change it is.
+    if let Some((before_tree, _)) = &block {
+        let changes = pin_net_changes(before_tree, &parse_sexp(&candidate)?);
+        if !changes.is_empty() {
+            return Ok(move_region_blocked(changes));
+        }
+    }
     write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
 
+    let items_moved = if let Some((_, block)) = block {
+        carried.extend(block.free_no_connects);
+        let written = read_consistent(&sch_path)?;
+        if let Some(reason) = misplaced_item(&written, &block.anchors) {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_region",
+                reason,
+            ));
+        }
+        Some(block.counts)
+    } else {
+        None
+    };
     let moved_markers = match observed_no_connect_moves(&sch_path, "move_region", &carried)? {
         Ok(moved) => moved,
         Err(error) => return Ok(error),
@@ -3373,7 +3437,7 @@ async fn handle_move_region(
         }));
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut response = json!({
         "moved_count": moved_references.len(),
         "moved": moved_references,
         "moved_unit_count": placements.len(),
@@ -3382,7 +3446,26 @@ async fn handle_move_region(
         "junctions_pruned_count": pruned,
         "no_connects_moved_count": moved_markers.len(),
         "no_connects_moved": moved_markers
-    })))
+    });
+    if let Some(items_moved) = items_moved {
+        response["items_moved"] = json!(items_moved);
+    }
+    Ok(CallToolResult::json(&response))
+}
+
+/// Why a rigid `move_region` cannot move its block, before anything is written.
+fn move_region_blocked(reasons: Vec<String>) -> CallToolResult {
+    let message = format!(
+        "move_region cannot move the region as one block: {}",
+        reasons.join("; ")
+    );
+    CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: "move_region".to_owned(),
+            reasons,
+        },
+        message,
+    )
 }
 
 async fn handle_annotate_schematic(

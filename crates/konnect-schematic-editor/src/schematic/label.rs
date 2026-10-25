@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::sexp::{atom, qstr, tagged, SexpNode};
-use crate::types::{At, Effects, Property};
+use crate::types::{translate_field_ats, At, Effects, Property};
 
 // ---- Label text effects -----------------------------------------------------
 
@@ -150,8 +150,10 @@ impl Label {
     pub fn position(&self) -> (f64, f64) {
         (self.at.x, self.at.y)
     }
+    /// Move the label and any fields it carries, whose positions are absolute.
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.translate(dx, dy);
+        translate_raw_fields(&mut self.raw_sub_nodes, dx, dy);
     }
 
     /// Set the rotation and keep the text's justify in step with it, creating
@@ -258,8 +260,15 @@ impl GlobalLabel {
     pub fn position(&self) -> (f64, f64) {
         (self.at.x, self.at.y)
     }
+
+    /// Move the label and its fields, `Intersheetrefs` among them: field
+    /// coordinates are absolute, as on a symbol.
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.translate(dx, dy);
+        for prop in &mut self.properties {
+            prop.translate(dx, dy);
+        }
+        translate_raw_fields(&mut self.raw_sub_nodes, dx, dy);
     }
 
     /// Set the rotation and keep the text's justify in step with it, creating
@@ -346,8 +355,10 @@ impl HierarchicalLabel {
     pub fn position(&self) -> (f64, f64) {
         (self.at.x, self.at.y)
     }
+    /// Move the label and any fields it carries, whose positions are absolute.
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.translate(dx, dy);
+        translate_raw_fields(&mut self.raw_sub_nodes, dx, dy);
     }
 
     /// Set the rotation and keep the text's justify in step with it, creating
@@ -440,3 +451,14 @@ macro_rules! label_collection {
 label_collection!(LabelCollection, Label);
 label_collection!(GlobalLabelCollection, GlobalLabel);
 label_collection!(HierarchicalLabelCollection, HierarchicalLabel);
+
+/// Move the `(property …)` fields a label keeps among its unmodelled children.
+fn translate_raw_fields(nodes: &mut [SexpNode], dx: f64, dy: f64) {
+    for node in nodes {
+        if node.tag() == Some("property") {
+            if let SexpNode::List(children) = node {
+                translate_field_ats(children, dx, dy);
+            }
+        }
+    }
+}
