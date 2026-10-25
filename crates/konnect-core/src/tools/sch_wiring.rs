@@ -353,8 +353,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54,
-                        "description": "Length of the wire stub in mm" },
+                    "stub_length": { "type": "number", "default": 2.54, "minimum": 0,
+                        "description": "Length of the wire stub in mm. 0 draws no wire and \
+                                        puts the label on the point itself." },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label"],
@@ -2496,6 +2497,17 @@ async fn handle_connect_to_net(
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    // A negative length would flip the stub's direction; 0 is a label on the
+    // point with no wire, as in batch_connect_to_net.
+    if stub_length < 0.0 || !stub_length.is_finite() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "stub_length".to_string(),
+                reason: "must be a finite number >= 0".into(),
+            },
+            "'stub_length' must be a finite number >= 0 (0 places the label on the point with no wire)",
+        ));
+    }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
     let (_, tree) = read_schematic(&sch_path)?;
@@ -2567,7 +2579,11 @@ async fn handle_connect_to_net(
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": dir.name,
-        "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
+        "wire": if stub_length > 0.0 {
+            json!({ "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y })
+        } else {
+            serde_json::Value::Null
+        },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
     })))
 }
@@ -2585,7 +2601,10 @@ pub(crate) fn add_net_stub(
     net: &str,
 ) -> (f64, f64, f64) {
     let end = dir.end(pin, stub_length);
-    add_stub_wire(sch, pins, pin, end);
+    // A zero-length stub is a label on the point: no degenerate wire.
+    if stub_length > 0.0 {
+        add_stub_wire(sch, pins, pin, end);
+    }
     add_stub_label(sch, label_type, net, end, dir.label_rotation);
     (end.0, end.1, dir.label_rotation)
 }
@@ -3363,6 +3382,32 @@ mod unit_aware_wiring_tests {
             after.contains("(justify right"),
             "a 180° label must be right-justified: {after}"
         );
+    }
+
+    /// stub_length 0 puts the label on the point and writes no wire.
+    #[tokio::test]
+    async fn a_zero_length_stub_writes_no_wire() {
+        let (_d, path) = dual_opamp_schematic();
+        let before = std::fs::read_to_string(&path)
+            .unwrap()
+            .matches("(wire")
+            .count();
+        let after = connect_to_net(
+            &path,
+            json!({ "pin_x": 165.1, "pin_y": 142.24, "net": "RST", "stub_length": 0 }),
+        )
+        .await;
+        assert_eq!(after.matches("(wire").count(), before, "{after}");
+        assert!(after.contains("(at 165.1 142.24 0)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn a_negative_stub_length_is_refused() {
+        let (_d, path) = dual_opamp_schematic();
+        let args = json!({ "schematic": path.display().to_string(), "pin_x": 1.0,
+                           "pin_y": 2.0, "net": "RST", "stub_length": -2.54 });
+        let result = handle_connect_to_net(&args, &test_ctx()).await.unwrap();
+        assert!(result.is_error, "{:?}", result.content);
     }
 
     /// An explicit direction still wins over the derived one.
