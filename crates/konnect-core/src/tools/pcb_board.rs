@@ -19,6 +19,7 @@ use crate::tools::{
 use konnect_ipc::builders;
 use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
+    paths::display_path,
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
         write_atomic, SexpEdit,
@@ -384,7 +385,7 @@ fn board_lock_refusal_from(
             &format!(
                 "KiCad sibling lock '{}' is present; its contents cannot prove whether an editor \
                  still owns newer in-memory state.",
-                lock_path.display()
+                display_path(&lock_path)
             ),
         )),
         live_board::EditorLock::Unreadable(lock_path, error) => Some(unsafe_file_fallback(
@@ -393,7 +394,7 @@ fn board_lock_refusal_from(
             &format!(
                 "KiCad sibling lock '{}' could not be inspected ({error}); its absence cannot be \
                  established.",
-                lock_path.display()
+                display_path(&lock_path)
             ),
         )),
     }
@@ -3563,6 +3564,30 @@ mod board_session_safety_tests {
         );
         assert_eq!(error_reason(&result), "kicad_lock_unreadable");
         assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    /// Windows resolves the lock path to `\\?\C:\…`. The refusal shows the
+    /// form a user can paste back (#673).
+    #[test]
+    fn a_lock_refusal_names_the_lock_without_the_verbatim_prefix() {
+        let board = std::path::Path::new(r"C:\proj\board.kicad_pcb");
+        let lock = std::path::PathBuf::from(r"\\?\C:\proj\~board.kicad_pcb.lck");
+        let denied = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+
+        for observed in [
+            live_board::EditorLock::Present(lock.clone()),
+            live_board::EditorLock::Unreadable(lock.clone(), denied()),
+        ] {
+            let result = board_lock_refusal_from(board, observed).expect("a lock refuses");
+            let body: serde_json::Value =
+                serde_json::from_str(&super::mounting_hole_tests::result_text(&result)).unwrap();
+            let message = body["message"].as_str().expect("a message");
+            assert!(
+                message.contains(r"'C:\proj\~board.kicad_pcb.lck'"),
+                "{message}"
+            );
+            assert!(!message.contains(r"\\?\"), "{message}");
+        }
     }
 
     /// Both refusals are correct, but `reason` is machine-readable and the
