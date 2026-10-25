@@ -268,7 +268,8 @@ pub fn tools() -> Vec<ToolDef> {
              accounting for rotation and mirroring. Uses the canonical pin transform. \
              Each pin also reports 'orientation_degrees', the direction leading away \
              from the symbol body (0 = east) — a net label at the pin must read that \
-             way or its text runs back over the symbol's pin names — and 'length_mm'.",
+             way or its text runs back over the symbol's pin names — and 'length_mm'. \
+             The component and each unit report 'rotation', 'mirror_x' and 'mirror_y'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -282,8 +283,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_get_schematic_pin_locations",
             "Get pin locations for multiple components in a single file read. Reports the \
-             same per-pin fields as get_schematic_pin_locations, including \
-             'orientation_degrees' and 'length_mm'.",
+             same fields as get_schematic_pin_locations, including \
+             'orientation_degrees', 'length_mm', 'mirror_x' and 'mirror_y'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3493,6 +3494,8 @@ fn pin_locations_for_reference(
             "x": instance.x,
             "y": instance.y,
             "rotation": instance.rotation,
+            "mirror_x": instance.mirror_x,
+            "mirror_y": instance.mirror_y,
             "pins": pins
         }));
     }
@@ -3506,6 +3509,8 @@ fn pin_locations_for_reference(
         "x": anchor.x,
         "y": anchor.y,
         "rotation": anchor.rotation,
+        "mirror_x": anchor.mirror_x,
+        "mirror_y": anchor.mirror_y,
         "unit_count": units.len(),
         "units": units,
         "pins": all_pins
@@ -9345,5 +9350,184 @@ mod rotate_junction_reconciliation_tests {
 
         assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+}
+
+/// Both pin-location tools report each placement's mirror beside its pins
+/// (#855). `pin_location_mirror_kicad10.kicad_sch` places two LM358s whose
+/// units disagree, and `ORACLE` is KiCad's answer; see its README.
+#[cfg(test)]
+mod pin_location_mirror_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/pin_location_mirror_kicad10.kicad_sch");
+
+    struct Placement {
+        unit: u64,
+        mirror_x: bool,
+        mirror_y: bool,
+        /// Pin number and position, from `kicad-cli sch erc --severity-all`.
+        pins: [(&'static str, f64, f64); 3],
+    }
+
+    /// Each reference's units, lowest first: the mirrors eeschema wrote and
+    /// the pins where KiCad puts them.
+    const ORACLE: [(&str, [Placement; 2]); 2] = [
+        (
+            "U1",
+            [
+                Placement {
+                    unit: 1,
+                    mirror_x: false,
+                    mirror_y: false,
+                    pins: [
+                        ("1", 109.22, 76.2),
+                        ("2", 93.98, 78.74),
+                        ("3", 93.98, 73.66),
+                    ],
+                },
+                Placement {
+                    unit: 2,
+                    mirror_x: false,
+                    mirror_y: true,
+                    pins: [
+                        ("5", 147.32, 73.66),
+                        ("6", 147.32, 78.74),
+                        ("7", 132.08, 76.2),
+                    ],
+                },
+            ],
+        ),
+        (
+            "U2",
+            [
+                Placement {
+                    unit: 1,
+                    mirror_x: true,
+                    mirror_y: false,
+                    pins: [
+                        ("1", 109.22, 127.0),
+                        ("2", 93.98, 124.46),
+                        ("3", 93.98, 129.54),
+                    ],
+                },
+                Placement {
+                    unit: 2,
+                    mirror_x: false,
+                    mirror_y: false,
+                    pins: [
+                        ("5", 132.08, 124.46),
+                        ("6", 132.08, 129.54),
+                        ("7", 147.32, 127.0),
+                    ],
+                },
+            ],
+        ),
+    ];
+
+    /// The anchor reports unit 1's mirror, and each unit its own, beside pins
+    /// where KiCad puts them.
+    fn assert_matches_kicad(component: &serde_json::Value, expected: &[Placement; 2]) {
+        assert_eq!(component["mirror_x"], expected[0].mirror_x, "{component}");
+        assert_eq!(component["mirror_y"], expected[0].mirror_y, "{component}");
+        let units = component["units"].as_array().unwrap();
+        assert_eq!(units.len(), expected.len(), "{component}");
+        for placement in expected {
+            let unit = units
+                .iter()
+                .find(|unit| unit["unit"] == placement.unit)
+                .unwrap_or_else(|| panic!("unit {}: {component}", placement.unit));
+            assert_eq!(unit["mirror_x"], placement.mirror_x, "{unit}");
+            assert_eq!(unit["mirror_y"], placement.mirror_y, "{unit}");
+            let pins = unit["pins"].as_array().unwrap();
+            assert_eq!(pins.len(), placement.pins.len(), "{unit}");
+            for (number, x, y) in placement.pins {
+                let pin = pins
+                    .iter()
+                    .find(|pin| pin["number"] == number)
+                    .unwrap_or_else(|| panic!("pin {number}: {unit}"));
+                assert!(
+                    konnect_sexp::geometry::points_coincident(
+                        x,
+                        y,
+                        pin["x"].as_f64().unwrap(),
+                        pin["y"].as_f64().unwrap(),
+                        0.005,
+                    ),
+                    "pin {number}: KiCad has ({x}, {y}), got {pin}"
+                );
+            }
+        }
+    }
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            auto_load_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Call `tool` through the served dispatch and parse its JSON answer.
+    async fn served(
+        handler: &McpHandler,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let message = json!({"jsonrpc": "2.0", "id": 855, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}});
+        let result = handler
+            .handle_message(message)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("pin_location_mirror_kicad10.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        (directory, path.display().to_string())
+    }
+
+    #[tokio::test]
+    async fn get_schematic_pin_locations_reports_each_units_mirror() {
+        let (_directory, schematic) = fixture();
+        let handler = handler().await;
+        for (reference, expected) in &ORACLE {
+            let component = served(
+                &handler,
+                "get_schematic_pin_locations",
+                json!({ "schematic": schematic, "reference": reference }),
+            )
+            .await;
+            assert_eq!(component["reference"], *reference, "{component}");
+            assert_matches_kicad(&component, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_get_schematic_pin_locations_reports_each_units_mirror() {
+        let (_directory, schematic) = fixture();
+        let result = served(
+            &handler().await,
+            "batch_get_schematic_pin_locations",
+            json!({ "schematic": schematic, "references": ["U1", "U2"] }),
+        )
+        .await;
+        let components = result["components"].as_array().unwrap();
+        assert_eq!(components.len(), ORACLE.len(), "{result}");
+        for (component, (reference, expected)) in components.iter().zip(&ORACLE) {
+            assert_eq!(component["reference"], *reference, "{component}");
+            assert_matches_kicad(component, expected);
+        }
     }
 }

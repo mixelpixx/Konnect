@@ -3,6 +3,14 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: pin-location tools report each placement's mirror (minor release)
+
+`get_schematic_pin_locations` and `batch_get_schematic_pin_locations` now
+return `mirror_x` and `mirror_y` beside `rotation`, at the top level (the
+lowest unit, like `x`, `y` and `rotation` there) and on each `units[]` entry.
+They are the names `get_schematic_component` already uses. The fields are
+additive; pin positions are unchanged (#855).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
