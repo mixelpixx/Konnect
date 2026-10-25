@@ -587,6 +587,9 @@ impl UnreachableReason {
     /// closes gives `Closed`, and one that never negotiates gives `TimedOut`
     /// after 10 s. NNG's POSIX dialer maps `ENOENT` to `ECONNREFUSED` and
     /// `EACCES` to `EPERM`, so Unix sockets land on the same variants.
+    /// Its POSIX table has no `ENOTCONN`, which macOS can return when the
+    /// listener closes first, so that raw errno is a closed peer too, as
+    /// NNG's Windows table makes `WSAENOTCONN` (#711).
     pub fn from_dial_error(error: nng::Error) -> Self {
         match error {
             nng::Error::ConnectionRefused | nng::Error::EntryNotFound => Self::NoListener,
@@ -597,6 +600,8 @@ impl UnreachableReason {
             | nng::Error::ConnectionReset
             | nng::Error::ConnectionAborted
             | nng::Error::Protocol => Self::HandshakeFailed,
+            #[cfg(unix)]
+            nng::Error::SystemErr(errno) if errno == libc::ENOTCONN as u32 => Self::HandshakeFailed,
             _ => Self::TransportError,
         }
     }
@@ -5842,6 +5847,29 @@ mod diagnostic_tests {
             (nng::Error::Protocol, HandshakeFailed),
             (nng::Error::AddressInvalid, TransportError),
             (nng::Error::OutOfMemory, TransportError),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                UnreachableReason::from_dial_error(error),
+                expected,
+                "{error:?}"
+            );
+        }
+    }
+
+    /// NNG's POSIX errno table has no `ENOTCONN`, so a peer that closes before
+    /// negotiation can surface as a raw errno on macOS (#711). Only that errno
+    /// joins `HandshakeFailed`; any other raw errno stays a transport error.
+    #[cfg(unix)]
+    #[test]
+    fn a_raw_enotconn_dial_error_is_a_failed_handshake() {
+        use UnreachableReason::*;
+        let cases = [
+            (
+                nng::Error::SystemErr(libc::ENOTCONN as u32),
+                HandshakeFailed,
+            ),
+            (nng::Error::SystemErr(libc::EIO as u32), TransportError),
         ];
         for (error, expected) in cases {
             assert_eq!(
