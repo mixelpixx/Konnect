@@ -124,6 +124,11 @@ pub fn tools() -> Vec<ToolDef> {
                                     "minimum": 0,
                                     "maximum": 0.5,
                                     "description": "Rounded-rectangle corner radius ratio (0..0.5)"
+                                },
+                                "fabrication_property": {
+                                    "type": "string",
+                                    "enum": PadFabricationProperty::names(),
+                                    "description": "KiCad's pad fabrication property (default 'none'), e.g. 'castellated' for a plated half-hole edge pad. A property KiCad flags for the pad type is still written, with KiCad's warning in 'warnings'."
                                 }
                             },
                             "required": ["number", "type", "shape", "x", "y", "width", "height"]
@@ -151,7 +156,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_footprint_pad",
-            "Edit the size, shape, position, drill, or zone connection of a pad in an existing .kicad_mod footprint file.",
+            "Edit the size, shape, position, drill, zone connection, or fabrication property of a pad in an existing .kicad_mod footprint file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -173,6 +178,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["inherited", "solid", "thermal", "none"],
                         "description": "How copper zones connect to this pad (optional; omit it to leave the pad as it is). 'solid', 'thermal' and 'none' write the pad's own override; 'inherited' removes it so the pad follows its footprint and zone settings."
+                    },
+                    "fabrication_property": {
+                        "type": "string",
+                        "enum": PadFabricationProperty::names(),
+                        "description": "KiCad's pad fabrication property (optional; omit it to leave the pad as it is). KiCad's DRC skips the copper-to-edge check for a 'castellated' pad; 'none' removes the property. A property KiCad flags for this pad type is still written, with KiCad's warning in 'warnings'."
                     }
                 },
                 "required": ["footprint_path", "pad_number"]
@@ -744,6 +754,7 @@ async fn handle_create_footprint(
     }
     let mut pad_geoms: Vec<PadGeom> = Vec::new();
     let mut pad_sexp = String::new();
+    let mut warnings = Vec::new();
     for pad in &pads_val {
         // Safe after validate_footprint_pad_items: every schema-required field
         // has the declared type, so no plausible-looking pad is invented.
@@ -816,9 +827,24 @@ async fn handle_create_footprint(
             String::new()
         };
 
+        // KiCad writes the property just before the layers.
+        let fabrication_property = pad["fabrication_property"]
+            .as_str()
+            .map(|name| PadFabricationProperty::parse(name).expect("validated"));
+        // This tool writes only round drills, given as a diameter.
+        let round_hole = pad["drill"].as_f64().is_some_and(|drill| drill > 0.0);
+        if let Some(warning) = fabrication_property
+            .and_then(|property| property.padstack_warning(&number, &pad_type, round_hole))
+        {
+            warnings.push(warning);
+        }
+        let property = fabrication_property
+            .and_then(PadFabricationProperty::token)
+            .map_or_else(String::new, |token| format!("(property {token}) "));
+
         pad_sexp.push_str(&format!(
-            "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {})",
-            number, pad_type, shape, at, w, h, layers, drill_sexp, roundrect_ratio
+            "\n  (pad \"{}\" {} {} {} (size {} {}) {}{} {} {})",
+            number, pad_type, shape, at, w, h, property, layers, drill_sexp, roundrect_ratio
         ));
         pad_geoms.push(PadGeom {
             number,
@@ -855,17 +881,20 @@ async fn handle_create_footprint(
     }
     write_atomic(&output, &content)?;
 
+    let mut response = json!({
+        "success": true,
+        "footprint": name,
+        "output": output.to_str().unwrap_or(""),
+        "pad_count": pad_geoms.len(),
+        "courtyard": !pad_geoms.is_empty(),
+        "pin1_marked": !pad_geoms.is_empty(),
+        "model": args.get("model").and_then(|m| m["path"].as_str()).unwrap_or("")
+    });
+    if !warnings.is_empty() {
+        response["warnings"] = json!(warnings);
+    }
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "footprint": name,
-            "output": output.to_str().unwrap_or(""),
-            "pad_count": pad_geoms.len(),
-            "courtyard": !pad_geoms.is_empty(),
-            "pin1_marked": !pad_geoms.is_empty(),
-            "model": args.get("model").and_then(|m| m["path"].as_str()).unwrap_or("")
-        }))
-        .unwrap(),
+        serde_json::to_string(&response).unwrap(),
     ))
 }
 
@@ -893,6 +922,17 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
                 return Err(invalid_library_argument(
                     &format!("pads[{index}].{field}"),
                     "missing or not a number",
+                ));
+            }
+        }
+        if let Some(value) = pad
+            .get("fabrication_property")
+            .filter(|value| !value.is_null())
+        {
+            if let Err(reason) = PadFabricationProperty::from_argument(value) {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].fabrication_property"),
+                    reason,
                 ));
             }
         }
@@ -979,6 +1019,15 @@ async fn handle_edit_footprint_pad(
         },
     };
 
+    let fabrication_property = match args
+        .get("fabrication_property")
+        .map(PadFabricationProperty::from_argument)
+        .transpose()
+    {
+        Ok(property) => property,
+        Err(reason) => return Ok(invalid_library_argument("fabrication_property", reason)),
+    };
+
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
         Ok(root) if root.head() == Some("footprint") => {}
@@ -999,6 +1048,8 @@ async fn handle_edit_footprint_pad(
     let mut edits = Vec::new();
     let mut matched_count = 0usize;
     let mut observed_zone_connects = Vec::new();
+    let mut observed_fabrication_properties = Vec::new();
+    let mut warnings = Vec::new();
     for (start, end) in find_direct_child_blocks(&content, "footprint") {
         let block = &content[start..end];
         let Ok(node) = parse_sexp(block) else {
@@ -1022,6 +1073,24 @@ async fn handle_edit_footprint_pad(
             observed_zone_connects.push(
                 PadZoneConnect::of_pad(&edited).map_or("unrecognized", PadZoneConnect::as_str),
             );
+        }
+        if let Some(property) = fabrication_property {
+            edited = set_pad_fabrication_property(edited, property);
+            // Judge the pad as written: this call may also change its number or drill.
+            let written = parse_sexp(&edited).unwrap_or_else(|_| node.clone());
+            let observed = PadFabricationProperty::of_pad(&written);
+            let header = |index| {
+                written
+                    .get(index)
+                    .and_then(SexpNode::as_str)
+                    .unwrap_or_default()
+            };
+            if let Some(warning) =
+                observed.padstack_warning(header(1), header(2), pad_has_round_hole(&written))
+            {
+                push_distinct(&mut warnings, warning);
+            }
+            observed_fabrication_properties.push(observed.as_str());
         }
         edits.push(SexpEdit::replace(start, end, edited));
         if !match_all {
@@ -1047,16 +1116,38 @@ async fn handle_edit_footprint_pad(
         "updated_count": matched_count
     });
     // Read off the pads as written, not echoed from the request.
-    observed_zone_connects.dedup();
-    match observed_zone_connects.as_slice() {
-        [] => {}
-        [observed] => response["zone_connect"] = json!(observed),
-        disagreeing => response["zone_connect"] = json!(disagreeing),
+    report_observed(&mut response, "zone_connect", observed_zone_connects);
+    report_observed(
+        &mut response,
+        "fabrication_property",
+        observed_fabrication_properties,
+    );
+    if !warnings.is_empty() {
+        response["warnings"] = json!(warnings);
     }
 
     Ok(CallToolResult::text(
         serde_json::to_string(&response).unwrap(),
     ))
+}
+
+/// Report one value when every edited pad agrees, or each distinct value.
+fn report_observed(response: &mut serde_json::Value, key: &str, observed: Vec<&str>) {
+    let mut distinct = Vec::new();
+    for value in observed {
+        push_distinct(&mut distinct, value);
+    }
+    match distinct.as_slice() {
+        [] => {}
+        [observed] => response[key] = json!(observed),
+        disagreeing => response[key] = json!(disagreeing),
+    }
+}
+
+fn push_distinct<T: PartialEq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 /// A pad's `(zone_connect N)` override. The numbers are KiCad's
@@ -1103,7 +1194,7 @@ impl PadZoneConnect {
     /// The connection a pad block carries, or `None` for a value this enum
     /// cannot name (such as KiCad's `3`).
     fn of_pad(pad_block: &str) -> Option<Self> {
-        let children = pad_zone_connect_children(pad_block);
+        let children = pad_children(pad_block, "zone_connect");
         let Some(&(start, end)) = children.first() else {
             return Some(Self::Inherited);
         };
@@ -1117,13 +1208,12 @@ impl PadZoneConnect {
     }
 }
 
-/// Direct `(zone_connect …)` children of a pad block.
-fn pad_zone_connect_children(pad_block: &str) -> Vec<(usize, usize)> {
+/// Direct children of a pad block whose head is `head`.
+fn pad_children(pad_block: &str, head: &str) -> Vec<(usize, usize)> {
     find_direct_child_blocks(pad_block, "pad")
         .into_iter()
         .filter(|&(start, end)| {
-            parse_sexp(&pad_block[start..end])
-                .is_ok_and(|child| child.head() == Some("zone_connect"))
+            parse_sexp(&pad_block[start..end]).is_ok_and(|child| child.head() == Some(head))
         })
         .collect()
 }
@@ -1136,30 +1226,68 @@ fn leading_whitespace_start(source: &str, index: usize) -> usize {
         .len()
 }
 
-/// Children KiCad writes after `zone_connect` inside a pad. A new token goes
-/// before the first of these, which is where KiCad itself would write it.
-const PAD_CHILDREN_AFTER_ZONE_CONNECT: &[&str] = &[
+/// The pad children `set_pad_child` places, in the order KiCad writes them
+/// (`PCB_IO_KICAD_SEXPR::format( const PAD* )`). A new child goes before the
+/// first existing child listed after it, which is where KiCad would write it.
+const PAD_CHILD_ORDER: &[&str] = &[
+    "property",
+    "layers",
+    "remove_unused_layers",
+    "keep_end_layers",
+    "zone_layer_connections",
+    "roundrect_rratio",
+    "chamfer_ratio",
+    "chamfer",
+    "net",
+    "pinfunction",
+    "pintype",
+    "die_length",
+    "solder_mask_margin",
+    "solder_paste_margin",
+    "solder_paste_margin_ratio",
+    "clearance",
+    "zone_connect",
     "thermal_bridge_width",
     "thermal_bridge_angle",
     "thermal_gap",
     "options",
     "primitives",
-    "zone_layer_connections",
     "padstack",
     "teardrops",
     "uuid",
 ];
 
 fn set_pad_zone_connect(pad_block: String, zone_connect: PadZoneConnect) -> String {
-    let existing = pad_zone_connect_children(&pad_block);
+    set_pad_child(
+        pad_block,
+        "zone_connect",
+        zone_connect
+            .token()
+            .map(|token| format!("(zone_connect {token})")),
+    )
+}
+
+fn set_pad_fabrication_property(pad_block: String, property: PadFabricationProperty) -> String {
+    set_pad_child(
+        pad_block,
+        "property",
+        property.token().map(|token| format!("(property {token})")),
+    )
+}
+
+/// Make `child` the pad's only `head` child, or remove every `head` child
+/// when it is `None`. `head` must be in `PAD_CHILD_ORDER`.
+fn set_pad_child(pad_block: String, head: &str, child: Option<String>) -> String {
+    let position = PAD_CHILD_ORDER
+        .iter()
+        .position(|&known| known == head)
+        .expect("pad child has a known order");
+    let before = &PAD_CHILD_ORDER[position + 1..];
+    let existing = pad_children(&pad_block, head);
     let mut edits = Vec::new();
-    match (zone_connect.token(), existing.split_first()) {
-        (Some(token), Some((&(start, end), duplicates))) => {
-            edits.push(SexpEdit::replace(
-                start,
-                end,
-                format!("(zone_connect {token})"),
-            ));
+    match (child, existing.split_first()) {
+        (Some(child), Some((&(start, end), duplicates))) => {
+            edits.push(SexpEdit::replace(start, end, child));
             for &(start, end) in duplicates {
                 edits.push(SexpEdit::delete(
                     leading_whitespace_start(&pad_block, start),
@@ -1167,29 +1295,20 @@ fn set_pad_zone_connect(pad_block: String, zone_connect: PadZoneConnect) -> Stri
                 ));
             }
         }
-        (Some(token), None) => {
+        (Some(child), None) => {
             let children = find_direct_child_blocks(&pad_block, "pad");
-            let before = children.iter().find(|&&(start, end)| {
-                parse_sexp(&pad_block[start..end]).is_ok_and(|child| {
-                    child
-                        .head()
-                        .is_some_and(|head| PAD_CHILDREN_AFTER_ZONE_CONNECT.contains(&head))
-                })
+            let first_after = children.iter().find(|&&(start, end)| {
+                parse_sexp(&pad_block[start..end])
+                    .is_ok_and(|node| node.head().is_some_and(|head| before.contains(&head)))
             });
-            if let Some(&(start, _)) = before {
+            if let Some(&(start, _)) = first_after {
                 let separator = &pad_block[leading_whitespace_start(&pad_block, start)..start];
-                edits.push(SexpEdit::insert(
-                    start,
-                    format!("(zone_connect {token}){separator}"),
-                ));
+                edits.push(SexpEdit::insert(start, format!("{child}{separator}")));
             } else if let Some(&(start, end)) = children.last() {
                 let separator = &pad_block[leading_whitespace_start(&pad_block, start)..start];
-                edits.push(SexpEdit::insert(
-                    end,
-                    format!("{separator}(zone_connect {token})"),
-                ));
+                edits.push(SexpEdit::insert(end, format!("{separator}{child}")));
             } else if let Some(close) = pad_block.rfind(')') {
-                edits.push(SexpEdit::insert(close, format!(" (zone_connect {token})")));
+                edits.push(SexpEdit::insert(close, format!(" {child}")));
             }
         }
         (None, _) => {
@@ -1202,6 +1321,127 @@ fn set_pad_zone_connect(pad_block: String, zone_connect: PadZoneConnect) -> Stri
         }
     }
     apply_edits(pad_block, edits)
+}
+
+/// A pad's fabrication property, KiCad's `PAD_PROP`. KiCad writes it as
+/// `(property pad_prop_<name>)` and writes nothing for `None`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PadFabricationProperty {
+    None,
+    Bga,
+    FiducialGlobal,
+    FiducialLocal,
+    Testpoint,
+    Heatsink,
+    Castellated,
+    Mechanical,
+    Pressfit,
+}
+
+impl PadFabricationProperty {
+    /// In KiCad's `PAD_PROP` order.
+    const ALL: [Self; 9] = [
+        Self::None,
+        Self::Bga,
+        Self::FiducialGlobal,
+        Self::FiducialLocal,
+        Self::Testpoint,
+        Self::Heatsink,
+        Self::Castellated,
+        Self::Mechanical,
+        Self::Pressfit,
+    ];
+
+    fn names() -> [&'static str; 9] {
+        Self::ALL.map(Self::as_str)
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|property| property.as_str() == name)
+    }
+
+    fn from_argument(value: &serde_json::Value) -> Result<Self, String> {
+        let name = value
+            .as_str()
+            .ok_or_else(|| "must be a string when supplied".to_string())?;
+        Self::parse(name).ok_or_else(|| {
+            format!(
+                "unsupported fabrication property '{name}'; expected one of {}",
+                Self::names().join(", ")
+            )
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bga => "bga",
+            Self::FiducialGlobal => "fiducial_glob",
+            Self::FiducialLocal => "fiducial_loc",
+            Self::Testpoint => "testpoint",
+            Self::Heatsink => "heatsink",
+            Self::Castellated => "castellated",
+            Self::Mechanical => "mechanical",
+            Self::Pressfit => "pressfit",
+        }
+    }
+
+    fn token(self) -> Option<String> {
+        (self != Self::None).then(|| format!("pad_prop_{}", self.as_str()))
+    }
+
+    /// The warning KiCad's DRC and pad dialog give this property on a pad of
+    /// `pad_type` (`PAD::CheckPad`, reported as "Padstack is questionable").
+    /// KiCad still saves such a pad, so this is a warning, not a refusal.
+    fn padstack_warning(self, number: &str, pad_type: &str, round_hole: bool) -> Option<String> {
+        let plated_hole = pad_type == "thru_hole";
+        let npth = pad_type == "np_thru_hole";
+        let reason = match self {
+            Self::FiducialGlobal | Self::FiducialLocal if npth => {
+                Some("('fiducial' pads are normally plated)")
+            }
+            Self::Testpoint if npth => Some("('testpoint' pads are normally plated)"),
+            Self::Heatsink if npth => Some("('heatsink' pads are normally plated)"),
+            Self::Castellated if !plated_hole => Some("('castellated' pads are normally PTH)"),
+            Self::Bga if pad_type != "smd" => Some("('BGA' property is for SMD pads)"),
+            Self::Mechanical if !plated_hole => Some("('mechanical' pads are normally PTH)"),
+            Self::Pressfit if !plated_hole || !round_hole => {
+                Some("('press-fit' pads are normally PTH with round holes)")
+            }
+            _ => None,
+        }?;
+        Some(format!("pad '{number}': Padstack is questionable {reason}"))
+    }
+
+    /// The property KiCad would load from a pad: the last token it
+    /// recognizes across every `(property …)` child, unknown tokens skipped.
+    fn of_pad(pad: &SexpNode) -> Self {
+        let mut property = Self::None;
+        for child in pad.find_all("property") {
+            for token in child.children().unwrap_or_default().iter().skip(1) {
+                match token.as_str() {
+                    Some("none") => property = Self::None,
+                    Some(name) => {
+                        if let Some(known) = name.strip_prefix("pad_prop_").and_then(Self::parse) {
+                            property = known;
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        property
+    }
+}
+
+/// Whether a pad has a drilled round hole, KiCad's `PAD::HasDrilledHole`: a
+/// drill whose width equals its height.
+fn pad_has_round_hole(pad: &SexpNode) -> bool {
+    crate::tools::pcb_components::file_pad_drill(pad)
+        .and_then(|drill| drill.size)
+        .is_some_and(|size| size.x > 0.0 && size.x == size.y)
 }
 
 fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
@@ -6276,6 +6516,10 @@ mod tests {
             json!(["inherited", "solid", "thermal", "none"])
         );
         assert_eq!(
+            properties["fabrication_property"]["enum"],
+            json!(KICAD_PAD_FABRICATION_PROPERTIES)
+        );
+        assert_eq!(
             tool.input_schema["required"],
             json!(["footprint_path", "pad_number"])
         );
@@ -6472,6 +6716,441 @@ mod tests {
             r#"(pad "1" smd rect (at 0 0) (size 2 1) (layers "F.Cu") (zone_connect 2))"#
         );
         assert_eq!(set_pad_zone_connect(solid, PadZoneConnect::Inherited), pad);
+    }
+
+    // KiCad 10.0.6 wrote every one of these; provenance in
+    // tests/fixtures/pad_fabrication_property_kicad10.README.md.
+    const PAD_PROP_MECHANICAL: &str =
+        include_str!("../../tests/fixtures/pad_fabrication_property_mechanical_kicad10.kicad_mod");
+    const PAD_PROP_CASTELLATED: &str =
+        include_str!("../../tests/fixtures/pad_fabrication_property_castellated_kicad10.kicad_mod");
+    const PAD_PROP_FIRST_CASTELLATED: &str = include_str!(
+        "../../tests/fixtures/pad_fabrication_property_first_castellated_kicad10.kicad_mod"
+    );
+    const PAD_PROP_NONE: &str =
+        include_str!("../../tests/fixtures/pad_fabrication_property_none_kicad10.kicad_mod");
+    const PAD_PROP_TESTPOINT: &str =
+        include_str!("../../tests/fixtures/pad_fabrication_property_testpoint_kicad10.kicad_mod");
+    const PAD_PROP_FOOTPRINT: &str =
+        "USB_C_Receptacle_GCT_USB4125-xx-x_6P_TopMnt_Horizontal.kicad_mod";
+
+    /// KiCad 10's `PAD_PROP` names (`pcb_io_kicad_sexpr.cpp`), the promise the
+    /// schema makes; not read from the code under test.
+    const KICAD_PAD_FABRICATION_PROPERTIES: [&str; 9] = [
+        "none",
+        "bga",
+        "fiducial_glob",
+        "fiducial_loc",
+        "testpoint",
+        "heatsink",
+        "castellated",
+        "mechanical",
+        "pressfit",
+    ];
+
+    #[tokio::test]
+    async fn edit_footprint_pad_writes_each_fabrication_property_as_kicad_does() {
+        let cases = [
+            (
+                "mechanical to castellated on every SH pad",
+                PAD_PROP_MECHANICAL,
+                "SH",
+                true,
+                "castellated",
+                PAD_PROP_CASTELLATED,
+                4,
+            ),
+            (
+                "castellated back to mechanical",
+                PAD_PROP_CASTELLATED,
+                "SH",
+                true,
+                "mechanical",
+                PAD_PROP_MECHANICAL,
+                4,
+            ),
+            (
+                "castellated on the first SH pad only",
+                PAD_PROP_MECHANICAL,
+                "SH",
+                false,
+                "castellated",
+                PAD_PROP_FIRST_CASTELLATED,
+                1,
+            ),
+            (
+                "remove the property",
+                PAD_PROP_MECHANICAL,
+                "SH",
+                true,
+                "none",
+                PAD_PROP_NONE,
+                4,
+            ),
+            (
+                "add one where there was none",
+                PAD_PROP_MECHANICAL,
+                "A5",
+                false,
+                "testpoint",
+                PAD_PROP_TESTPOINT,
+                1,
+            ),
+            (
+                "none on a pad without one",
+                PAD_PROP_NONE,
+                "A5",
+                false,
+                "none",
+                PAD_PROP_NONE,
+                1,
+            ),
+        ];
+        for (case, source, pad, match_all, property, kicad, matched) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(PAD_PROP_FOOTPRINT);
+            std::fs::write(&path, source).unwrap();
+
+            let result = handle_edit_footprint_pad(
+                &json!({
+                    "footprint_path": path,
+                    "pad_number": pad,
+                    "match_all": match_all,
+                    "fabrication_property": property
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(!result.is_error, "{case}: {:?}", result.content);
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["updated_count"], matched, "{case}");
+            assert_eq!(output["fabrication_property"], property, "{case}");
+            assert!(output.get("warnings").is_none(), "{case}: {output}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                with_kicad_pads(source, kicad),
+                "{case}: pads must match KiCad's and nothing else may change"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_passes_on_kicads_padstack_warning() {
+        // KiCad 10.0.6 DRC on castellated A5 (SMD) reports "Padstack is
+        // questionable ('castellated' pads are normally PTH)"; see the README.
+        let cases = [
+            ("A5", "castellated", Some("pad 'A5': Padstack is questionable ('castellated' pads are normally PTH)")),
+            ("SH", "pressfit", Some("pad 'SH': Padstack is questionable ('press-fit' pads are normally PTH with round holes)")),
+            ("SH", "bga", Some("pad 'SH': Padstack is questionable ('BGA' property is for SMD pads)")),
+            ("A5", "bga", None),
+            ("SH", "heatsink", None),
+        ];
+        for (pad, property, warning) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(PAD_PROP_FOOTPRINT);
+            std::fs::write(&path, PAD_PROP_MECHANICAL).unwrap();
+            let result = handle_edit_footprint_pad(
+                &json!({
+                    "footprint_path": path,
+                    "pad_number": pad,
+                    "match_all": true,
+                    "fabrication_property": property
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{pad} {property}: {:?}", result.content);
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["fabrication_property"], property);
+            match warning {
+                Some(warning) => {
+                    assert_eq!(output["warnings"], json!([warning]), "{pad} {property}")
+                }
+                None => assert!(
+                    output.get("warnings").is_none(),
+                    "{pad} {property}: {output}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn padstack_warning_judges_the_pad_as_written() {
+        // The SH pads' oval drill draws KiCad's press-fit warning; a round
+        // drill written in the same call does not, and a rename is reported.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(PAD_PROP_FOOTPRINT);
+        for (extra, warning) in [
+            (json!({}), Some("pad 'SH': Padstack is questionable ('press-fit' pads are normally PTH with round holes)")),
+            (json!({ "drill": 1.0 }), None),
+            (json!({ "new_number": "S1" }), Some("pad 'S1': Padstack is questionable ('press-fit' pads are normally PTH with round holes)")),
+        ] {
+            std::fs::write(&path, PAD_PROP_MECHANICAL).unwrap();
+            let mut args = json!({
+                "footprint_path": path,
+                "pad_number": "SH",
+                "fabrication_property": "pressfit"
+            });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = handle_edit_footprint_pad(&args, &test_ctx()).await.unwrap();
+            assert!(!result.is_error, "{extra}: {:?}", result.content);
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            match warning {
+                Some(warning) => assert_eq!(output["warnings"], json!([warning]), "{extra}"),
+                None => assert!(output.get("warnings").is_none(), "{extra}: {output}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn served_edit_footprint_pad_sets_castellated() {
+        use crate::mcp::handler::McpHandler;
+        use crate::tools::ServerConfig;
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(PAD_PROP_FOOTPRINT);
+        std::fs::write(&path, PAD_PROP_MECHANICAL).unwrap();
+
+        let call = |property: serde_json::Value| {
+            json!({
+                "jsonrpc": "2.0", "id": 961, "method": "tools/call",
+                "params": {"name": "edit_footprint_pad", "arguments": {
+                    "footprint_path": path, "pad_number": "SH", "match_all": true,
+                    "fabrication_property": property
+                }}
+            })
+        };
+        let refused = handler
+            .handle_message(call(json!("castellated_pad")))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PAD_PROP_MECHANICAL);
+
+        let response = handler
+            .handle_message(call(json!("castellated")))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(response["isError"], true, "{response}");
+        let report: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(report["fabrication_property"], "castellated");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            with_kicad_pads(PAD_PROP_MECHANICAL, PAD_PROP_CASTELLATED)
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_refuses_an_unsupported_fabrication_property_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(PAD_PROP_FOOTPRINT);
+        std::fs::write(&path, PAD_PROP_MECHANICAL).unwrap();
+
+        for property in [
+            json!("pad_prop_castellated"),
+            json!("Castellated"),
+            json!(6),
+            serde_json::Value::Null,
+        ] {
+            let result = handle_edit_footprint_pad(
+                &json!({
+                    "footprint_path": path,
+                    "pad_number": "SH",
+                    "fabrication_property": property
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error, "{property} must be refused");
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["error"]["kind"], "invalid_argument");
+            assert_eq!(output["error"]["field"], "fabrication_property");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), PAD_PROP_MECHANICAL);
+        }
+    }
+
+    #[test]
+    fn fabrication_property_is_read_as_kicad_loads_it() {
+        // KiCad's parser keeps the last token it knows and skips the rest.
+        for (pad, expected) in [
+            (r#"(pad "1" smd rect (layers "F.Cu"))"#, "none"),
+            (
+                r#"(pad "1" smd rect (property pad_prop_bga) (layers "F.Cu"))"#,
+                "bga",
+            ),
+            (
+                r#"(pad "1" smd rect (property pad_prop_bga pad_prop_heatsink))"#,
+                "heatsink",
+            ),
+            (
+                r#"(pad "1" smd rect (property pad_prop_bga) (property none))"#,
+                "none",
+            ),
+            (
+                r#"(pad "1" smd rect (property pad_prop_castellated pad_prop_future))"#,
+                "castellated",
+            ),
+        ] {
+            assert_eq!(
+                PadFabricationProperty::of_pad(&parse_sexp(pad).unwrap()).as_str(),
+                expected,
+                "{pad}"
+            );
+        }
+    }
+
+    #[test]
+    fn fabrication_property_replaces_duplicates_and_follows_a_single_line_pad() {
+        let pad = r#"(pad "1" smd rect (at 0 0) (size 2 1) (layers "F.Cu") (uuid "u"))"#;
+        let castellated =
+            set_pad_fabrication_property(pad.to_string(), PadFabricationProperty::Castellated);
+        assert_eq!(
+            castellated,
+            r#"(pad "1" smd rect (at 0 0) (size 2 1) (property pad_prop_castellated) (layers "F.Cu") (uuid "u"))"#
+        );
+        let doubled = r#"(pad "1" smd rect (property pad_prop_bga) (property pad_prop_heatsink) (layers "F.Cu"))"#;
+        assert_eq!(
+            set_pad_fabrication_property(doubled.to_string(), PadFabricationProperty::Testpoint),
+            r#"(pad "1" smd rect (property pad_prop_testpoint) (layers "F.Cu"))"#
+        );
+        assert_eq!(
+            set_pad_fabrication_property(doubled.to_string(), PadFabricationProperty::None),
+            r#"(pad "1" smd rect (layers "F.Cu"))"#
+        );
+    }
+
+    #[test]
+    fn zone_connect_goes_after_the_pth_layer_children_as_kicad_writes_it() {
+        // KiCad writes zone_layer_connections beside remove_unused_layers and
+        // keep_end_layers, before net and zone_connect (format( const PAD* )).
+        let pad = r#"(pad "1" thru_hole circle (layers "*.Cu") (remove_unused_layers yes) (keep_end_layers no) (zone_layer_connections) (net 1 "GND") (uuid "u"))"#;
+        assert_eq!(
+            set_pad_zone_connect(pad.to_string(), PadZoneConnect::Solid),
+            r#"(pad "1" thru_hole circle (layers "*.Cu") (remove_unused_layers yes) (keep_end_layers no) (zone_layer_connections) (net 1 "GND") (zone_connect 2) (uuid "u"))"#
+        );
+    }
+
+    #[test]
+    fn observed_values_are_reported_once_each_in_first_seen_order() {
+        let mut response = json!({});
+        report_observed(
+            &mut response,
+            "k",
+            vec!["thermal", "unrecognized", "thermal"],
+        );
+        assert_eq!(response["k"], json!(["thermal", "unrecognized"]));
+        report_observed(&mut response, "one", vec!["solid", "solid"]);
+        assert_eq!(response["one"], "solid");
+    }
+
+    #[tokio::test]
+    async fn create_footprint_writes_a_pad_fabrication_property() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("CASTELLATED.kicad_mod");
+        let pad = |number: &str, x: f64, property: serde_json::Value| {
+            json!({
+                "number": number, "type": "thru_hole", "shape": "circle",
+                "x": x, "y": 0.0, "width": 1.7, "height": 1.7, "drill": 1.0,
+                "fabrication_property": property
+            })
+        };
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "CASTELLATED",
+            "pads": [
+                pad("1", 0.0, json!("castellated")),
+                pad("2", 2.54, json!("none")),
+                pad("3", 5.08, serde_json::Value::Null)
+            ]
+        });
+
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert!(output.get("warnings").is_none(), "{output}");
+        let content = std::fs::read_to_string(&out).unwrap();
+        let pads: Vec<&str> = footprint_pad_ranges(&content)
+            .into_iter()
+            .map(|(start, end)| &content[start..end])
+            .collect();
+        assert_eq!(pads.len(), 3);
+        assert!(
+            pads[0].contains(r#"(property pad_prop_castellated) (layers "*.Cu" "*.Mask")"#),
+            "{}",
+            pads[0]
+        );
+        for (pad, expected) in pads.iter().zip(["castellated", "none", "none"]) {
+            assert_eq!(
+                PadFabricationProperty::of_pad(&parse_sexp(pad).unwrap()).as_str(),
+                expected,
+                "{pad}"
+            );
+        }
+        assert!(!pads[1].contains("(property") && !pads[2].contains("(property"));
+    }
+
+    #[tokio::test]
+    async fn create_footprint_passes_on_kicads_padstack_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("SMD_CASTELLATED.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "SMD_CASTELLATED",
+            "pads": [{
+                "number": "1", "type": "smd", "shape": "rect",
+                "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                "fabrication_property": "castellated"
+            }]
+        });
+
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(
+            output["warnings"],
+            json!(["pad '1': Padstack is questionable ('castellated' pads are normally PTH)"])
+        );
+        assert!(std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("(property pad_prop_castellated)"));
+    }
+
+    #[tokio::test]
+    async fn create_footprint_rejects_an_unsupported_fabrication_property_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("INVALID_PROPERTY.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "INVALID_PROPERTY",
+            "pads": [{
+                "number": "1", "type": "smd", "shape": "rect",
+                "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                "fabrication_property": "half_hole"
+            }]
+        });
+
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["field"], "pads[0].fabrication_property");
+        assert!(!out.exists());
     }
 
     #[test]
@@ -6825,6 +7504,10 @@ mod tests {
         assert_eq!(pad_properties["layers"]["items"]["type"], json!("string"));
         assert_eq!(pad_properties["rotation"]["type"], json!("number"));
         assert_eq!(pad_properties["roundrect_rratio"]["maximum"], json!(0.5));
+        assert_eq!(
+            pad_properties["fabrication_property"]["enum"],
+            json!(KICAD_PAD_FABRICATION_PROPERTIES)
+        );
     }
 
     #[tokio::test]
