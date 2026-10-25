@@ -618,8 +618,8 @@ impl UnreachableReason {
             Self::NotConfigured => "No KiCad IPC address is configured.",
             Self::NoListener => {
                 "Nothing is listening there: KiCad may be closed, its API disabled \
-                 (Edit > Preferences > Plugins > 'Enable KiCad API'), or this address left \
-                 behind by a closed session."
+                 (Preferences > Plugins > 'Enable KiCad API', or KiCad > Preferences on macOS), \
+                 or this address left behind by a closed session."
             }
             Self::AccessDenied => {
                 "The operating system refused this account access to the endpoint. Likely \
@@ -1077,8 +1077,8 @@ impl KiCadIpcClient {
             return Err(unreachable_error(
                 UnreachableReason::NotConfigured,
                 "KiCAD IPC socket path not configured. To fix: \
-                 (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
-                 and copy the listed ipc:// address; \
+                 (1) in KiCAD, enable Preferences > Plugins > 'Enable KiCad API' \
+                 (KiCad > Preferences on macOS) and copy the listed ipc:// address; \
                  (2) paste it into the 'IPC Socket' field of the Konnect settings dialog \
                  (Tools > External Plugins > Konnect) and save; \
                  (3) restart the AI client so the server rereads settings. \

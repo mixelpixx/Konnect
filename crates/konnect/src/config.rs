@@ -95,8 +95,8 @@ impl IpcAddressSource {
         warn!(
             "No KiCad IPC socket found (no KICAD_API_SOCKET, none detected at {}). \
              Live-KiCad tools will fail and file-backed ones will edit the \
-             project on disk instead. Enable Edit > Preferences > Plugins > \
-             'Enable KiCad API' in KiCad, or set ipc_address in your config.",
+             project on disk instead. Enable Preferences > Plugins > \
+             'Enable KiCad API' (KiCad > Preferences on macOS), or set ipc_address in your config.",
             konnect_ipc::candidate_socket_paths()
                 .iter()
                 .map(|path| path.display().to_string())
@@ -205,9 +205,12 @@ impl Config {
         &mut self,
         detect_ipc_address: impl FnOnce() -> Option<String>,
     ) -> IpcAddressSource {
-        if !self.ipc_address.is_empty() {
+        let trimmed = self.ipc_address.trim().to_string();
+        if !trimmed.is_empty() {
+            self.ipc_address = trimmed;
             return IpcAddressSource::Config;
         }
+        self.ipc_address.clear();
         if let Ok(sock) = std::env::var("KICAD_API_SOCKET") {
             let sock = sock.trim();
             if !sock.is_empty() {
@@ -490,6 +493,18 @@ mod tests {
         assert_eq!(c.ipc_address, "ipc://file-wins.sock");
 
         std::env::remove_var("KICAD_API_SOCKET");
+    }
+
+    #[test]
+    fn whitespace_only_ipc_address_in_config_file_does_not_block_env_or_detection() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("KICAD_API_SOCKET");
+
+        let f = write_temp("json", r#"{"ipc_socket_path": "   "}"#);
+        let mut c = Config::load_from(f.path()).unwrap();
+        let source = c.resolve_ipc_address_with(|| Some("ipc:///tmp/kicad/api.sock".to_string()));
+        assert_eq!(source, IpcAddressSource::Detected);
+        assert_eq!(c.ipc_address, "ipc:///tmp/kicad/api.sock");
     }
 
     // Auto-detection: only reached when neither the file nor the env var
