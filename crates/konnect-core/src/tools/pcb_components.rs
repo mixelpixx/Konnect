@@ -230,11 +230,17 @@ pub(crate) fn extract_pad_definitions(
                     .ok_or_else(|| anyhow::anyhow!("footprint pad is missing {label}"))
             };
             let shape = required(3, "shape")?.to_string();
-            if shape == "custom" {
-                anyhow::bail!(
-                    "custom-shape pads are not supported by KiCad 10's typed placement path"
-                );
-            }
+            // KiCAD's typed IPC pad path expresses a pad as one of circle / rect /
+            // oval / trapezoid; the client already maps any other name — including
+            // "roundrect" — to a rectangle. A custom pad's primitives are bounded by
+            // its (size ...) box, so place it as that rectangle rather than refusing
+            // the entire footprint: a footprint that is 95% placeable should place,
+            // with the one custom pad approximated, not fail outright.
+            let shape = if shape == "custom" {
+                "rect".to_string()
+            } else {
+                shape
+            };
             let at = pad
                 .find("at")
                 .context("footprint pad is missing its position")?;
@@ -4177,6 +4183,27 @@ mod tests {
         assert_eq!(pads[0].number, "1");
         assert_eq!(pads[0].shape, "roundrect");
         assert_eq!(pads[0].layers, ["F.Cu", "F.Paste", "F.Mask"]);
+    }
+
+    #[test]
+    fn a_custom_shape_pad_places_as_its_bounding_rectangle() {
+        // A footprint whose pad is a custom primitive (e.g. a solder jumper's
+        // rounded pad) used to fail the whole placement. KiCAD's typed IPC pad path
+        // has no custom shape, so the pad goes down as the rectangle its (size ...)
+        // bounds — the same reduction "roundrect" already gets downstream.
+        let source = "(footprint \"Jumper:SolderJumper-2_P1.3mm_Open_RoundedPad1.0x1.5mm\"\n\
+            \t(layer \"F.Cu\")\n\
+            \t(pad \"1\" smd custom (at -1.3 0) (size 1.0 1.5)\n\
+            \t\t(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")\n\
+            \t\t(options (clearance outline) (anchor rect))\n\
+            \t\t(primitives (gr_poly (pts (xy -0.5 -0.75) (xy 0.5 -0.75) (xy 0.5 0.75) (xy -0.5 0.75)) (width 0)))\n\
+            \t)\n\
+            )";
+        let pads = extract_pad_definitions(source).unwrap();
+        assert_eq!(pads.len(), 1);
+        assert_eq!(pads[0].shape, "rect");
+        assert_eq!(pads[0].size_x, 1.0);
+        assert_eq!(pads[0].size_y, 1.5);
     }
 
     #[test]
