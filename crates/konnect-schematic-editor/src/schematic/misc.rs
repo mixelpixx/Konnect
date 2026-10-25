@@ -71,6 +71,12 @@ pub struct Text {
     pub at: At,
     pub uuid: String,
     pub effects: Option<Effects>,
+    /// `(exclude_from_sim …)`, which eeschema writes ahead of `at` on every
+    /// text element it saves. `None` for files that predate it.
+    pub exclude_from_sim: Option<bool>,
+    /// Everything else KiCAD wrote on this node that we do not model, kept so a
+    /// load/save round-trip does not delete it (#691).
+    pub raw_sub_nodes: Vec<SexpNode>,
 }
 
 impl Text {
@@ -80,6 +86,8 @@ impl Text {
             at: At::new(x, y),
             uuid: uuid::Uuid::new_v4().to_string(),
             effects: None,
+            exclude_from_sim: None,
+            raw_sub_nodes: vec![],
         }
     }
 
@@ -94,20 +102,41 @@ impl Text {
             .ok_or(Error::MissingField("at"))?;
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
         let effects = node.find("effects").and_then(Effects::from_sexp);
+        let exclude_from_sim = node.get_bool("exclude_from_sim");
+        const MODELLED: &[&str] = &["exclude_from_sim", "at", "effects", "uuid"];
+        // The text string itself is a bare scalar argument, not a tagged child,
+        // so it is "unmodelled" by tag and has to be filtered out here or it
+        // would be written a second time.
+        let raw_sub_nodes = super::unmodelled_children(node, MODELLED)
+            .into_iter()
+            .filter(SexpNode::is_list)
+            .collect();
         Ok(Text {
             text,
             at,
             uuid,
             effects,
+            exclude_from_sim,
+            raw_sub_nodes,
         })
     }
 
     pub fn to_sexp(&self) -> SexpNode {
-        let mut c = vec![atom("text"), qstr(self.text.clone()), self.at.to_sexp()];
+        let mut c = vec![atom("text"), qstr(self.text.clone())];
+        // eeschema emits exclude_from_sim before `at`; keep its order so a
+        // round-trip is a no-op for files it wrote.
+        if let Some(x) = self.exclude_from_sim {
+            c.push(tagged(
+                "exclude_from_sim",
+                vec![atom(if x { "yes" } else { "no" })],
+            ));
+        }
+        c.push(self.at.to_sexp());
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
+        c.extend(self.raw_sub_nodes.iter().cloned());
         SexpNode::List(c)
     }
 
