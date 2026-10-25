@@ -704,6 +704,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "hot_swap",
         "exclude_from_pos_files",
         "exclude_from_bom",
+        "through_hole",
         "new_number",
         "match_all",
         "replace_existing",
