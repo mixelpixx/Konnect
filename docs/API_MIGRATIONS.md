@@ -3,6 +3,27 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `update_pcb_from_schematic` keeps parts excluded from the BOM on the board (minor release)
+
+The sync dropped every symbol marked *Exclude from bill of materials*, so test
+points, wire pads and mounting holes never reached the board, and a part with
+both flags off was dropped without being listed (#875). KiCad's own Update PCB
+removes only a part marked *Exclude from board*; *Exclude from BOM* sets the
+footprint's attribute.
+
+The sync now does the same:
+
+- A symbol with `(in_bom no)` and `(on_board yes)` is added or updated like any
+  other, its footprint's `exclude_from_bill_of_materials` attribute set from the
+  symbol, as `dnp` is. A footprint whose attribute differs from its symbol is
+  planned as an update.
+- Only `(on_board no)` keeps a part off the board, and such a part is always
+  listed under `skipped_by_flag`, whatever its BOM flag.
+- Each `add` and `update` change carries `exclude_from_bom` beside `dnp`.
+
+A board synced before this change gains the footprints the old sync dropped on
+its next sync. No argument was renamed or removed.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
