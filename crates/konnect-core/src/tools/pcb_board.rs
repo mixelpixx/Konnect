@@ -21,8 +21,9 @@ use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
-        write_atomic, SexpEdit,
+        read_consistent, transact_atomic, SexpEdit,
     },
+    SexpError,
 };
 use serde_json::json;
 use std::path::Path;
@@ -362,6 +363,100 @@ fn unsafe_file_fallback(
              restart Konnect only after confirming that the saved file is authoritative."
         ),
     )
+}
+
+/// Apply `edits` to `content` and replace `board_path` with the result only
+/// while it still holds `content`, the bytes the edits were built from. A
+/// board that KiCad's autosave, an editor or another call saved in between is
+/// refused as `conflict` instead of being overwritten with an edit of the
+/// older read. `write_atomic_if_unchanged` would report that refusal and a
+/// failed post-write readback as the same `Conflict`; these need telling apart.
+fn write_board_edits(
+    board_path: &Path,
+    operation: &str,
+    content: String,
+    edits: Vec<SexpEdit>,
+) -> anyhow::Result<Option<CallToolResult>> {
+    #[cfg(test)]
+    board_write_hook::run(board_path);
+    // Compare under the writer's lock. A changed board is handed back as it
+    // is, and the writer does not rewrite an unchanged result.
+    let written = transact_atomic(board_path, move |current| {
+        Ok(if current == content {
+            (apply_edits(content, edits), true)
+        } else {
+            (current.to_owned(), false)
+        })
+    });
+    board_write_outcome(board_path, operation, written)
+}
+
+/// What `write_board_edits` tells the caller. The writer reports a readback
+/// that no longer holds the edit as `SexpError::Conflict`; by then the board
+/// was replaced, so that is an uncertain outcome, not a refusal.
+fn board_write_outcome(
+    board_path: &Path,
+    operation: &str,
+    written: Result<bool, SexpError>,
+) -> anyhow::Result<Option<CallToolResult>> {
+    let path = board_path.display().to_string();
+    match written {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(CallToolResult::error_kind(
+            ToolErrorKind::Conflict {
+                paths: vec![path.clone()],
+            },
+            format!(
+                "Board '{path}' changed after Konnect read it, so {operation} wrote nothing. \
+                 Reload the board and retry."
+            ),
+        ))),
+        Err(SexpError::Conflict { .. }) => {
+            let reason = "the board no longer held the edit when read back after the write";
+            Ok(Some(CallToolResult::error_kind(
+                ToolErrorKind::MutationOutcomeUncertain {
+                    operation: operation.to_string(),
+                    path: path.clone(),
+                    reason: reason.to_string(),
+                },
+                format!(
+                    "{operation} replaced board '{path}', but {reason}. Another program may \
+                     have saved it. Reload and inspect the board before retrying."
+                ),
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A test-only seam between a fallback's read and its write, where a test
+/// plays the intervening save.
+#[cfg(test)]
+mod board_write_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Run `hook` just before the next board write on this thread.
+    pub(super) fn set(hook: impl FnOnce(&Path) + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Whether a hook is still waiting for a write.
+    pub(super) fn armed() -> bool {
+        HOOK.with(|slot| slot.borrow().is_some())
+    }
+
+    pub(super) fn run(path: &Path) {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
 }
 
 /// A KiCad sibling lock is persistent evidence that the saved board may not be
@@ -1417,7 +1512,7 @@ async fn handle_set_board_size(
         BoardWrite::File(reason) => reason,
     };
 
-    let content = std::fs::read_to_string(&board_path)?;
+    let content = read_consistent(&board_path)?;
 
     // Locate every existing top-level Edge.Cuts graphic. Plain `gr_line`s are
     // replaced; anything else refuses, because silently deleting an arc or
@@ -1457,8 +1552,9 @@ async fn handle_set_board_size(
     );
     let close_pos = content.rfind(')').unwrap_or(content.len());
     edits.push(SexpEdit::insert(close_pos, lines));
-    let new_content = apply_edits(content, edits);
-    write_atomic(&board_path, &new_content)?;
+    if let Some(conflict) = write_board_edits(&board_path, "set_board_size", content, edits)? {
+        return Ok(conflict);
+    }
 
     Ok(CallToolResult::json(&json!({
         "width": width, "height": height,
@@ -1948,7 +2044,7 @@ async fn handle_add_layer(
         )));
     }
 
-    let content = std::fs::read_to_string(&board_path)?;
+    let content = read_consistent(&board_path)?;
 
     // Find the (layers ...) block and insert before its closing paren
     let layers_pos = match content.find("(layers") {
@@ -1995,8 +2091,14 @@ async fn handle_add_layer(
     // hardcoding spaces into a file that may be tab-indented.
     let indent = entry_indent(&content, layers_pos).unwrap_or_else(|| "    ".to_string());
     let new_layer = format!("\n{indent}({new_id} \"{layer_name}\" {layer_type})");
-    let new_content = apply_edits(content, vec![SexpEdit::insert(insert_pos, new_layer)]);
-    write_atomic(&board_path, &new_content)?;
+    if let Some(conflict) = write_board_edits(
+        &board_path,
+        "add_layer",
+        content,
+        vec![SexpEdit::insert(insert_pos, new_layer)],
+    )? {
+        return Ok(conflict);
+    }
 
     Ok(CallToolResult::json(&json!({
         "added_layer": layer_name, "id": new_id, "type": layer_type
@@ -2167,10 +2269,16 @@ async fn handle_add_board_outline(
 
     let outline = format_outline(&primitives, "Edge.Cuts", w);
 
-    let content = std::fs::read_to_string(&board_path)?;
+    let content = read_consistent(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, outline)]);
-    write_atomic(&board_path, &new_content)?;
+    if let Some(conflict) = write_board_edits(
+        &board_path,
+        "add_board_outline",
+        content,
+        vec![SexpEdit::insert(close_pos, outline)],
+    )? {
+        return Ok(conflict);
+    }
 
     Ok(CallToolResult::json(&json!({
         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
@@ -2296,7 +2404,7 @@ async fn handle_delete_graphics(
         ),
         BoardWrite::Refused(result) => return Ok(result),
         BoardWrite::File(reason) => {
-            let content = std::fs::read_to_string(&board_path)?;
+            let content = read_consistent(&board_path)?;
             let matched: Vec<FileGraphic> = read_file_graphics(&content)
                 .into_iter()
                 .filter(|g| filter.matches(&g.uuid, g.kind, &g.layer))
@@ -2311,7 +2419,11 @@ async fn handle_delete_graphics(
                     .iter()
                     .map(|g| SexpEdit::delete(g.span.0, g.span.1))
                     .collect();
-                write_atomic(&board_path, &apply_edits(content, edits))?;
+                if let Some(conflict) =
+                    write_board_edits(&board_path, "delete_graphics", content, edits)?
+                {
+                    return Ok(conflict);
+                }
             }
             (graphics, "file", Some(reason))
         }
@@ -2508,10 +2620,16 @@ async fn handle_add_board_text(
     };
 
     let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
-    let content = std::fs::read_to_string(&board_path)?;
+    let content = read_consistent(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, gr_text)]);
-    write_atomic(&board_path, &new_content)?;
+    if let Some(conflict) = write_board_edits(
+        &board_path,
+        "add_board_text",
+        content,
+        vec![SexpEdit::insert(close_pos, gr_text)],
+    )? {
+        return Ok(conflict);
+    }
 
     Ok(CallToolResult::json(&json!({
         "text": text, "x": x, "y": y, "layer": layer, "size": size,
@@ -2611,7 +2729,7 @@ pub(crate) async fn add_zone_impl(
         BoardWrite::File(reason) => reason,
     };
 
-    let content = std::fs::read_to_string(&board_path)?;
+    let content = read_consistent(&board_path)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
     let Some(net) = konnect_sexp::net::net_ref_for_write(&tree, &net_name) else {
         return Ok(CallToolResult::error(format!(
@@ -2627,8 +2745,14 @@ pub(crate) async fn add_zone_impl(
     );
 
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_sexp)]);
-    write_atomic(&board_path, &new_content)?;
+    if let Some(conflict) = write_board_edits(
+        &board_path,
+        "add_zone",
+        content,
+        vec![SexpEdit::insert(close_pos, zone_sexp)],
+    )? {
+        return Ok(conflict);
+    }
 
     let mut body = describe();
     body["source"] = json!("file");
@@ -2693,10 +2817,16 @@ async fn handle_import_svg_logo(
     for polygon in &placed {
         sexp.push_str(&format_gr_poly(polygon, &layer));
     }
-    let content = std::fs::read_to_string(&board_path)?;
+    let content = read_consistent(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, sexp)]);
-    write_atomic(&board_path, &new_content)?;
+    if let Some(conflict) = write_board_edits(
+        &board_path,
+        "import_svg_logo",
+        content,
+        vec![SexpEdit::insert(close_pos, sexp)],
+    )? {
+        return Ok(conflict);
+    }
 
     Ok(CallToolResult::json(&json!({
         "polygon_count": placed.len(),
@@ -5683,5 +5813,216 @@ mod single_board_lookup_tests {
             ],
             "every board command names the document GetOpenDocuments returned"
         );
+    }
+}
+
+#[cfg(test)]
+mod board_revision_tests {
+    use super::board_mock::ctx_talking_to;
+    use super::mounting_hole_tests::result_text;
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    /// Saved by KiCad 10.0.5; see `specctra_two_resistors.README.md`.
+    const BOARD: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+
+    /// The save that lands between a fallback's read and its write: the
+    /// page size KiCad's Page Settings dialog would change.
+    fn newer() -> String {
+        BOARD.replacen("(paper \"A4\")", "(paper \"A3\")", 1)
+    }
+
+    const LOGO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <path d="M0 0 L100 0 L100 100 L0 100 Z" fill="black"/>
+    </svg>"##;
+
+    /// Every fallback this guard covers, with arguments that reach its write.
+    fn cases(dir: &Path, board: &Path) -> Vec<(&'static str, serde_json::Value)> {
+        let svg = dir.join("logo.svg");
+        std::fs::write(&svg, LOGO).unwrap();
+        let board = board.display().to_string();
+        vec![
+            (
+                "set_board_size",
+                json!({"board": board, "width": 50.0, "height": 40.0}),
+            ),
+            ("add_layer", json!({"board": board, "layer_name": "In1.Cu"})),
+            (
+                "add_board_outline",
+                json!({"board": board, "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 10.0}),
+            ),
+            (
+                "delete_graphics",
+                json!({"board": board, "layer": "Edge.Cuts"}),
+            ),
+            (
+                "add_board_text",
+                json!({"board": board, "text": "REV B", "x": 5.0, "y": 5.0}),
+            ),
+            (
+                "add_zone",
+                json!({
+                    "board": board, "net_name": "GND", "layer": "F.Cu",
+                    "points": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}]
+                }),
+            ),
+            (
+                "import_svg_logo",
+                json!({"board": board, "svg": svg.display().to_string(), "width_mm": 5.0}),
+            ),
+        ]
+    }
+
+    async fn call(tool: &str, args: &serde_json::Value) -> CallToolResult {
+        let def = tools()
+            .into_iter()
+            .find(|def| def.name == tool)
+            .expect("registered tool");
+        (def.handler)(args, Arc::new(ctx_talking_to(String::new())))
+            .await
+            .unwrap_or_else(|error| panic!("{tool}: {error:#}"))
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&result_text(result)).unwrap()
+    }
+
+    fn assert_conflict(tool: &str, error: &serde_json::Value, board: &Path) {
+        assert_eq!(error["kind"], "conflict", "{tool}: {error}");
+        assert_eq!(
+            error["paths"],
+            json!([board.display().to_string()]),
+            "{tool}: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_board_saved_between_read_and_write_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        for (tool, args) in cases(dir.path(), &board) {
+            std::fs::write(&board, BOARD).unwrap();
+            board_write_hook::set(|path| std::fs::write(path, newer()).unwrap());
+            let result = call(tool, &args).await;
+
+            assert!(
+                !board_write_hook::armed(),
+                "{tool} bypassed the revision-checked write"
+            );
+            assert!(
+                result.is_error,
+                "{tool} reported success over a newer board"
+            );
+            assert_conflict(tool, &body(&result)["error"], &board);
+            assert_eq!(
+                std::fs::read_to_string(&board).unwrap(),
+                newer(),
+                "{tool} must leave the newer save byte for byte"
+            );
+        }
+    }
+
+    /// The writer reports a readback that no longer holds the edit as
+    /// `Conflict` after the board was replaced. That is not a refusal.
+    #[test]
+    fn a_readback_mismatch_is_an_uncertain_outcome() {
+        let board = Path::new("/boards/board.kicad_pcb");
+        let written = Err(SexpError::Conflict {
+            path: board.to_path_buf(),
+        });
+        let result = board_write_outcome(board, "add_board_text", written)
+            .unwrap()
+            .expect("an error result");
+        let error = &body(&result)["error"];
+        assert_eq!(error["kind"], "mutation_outcome_uncertain", "{error}");
+        assert_eq!(error["operation"], "add_board_text", "{error}");
+        assert_eq!(error["path"], "/boards/board.kicad_pcb", "{error}");
+
+        let refused = board_write_outcome(board, "add_board_text", Ok(false))
+            .unwrap()
+            .expect("an error result");
+        assert_conflict("add_board_text", &body(&refused)["error"], board);
+        assert!(board_write_outcome(board, "add_board_text", Ok(true))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The top-level blocks a tool edits: `set_board_size` replaces the
+    /// Edge.Cuts lines, `delete_graphics` deletes them, and `add_layer`
+    /// extends the layer table.
+    fn edited_by(tool: &str, block: &str) -> bool {
+        match tool {
+            "set_board_size" | "delete_graphics" => {
+                block.starts_with("(gr_line") && block.contains("\"Edge.Cuts\"")
+            }
+            "add_layer" => block.starts_with("(layers"),
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_board_is_written_with_its_kicad_content_kept() {
+        let blocks: Vec<&str> = find_direct_child_blocks(BOARD, "kicad_pcb")
+            .into_iter()
+            .map(|(start, end)| &BOARD[start..end])
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        for (tool, args) in cases(dir.path(), &board) {
+            std::fs::write(&board, BOARD).unwrap();
+            let result = call(tool, &args).await;
+            assert!(!result.is_error, "{tool}: {:?}", result.content);
+            // add_layer has no IPC path, so it reports no source.
+            if tool != "add_layer" {
+                assert_eq!(body(&result)["source"], "file", "{tool}");
+            }
+
+            let after = std::fs::read_to_string(&board).unwrap();
+            assert_ne!(after, BOARD, "{tool} wrote nothing");
+            let mut from = 0;
+            for block in blocks.iter().filter(|block| !edited_by(tool, block)) {
+                let at = after[from..]
+                    .find(block)
+                    .unwrap_or_else(|| panic!("{tool} lost or reordered:\n{block}"));
+                from += at + block.len();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_served_dispatch_reports_the_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, BOARD).unwrap();
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+
+        board_write_hook::set(|path| std::fs::write(path, newer()).unwrap());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 845,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_board_text",
+                    "arguments": {
+                        "board": board.display().to_string(),
+                        "text": "REV B", "x": 5.0, "y": 5.0
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_conflict("add_board_text", &text["error"], &board);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), newer());
     }
 }
