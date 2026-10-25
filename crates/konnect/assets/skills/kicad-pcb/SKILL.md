@@ -302,7 +302,7 @@ route_differential_pair(board, net_pos, net_neg, x1, y1, x2, y2, gap?, layer?, w
 Define routing rules for groups of nets:
 
 ```
-create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?)
+create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?, diff_pair_width?, diff_pair_gap?, diff_pair_via_gap?)
 ```
 
 The class is written to the project's `.kicad_pro` file, which is where KiCad

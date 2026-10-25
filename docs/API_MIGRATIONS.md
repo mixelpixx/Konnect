@@ -3,6 +3,28 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `create_netclass` and `get_netclasses` carry the differential-pair settings (minor release)
+
+`create_netclass` could not set a netclass's differential-pair width, gap or
+via gap, and `get_netclasses` did not report them (#777). `create_netclass`
+now takes `diff_pair_width`, `diff_pair_gap` and `diff_pair_via_gap`,
+optional, in mm and greater than zero. An update changes only the ones named.
+A new named class without them leaves them out of the project file, so its
+width and gap keep resolving from the Default; the four older settings keep
+their creation defaults. A Default is still written complete, and an
+incomplete one is still repaired without touching values already set.
+
+`create_netclass`'s reply and each class `get_netclasses` reports gain the
+three fields. The reply reports the class as stored, `null` where it sets
+none. `get_netclasses` reports them resolved, naming in `inherits` those taken
+from the Default. KiCad 10.0.6 never fills a named class's `diff_pair_via_gap`
+from the Default (`addMissingDefaults` has it commented out), so a named class
+without its own reports `null` and does not list it. KiCad 10.0.6's router and
+DRC never use a named class's via gap, and its Board Setup, which has no via-gap
+column, drops one when its changes are applied.
+
+No argument or field was renamed or removed.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

@@ -8,7 +8,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::{
-    get_path, opt_f64, require_f64, require_str, with_board_ipc_classified,
+    get_path, opt_f64, opt_positive_f64, require_f64, require_str, with_board_ipc_classified,
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
@@ -252,7 +252,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "clearance":    { "type": "number", "description": "Clearance in mm", "default": 0.2 },
                     "trace_width":  { "type": "number", "description": "Default trace width in mm", "default": 0.25 },
                     "via_drill":    { "type": "number", "description": "Via drill diameter in mm", "default": 0.4 },
-                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 },
+                    "diff_pair_width":   { "type": "number", "exclusiveMinimum": 0, "description": "Differential-pair width in mm; unset, the Default's applies" },
+                    "diff_pair_gap":     { "type": "number", "exclusiveMinimum": 0, "description": "Differential-pair gap in mm; unset, the Default's applies" },
+                    "diff_pair_via_gap": { "type": "number", "exclusiveMinimum": 0, "description": "Differential-pair via gap in mm; a named class never inherits the Default's" }
                 },
                 "required": ["board", "name"]
             }),
@@ -273,7 +276,9 @@ pub fn tools() -> Vec<ToolDef> {
              higher priority) and falls back to Default. Settings are reported \
              resolved, with 'inherits' naming the ones a class takes from the \
              Default rather than setting itself; 'missing_fields' on the \
-             Default names settings nothing can resolve. 'orphan_patterns' \
+             Default names settings nothing can resolve. KiCad never fills a \
+             class's diff_pair_via_gap from the Default, so one without its own \
+             reports null. 'orphan_patterns' \
              lists patterns naming a class that does not exist; \
              'unmatched_patterns' lists patterns whose class exists but which \
              fit no net on the board read (null when its nets are \
@@ -1381,6 +1386,14 @@ async fn handle_create_netclass(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+    // Held to the schema's bound on a direct call too, before the guard as
+    // every argument error is: KiCad 10.0.6's loader takes zero or a negative
+    // as given (`net_settings.cpp:44-51`).
+    for arg in ["diff_pair_width", "diff_pair_gap", "diff_pair_via_gap"] {
+        if let Err(refusal) = opt_positive_f64(args, arg) {
+            return Ok(refusal);
+        }
+    }
     let name = match require_str(args, "name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1388,16 +1401,6 @@ async fn handle_create_netclass(
     if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
         return Ok(refusal);
     }
-    // KiCad's key, this tool's argument name, and the value a *new* class
-    // takes when the caller says nothing. The defaults belong to creation
-    // only: folding them in before an update turned "widen HV's track" into a
-    // silent reset of the clearance, drill and via size the caller had tuned.
-    const FIELDS: [(&str, &str, f64); 4] = [
-        ("clearance", "clearance", 0.2),
-        ("track_width", "trace_width", 0.25),
-        ("via_drill", "via_drill", 0.4),
-        ("via_diameter", "via_diameter", 0.8),
-    ];
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
@@ -1428,7 +1431,7 @@ async fn handle_create_netclass(
     let mut backfilled: Vec<String> = Vec::new();
     let updated = if let Some(class) = classes.iter_mut().find(|c| c["name"] == json!(name)) {
         let before = class.clone();
-        for (key, arg, _) in FIELDS {
+        for (key, arg, _) in NETCLASS_FIELDS {
             if let Some(value) = opt_f64(args, arg) {
                 class[key] = json!(value);
             }
@@ -1458,7 +1461,7 @@ async fn handle_create_netclass(
         // to them, so start from the full set.
         let mut class = kicad_default_class();
         class["name"] = json!(name);
-        for (key, arg, _) in FIELDS {
+        for (key, arg, _) in NETCLASS_FIELDS {
             if let Some(value) = opt_f64(args, arg) {
                 class[key] = json!(value);
             }
@@ -1470,8 +1473,10 @@ async fn handle_create_netclass(
         // writing the full set would sever that inheritance. -1 is what
         // KiCad's constructor gives every non-default class.
         let mut class = json!({ "name": name, "priority": -1 });
-        for (key, arg, default) in FIELDS {
-            class[key] = json!(opt_f64(args, arg).unwrap_or(default));
+        for (key, arg, default) in NETCLASS_FIELDS {
+            if let Some(value) = opt_f64(args, arg).or(default) {
+                class[key] = json!(value);
+            }
         }
         classes.push(class);
         false
@@ -1510,6 +1515,8 @@ async fn handle_create_netclass(
         "is_default": is_default,
         "clearance": stored["clearance"], "trace_width": stored["track_width"],
         "via_drill": stored["via_drill"], "via_diameter": stored["via_diameter"],
+        "diff_pair_width": stored["diff_pair_width"], "diff_pair_gap": stored["diff_pair_gap"],
+        "diff_pair_via_gap": stored["diff_pair_via_gap"],
         "file": pro.display().to_string(),
         "note": note
     })))
@@ -1552,19 +1559,33 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
     p == pat.len()
 }
 
-/// The four settings `create_netclass` writes, as (KiCad's key, this API's
-/// name). Reported per class so a caller can see what a class holds before
-/// overwriting it — the gap that made #220 hard to review.
+/// The settings `create_netclass` writes and `get_netclasses` reports, as
+/// (KiCad's key, this API's name, the value a *new* named class takes when the
+/// caller says nothing). Reported per class so a caller can see what a class
+/// holds before overwriting it — the gap that made #220 hard to review.
+///
+/// The defaults belong to creation only: folding them in before an update
+/// turned "widen HV's track" into a silent reset of the clearance, drill and
+/// via size the caller had tuned. The differential-pair settings have none, so
+/// a new class leaves them unset and takes the Default's width and gap (#777).
 ///
 /// A key absent from a named class means inheritance, not an unset value, so
 /// these are reported resolved with `inherits` naming what came from the
-/// Default (#326).
-const NETCLASS_FIELDS: [(&str, &str); 4] = [
-    ("clearance", "clearance"),
-    ("track_width", "trace_width"),
-    ("via_drill", "via_drill"),
-    ("via_diameter", "via_diameter"),
+/// Default (#326) — all but [`NOT_INHERITED`].
+const NETCLASS_FIELDS: [(&str, &str, Option<f64>); 7] = [
+    ("clearance", "clearance", Some(0.2)),
+    ("track_width", "trace_width", Some(0.25)),
+    ("via_drill", "via_drill", Some(0.4)),
+    ("via_diameter", "via_diameter", Some(0.8)),
+    ("diff_pair_width", "diff_pair_width", None),
+    ("diff_pair_gap", "diff_pair_gap", None),
+    ("diff_pair_via_gap", "diff_pair_via_gap", None),
 ];
+
+/// Of the settings above, the one KiCad never fills from the Default:
+/// `addMissingDefaults` has it commented out (`net_settings.cpp:1108-1114` in
+/// KiCad 10.0.6), so a named class without its own has none.
+const NOT_INHERITED: &str = "diff_pair_via_gap";
 
 /// Every distinct net the saved board names, sorted.
 ///
@@ -1696,11 +1717,11 @@ async fn handle_get_netclasses(
             "matched_nets": matched,
         });
         let mut inherits: Vec<&str> = Vec::new();
-        for (key, api) in NETCLASS_FIELDS {
+        for (key, api, _) in NETCLASS_FIELDS {
             let own = class.get(key).filter(|v| !v.is_null());
             entry[api] = match own {
                 Some(value) => value.clone(),
-                None if !is_default => {
+                None if !is_default && key != NOT_INHERITED => {
                     let inherited = effective_default[key].clone();
                     if !inherited.is_null() {
                         inherits.push(api);
@@ -2286,16 +2307,22 @@ mod add_net_format_tests {
 #[cfg(test)]
 mod netclass_tests {
     use super::*;
+    use crate::mcp::handler::McpHandler;
     use crate::router::ToolRouter;
+    use crate::tools::pcb_board::board_mock::spawn_kicad_holding_boards;
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
     fn test_ctx() -> ToolContext {
+        ctx_talking_to("")
+    }
+
+    fn ctx_talking_to(address: &str) -> ToolContext {
         ToolContext::new(
             ServerConfig {
                 kicad_cli: String::new(),
                 kicad_binary: String::new(),
-                ipc_address: String::new(),
+                ipc_address: address.to_string(),
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
@@ -2353,6 +2380,44 @@ mod netclass_tests {
         .unwrap()
     }
 
+    async fn served_handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    /// A `tools/call` the way a client makes it, so the advertised schema is
+    /// enforced before the handler runs.
+    async fn served(
+        handler: &McpHandler,
+        tool: &str,
+        board: &std::path::Path,
+        args: serde_json::Value,
+    ) -> CallToolResult {
+        let mut arguments = args;
+        arguments["board"] = json!(board.to_str().unwrap());
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        assert!(response.error.is_none(), "tool errors are MCP results");
+        serde_json::from_value(response.result.expect("a result"))
+            .expect("result uses the advertised MCP shape")
+    }
+
     /// The board file is data KiCad refuses if a netclass node lands in it;
     /// the class must go into the project file and the board must not change
     /// by a single byte.
@@ -2403,6 +2468,9 @@ mod netclass_tests {
         assert_eq!(default["track_width"], json!(0.2), "{default}");
         assert_eq!(default["via_diameter"], json!(0.6), "{default}");
         assert_eq!(default["via_drill"], json!(0.3), "{default}");
+        assert_eq!(default["diff_pair_width"], json!(0.2), "{default}");
+        assert_eq!(default["diff_pair_gap"], json!(0.25), "{default}");
+        assert_eq!(default["diff_pair_via_gap"], json!(0.25), "{default}");
         assert_eq!(default["priority"], json!(i32::MAX), "{default}");
         for key in ["schematic_color", "pcb_color", "tuning_profile"] {
             assert!(default.get(key).is_some(), "{key} missing from {default}");
@@ -2413,10 +2481,16 @@ mod netclass_tests {
     #[tokio::test]
     async fn create_netclass_lets_the_caller_override_the_default_class() {
         let (_dir, board) = fixture(true);
-        create(&board, json!({ "name": "Default", "trace_width": 0.35 })).await;
+        create(
+            &board,
+            json!({ "name": "Default", "trace_width": 0.35, "diff_pair_gap": 0.18 }),
+        )
+        .await;
 
         let default = project_json(&board)["net_settings"]["classes"][0].clone();
         assert_eq!(default["track_width"], json!(0.35), "{default}");
+        assert_eq!(default["diff_pair_gap"], json!(0.18), "{default}");
+        assert_eq!(default["diff_pair_width"], json!(0.2), "{default}");
         assert_eq!(default["wire_width"], json!(6), "{default}");
     }
 
@@ -2434,7 +2508,8 @@ mod netclass_tests {
             "classes": [{
                 "name": "Default", "priority": 0,
                 "clearance": 1.5, "track_width": 0.25,
-                "via_drill": 0.4, "via_diameter": 0.8
+                "via_drill": 0.4, "via_diameter": 0.8,
+                "diff_pair_gap": 0.3
             }],
             "meta": { "version": 5 },
             "netclass_patterns": []
@@ -2451,12 +2526,16 @@ mod netclass_tests {
         // absent is repaired, present is left alone.
         assert_eq!(default["clearance"], json!(1.5), "{default}");
         assert_eq!(default["track_width"], json!(0.25), "{default}");
+        assert_eq!(default["diff_pair_gap"], json!(0.3), "{default}");
+        assert_eq!(default["diff_pair_width"], json!(0.2), "{default}");
         assert_eq!(default["priority"], json!(0), "{default}");
 
         let echoed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
         let note = echoed["note"].as_str().unwrap_or_default();
         assert!(note.contains("wire_width"), "{note}");
+        assert!(note.contains("diff_pair_via_gap"), "{note}");
         assert!(!note.contains("clearance"), "{note}");
+        assert!(!note.contains("diff_pair_gap"), "{note}");
     }
 
     /// Only the Default carries the completeness requirement. A named class
@@ -2466,11 +2545,19 @@ mod netclass_tests {
     #[tokio::test]
     async fn create_netclass_leaves_a_named_class_sparse() {
         let (_dir, board) = fixture(true);
-        create(&board, json!({ "name": "HV", "clearance": 0.5 })).await;
+        let result = create(&board, json!({ "name": "HV", "clearance": 0.5 })).await;
 
         let hv = project_json(&board)["net_settings"]["classes"][0].clone();
         assert!(hv.get("wire_width").is_none(), "{hv}");
-        assert!(hv.get("diff_pair_gap").is_none(), "{hv}");
+        // The reply reports the class as stored: null where it sets nothing.
+        let echoed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        for key in ["diff_pair_width", "diff_pair_gap", "diff_pair_via_gap"] {
+            assert!(hv.get(key).is_none(), "{key}: {hv}");
+            assert!(
+                echoed.get(key).is_some_and(|v| v.is_null()),
+                "{key}: {echoed}"
+            );
+        }
         // KiCad's constructor gives every non-default class -1.
         assert_eq!(hv["priority"], json!(-1), "{hv}");
     }
@@ -2584,7 +2671,8 @@ mod netclass_tests {
     #[tokio::test]
     async fn a_call_that_changes_nothing_leaves_the_project_file_untouched() {
         let (_dir, board) = fixture(true);
-        create(&board, json!({ "name": "HV", "clearance": 1.5 })).await;
+        let held = json!({ "name": "HV", "clearance": 1.5, "diff_pair_gap": 0.15 });
+        create(&board, held.clone()).await;
 
         // Re-written by hand in a shape the serialiser would not produce, so
         // any save at all is visible in the bytes.
@@ -2606,7 +2694,7 @@ mod netclass_tests {
         assert_eq!(echoed["updated_existing"], json!(true));
 
         // Naming the values it already holds: also nothing to decide.
-        create(&board, json!({ "name": "HV", "clearance": 1.5 })).await;
+        create(&board, held).await;
         assert_eq!(std::fs::read_to_string(&pro).unwrap(), compact);
 
         // A real change still writes.
@@ -2626,6 +2714,267 @@ mod netclass_tests {
         assert_eq!(hv["track_width"], json!(0.25), "{hv}");
         assert_eq!(hv["via_drill"], json!(0.4), "{hv}");
         assert_eq!(hv["via_diameter"], json!(0.8), "{hv}");
+    }
+
+    /// #777: the differential-pair settings KiCad keeps per class are written
+    /// as given, and the reply reports the stored class.
+    #[tokio::test]
+    async fn create_netclass_writes_the_differential_pair_settings_it_is_given() {
+        let (_dir, board) = fixture(true);
+        let result = create(
+            &board,
+            json!({ "name": "USB", "diff_pair_width": 0.18, "diff_pair_gap": 0.15,
+                    "diff_pair_via_gap": 0.3 }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+
+        let usb = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert_eq!(usb["diff_pair_width"], json!(0.18), "{usb}");
+        assert_eq!(usb["diff_pair_gap"], json!(0.15), "{usb}");
+        assert_eq!(usb["diff_pair_via_gap"], json!(0.3), "{usb}");
+        let echoed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(echoed["diff_pair_width"], json!(0.18), "{echoed}");
+        assert_eq!(echoed["diff_pair_gap"], json!(0.15), "{echoed}");
+        assert_eq!(echoed["diff_pair_via_gap"], json!(0.3), "{echoed}");
+    }
+
+    /// Updating one differential-pair setting leaves every other setting the
+    /// class holds alone, and the reply reports the class as stored.
+    #[tokio::test]
+    async fn create_netclass_updates_one_differential_pair_setting_alone() {
+        let (_dir, board) = fixture(true);
+        create(
+            &board,
+            json!({ "name": "USB", "clearance": 0.15, "diff_pair_width": 0.18,
+                    "diff_pair_gap": 0.15, "diff_pair_via_gap": 0.3 }),
+        )
+        .await;
+        let second = create(&board, json!({ "name": "USB", "diff_pair_gap": 0.12 })).await;
+        assert!(!second.is_error, "{}", text_of(&second));
+
+        let usb = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert_eq!(usb["diff_pair_gap"], json!(0.12), "the named value changes");
+        assert_eq!(usb["diff_pair_width"], json!(0.18), "{usb}");
+        assert_eq!(usb["diff_pair_via_gap"], json!(0.3), "{usb}");
+        assert_eq!(usb["clearance"], json!(0.15), "{usb}");
+        let echoed: serde_json::Value = serde_json::from_str(&text_of(&second)).unwrap();
+        assert_eq!(echoed["diff_pair_width"], json!(0.18), "{echoed}");
+        assert_eq!(echoed["diff_pair_gap"], json!(0.12), "{echoed}");
+    }
+
+    /// Every setting `create_netclass` writes, `get_netclasses` reads back as
+    /// the class's own: a row missing from the shared mapping is neither
+    /// written nor reported.
+    #[tokio::test]
+    async fn every_setting_create_netclass_writes_reads_back_as_its_own() {
+        let (_dir, board) = fixture_with_nets(&["USB_P"]);
+        let written = json!({
+            "clearance": 0.11, "trace_width": 0.12, "via_drill": 0.13, "via_diameter": 0.14,
+            "diff_pair_width": 0.15, "diff_pair_gap": 0.16, "diff_pair_via_gap": 0.17
+        });
+        let mut args = written.clone();
+        args["name"] = json!("USB");
+        create(&board, args).await;
+
+        let body = get_classes(&board).await;
+        let usb = body["netclasses"][0].clone();
+        for (arg, value) in written.as_object().unwrap() {
+            assert_eq!(&usb[arg], value, "{arg}: {usb}");
+        }
+        assert_eq!(usb["inherits"], json!([]), "{usb}");
+    }
+
+    /// The advertised schema types each differential-pair setting a number
+    /// above zero, so a served call breaking either is refused by name before
+    /// the handler runs, and nothing is written. A direct call meets the same
+    /// bound in the handler, before the guard as every argument error is: with
+    /// KiCad holding the board, a valid value meets the guard and zero still
+    /// meets the bound.
+    #[tokio::test]
+    async fn differential_pair_settings_out_of_bounds_are_refused_by_name() {
+        let (_dir, board) = fixture(true);
+        let pro = board.with_extension("kicad_pro");
+        let before = std::fs::read_to_string(&pro).unwrap();
+        let def = tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_netclass")
+            .expect("create_netclass is registered");
+        let handler = served_handler().await;
+
+        for field in ["diff_pair_width", "diff_pair_gap", "diff_pair_via_gap"] {
+            let call = |value: serde_json::Value| {
+                let mut args = json!({ "board": "/b.kicad_pcb", "name": "USB" });
+                args[field] = value;
+                args
+            };
+            assert!(def.input_validator.is_valid(&call(json!(0.2))), "{field}");
+            for value in [json!(0), json!(-0.1), json!("0.2"), json!(null)] {
+                assert!(
+                    !def.input_validator.is_valid(&call(value.clone())),
+                    "the schema accepts {field} {value}"
+                );
+                let mut args = json!({ "name": "USB" });
+                args[field] = value.clone();
+                let result = served(&handler, "create_netclass", &board, args).await;
+                assert_eq!(
+                    crate::mcp::error::extract_error_kind(&result).as_deref(),
+                    Some("invalid_argument"),
+                    "{field} / {value}"
+                );
+                let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+                assert_eq!(body["error"]["field"], json!(field), "{field} / {value}");
+            }
+            let kicad = spawn_kicad_holding_boards(&[&board], |_| None);
+            let held = ctx_talking_to(kicad.address());
+            let guarded = handle_create_netclass(
+                &json!({ "board": board.to_str().unwrap(), "name": "USB", field: 0.2 }),
+                &held,
+            )
+            .await
+            .unwrap();
+            assert!(
+                text_of(&guarded).contains("holds this board open"),
+                "the mock KiCad holds the board: {}",
+                text_of(&guarded)
+            );
+            let direct = handle_create_netclass(
+                &json!({ "board": board.to_str().unwrap(), "name": "USB", field: 0 }),
+                &held,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&direct).as_deref(),
+                Some("invalid_argument"),
+                "a direct call with {field} 0, KiCad holding the board: {}",
+                text_of(&direct)
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&pro).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    /// A project file that is not JSON is refused by both tools, and one whose
+    /// net settings are not the shape KiCad writes is refused by the writer.
+    /// Neither file changes.
+    #[tokio::test]
+    async fn a_malformed_project_file_is_refused_and_left_alone() {
+        let (_dir, board) = fixture(true);
+        let pro = board.with_extension("kicad_pro");
+        let handler = served_handler().await;
+        let write = (
+            "create_netclass",
+            json!({ "name": "USB", "diff_pair_gap": 0.15 }),
+        );
+        let read = ("get_netclasses", json!({}));
+        for (text, reason, calls) in [
+            (
+                "{ \"net_settings\": ",
+                "is not valid JSON",
+                vec![write.clone(), read],
+            ),
+            (
+                "{ \"net_settings\": [] }",
+                "net_settings is not an object",
+                vec![write],
+            ),
+        ] {
+            std::fs::write(&pro, text).unwrap();
+            for (tool, args) in calls {
+                let result = served(&handler, tool, &board, args).await;
+                assert!(result.is_error, "{tool} on {text:?}: {}", text_of(&result));
+                assert!(text_of(&result).contains(reason), "{}", text_of(&result));
+                assert_eq!(std::fs::read_to_string(&pro).unwrap(), text, "{tool}");
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    /// The project KiCad wrote in `netclass_diff_pair_kicad10.README.md`: its
+    /// own Default, `USB` setting all three differential-pair values and
+    /// `Power` setting none.
+    fn kicad_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for file in [
+            "netclass_diff_pair_kicad10.kicad_pro",
+            "netclass_diff_pair_kicad10.kicad_pcb",
+        ] {
+            std::fs::copy(fixtures.join(file), dir.path().join(file))
+                .expect("the fixture is committed beside the tests");
+        }
+        let board = dir.path().join("netclass_diff_pair_kicad10.kicad_pcb");
+        (dir, board)
+    }
+
+    /// On a project KiCad wrote, a class's own differential-pair values read
+    /// as its own, and one setting none reads the Default's width and gap,
+    /// named in `inherits`, and no via gap.
+    #[tokio::test]
+    async fn a_kicad_written_project_reads_explicit_and_inherited_differential_pair_settings() {
+        let (_dir, board) = kicad_fixture();
+        let body = get_classes(&board).await;
+        let class = |name: &str| {
+            body["netclasses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap()
+                .clone()
+        };
+
+        let usb = class("USB");
+        assert_eq!(usb["diff_pair_width"], json!(0.18), "{usb}");
+        assert_eq!(usb["diff_pair_gap"], json!(0.15), "{usb}");
+        assert_eq!(usb["diff_pair_via_gap"], json!(0.3), "{usb}");
+        assert_eq!(usb["inherits"], json!([]), "{usb}");
+
+        let power = class("Power");
+        assert_eq!(power["diff_pair_width"], json!(0.2), "{power}");
+        assert_eq!(power["diff_pair_gap"], json!(0.25), "{power}");
+        assert!(power["diff_pair_via_gap"].is_null(), "{power}");
+        assert_eq!(
+            power["inherits"],
+            json!(["diff_pair_width", "diff_pair_gap"]),
+            "{power}"
+        );
+
+        assert_eq!(class("Default")["missing_fields"], json!([]));
+    }
+
+    /// Changing one value of a project KiCad wrote changes that value and
+    /// nothing else: every other setting, class and pattern is as KiCad left
+    /// it, and the board keeps its bytes.
+    #[tokio::test]
+    async fn updating_a_kicad_written_project_changes_only_the_value_named() {
+        let (_dir, board) = kicad_fixture();
+        let before = project_json(&board);
+        let board_bytes = std::fs::read(&board).unwrap();
+
+        let handler = served_handler().await;
+        let result = served(
+            &handler,
+            "create_netclass",
+            &board,
+            json!({ "name": "USB", "diff_pair_gap": 0.12 }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+
+        let mut after = project_json(&board);
+        let usb = after["net_settings"]["classes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c["name"] == "USB")
+            .unwrap();
+        assert_eq!(usb["diff_pair_gap"], json!(0.12), "{usb}");
+        usb["diff_pair_gap"] = json!(0.15);
+        assert_eq!(after, before);
+        assert_eq!(std::fs::read(&board).unwrap(), board_bytes);
     }
 
     /// Membership is a netclass_patterns entry keyed by the exact net name.
@@ -2910,6 +3259,105 @@ mod netclass_tests {
                 .unwrap_or_default()
                 .contains("Default"),
             "{default}"
+        );
+    }
+
+    /// #777: a class's own differential-pair value is reported as its own, and
+    /// one it omits as the Default's, named in `inherits` — except the via
+    /// gap, which KiCad never takes from the Default, so it is null.
+    #[tokio::test]
+    async fn get_netclasses_reports_differential_pair_settings_as_kicad_resolves_them() {
+        let (_dir, board) = fixture(true);
+        let pro_path = board.with_extension("kicad_pro");
+        let mut settings = project_json(&board);
+        let mut default = kicad_default_class();
+        default["name"] = json!("Default");
+        default["diff_pair_via_gap"] = json!(0.3);
+        settings["net_settings"] = json!({
+            "classes": [
+                default,
+                { "name": "USB", "priority": -1, "diff_pair_gap": 0.15 },
+                { "name": "LVDS", "priority": -1, "diff_pair_via_gap": 0.35 }
+            ],
+            "netclass_patterns": []
+        });
+        std::fs::write(&pro_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let body = get_classes(&board).await;
+        let class = |name: &str| {
+            body["netclasses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let usb = class("USB");
+        assert_eq!(usb["diff_pair_gap"], json!(0.15), "its own: {usb}");
+        assert_eq!(usb["diff_pair_width"], json!(0.2), "the Default's: {usb}");
+        assert!(usb["diff_pair_via_gap"].is_null(), "never inherited: {usb}");
+        let inherits = usb["inherits"].as_array().unwrap();
+        assert!(inherits.contains(&json!("diff_pair_width")), "{usb}");
+        assert!(!inherits.contains(&json!("diff_pair_gap")), "{usb}");
+        assert!(!inherits.contains(&json!("diff_pair_via_gap")), "{usb}");
+
+        let lvds = class("LVDS");
+        assert_eq!(lvds["diff_pair_via_gap"], json!(0.35), "its own: {lvds}");
+        assert_eq!(lvds["diff_pair_gap"], json!(0.25), "the Default's: {lvds}");
+        assert_eq!(
+            lvds["inherits"],
+            json!([
+                "clearance",
+                "trace_width",
+                "via_drill",
+                "via_diameter",
+                "diff_pair_width",
+                "diff_pair_gap"
+            ]),
+            "everything but its own via gap: {lvds}"
+        );
+
+        let default = class("Default");
+        assert_eq!(default["diff_pair_via_gap"], json!(0.3), "{default}");
+        assert_eq!(default["missing_fields"], json!([]), "{default}");
+    }
+
+    /// With the Default missing a differential-pair setting, nothing resolves
+    /// it: the Default names it missing and a class omitting it reports null,
+    /// not a value this tool made up.
+    #[tokio::test]
+    async fn an_unresolved_differential_pair_setting_is_named_missing_not_invented() {
+        let (_dir, board) = fixture(true);
+        let pro_path = board.with_extension("kicad_pro");
+        let mut settings = project_json(&board);
+        let mut default = kicad_default_class();
+        default["name"] = json!("Default");
+        default.as_object_mut().unwrap().remove("diff_pair_gap");
+        settings["net_settings"] = json!({
+            "classes": [default, { "name": "USB", "priority": -1 }],
+            "netclass_patterns": []
+        });
+        std::fs::write(&pro_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let body = get_classes(&board).await;
+        let default = body["netclasses"][0].clone();
+        assert_eq!(
+            default["missing_fields"],
+            json!(["diff_pair_gap"]),
+            "{default}"
+        );
+        let usb = body["netclasses"][1].clone();
+        assert!(
+            usb.get("diff_pair_gap").is_some_and(|v| v.is_null()),
+            "reported, as null: {usb}"
+        );
+        assert!(
+            !usb["inherits"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("diff_pair_gap")),
+            "{usb}"
         );
     }
 
