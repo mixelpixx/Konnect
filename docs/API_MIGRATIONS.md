@@ -3,6 +3,18 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: board text, logo and zone writers refuse an unknown layer (patch release)
+
+`add_board_text`, `import_svg_logo`, `add_zone` and `add_copper_pour` now
+refuse a `layer` KiCad has no board layer for, such as the typo `F.Silk`, as
+`invalid_argument` with `field: "layer"`. Before, a live KiCad was sent the
+item on `BL_UNDEFINED`, which KiCad 10 does not validate (#237), and the file
+fallback wrote the name into the board, which KiCad 10.0.6 then refuses to
+load. The refusal comes before KiCad is asked anything or the board is read,
+so neither changes. Every name these tools accepted and KiCad also accepts
+still works, and the `F.SilkS` default is unchanged. Response shapes are
+unchanged (#844).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
