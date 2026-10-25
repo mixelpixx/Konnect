@@ -1584,7 +1584,12 @@ fn single_file_pcb_export_args(
     layers: &[&str],
     black_and_white: bool,
     pcb: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
+    // kicad-cli 10 refuses a single-file plot without layers (#465).
+    anyhow::ensure!(
+        !layers.is_empty(),
+        "a PCB {format} plot needs at least one layer"
+    );
     let mut args = vec![
         "pcb".to_string(),
         "export".to_string(),
@@ -1592,19 +1597,17 @@ fn single_file_pcb_export_args(
         "--output".to_string(),
         output.to_string(),
         "--mode-single".to_string(),
+        "--layers".to_string(),
+        layers.join(","),
     ];
-    if !layers.is_empty() {
-        args.push("--layers".to_string());
-        args.push(layers.join(","));
-    }
     if black_and_white {
         args.push("--black-and-white".to_string());
     }
     args.push(pcb.to_string());
-    args
+    Ok(args)
 }
 
-/// KiCAD 10: `pcb export pdf --output <path> --mode-single [--layers <a,b>]
+/// KiCAD 10: `pcb export pdf --output <path> --mode-single --layers <a,b>
 /// [--black-and-white] <input>`
 pub async fn export_pdf(
     cli: &str,
@@ -1625,14 +1628,14 @@ pub async fn export_pdf(
         layers,
         black_and_white,
         pcb.to_str().unwrap(),
-    );
+    )?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     publish_verified_file(&staged, output, "PCB PDF").await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>]
+/// KiCAD 10: `pcb export svg --output <path> --mode-single --layers <a,b>
 /// [--black-and-white] <input>`
 pub async fn export_svg_pcb(
     cli: &str,
@@ -1647,7 +1650,7 @@ pub async fn export_svg_pcb(
         layers,
         black_and_white,
         pcb.to_str().unwrap(),
-    );
+    )?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
@@ -2007,7 +2010,8 @@ mod pcb_plot_export_tests {
             &["F.Cu", "F.Paste", "F.SilkS", "Edge.Cuts"],
             false,
             "/tmp/board.kicad_pcb",
-        );
+        )
+        .unwrap();
 
         assert_eq!(args.iter().filter(|arg| *arg == "--layers").count(), 1);
         let layers = args
@@ -2018,21 +2022,29 @@ mod pcb_plot_export_tests {
     }
 
     #[test]
-    fn file_output_uses_single_mode_and_empty_layers_are_omitted() {
+    fn file_output_uses_single_mode_and_refuses_empty_layers() {
         let args = single_file_pcb_export_args(
+            "pdf",
+            "/out/board.pdf",
+            &["F.Cu"],
+            false,
+            "/tmp/board.kicad_pcb",
+        )
+        .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--mode-single"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/tmp/board.kicad_pcb")
+        );
+        assert!(single_file_pcb_export_args(
             "pdf",
             "/out/board.pdf",
             &[],
             false,
             "/tmp/board.kicad_pcb",
-        );
-
-        assert!(args.iter().any(|arg| arg == "--mode-single"));
-        assert!(!args.iter().any(|arg| arg == "--layers"));
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("/tmp/board.kicad_pcb")
-        );
+        )
+        .is_err());
     }
 
     #[test]
@@ -2044,7 +2056,8 @@ mod pcb_plot_export_tests {
                 &["F.Cu"],
                 true,
                 "/tmp/board.kicad_pcb",
-            );
+            )
+            .unwrap();
             assert!(args.iter().any(|argument| argument == "--black-and-white"));
         }
     }
