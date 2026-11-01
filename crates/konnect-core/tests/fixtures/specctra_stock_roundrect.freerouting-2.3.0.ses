@@ -1,0 +1,79 @@
+(session "specctra_stock_roundrect"
+  (base_design "specctra_stock_roundrect")
+  (placement
+    (resolution um 10)
+    (component "konnect_image_C1"
+      (place C1 1100000 -500000 front 0)
+    )
+    (component "konnect_image_R1"
+      (place R1 1000000 -500000 front 0)
+    )
+    (component "konnect_image_R2"
+      (place R2 1050000 -600000 front 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad Konnect)
+      (host_version "0.13.0")
+    )
+    (library_out 
+      (padstack "konnect_via_0001"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net GND
+        (wire
+          (path F.Cu 2000
+            1100001 -507749
+            1100001 -558249
+            1058250 -600000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1100001 -507749
+            1107750 -500000
+          )
+        )
+        (via "konnect_via_0001" 1100001 -507749
+        )
+      )
+      (net SIG
+        (wire
+          (path F.Cu 2000
+            1005100 -500000
+            1092250 -500000
+          )
+        )
+      )
+      (net VCC
+        (wire
+          (path F.Cu 2000
+            1003353 -508453
+            1041750 -546850
+            1041750 -600000
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1003353 -508453
+            994900 -500000
+          )
+        )
+        (via "konnect_via_0001" 1003353 -508453
+        )
+      )
+    )
+  )
+)

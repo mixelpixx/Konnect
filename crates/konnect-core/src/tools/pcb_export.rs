@@ -256,7 +256,8 @@ pub fn tools() -> Vec<ToolDef> {
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
              is used. The first \
              supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
+             through-hole footprints, circle, rectangle and unchamfered rounded-rectangle pads \
+             (written as polygons that enclose the copper), one straight-line closed outline, \
              and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
              custom DRC rules, or incomplete effective routing rules instead of approximating \
              them, and writes a \
@@ -893,7 +894,7 @@ async fn handle_export_specctra_dsn(
                 "ses_import_available": false,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_circle_rect_no_existing_routing_or_zones"
+                "supported_profile": "two_layer_front_side_circle_rect_roundrect_no_existing_routing_or_zones"
             }
         })
         .to_string(),
@@ -1518,5 +1519,133 @@ mod fabrication_option_tests {
         };
         let error: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(error["error"]["field"], "layers[1]");
+    }
+}
+
+/// `export_specctra_dsn` served end to end against a KiCad holding a board of
+/// stock footprints, every pad of which is a rounded rectangle (#790).
+#[cfg(test)]
+mod specctra_roundrect_served_tests {
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::pcb_board::board_mock::spawn_kicad_holding_board;
+    use crate::tools::ServerConfig;
+    use konnect_ipc::builders::pack_any;
+    use konnect_ipc::gen::kiapi;
+    use serde_json::{json, Value};
+
+    const STOCK_ROUNDRECT: &str =
+        include_str!("../../tests/fixtures/specctra_stock_roundrect.kicad_pcb");
+
+    /// KiCad's default netclass: 0.2 mm track and clearance, 0.6/0.3 mm via.
+    fn default_class() -> kiapi::common::project::NetClass {
+        let size = |nm| kiapi::common::types::Vector2 { x_nm: nm, y_nm: nm };
+        kiapi::common::project::NetClass {
+            name: "Default".to_string(),
+            board: Some(kiapi::common::project::NetClassBoardSettings {
+                clearance: Some(kiapi::common::types::Distance { value_nm: 200_000 }),
+                track_width: Some(kiapi::common::types::Distance { value_nm: 200_000 }),
+                via_stack: Some(kiapi::board::types::PadStack {
+                    drill: Some(kiapi::board::types::DrillProperties {
+                        diameter: Some(size(300_000)),
+                        ..Default::default()
+                    }),
+                    copper_layers: vec![kiapi::board::types::PadStackLayer {
+                        size: Some(size(600_000)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn served_export_writes_stock_roundrect_pads_as_polygons() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("specctra_stock_roundrect.kicad_pcb");
+        std::fs::write(&board, STOCK_ROUNDRECT).unwrap();
+        let output = dir.path().join("board.dsn");
+        let nets = ["GND", "SIG", "VCC"];
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            let name = command.type_url.rsplit('.').next().unwrap();
+            Some(match name {
+                "SaveDocumentToString" => pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        contents: STOCK_ROUNDRECT.to_string(),
+                        document: None,
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ),
+                "GetNets" => pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: (1..)
+                            .zip(nets)
+                            .map(|(code, net)| konnect_ipc::builders::net(net, code))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ),
+                "GetNetClassForNets" => pack_any(
+                    &kiapi::board::commands::NetClassForNetsResponse {
+                        classes: nets
+                            .iter()
+                            .map(|net| (net.to_string(), default_class()))
+                            .collect(),
+                    },
+                    "kiapi.board.commands.NetClassForNetsResponse",
+                ),
+                _ => return None,
+            })
+        });
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 790, "method": "tools/call",
+                "params": {"name": "export_specctra_dsn",
+                    "arguments": {"board": board, "output": output}}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(result["isError"], false, "{text}");
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["method"], "kicad_ipc_snapshot");
+        assert_eq!(body["pad_count"], 6);
+        assert_eq!(
+            body["capabilities"]["supported_profile"],
+            "two_layer_front_side_circle_rect_roundrect_no_existing_routing_or_zones"
+        );
+        let dsn = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(dsn.matches("(polygon F.Cu 0").count(), 3, "{dsn}");
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("board.dsn.konnect.json")).unwrap(),
+        )
+        .unwrap();
+        let radii = manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|padstack| padstack["purpose"] == "pad")
+            .map(|padstack| padstack["corner_radius_um"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(radii, [135, 200, 225]);
     }
 }
