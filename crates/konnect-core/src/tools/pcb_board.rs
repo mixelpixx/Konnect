@@ -450,7 +450,7 @@ pub(crate) const DEFAULT_ZONE_MIN_WIDTH_MM: f64 = 0.2;
 
 /// Warning for a board operation that has no live IPC implementation. Its
 /// preflight established only that no live KiCad is holding this board.
-const FILE_ONLY_EDIT_WARNING: &str =
+pub(crate) const FILE_ONLY_EDIT_WARNING: &str =
     "No live KiCad is holding this board, and it has not been observed live during the current \
      Konnect server session, and no KiCad sibling lock was present, so Konnect edited the saved \
      board file directly. If KiCad crashed or was force-quit before this server started without \
@@ -580,7 +580,7 @@ fn graphic_kind(tag: &str) -> Option<&'static str> {
 }
 
 /// The head tag of a `(tag …)` block, without parsing it.
-fn block_tag(block: &str) -> Option<&str> {
+pub(crate) fn block_tag(block: &str) -> Option<&str> {
     let after_paren = block.strip_prefix('(')?;
     let end = after_paren
         .find(|c: char| c.is_whitespace() || c == '(' || c == ')')

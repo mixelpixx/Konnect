@@ -3,13 +3,25 @@
 //! DRC delegates to `kicad-cli`. Design rules are read/written as S-expressions.
 //! KiCAD UI management uses process inspection + subprocess spawning.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::pcb_board::block_tag;
+use crate::tools::pcb_components::escape_sexp_string;
 use crate::tools::{
-    get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
+    get_path, invalid_arg, opt_str, require_f64, require_str, with_board_ipc_classified,
+    ToolContext, ToolDef,
 };
-use konnect_sexp::writer::write_atomic;
+use konnect_sexp::board::exact_coordinate_pair;
+use konnect_sexp::geometry::round6;
+use konnect_sexp::net::{collect_net_keys, names_nets_in_place, net_name};
+use konnect_sexp::writer::{
+    apply_edits, find_direct_child_blocks, new_uuid, read_consistent, write_atomic,
+    write_atomic_if_unchanged, SexpEdit,
+};
+use konnect_sexp::{parse_sexp, SexpError, SexpNode};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::task;
 
@@ -167,7 +179,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "copy_routing_pattern",
-            "Copy a routing pattern (traces and vias) from one region of the board to another.",
+            "Copy the segments, arcs and vias inside a source region of a board KiCad is not \
+             holding, shifted by (dest_x - src_x1, dest_y - src_y1). An item is copied when all \
+             of its points (segment start/end, arc start/mid/end, via position) are inside the \
+             region, edges included; one that crosses the edge is listed in `excluded_crossing` \
+             and not copied. Copies keep every attribute and get fresh UUIDs.",
             json!({
                 "type": "object",
                 "properties": {
@@ -180,7 +196,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "dest_y": { "type": "number", "description": "Destination anchor Y (maps to src_y1)" },
                     "net_map": {
                         "type": "object",
-                        "additionalProperties": true,
+                        "additionalProperties": { "type": "string" },
                         "description": "Optional mapping from source net names to destination net names"
                     }
                 },
@@ -954,7 +970,7 @@ async fn handle_launch_kicad_ui(
 
 async fn handle_copy_routing_pattern(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     // All six are schema-required and each defaulted to 0.0. Omitting them all
@@ -973,191 +989,284 @@ async fn handle_copy_routing_pattern(
         }
     }
     let [src_x1, src_y1, src_x2, src_y2, dest_x, dest_y] = coords;
-
-    let dx = dest_x - src_x1;
-    let dy = dest_y - src_y1;
-
-    let net_map: std::collections::HashMap<String, String> =
-        if let Some(obj) = args["net_map"].as_object() {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
-
-    let content = tokio::fs::read_to_string(&board).await?;
-    let mut new_tracks = Vec::new();
-
-    // Find all (segment ...) and (via ...) blocks within the bounding box
-    // and collect translated copies.
-    for (block_start, block_end, _block_type) in find_routing_blocks(&content) {
-        let block = &content[block_start..block_end];
-        if let Some((bx, by)) = extract_start_xy(block) {
-            if bx >= src_x1 && bx <= src_x2 && by >= src_y1 && by <= src_y2 {
-                let translated = translate_block(block, dx, dy, &net_map);
-                new_tracks.push(translated);
-            }
+    // An inverted box used to select nothing and report success.
+    for (field, low, high) in [("src_x2", src_x1, src_x2), ("src_y2", src_y1, src_y2)] {
+        if high < low {
+            return Ok(invalid_arg(
+                field,
+                &format!("{high} is less than the region's minimum {low}"),
+            ));
         }
     }
 
-    if new_tracks.is_empty() {
-        return Ok(CallToolResult::text(
-            serde_json::to_string(&json!({
-                "copied": 0,
-                "note": "No routing elements found in the specified source region"
-            }))
-            .unwrap(),
-        ));
+    let mut net_map = HashMap::new();
+    if let Some(obj) = args["net_map"].as_object() {
+        for (from, to) in obj {
+            let Some(to) = to.as_str() else {
+                return Ok(invalid_arg(
+                    &format!("net_map.{from}"),
+                    "must be a destination net name",
+                ));
+            };
+            net_map.insert(from.clone(), to.to_string());
+        }
     }
 
-    // Insert all new blocks before the final `)` of the file
-    let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let insertion = new_tracks.join("\n");
-    let new_content = format!(
-        "{}\n{}\n{}",
-        &content[..insert_pos],
-        insertion,
-        &content[insert_pos..]
-    );
+    let copy = RoutingCopy {
+        region: [src_x1, src_y1, src_x2, src_y2],
+        dx: round6(dest_x - src_x1),
+        dy: round6(dest_y - src_y1),
+        net_map,
+    };
+    if copy.dx == 0.0 && copy.dy == 0.0 {
+        return Ok(invalid_arg(
+            "dest_x",
+            "the destination is the source anchor (src_x1, src_y1), so every copy would land \
+             on its original",
+        ));
+    }
+    // A copy written to the file while KiCad holds the board would be
+    // discarded by its next save. Asked before the read: the file can be
+    // older than what KiCad holds.
+    if let Some(refusal) =
+        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "routing copy").await?
+    {
+        return Ok(refusal);
+    }
+    task::spawn_blocking(move || {
+        let content = read_consistent(&board)?;
+        match plan_routing_copy(&content, &copy) {
+            Ok(planned) => commit_routing_copy(&board, &content, &copy, &planned),
+            Err(refusal) => Ok(refusal),
+        }
+    })
+    .await?
+}
 
-    // Assign new UUIDs to inserted blocks (replace uuid "ORIGINAL" with new ones)
-    let new_content = reassign_uuids(&new_content, insert_pos);
+/// What one `copy_routing_pattern` call asks for.
+pub(crate) struct RoutingCopy {
+    /// The source region `[x1, y1, x2, y2]`, inclusive, with `x1 ≤ x2` and
+    /// `y1 ≤ y2`.
+    pub(crate) region: [f64; 4],
+    pub(crate) dx: f64,
+    pub(crate) dy: f64,
+    pub(crate) net_map: HashMap<String, String>,
+}
 
-    write_atomic(&board, &new_content)?;
+/// The copies to insert, and what was left out.
+pub(crate) struct PlannedCopy {
+    /// The board with the copies inserted; `None` when nothing is copied.
+    content: Option<String>,
+    uuids: Vec<String>,
+    /// Copies per entry of [`ROUTING_KINDS`].
+    counts: [usize; 3],
+    excluded_crossing: Vec<Value>,
+}
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "copied": new_tracks.len(),
-            "dx": dx,
-            "dy": dy
-        }))
-        .unwrap(),
+const ROUTING_KINDS: [&str; 3] = ["segment", "arc", "via"];
+
+/// The points that place a routing item, as KiCad writes it.
+fn defining_points(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "segment" => &["start", "end"],
+        "arc" => &["start", "mid", "end"],
+        _ => &["at"],
+    }
+}
+
+/// An item's identity child: `uuid` since KiCad 8, `tstamp` before it.
+fn identity_of(node: &SexpNode) -> Option<(&'static str, &str)> {
+    ["uuid", "tstamp"]
+        .into_iter()
+        .find_map(|tag| Some((tag, node.find_str(tag)?)))
+}
+
+fn unreadable(reason: String) -> CallToolResult {
+    CallToolResult::error(format!(
+        "Refusing to copy routing: {reason}. The board file was not modified."
     ))
 }
 
-/// Find all `(segment ...)` and `(via ...)` blocks in the PCB content.
-/// Returns (start, end, type) tuples.
-fn find_routing_blocks(content: &str) -> Vec<(usize, usize, &'static str)> {
-    let mut results = Vec::new();
-    for (prefix, kind) in &[("\n  (segment ", "segment"), ("\n  (via ", "via")] {
-        let mut pos = 0;
-        while let Some(found) = content[pos..].find(prefix) {
-            let start = pos + found + 3; // skip \n
-            let mut depth = 0i32;
-            let mut end = start;
-            for (i, ch) in content[start..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
+/// Plan the copy of every top-level `segment`, `arc` and `via` whose defining
+/// points all lie in the region. An item with only some of them inside is
+/// left out and named in `excluded_crossing`, so a copy is never a silent
+/// subset of a track. An item whose points cannot be read refuses the whole
+/// copy, wherever it is: without them, whether it is in the region is unknown.
+pub(crate) fn plan_routing_copy(
+    content: &str,
+    copy: &RoutingCopy,
+) -> Result<PlannedCopy, CallToolResult> {
+    crate::tools::pcb_components::check_single_board_form(content).map_err(unreadable)?;
+    if !copy.net_map.is_empty() {
+        // A destination net with no pads is a typo, not a net: KiCad would
+        // create it and DRC would report the copy unconnected.
+        let tree = parse_sexp(content)
+            .map_err(|e| unreadable(format!("the board does not parse: {e}")))?;
+        if !names_nets_in_place(&tree) {
+            return Err(invalid_arg(
+                "net_map",
+                "this board references nets by number, as boards before KiCad 10 do, and \
+                 net_map renames by name; resave the board in KiCad 10 or omit net_map",
+            ));
+        }
+        let nets = collect_net_keys(&tree);
+        let mut map: Vec<_> = copy.net_map.iter().collect();
+        map.sort();
+        if let Some((from, to)) = map.into_iter().find(|(_, to)| !nets.contains(*to)) {
+            return Err(invalid_arg(
+                &format!("net_map.{from}"),
+                &format!("net '{to}' is not on this board"),
+            ));
+        }
+    }
+    let [x1, y1, x2, y2] = copy.region;
+    let inside = |&(x, y): &(f64, f64)| x >= x1 && x <= x2 && y >= y1 && y <= y2;
+    let eol = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut insertion = String::new();
+    let mut insert_at = content.len();
+    let mut uuids = Vec::new();
+    let mut counts = [0usize; 3];
+    let mut excluded_crossing = Vec::new();
+    for (start, end) in find_direct_child_blocks(content, "kicad_pcb") {
+        let block = &content[start..end];
+        let Some(kind_index) =
+            block_tag(block).and_then(|tag| ROUTING_KINDS.iter().position(|k| *k == tag))
+        else {
+            continue;
+        };
+        let kind = ROUTING_KINDS[kind_index];
+        // Copies go after the last routing item, where KiCad keeps them.
+        insert_at = end;
+        let node =
+            parse_sexp(block).map_err(|e| unreadable(format!("a {kind} does not parse: {e}")))?;
+        let (identity_tag, id) =
+            identity_of(&node).ok_or_else(|| unreadable(format!("a {kind} has no uuid")))?;
+        let points = defining_points(kind);
+        let xys: Vec<(f64, f64)> = points
+            .iter()
+            .map(|p| match node.find_all(p).as_slice() {
+                [one] => exact_coordinate_pair(one),
+                _ => None,
+            })
+            .collect::<Option<_>>()
+            .ok_or_else(|| {
+                unreadable(format!(
+                    "{kind} {id} does not have exactly one readable ({}) point each",
+                    points.join(", ")
+                ))
+            })?;
+        if !xys.iter().any(inside) {
+            continue;
+        }
+        if !xys.iter().all(inside) {
+            excluded_crossing.push(json!({ "kind": kind, "uuid": id }));
+            continue;
+        }
+
+        let new_uuid = new_uuid();
+        let mut edits = Vec::new();
+        for (child_start, child_end) in find_direct_child_blocks(block, kind) {
+            let child = &block[child_start..child_end];
+            let replacement = match block_tag(child) {
+                Some(tag) if points.contains(&tag) => {
+                    let (x, y) = xys[points.iter().position(|p| *p == tag).expect("guarded")];
+                    format!("({tag} {} {})", round6(x + copy.dx), round6(y + copy.dy))
                 }
-            }
-            results.push((start, end, *kind));
-            pos = start + 1;
+                Some(tag) if tag == identity_tag => format!("({tag} \"{new_uuid}\")"),
+                Some("net") => match node
+                    .find("net")
+                    .and_then(net_name)
+                    .and_then(|name| copy.net_map.get(name))
+                {
+                    Some(to) => format!("(net \"{}\")", escape_sexp_string(to)),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            edits.push(SexpEdit::replace(child_start, child_end, replacement));
         }
+        let line_start = content[..start].rfind('\n').map_or(0, |i| i + 1);
+        let indent: String = content[line_start..start]
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
+        insertion.push_str(eol);
+        insertion.push_str(&indent);
+        insertion.push_str(&apply_edits(block.to_string(), edits));
+        uuids.push(new_uuid);
+        counts[kind_index] += 1;
     }
-    results
+
+    let content = (!uuids.is_empty()).then(|| {
+        apply_edits(
+            content.to_string(),
+            vec![SexpEdit::insert(insert_at, insertion)],
+        )
+    });
+    Ok(PlannedCopy {
+        content,
+        uuids,
+        counts,
+        excluded_crossing,
+    })
 }
 
-/// Extract the `(start X Y)` coordinates from a routing block.
-fn extract_start_xy(block: &str) -> Option<(f64, f64)> {
-    let pat = "(start ";
-    let pos = block.find(pat)?;
-    let after = &block[pos + pat.len()..];
-    let end = after.find(')')?;
-    let parts: Vec<&str> = after[..end].split_whitespace().collect();
-    let x = parts.first()?.parse::<f64>().ok()?;
-    let y = parts.get(1)?.parse::<f64>().ok()?;
-    Some((x, y))
-}
+/// Write the planned copies if the board still holds `expected`.
+pub(crate) fn commit_routing_copy(
+    board: &Path,
+    expected: &str,
+    copy: &RoutingCopy,
+    planned: &PlannedCopy,
+) -> anyhow::Result<CallToolResult> {
+    let reply = |counts: [usize; 3]| {
+        let by_kind: serde_json::Map<String, Value> = ROUTING_KINDS
+            .iter()
+            .zip(counts)
+            .map(|(kind, n)| (kind.to_string(), json!(n)))
+            .collect();
+        json!({
+            "copied": counts.iter().sum::<usize>(),
+            "copied_by_kind": by_kind,
+            "dx": copy.dx,
+            "dy": copy.dy,
+            "uuids": planned.uuids,
+            "excluded_crossing": planned.excluded_crossing,
+        })
+    };
+    let Some(next) = &planned.content else {
+        let mut reply = reply([0; 3]);
+        reply["note"] = json!(
+            "No routing item lies wholly inside the source region; the board was not modified"
+        );
+        return Ok(CallToolResult::json(&reply));
+    };
 
-/// Translate all coordinate pairs in a routing block by (dx, dy).
-fn translate_block(
-    block: &str,
-    dx: f64,
-    dy: f64,
-    net_map: &std::collections::HashMap<String, String>,
-) -> String {
-    let mut result = block.to_string();
-
-    // Translate (start X Y), (end X Y), (at X Y) coordinate pairs
-    for coord_key in &["start", "end", "at"] {
-        let pat = format!("({} ", coord_key);
-        let mut new_result = String::new();
-        let mut remaining = result.as_str();
-        while let Some(pos) = remaining.find(&pat) {
-            new_result.push_str(&remaining[..pos]);
-            new_result.push_str(&pat);
-            let after = &remaining[pos + pat.len()..];
-            if let Some(close) = after.find(')') {
-                let coords_str = &after[..close];
-                let parts: Vec<&str> = coords_str.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let (Ok(x), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                        new_result.push_str(&format!("{} {}", x + dx, y + dy));
-                        if parts.len() > 2 {
-                            new_result.push(' ');
-                            new_result.push_str(&parts[2..].join(" "));
-                        }
-                        new_result.push(')');
-                        remaining = &remaining[pos + pat.len() + close + 1..];
-                        continue;
-                    }
-                }
-                // Fall through if parsing failed
-                new_result.push_str(coords_str);
-                new_result.push(')');
-                remaining = &remaining[pos + pat.len() + close + 1..];
-            } else {
-                break;
-            }
+    // Under the lock, this rereads the file after the rename and compares it
+    // with `next` byte for byte, so the planned counts are what the board now
+    // holds.
+    match write_atomic_if_unchanged(board, expected, next) {
+        Ok(()) => {}
+        Err(SexpError::Conflict { .. }) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![board.display().to_string()],
+                },
+                "No routing was copied because the board changed after it was read. Read it \
+                 again and retry.",
+            ))
         }
-        new_result.push_str(remaining);
-        result = new_result;
+        Err(error) => return Err(error.into()),
     }
 
-    // Remap net names
-    for (old_net, new_net) in net_map {
-        let old_pat = format!("(net \"{}\")", old_net);
-        let new_pat = format!("(net \"{}\")", new_net);
-        result = result.replace(&old_pat, &new_pat);
-        // Also handle numeric net references if needed (not replaced here)
-    }
-
-    result
+    let mut reply = reply(planned.counts);
+    reply["warning"] = json!(crate::tools::pcb_board::FILE_ONLY_EDIT_WARNING);
+    Ok(CallToolResult::json(&reply))
 }
-
-/// Reassign UUIDs in all newly inserted blocks (those after `insert_boundary`).
-fn reassign_uuids(content: &str, insert_boundary: usize) -> String {
-    let mut result = String::with_capacity(content.len() + 64);
-    result.push_str(&content[..insert_boundary]);
-    let tail = &content[insert_boundary..];
-    let mut remaining = tail;
-    while let Some(pos) = remaining.find("(uuid \"") {
-        result.push_str(&remaining[..pos]);
-        result.push_str("(uuid \"");
-        // Find end of UUID string
-        let after = &remaining[pos + 7..];
-        if let Some(end) = after.find('"') {
-            let new_uuid = uuid::Uuid::new_v4().to_string();
-            result.push_str(&new_uuid);
-            result.push('"');
-            remaining = &remaining[pos + 7 + end + 1..];
-        } else {
-            break;
-        }
-    }
-    result.push_str(remaining);
-    result
-}
-
 // ─── Symbol info ──────────────────────────────────────────────────────────────
 
 // ─── Layer constraints ───────────────────────────────────────────────────────

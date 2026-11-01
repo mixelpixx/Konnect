@@ -138,7 +138,7 @@ fn back_side_layer_error(layer: &str) -> Option<CallToolResult> {
     ))
 }
 
-fn escape_sexp_string(value: &str) -> String {
+pub(crate) fn escape_sexp_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -1791,7 +1791,7 @@ fn set_closed_board_footprint_side(
 /// above: `find_balanced_block` skips whatever precedes the first paren, so
 /// leading garbage would pass, as would a well-formed form that is not a board
 /// at all.
-fn check_single_board_form(content: &str) -> Result<(), String> {
+pub(crate) fn check_single_board_form(content: &str) -> Result<(), String> {
     let trimmed = content.trim();
     let (start, end) = find_balanced_block(trimmed, 0)
         .ok_or_else(|| "the result is not a balanced S-expression".to_string())?;
