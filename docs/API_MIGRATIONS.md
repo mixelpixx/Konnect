@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: setting the board's title block (minor release)
+
+New `pcb_board` tool `set_board_title_block` sets any of `title`, `date`,
+`revision`, `company` and `comment_1` to `comment_9`, the fields that
+`${TITLE}`, `${ISSUE_DATE}`, `${REVISION}`, `${COMPANY}` and
+`${COMMENT1}`..`${COMMENT9}` resolve from on the board. An omitted field keeps
+its value, an empty string clears it, and a call that supplies none is refused
+as `invalid_argument`. Values are stored verbatim.
+
+When KiCad holds the board, the write goes through `SetTitleBlockInfo`, which
+the PCB editor handles from KiCad 10.0.1. The change is unsaved and has no undo
+step. An older KiCad answers `unsupported_capability`, and the file is not
+touched. Otherwise the saved file's `(title_block …)` node is rewritten as KiCad
+writes it, and nothing else in the file changes. Both paths return the block
+read back after the write, `changed`, `source` and `saved` (`false` for the
+live board); a readback that differs is `mutation_outcome_uncertain`. Existing tools are unchanged (#714, board half).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

@@ -318,15 +318,6 @@ pub struct IpcPad {
     pub copper_layers: Vec<IpcPadLayerGeometry>,
 }
 
-/// The document's title block, which the board file also carries.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct IpcTitleBlock {
-    pub title: String,
-    pub date: String,
-    pub revision: String,
-    pub company: String,
-}
-
 /// Complete target placement for one existing footprint.
 ///
 /// Keeping the four values together lets the IPC client transform all selected

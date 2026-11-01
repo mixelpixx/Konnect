@@ -13,16 +13,18 @@ use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::live_board::{self, LiveBoard};
 use crate::tools::{
-    get_path, opt_str_list, require_f64, require_str, with_board_ipc_classified, ToolContext,
-    ToolDef,
+    get_path, invalid_arg, opt_str_list, require_f64, require_str, with_board_ipc_classified,
+    ToolContext, ToolDef,
 };
 use konnect_ipc::builders;
 use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
+    title_block::{self, TitleBlock},
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
         write_atomic, SexpEdit,
     },
+    SexpError,
 };
 use serde_json::json;
 use std::path::Path;
@@ -282,47 +284,65 @@ where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
-    Ok(
-        match live_board::observe(ctx, board_path, move |client, _| f(client)).await? {
-            LiveBoard::Answered(value) => BoardWrite::Ipc(value),
-            LiveBoard::Recovered(message) => {
-                BoardWrite::Refused(crate::tools::ipc_recovered_result(&message))
-            }
-            LiveBoard::Uncertain(message) => {
-                BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
-            }
-            // An endpoint that served no board is mapped exactly as a
-            // rejection, which is what it was before those cases had names —
-            // `observed_live` and `absence` deliberately unread here. Whether
-            // a write should instead treat a proven-absent editor as
-            // permission is #577's question, not this one's.
-            LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
-                BoardWrite::Refused(CallToolResult::error(format!(
-                    "KiCAD rejected the {what} over IPC: {message}. \
+    attempt_ipc_write_in(ctx, board_path, what, move |client, _| f(client)).await
+}
+
+/// As [`attempt_ipc_write`], handing `f` the document KiCad identified as
+/// the requested board, for commands that name their document.
+pub(crate) async fn attempt_ipc_write_in<T, F>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    what: &str,
+    f: F,
+) -> anyhow::Result<BoardWrite<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &konnect_ipc::client::KiCadIpcClient,
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+{
+    Ok(match live_board::observe(ctx, board_path, f).await? {
+        LiveBoard::Answered(value) => BoardWrite::Ipc(value),
+        LiveBoard::Recovered(message) => {
+            BoardWrite::Refused(crate::tools::ipc_recovered_result(&message))
+        }
+        LiveBoard::Uncertain(message) => {
+            BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
+        }
+        // An endpoint that served no board is mapped exactly as a
+        // rejection, which is what it was before those cases had names —
+        // `observed_live` and `absence` deliberately unread here. Whether
+        // a write should instead treat a proven-absent editor as
+        // permission is #577's question, not this one's.
+        LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
+            BoardWrite::Refused(CallToolResult::error(format!(
+                "KiCAD rejected the {what} over IPC: {message}. \
                  The board file was not modified — KiCAD is reachable and may hold this \
                  board open, so editing the file directly could be silently overwritten."
-                )))
-            }
-            LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
-            LiveBoard::Unresolved(error) => {
-                BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
-            }
-            // A lock outranks the never-reached verdict: it is persistent evidence
-            // that an editor may hold newer state even where no IPC session ever did.
-            LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
-                Some(refusal) => BoardWrite::Refused(refusal),
-                None => BoardWrite::File(NoLiveBoard::Unreachable),
-            },
-            // A lock outranks this verdict too, but only when the transport is
-            // what went away: it is then the more specific evidence, and
-            // `reason` is machine-readable, so which one a client sees must not
-            // depend on how the arms were folded.
-            LiveBoard::LostAfterObservation {
-                situation,
-                ipc_unreachable,
-            } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
+            )))
+        }
+        LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
+        LiveBoard::Unresolved(error) => {
+            BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
+        }
+        // A lock outranks the never-reached verdict: it is persistent evidence
+        // that an editor may hold newer state even where no IPC session ever did.
+        LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
+            Some(refusal) => BoardWrite::Refused(refusal),
+            None => BoardWrite::File(NoLiveBoard::Unreachable),
         },
-    )
+        // A lock outranks this verdict too, but only when the transport is
+        // what went away: it is then the more specific evidence, and
+        // `reason` is machine-readable, so which one a client sees must not
+        // depend on how the arms were folded.
+        LiveBoard::LostAfterObservation {
+            situation,
+            ipc_unreachable,
+        } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
+    })
 }
 
 /// A board observed live and now out of reach. When the transport is what
@@ -1093,6 +1113,19 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_board_info(args, ctx).await }
         ),
         tool!(
+            "set_board_title_block",
+            "Set fields of the board's title block, which ${TITLE}, ${ISSUE_DATE}, \
+             ${REVISION}, ${COMPANY} and ${COMMENT1}..${COMMENT9} resolve from. An \
+             omitted field keeps its value, an empty string clears it, and values are \
+             stored verbatim. Writes the board KiCad holds open (KiCad 10.0.1 or newer; \
+             older answers unsupported_capability), where the change is unsaved and has \
+             no undo step, else the saved file. Returns the title block read back after \
+             the write, the fields that changed, and 'source'.",
+            title_block_schema(),
+            |args, ctx| async move { handle_set_board_title_block(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        tool!(
             "get_board_extents",
             "Return the box enclosing the board's items: footprints (without their \
              text), graphics, tracks, vias and zones, plus board text and dimensions \
@@ -1614,6 +1647,284 @@ async fn handle_get_board_info(
         "copper_layer_count": copper_layer_count,
         "net_count": net_count,
         "source": "file"
+    })))
+}
+
+/// The tool's argument for each title-block field, in `title_block::FIELDS`
+/// order. Spelled out because these names are this tool's public API.
+fn title_block_arguments() -> &'static [&'static str] {
+    &[
+        "title",
+        "date",
+        "revision",
+        "company",
+        "comment_1",
+        "comment_2",
+        "comment_3",
+        "comment_4",
+        "comment_5",
+        "comment_6",
+        "comment_7",
+        "comment_8",
+        "comment_9",
+    ]
+}
+
+fn title_block_schema() -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "board".into(),
+        json!({ "type": "string", "description": "Path to .kicad_pcb file" }),
+    );
+    for &field in title_block_arguments() {
+        let description = match field.strip_prefix("comment_") {
+            Some(number) => format!("Comment {number}, which ${{COMMENT{number}}} resolves to"),
+            None => format!("The title block's {field}"),
+        };
+        properties.insert(
+            field.into(),
+            json!({ "type": "string", "description": description }),
+        );
+    }
+    json!({ "type": "object", "properties": properties, "required": ["board"] })
+}
+
+/// The title-block fields a call supplies, each replacing the stored value.
+#[derive(Clone)]
+struct TitleBlockUpdate(Vec<(&'static str, String)>);
+
+impl TitleBlockUpdate {
+    fn parse(args: &serde_json::Value) -> Result<Self, CallToolResult> {
+        let mut fields = Vec::new();
+        for &field in title_block_arguments() {
+            match &args[field] {
+                serde_json::Value::Null => {}
+                serde_json::Value::String(value) => fields.push((field, value.clone())),
+                _ => return Err(invalid_arg(field, "must be a string when supplied")),
+            }
+        }
+        if fields.is_empty() {
+            return Err(invalid_arg(
+                "title_block",
+                "supply at least one of title, date, revision, company, comment_1 .. comment_9",
+            ));
+        }
+        Ok(Self(fields))
+    }
+
+    fn applied_to(&self, block: &TitleBlock) -> TitleBlock {
+        let mut block = block.clone();
+        for (field, value) in &self.0 {
+            *block.field_mut(field).expect("a title_block::FIELDS entry") = value.clone();
+        }
+        block
+    }
+}
+
+fn title_block_json(block: &TitleBlock) -> serde_json::Value {
+    block
+        .fields()
+        .into_iter()
+        .map(|(field, value)| (field.to_string(), json!(value)))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+/// What KiCad did with a title-block write.
+enum TitleBlockIpcOutcome {
+    /// A fresh read returned the intended block, `changed` from the one read
+    /// before the write.
+    Applied {
+        after: Box<TitleBlock>,
+        changed: Vec<&'static str>,
+    },
+    /// KiCad answered `AS_UNHANDLED`/`AS_UNIMPLEMENTED`: it predates 10.0.1.
+    Unsupported { kicad_version: Option<String> },
+    /// KiCad accepted the write, but a fresh read did not return the intended
+    /// block, or failed.
+    Uncertain { reason: String },
+}
+
+/// Merge `update` into the open board's title block. KiCad's handler replaces
+/// all thirteen fields, so the block is read first and sent whole.
+fn set_title_block_over_ipc(
+    client: &konnect_ipc::client::KiCadIpcClient,
+    document: konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    update: &TitleBlockUpdate,
+) -> anyhow::Result<TitleBlockIpcOutcome> {
+    let before = client.get_title_block_in(document.clone())?;
+    let intended = update.applied_to(&before);
+    if intended == before {
+        return Ok(TitleBlockIpcOutcome::Applied {
+            after: Box::new(before),
+            changed: Vec::new(),
+        });
+    }
+    if let Err(error) = client.set_title_block_in(document.clone(), &intended) {
+        if konnect_ipc::client::ApiStatusError::from_error(&error)
+            .is_some_and(|status| status.is_unsupported())
+        {
+            return Ok(TitleBlockIpcOutcome::Unsupported {
+                kicad_version: client.get_kicad_version().ok().map(|v| v.full_version),
+            });
+        }
+        return Err(error);
+    }
+    Ok(match client.get_title_block_in(document) {
+        Ok(after) if after == intended => TitleBlockIpcOutcome::Applied {
+            changed: after.changed_from(&before),
+            after: Box::new(after),
+        },
+        Ok(after) => TitleBlockIpcOutcome::Uncertain {
+            reason: format!(
+                "KiCad's title block reads back differing from the request in {}",
+                after.changed_from(&intended).join(", ")
+            ),
+        },
+        Err(error) => TitleBlockIpcOutcome::Uncertain {
+            reason: format!("the title block could not be read back: {error:#}"),
+        },
+    })
+}
+
+/// The board file's title block, which must equal `intended`; `Err` gives why
+/// it does not.
+fn saved_title_block_matches(
+    board_path: &Path,
+    intended: &TitleBlock,
+) -> Result<TitleBlock, String> {
+    let source = std::fs::read_to_string(board_path).map_err(|error| error.to_string())?;
+    let tree = parse_sexp(&source).map_err(|error| error.to_string())?;
+    let saved = title_block::read(&tree).map_err(|error| error.to_string())?;
+    if saved != *intended {
+        return Err(format!(
+            "the saved title block differs from the request in {}",
+            saved.changed_from(intended).join(", ")
+        ));
+    }
+    Ok(saved)
+}
+
+async fn handle_set_board_title_block(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    const OPERATION: &str = "set_board_title_block";
+    let board_path = get_path(args, "board")?;
+    let update = match TitleBlockUpdate::parse(args) {
+        Ok(update) => update,
+        Err(error) => return Ok(error),
+    };
+
+    let ipc_update = update.clone();
+    let fallback_reason =
+        match attempt_ipc_write_in(ctx, &board_path, "title block", move |c, d| {
+            set_title_block_over_ipc(c, d, &ipc_update)
+        })
+        .await?
+        {
+            BoardWrite::Ipc(TitleBlockIpcOutcome::Applied { after, changed }) => {
+                return Ok(CallToolResult::json(&json!({
+                    "file": board_path.display().to_string(),
+                    "title_block": title_block_json(&after),
+                    "changed": changed,
+                    "source": "ipc",
+                    "saved": false,
+                    // Nothing to undo or save when nothing changed.
+                    "undo": (!changed.is_empty()).then_some(
+                        "KiCad records no undo step for a title-block change. Save the board \
+                         in KiCad to keep it."
+                    )
+                })));
+            }
+            BoardWrite::Ipc(TitleBlockIpcOutcome::Unsupported { kicad_version }) => {
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::UnsupportedCapability {
+                        capability: OPERATION.to_string(),
+                        kicad_version,
+                    },
+                    "The running KiCad does not handle SetTitleBlockInfo, which the PCB editor \
+                 gained in KiCad 10.0.1. It may hold this board open, so the board file was \
+                 not modified. Update KiCad, or set the title block in File > Page Settings.",
+                ));
+            }
+            BoardWrite::Ipc(TitleBlockIpcOutcome::Uncertain { reason }) => {
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::MutationOutcomeUncertain {
+                        operation: OPERATION.to_string(),
+                        path: board_path.display().to_string(),
+                        reason: reason.clone(),
+                    },
+                    format!(
+                        "KiCad accepted the title-block write for '{}', but {reason}. Inspect the \
+                     title block in KiCad (File > Page Settings) before retrying.",
+                        board_path.display()
+                    ),
+                ));
+            }
+            BoardWrite::Refused(refusal) => return Ok(refusal),
+            BoardWrite::File(reason) => reason,
+        };
+
+    let written = konnect_sexp::transact_atomic(&board_path, |current| {
+        let before = title_block::read(&parse_sexp(current)?)?;
+        let intended = update.applied_to(&before);
+        let next = if intended == before {
+            current.to_string()
+        } else {
+            title_block::replace(current, &intended)?
+        };
+        Ok((next, (before, intended)))
+    });
+    let (before, intended) = match written {
+        Ok(written) => written,
+        // Nothing is compared before the write, so a conflict can only be the
+        // readback after it.
+        Err(SexpError::Conflict { .. }) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &board_path,
+                OPERATION,
+                "the board file did not read back as written",
+            ))
+        }
+        Err(SexpError::InvalidValue(reason)) => {
+            return Ok(CallToolResult::error(format!(
+                "The board's title block cannot be edited safely: {reason}. The board file \
+                 was not modified."
+            )))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if intended == before {
+        return Ok(CallToolResult::json(&json!({
+            "file": board_path.display().to_string(),
+            "title_block": title_block_json(&before),
+            "changed": [],
+            "source": "file",
+            "saved": true,
+            "fallback_reason": fallback_reason.evidence(),
+            "warning": fallback_reason.warning()
+        })));
+    }
+    let after = match saved_title_block_matches(&board_path, &intended) {
+        Ok(after) => after,
+        Err(reason) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &board_path,
+                OPERATION,
+                reason,
+            ))
+        }
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "file": board_path.display().to_string(),
+        "title_block": title_block_json(&after),
+        "changed": after.changed_from(&before),
+        "source": "file",
+        "saved": true,
+        "fallback_reason": fallback_reason.evidence(),
+        "warning": fallback_reason.warning()
     })))
 }
 
@@ -5683,5 +5994,42 @@ mod single_board_lookup_tests {
             ],
             "every board command names the document GetOpenDocuments returned"
         );
+    }
+}
+
+#[cfg(test)]
+mod title_block_readback_tests {
+    use super::*;
+
+    #[test]
+    fn the_arguments_are_the_models_field_names() {
+        assert_eq!(title_block_arguments(), title_block::FIELDS.as_slice());
+    }
+
+    /// The post-write check, against a file holding something other than
+    /// the request: the case a correct write never produces.
+    #[test]
+    fn a_saved_block_other_than_the_request_names_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\t(paper \"A4\")\n\t(title_block\n\t\t(rev \"B\")\n\t)\n)\n",
+        )
+        .unwrap();
+        let mut intended = TitleBlock {
+            revision: "B".into(),
+            ..TitleBlock::default()
+        };
+        assert_eq!(
+            saved_title_block_matches(&board, &intended),
+            Ok(intended.clone())
+        );
+
+        intended.comments[8] = "ninth".into();
+        let reason = saved_title_block_matches(&board, &intended).unwrap_err();
+        assert!(reason.contains("comment_9"), "{reason}");
+        std::fs::remove_file(&board).unwrap();
+        assert!(saved_title_block_matches(&board, &intended).is_err());
     }
 }
