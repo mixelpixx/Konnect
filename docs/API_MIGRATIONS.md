@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: board file fallbacks refuse a board that changed mid-edit (patch release)
+
+`add_layer` always edits the saved board file. `set_board_size`,
+`add_board_outline`, `delete_graphics`, `add_board_text`, `add_zone`,
+`add_copper_pour` and `import_svg_logo` edit it when no live KiCad holds the
+board. They used to read the file, splice in the edit and replace it
+unconditionally, so a save that landed in between (KiCad's autosave, an editor,
+another call) was overwritten with an edit of the older read, and the call
+still reported success.
+
+The write now goes through only while the file still holds the bytes the edit
+was read from. Otherwise the call returns `conflict` with the board in `paths`
+and leaves the newer file as it is; reload and retry. If the file no longer
+holds the edit when read back after the write, the call returns
+`mutation_outcome_uncertain`; reload and inspect the board before retrying.
+Successful responses and the IPC path are unchanged (#845).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
