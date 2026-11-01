@@ -64,7 +64,7 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2-zli
 anyhow = "1"
 thiserror = "1"
 fs4 = "1.1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Logging
 tracing = "0.1"
