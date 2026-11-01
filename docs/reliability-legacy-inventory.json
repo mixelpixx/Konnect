@@ -4,6 +4,7 @@
     "add_schematic_component",
     "annotate_schematic",
     "batch_place_components",
+    "delete_zone",
     "run_design_review"
   ],
   "legacy_entry_ceiling": 3,
