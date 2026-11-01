@@ -71,6 +71,9 @@ impl At {
 
 #[derive(Debug, Clone)]
 pub struct Property {
+    /// KiCad 10 writes a bare `private` token before the name of a field that
+    /// stays out of the BOM and netlist: `(property private "MPN" "X" …)`.
+    pub private: bool,
     pub name: String,
     pub value: String,
     /// Trailing sub-nodes after name+value (at, effects, show_pin_number, …).
@@ -80,6 +83,7 @@ pub struct Property {
 impl Property {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Property {
+            private: false,
             name: name.into(),
             value: value.into(),
             sub_nodes: vec![],
@@ -87,7 +91,12 @@ impl Property {
     }
 
     pub fn from_sexp(node: &SexpNode) -> Option<Self> {
-        let args = node.args();
+        let mut args = node.args();
+        // Only a bare atom is the flag; a quoted "private" is a field name.
+        let private = matches!(args.first(), Some(SexpNode::Atom(token)) if token == "private");
+        if private {
+            args = &args[1..];
+        }
         let name = args.first()?.text()?.to_owned();
         let value = args.get(1)?.text()?.to_owned();
         let sub_nodes = args
@@ -97,6 +106,7 @@ impl Property {
             .cloned()
             .collect();
         Some(Property {
+            private,
             name,
             value,
             sub_nodes,
@@ -104,11 +114,12 @@ impl Property {
     }
 
     pub fn to_sexp(&self) -> SexpNode {
-        let mut children = vec![
-            atom("property"),
-            qstr(self.name.clone()),
-            qstr(self.value.clone()),
-        ];
+        let mut children = vec![atom("property")];
+        if self.private {
+            children.push(atom("private"));
+        }
+        children.push(qstr(self.name.clone()));
+        children.push(qstr(self.value.clone()));
         children.extend(self.sub_nodes.iter().cloned());
         SexpNode::List(children)
     }
@@ -181,5 +192,52 @@ impl ChangeSet {
 impl std::fmt::Display for ChangeSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.summary())
+    }
+}
+
+#[cfg(test)]
+mod private_property_tests {
+    use super::*;
+    use crate::sexp::parser::parse;
+    use crate::sexp::writer::write;
+
+    fn parse_prop(source: &str) -> Property {
+        Property::from_sexp(&parse(source).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_private_property_keeps_its_name_value_and_flag() {
+        let property = parse_prop("(property private \"MPN\" \"X-1\" (at 1 2 0))");
+        assert_eq!(property.name, "MPN");
+        assert_eq!(property.value, "X-1");
+        assert!(property.private);
+        assert_eq!(property.sub_nodes.len(), 1);
+    }
+
+    #[test]
+    fn a_private_property_round_trips() {
+        let source = "(property private \"MPN\" \"X-1\" (at 1 2 0))";
+        let written = write(&parse_prop(source).to_sexp());
+        let again = parse_prop(&written);
+        assert!(again.private, "{written}");
+        assert_eq!(again.name, "MPN", "{written}");
+        assert_eq!(again.value, "X-1", "{written}");
+        let words: Vec<&str> = written.split_whitespace().collect();
+        assert_eq!(
+            &words[..3],
+            ["(property", "private", "\"MPN\""],
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_field_named_private_is_not_a_flag() {
+        let property = parse_prop("(property \"private\" \"X\")");
+        assert_eq!(property.name, "private");
+        assert!(!property.private);
+        let written = write(&property.to_sexp());
+        let words: Vec<&str> = written.split_whitespace().collect();
+        assert_eq!(&words[..2], ["(property", "\"private\""], "{written}");
+        assert!(!parse_prop(&written).private, "{written}");
     }
 }

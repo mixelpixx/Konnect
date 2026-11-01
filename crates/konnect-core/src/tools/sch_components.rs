@@ -1116,11 +1116,18 @@ fn component_target_from_source(
             .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
         let mut fields = BTreeMap::new();
         for property in node.find_all("property") {
-            let Some(name) = property.get(1).and_then(|value| value.as_str()) else {
+            // KiCad writes a private field as `(property private "NAME" "VALUE" …)`;
+            // a quoted "private" is a Str and stays the field name.
+            let private = matches!(
+                property.get(1),
+                Some(konnect_sexp::SexpNode::Atom(token)) if token == "private"
+            );
+            let first = if private { 2 } else { 1 };
+            let Some(name) = property.get(first).and_then(|value| value.as_str()) else {
                 continue;
             };
             let value = property
-                .get(2)
+                .get(first + 1)
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             if fields.insert(name.to_owned(), value.to_owned()).is_some() {
@@ -9345,5 +9352,130 @@ mod rotate_junction_reconciliation_tests {
 
         assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+}
+
+#[cfg(test)]
+mod private_field_tests {
+    use super::*;
+    use crate::mcp::error::extract_error_kind;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/component_fields_kicad10.kicad_sch");
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    /// The fixture with R1's MPN and LCSC fields marked private, the way
+    /// KiCad writes them: a bare `private` token before the name.
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let source = SHEET
+            .replace(
+                "(property \"MPN\" \"MPN-679-R1\"",
+                "(property private \"MPN\" \"MPN-679-R1\"",
+            )
+            .replace(
+                "(property \"LCSC\" \"C679001\"",
+                "(property private \"LCSC\" \"C679001\"",
+            );
+        assert_eq!(source.matches("(property private ").count(), 2);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_reports_private_fields_under_their_names() {
+        let (_directory, path) = fixture();
+        let result = handle_get_schematic_component(
+            &json!({ "schematic": path, "reference": "R1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let properties = &body(&result)["properties"];
+        assert_eq!(properties["MPN"], "MPN-679-R1", "{properties}");
+        assert_eq!(properties["LCSC"], "C679001", "{properties}");
+        assert!(properties.get("private").is_none(), "{properties}");
+    }
+
+    #[tokio::test]
+    async fn list_reports_private_fields_under_their_names() {
+        let (_directory, path) = fixture();
+        let result = handle_list_schematic_components(&json!({ "schematic": path }), &context())
+            .await
+            .unwrap();
+        let response = body(&result);
+        let r1 = response["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == "R1")
+            .expect("R1 is listed");
+        assert_eq!(r1["properties"]["MPN"], "MPN-679-R1", "{r1}");
+        assert!(r1["properties"].get("private").is_none(), "{r1}");
+    }
+
+    #[tokio::test]
+    async fn moving_another_part_keeps_private_fields_private() {
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "x": 50.8, "y": 50.8 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            committed.contains("(property private \"MPN\" \"MPN-679-R1\""),
+            "MPN lost its flag or value"
+        );
+        assert!(
+            committed.contains("(property private \"LCSC\" \"C679001\""),
+            "LCSC lost its flag or value"
+        );
+        assert!(!committed.contains("(property \"private\""));
+    }
+
+    #[tokio::test]
+    async fn two_private_fields_do_not_make_a_part_ambiguous() {
+        let (_directory, path) = fixture();
+        let result = handle_move_schematic_component(
+            &json!({ "schematic": path, "reference": "R1", "x": 60.96, "y": 60.96 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.is_error,
+            "{result:?} (kind {:?})",
+            extract_error_kind(&result)
+        );
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(committed.contains("(property private \"MPN\" \"MPN-679-R1\""));
     }
 }
