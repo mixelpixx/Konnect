@@ -152,14 +152,14 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_delete",
             "Delete multiple schematic items (wires, labels, junctions, components) by UUID \
-             or component reference designator — single file write.",
+             (`uuids`) or component reference designator (`references`) — single file write.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "uuids": {
                         "type": "array",
-                        "description": "UUIDs of items to delete",
+                        "description": "UUIDs of items to delete. Reference designators go in references.",
                         "items": { "type": "string" }
                     },
                     "references": {
@@ -1368,7 +1368,13 @@ async fn handle_structural_batch_delete(
                     continue;
                 };
                 let Some(item) = indexed.get(uuid) else {
-                    errors.push(format!("UUID '{}' not found", uuid));
+                    let mut error = format!("UUID '{uuid}' not found");
+                    // A reference also passed in `references` was found there.
+                    if available_references.contains(uuid) && !seen_references.contains(uuid) {
+                        error +=
+                            &format!("; '{uuid}' is a component reference, pass it in references");
+                    }
+                    errors.push(error);
                     continue;
                 };
                 if !is_deletable_schematic_tag(&item.kind) {
@@ -2165,6 +2171,115 @@ mod connectivity_safe_batch_delete_tests {
             assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), CONNECTIVITY);
         }
+    }
+
+    /// #954: a reference passed in `uuids` is not deleted as a component, and
+    /// its error says where references go. R1 and the wire UUID are as eeschema
+    /// wrote them in the fixture.
+    #[tokio::test]
+    async fn reference_in_uuids_names_the_references_argument() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path,
+                "uuids": ["18704fbf-0b66-4864-a63f-39e3ac9f5a5c", "R1", "MISSING"]
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(
+            response["deleted_item_uuids"],
+            json!(["18704fbf-0b66-4864-a63f-39e3ac9f5a5c"])
+        );
+        assert_eq!(
+            response["errors"],
+            json!([
+                "UUID 'R1' not found; 'R1' is a component reference, pass it in references",
+                "UUID 'MISSING' not found"
+            ])
+        );
+        let after = konnect_sexp::schematic::read_schematic(&path).unwrap().1;
+        assert!(extract_symbol_instances(&after)
+            .iter()
+            .any(|instance| instance.reference == "R1"));
+    }
+
+    /// #954 through `tools/call`: references alone in `uuids` select nothing,
+    /// so the refusal carries the hint and the file is unchanged. #PWR01 and
+    /// U1 (three units) are eeschema's designators in the ECC83 fixture.
+    /// A reference passed in both arguments is deleted, so the `uuids` miss
+    /// keeps its plain error instead of advice the caller already followed.
+    #[tokio::test]
+    async fn reference_in_both_arguments_gets_no_hint() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let result = handle_batch_delete(
+            &json!({ "schematic": path, "references": ["R1"], "uuids": ["R1"] }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(response["deleted"], json!(["R1"]));
+        assert_eq!(response["errors"], json!(["UUID 'R1' not found"]));
+    }
+
+    #[tokio::test]
+    async fn served_reference_only_uuids_refuse_with_the_hint() {
+        let (_directory, path) = fixture(ECC83);
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            auto_load_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("handler builds");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 954,
+                "method": "tools/call",
+                "params": {
+                    "name": "batch_delete",
+                    "arguments": { "schematic": path, "uuids": ["#PWR01", "U1"] }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let error: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(error["error"]["kind"], "stale_target", "{error}");
+        for reference in ["#PWR01", "U1"] {
+            assert!(
+                text.contains(&format!(
+                    "'{reference}' is a component reference, pass it in references"
+                )),
+                "{text}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ECC83);
+    }
+
+    #[test]
+    fn batch_delete_description_names_both_selection_arguments() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "batch_delete")
+            .unwrap();
+        for argument in ["uuids", "references"] {
+            assert!(
+                tool.description.contains(argument),
+                "{argument}: {}",
+                tool.description
+            );
+        }
+        let uuids = &tool.input_schema["properties"]["uuids"]["description"];
+        assert!(uuids.as_str().unwrap().contains("references"), "{uuids}");
     }
 
     #[tokio::test]
