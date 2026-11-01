@@ -41,3 +41,24 @@ layer (10 declared, 9 by substring); this fixture makes the gap unmissable.
 
 `crates/konnect-core/src/tools/manufacturing.rs`, module
 `copper_layer_count_tests`.
+
+`crates/konnect-core/src/tools/board_layer_refusal_tests.rs` (#844) uses the board
+as KiCad's own serialization to write into, and as the oracle for which layer
+names KiCad accepts on a board item.
+
+## Layer names KiCad loads on an item (#844)
+
+One `(gr_text "LOGO" (at 10 10 0) (layer "<name>") …)` was inserted before the
+board's closing paren, then loaded with KiCad 10.0.6:
+
+```text
+kicad-cli pcb export svg --layers F.SilkS,Edge.Cuts -o out.svg t.kicad_pcb
+```
+
+| `<name>` | KiCad 10.0.6 |
+|---|---|
+| `F.SilkS` | loads, plots |
+| `F.Silk` | `Failed to load board: One or more items were found on undefined layers (F.Silk).` |
+| `Not.A.Layer` | `Failed to load board: … undefined layers (Not.A.Layer).` |
+
+The tests refuse the two rejected names and still write `F.SilkS`.
