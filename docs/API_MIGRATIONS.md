@@ -3,6 +3,35 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `rename_project` refuses a file that changed mid-rename (patch release)
+
+`rename_project` used to read each file it rewrites and write it back
+unconditionally. If KiCad or another writer saved one of them in between, the
+rename replaced that save with the older copy plus the new name, and reported
+success.
+
+It now reads every file before renaming any, and rewrites them in one journaled
+transaction that replaces a file only if it still holds what was read. If one
+changed, or KiCad opened one under its new name, nothing is rewritten, the
+renames are undone, and the call returns `conflict` naming that file under its
+old name. Retry the rename. As with other writes, a KiCad lock on a board
+returns `unsafe_file_fallback` rather than `conflict`.
+
+Three refusals now come before anything moves:
+
+- KiCad holds one of the files under its old name (a `~NAME.kicad_sch.lck` or
+  `~NAME.kicad_pcb.lck` beside it). Its next save would recreate the old name,
+  outside the renamed project. Close the project in KiCad first.
+- A file cannot be read.
+- A `.konnect-transaction-*.json` journal left by an earlier interrupted call
+  cannot be recovered. Use `konnect transaction status` to inspect it.
+
+When the outcome cannot be proven, the call returns
+`mutation_outcome_uncertain`. This happens when the transaction fails after its
+journal was written (the `path` is that journal, and the files stay renamed), or
+when undoing the renames fails. Arguments and the success response are unchanged
+(#851).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

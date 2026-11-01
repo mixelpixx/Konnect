@@ -279,29 +279,74 @@ pub fn commit_file_transaction(
     journal_directory: impl AsRef<Path>,
     transitions: Vec<FileTransition>,
 ) -> Result<TransactionCommit, SexpError> {
-    let root = canonical_directory(journal_directory.as_ref())?;
-    recover_file_transactions(&root)?;
-    let entries = normalize_transitions(&root, transitions)?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let journal = Journal {
-        version: JOURNAL_VERSION,
-        id: id.clone(),
-        entries,
-    };
-    let journal_path = journal_path(&root, &id);
-    let _locks = lock_entries(&root, &journal.entries)?;
-    ensure_entries_are_closed(&root, &journal.entries)?;
-    verify_before_images(&root, &journal_path, &journal.entries)?;
-    persist_journal(&journal_path, &journal)?;
+    try_commit_file_transaction(journal_directory, transitions).map_err(|failure| failure.error)
+}
 
-    for entry in &journal.entries {
-        apply_entry(&root, entry)?;
-    }
-    verify_after_images(&root, &journal_path, &journal.entries)?;
-    remove_journal(&journal_path)?;
+/// A failed [`try_commit_file_transaction`].
+#[derive(Debug)]
+pub struct TransactionFailure {
+    pub error: SexpError,
+    /// The journal that reached disk, so this transaction's targets may
+    /// already hold their replacements and recovery may still complete them.
+    /// `None` means none of its targets was touched.
+    pub journal: Option<PathBuf>,
+}
+
+/// [`commit_file_transaction`], reporting whether a failure came before any
+/// target could change.
+///
+/// # Errors
+///
+/// The same errors as [`commit_file_transaction`], with the journal left
+/// behind, if any.
+pub fn try_commit_file_transaction(
+    journal_directory: impl AsRef<Path>,
+    transitions: Vec<FileTransition>,
+) -> Result<TransactionCommit, TransactionFailure> {
+    // Everything up to the journal leaves the targets untouched.
+    let prepare = || -> Result<_, SexpError> {
+        let root = canonical_directory(journal_directory.as_ref())?;
+        recover_file_transactions(&root)?;
+        let entries = normalize_transitions(&root, transitions)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let journal = Journal {
+            version: JOURNAL_VERSION,
+            id,
+            entries,
+        };
+        let journal_path = journal_path(&root, &journal.id);
+        let locks = lock_entries(&root, &journal.entries)?;
+        ensure_entries_are_closed(&root, &journal.entries)?;
+        verify_before_images(&root, &journal_path, &journal.entries)?;
+        Ok((root, journal, journal_path, locks))
+    };
+    let (root, journal, journal_path, _locks) = prepare().map_err(|error| TransactionFailure {
+        error,
+        journal: None,
+    })?;
+    // The journal is renamed into place, so a failed persist may still have
+    // left it behind.
+    persist_journal(&journal_path, &journal).map_err(|error| TransactionFailure {
+        error,
+        journal: std::fs::symlink_metadata(&journal_path)
+            .is_ok()
+            .then(|| journal_path.clone()),
+    })?;
+
+    (|| -> Result<(), SexpError> {
+        for entry in &journal.entries {
+            apply_entry(&root, entry)?;
+        }
+        verify_after_images(&root, &journal_path, &journal.entries)?;
+        remove_journal(&journal_path)
+    })()
+    .map_err(|error| TransactionFailure {
+        error,
+        journal: Some(journal_path.clone()),
+    })?;
 
     Ok(TransactionCommit {
-        id,
+        id: journal.id,
         files: journal.entries.len(),
     })
 }
@@ -823,6 +868,67 @@ mod tests {
             }],
         };
         (journal, root.join(relative))
+    }
+
+    #[test]
+    fn a_refused_transaction_reports_that_no_journal_was_written() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("root.kicad_sch");
+        std::fs::write(&target, "saved meanwhile").unwrap();
+
+        let failure = try_commit_file_transaction(
+            directory.path(),
+            vec![FileTransition::replace(&target, "read earlier", "after")],
+        )
+        .expect_err("a changed target is refused");
+        assert!(
+            matches!(failure.error, SexpError::TransactionConflict { .. }),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(failure.journal, None);
+        assert!(inspect_file_transactions(directory.path())
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "saved meanwhile");
+    }
+
+    /// A target whose directory refuses the replacement fails after the
+    /// journal reached disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_transaction_failing_after_its_journal_reports_it_persisted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let sealed = directory.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        let first = directory.path().join("a.kicad_sch");
+        let second = sealed.join("b.kicad_sch");
+        std::fs::write(&first, "a before").unwrap();
+        std::fs::write(&second, "b before").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(sealed.join("probe"), "").is_ok() {
+            return; // Permissions are not enforced (running as root).
+        }
+
+        let failure = try_commit_file_transaction(
+            directory.path(),
+            vec![
+                FileTransition::replace(&first, "a before", "a after"),
+                FileTransition::replace(&second, "b before", "b after"),
+            ],
+        )
+        .expect_err("the sealed target cannot be replaced");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let journal = failure
+            .journal
+            .unwrap_or_else(|| panic!("{:?}", failure.error));
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "a after");
+        let active = inspect_file_transactions(directory.path()).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].journal, journal);
     }
 
     #[cfg(unix)]

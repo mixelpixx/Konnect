@@ -12,7 +12,10 @@
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{get_path, invalid_arg, opt_str, require_str, ToolContext, ToolDef};
-use konnect_sexp::{commit_file_transaction, FileTransition, SexpError};
+use konnect_sexp::{
+    commit_file_transaction, try_commit_file_transaction, FileTransition, SexpError,
+    TransactionFailure,
+};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1342,6 +1345,113 @@ fn rewrite_project_references(text: &str, old: &str, new: &str, sexp: bool) -> (
     (out, hits)
 }
 
+/// `rename_project` stopped with the project in a state it could not prove.
+fn rename_uncertain(path: &Path, reason: String) -> CallToolResult {
+    let path = path.display().to_string();
+    let message = format!(
+        "rename_project did not finish cleanly. {reason} Inspect '{path}' before retrying."
+    );
+    CallToolResult::error_kind(
+        ToolErrorKind::MutationOutcomeUncertain {
+            operation: "rename_project".to_owned(),
+            path,
+            reason,
+        },
+        message,
+    )
+}
+
+/// Undo `done` renames, last first, returning the ones that failed.
+fn undo_renames(done: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    done.iter()
+        .rev()
+        .filter_map(|(from, to)| {
+            std::fs::rename(to, from)
+                .err()
+                .map(|e| format!("{} back to {}: {e}", to.display(), from.display()))
+        })
+        .collect()
+}
+
+fn renames_not_undone(dir: &Path, cause: String, failures: Vec<String>) -> CallToolResult {
+    rename_uncertain(
+        dir,
+        format!(
+            "{cause}, and undoing the renames failed ({}).",
+            failures.join("; ")
+        ),
+    )
+}
+
+/// Report a failed rewrite of the renamed set, undoing the renames when the
+/// transaction touched nothing.
+fn rename_rewrite_failed(
+    failure: TransactionFailure,
+    dir: &Path,
+    planned_files: &[(PathBuf, PathBuf)],
+    targets: &[(PathBuf, PathBuf)],
+) -> anyhow::Result<CallToolResult> {
+    // Renaming back would strand the journal, which names the new paths.
+    if let Some(journal) = failure.journal {
+        return Ok(rename_uncertain(
+            &journal,
+            format!(
+                "The files were renamed, but rewriting their project references failed after \
+                 this journal was written ({}), so some may already hold the new name. Run \
+                 `konnect transaction status` in the project directory.",
+                failure.error
+            ),
+        ));
+    }
+    let failures = undo_renames(planned_files);
+    if !failures.is_empty() {
+        return Ok(renames_not_undone(
+            dir,
+            format!(
+                "Rewriting project references was refused ({})",
+                failure.error
+            ),
+            failures,
+        ));
+    }
+    // The transaction names a target by its new, canonical path; after the
+    // rollback the caller's file is its source.
+    let on_disk = |path: &Path| {
+        targets
+            .iter()
+            .find(|(_, target)| target.file_name() == path.file_name())
+            .map_or_else(|| path.to_path_buf(), |(source, _)| source.clone())
+    };
+    match failure.error {
+        SexpError::Conflict { path } | SexpError::TransactionConflict { path, .. } => {
+            let path = on_disk(&path);
+            Ok(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![path.display().to_string()],
+                },
+                format!(
+                    "{} changed while rename_project was running; rolled back, nothing was \
+                     changed. Retry the rename.",
+                    path.display()
+                ),
+            ))
+        }
+        // Dispatch classifies a KiCad lock, as it does the one checked
+        // before the renames.
+        SexpError::KiCadEditorLocked {
+            path,
+            lock_path,
+            inspection_error,
+        } => Err(SexpError::KiCadEditorLocked {
+            path: on_disk(&path),
+            lock_path,
+            inspection_error,
+        }
+        .into()),
+        other => Err(other.into()),
+    }
+}
+
 async fn handle_rename_project(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1416,83 +1526,81 @@ async fn handle_rename_project(
 
     // Rewriting content is what keeps annotations attached: each symbol
     // instance in the schematic stores `(project "NAME"`, and the .kicad_pro
-    // and .kicad_prl embed their own filenames.
+    // and .kicad_prl embed their own filenames. A hierarchical design keeps
+    // that key in every sheet file, and the children are never renamed, so
+    // rewriting only the root would de-annotate them.
+    let sources: Vec<PathBuf> = planned_files.iter().map(|(from, _)| from.clone()).collect();
+    let mut targets = planned_files.clone();
+    targets.extend(
+        sibling_sheets(&dir, &sources)
+            .into_iter()
+            .map(|sheet| (sheet.clone(), sheet)),
+    );
+
+    if !dry_run {
+        // Settle a journal an earlier call left before anything is read or
+        // moved: one naming an old path would fail against the renamed set.
+        konnect_sexp::recover_file_transactions(&dir)?;
+        // KiCad locks a document under the name it opened. Once the files
+        // move, its next save recreates the old name and is lost to the
+        // renamed project, so its lock is checked while that name still holds.
+        for (source, _) in &targets {
+            konnect_sexp::writer::ensure_kicad_design_document_is_closed(source)?;
+        }
+    }
+
+    // Every file is read before anything moves, and each is replaced below
+    // only if it still holds what was read here (#851).
     let mut rewritten = Vec::new();
+    let mut transitions = Vec::new();
+    for (source, target) in &targets {
+        let sexp = matches!(
+            source.extension().and_then(|s| s.to_str()),
+            Some("kicad_sch" | "kicad_pcb")
+        );
+        let text = if dry_run {
+            std::fs::read_to_string(source).unwrap_or_default()
+        } else {
+            konnect_sexp::read_consistent(source)?
+        };
+        let (updated, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
+        if dry_run || hits > 0 {
+            rewritten.push(json!({
+                "file": target.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                "references_updated": hits,
+            }));
+        }
+        if !dry_run && hits > 0 {
+            transitions.push(FileTransition::replace(target, text, updated));
+        }
+    }
+
     if !dry_run {
         // Rename the set, undoing what landed if one fails: a half-renamed
         // project is one KiCad cannot open at all.
-        let mut done: Vec<(&std::path::PathBuf, &std::path::PathBuf)> = Vec::new();
-        for (from, to) in &planned_files {
+        for (i, (from, to)) in planned_files.iter().enumerate() {
             if let Err(e) = std::fs::rename(from, to) {
-                for (undo_from, undo_to) in done.iter().rev() {
-                    let _ = std::fs::rename(undo_to, undo_from);
+                let failures = undo_renames(&planned_files[..i]);
+                if !failures.is_empty() {
+                    return Ok(renames_not_undone(
+                        &dir,
+                        format!("Rename failed on {} ({e})", to.display()),
+                        failures,
+                    ));
                 }
                 return Ok(CallToolResult::error(format!(
                     "Rename failed on {} ({e}); rolled back, nothing was changed.",
                     to.display()
                 )));
             }
-            done.push((from, to));
         }
-        // The renamed set plus every child sheet: a hierarchical design keeps
-        // `(project "NAME"` in each sheet file, and the children are never
-        // renamed, so rewriting only the root would de-annotate them.
-        let renamed: Vec<std::path::PathBuf> =
-            planned_files.iter().map(|(_, to)| to.clone()).collect();
-        let mut to_rewrite = renamed.clone();
-        to_rewrite.extend(sibling_sheets(&dir, &renamed));
 
-        for target in &to_rewrite {
-            let sexp = matches!(
-                target.extension().and_then(|s| s.to_str()),
-                Some("kicad_sch" | "kicad_pcb")
-            );
-            let text = std::fs::read_to_string(target)?;
-            let (updated, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
-            if hits > 0 {
-                konnect_sexp::writer::write_atomic(target, &updated)?;
-                rewritten.push(json!({
-                    "file": target.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
-                    "references_updated": hits,
-                }));
+        #[cfg(test)]
+        rename_rewrite_hook::run(&dir);
+        if !transitions.is_empty() {
+            if let Err(failure) = try_commit_file_transaction(&dir, transitions) {
+                return rename_rewrite_failed(failure, &dir, &planned_files, &targets);
             }
-        }
-    } else {
-        let sources: Vec<std::path::PathBuf> =
-            planned_files.iter().map(|(from, _)| from.clone()).collect();
-        let mut previewed: Vec<(std::path::PathBuf, String)> = planned_files
-            .iter()
-            .map(|(from, to)| {
-                (
-                    from.clone(),
-                    to.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-            })
-            .collect();
-        // Child sheets keep their names, so the reported name is their own.
-        for sheet in sibling_sheets(&dir, &sources) {
-            let name = sheet
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            previewed.push((sheet, name));
-        }
-
-        for (source, reported_name) in &previewed {
-            let sexp = matches!(
-                source.extension().and_then(|s| s.to_str()),
-                Some("kicad_sch" | "kicad_pcb")
-            );
-            let text = std::fs::read_to_string(source).unwrap_or_default();
-            let (_, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
-            rewritten.push(json!({
-                "file": reported_name,
-                "references_updated": hits,
-            }));
         }
     }
 
@@ -1534,6 +1642,34 @@ async fn handle_rename_project(
         "backups_folder": backups,
         "directory": directory,
     })))
+}
+
+/// Runs a test's edit between the renames and the rewrite, where KiCad or
+/// another writer could save one of the files.
+#[cfg(test)]
+mod rename_rewrite_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(super) fn set(hook: impl FnOnce(&Path) + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn armed() -> bool {
+        HOOK.with(|slot| slot.borrow().is_some())
+    }
+
+    pub(super) fn run(dir: &Path) {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(dir);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1675,7 +1811,7 @@ mod rename_hierarchy_tests {
         pro
     }
 
-    fn body(result: &CallToolResult) -> serde_json::Value {
+    pub(super) fn body(result: &CallToolResult) -> serde_json::Value {
         match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
             _ => panic!("expected text"),
@@ -1755,6 +1891,276 @@ mod rename_hierarchy_tests {
             "dry_run must not write"
         );
         assert!(pro.exists(), "dry_run must not rename");
+    }
+}
+
+/// `rename_project` against KiCad 10.0.5's own `multichannel` demo (root,
+/// child sheet and project file, verbatim; see
+/// `tests/fixtures/annotate_duplicates.README.md`). Each file must be replaced
+/// only if it still holds what the rename read (#851).
+#[cfg(test)]
+mod rename_revision_tests {
+    use super::rename_hierarchy_tests::body;
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+
+    const ROOT: &str = include_str!("../../tests/fixtures/multichannel_mixer.kicad_sch");
+    const CHILD: &str = include_str!("../../tests/fixtures/multichannel_channel_strip.kicad_sch");
+    const PRO: &str = include_str!("../../tests/fixtures/multichannel_mixer.kicad_pro");
+
+    fn project(dir: &Path) -> PathBuf {
+        std::fs::write(dir.join("multichannel_mixer.kicad_sch"), ROOT).unwrap();
+        std::fs::write(dir.join("multichannel_channel_strip.kicad_sch"), CHILD).unwrap();
+        let pro = dir.join("multichannel_mixer.kicad_pro");
+        std::fs::write(&pro, PRO).unwrap();
+        pro
+    }
+
+    async fn rename(pro: &Path) -> CallToolResult {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 851, "method": "tools/call",
+                "params": { "name": "rename_project", "arguments": {
+                    "project": pro.to_string_lossy(), "new_name": "mixer"
+                }}
+            }))
+            .await
+            .expect("tools/call receives a response");
+        assert!(response.error.is_none(), "tool errors are MCP results");
+        serde_json::from_value(response.result.expect("a result")).expect("an MCP result")
+    }
+
+    /// Rename with `hook` run between the renames and the rewrite.
+    async fn rename_with_hook(pro: &Path, hook: impl FnOnce(&Path) + 'static) -> CallToolResult {
+        rename_rewrite_hook::set(hook);
+        let result = rename(pro).await;
+        assert!(
+            !rename_rewrite_hook::armed(),
+            "the rewrite path skipped the hook"
+        );
+        result
+    }
+
+    /// A refusal names the file as it is on disk after the rollback.
+    fn assert_conflict_on(result: &CallToolResult, path: &Path) {
+        assert!(result.is_error, "{:?}", body(result));
+        let error = &body(result)["error"];
+        assert_eq!(error["kind"], "conflict", "{error}");
+        assert_eq!(
+            error["paths"],
+            json!([path.display().to_string()]),
+            "{error}"
+        );
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// Counts of `(project "multichannel_mixer"` in KiCad's files: the root
+    /// sheet has 29, the child 36.
+    #[tokio::test]
+    async fn a_rename_rewrites_every_reference_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = project(dir.path());
+
+        let result = rename(&pro).await;
+        assert!(!result.is_error, "{:?}", body(&result));
+
+        let root = read(&dir.path().join("mixer.kicad_sch"));
+        let child = read(&dir.path().join("multichannel_channel_strip.kicad_sch"));
+        assert_eq!(root.matches("(project \"mixer\"").count(), 29);
+        assert_eq!(child.matches("(project \"mixer\"").count(), 36);
+        let restore =
+            |text: &str| text.replace("(project \"mixer\"", "(project \"multichannel_mixer\"");
+        assert_eq!(restore(&root), ROOT, "only project keys may change");
+        assert_eq!(restore(&child), CHILD, "only project keys may change");
+        assert!(!dir.path().join("multichannel_mixer.kicad_sch").exists());
+        assert!(
+            konnect_sexp::inspect_file_transactions(dir.path())
+                .unwrap()
+                .is_empty(),
+            "a committed rename leaves no journal"
+        );
+    }
+
+    /// The child sheet keeps its name, so KiCad saving it mid-rename is the
+    /// plainest form of the lost edit.
+    #[tokio::test]
+    async fn a_child_sheet_saved_mid_rename_is_kept_and_the_rename_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = project(dir.path());
+        let child_path = dir.path().join("multichannel_channel_strip.kicad_sch");
+        let saved = CHILD.replace("(property \"Value\" \"CH1\"", "(property \"Value\" \"CH9\"");
+        assert_ne!(saved, CHILD);
+        let result = rename_with_hook(&pro, {
+            let child_path = child_path.clone();
+            let saved = saved.clone();
+            move |_| std::fs::write(&child_path, saved).unwrap()
+        })
+        .await;
+        assert_conflict_on(&result, &child_path);
+
+        assert_eq!(read(&child_path), saved, "the save KiCad made must survive");
+        assert_eq!(read(&dir.path().join("multichannel_mixer.kicad_sch")), ROOT);
+        assert_eq!(read(&pro), PRO);
+        assert!(!dir.path().join("mixer.kicad_sch").exists());
+        assert!(!dir.path().join("mixer.kicad_pro").exists());
+    }
+
+    /// A save to the root lands under its new name, and must follow it back.
+    #[tokio::test]
+    async fn a_root_sheet_saved_mid_rename_is_kept_under_its_old_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = project(dir.path());
+        let saved = format!("{ROOT}\r\n");
+        let result = rename_with_hook(&pro, {
+            let saved = saved.clone();
+            move |dir| std::fs::write(dir.join("mixer.kicad_sch"), saved).unwrap()
+        })
+        .await;
+        assert_conflict_on(&result, &dir.path().join("multichannel_mixer.kicad_sch"));
+
+        assert_eq!(
+            read(&dir.path().join("multichannel_mixer.kicad_sch")),
+            saved
+        );
+        assert_eq!(
+            read(&dir.path().join("multichannel_channel_strip.kicad_sch")),
+            CHILD
+        );
+        assert_eq!(read(&pro), PRO);
+        assert!(!dir.path().join("mixer.kicad_sch").exists());
+    }
+
+    /// KiCad opening the renamed root before the rewrite is refused too, and
+    /// the renames are undone.
+    #[tokio::test]
+    async fn a_sheet_kicad_opens_mid_rename_rolls_the_rename_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = project(dir.path());
+        let result = rename_with_hook(&pro, |dir| {
+            std::fs::write(dir.join("~mixer.kicad_sch.lck"), "user\nhost\n").unwrap()
+        })
+        .await;
+        assert_conflict_on(&result, &dir.path().join("multichannel_mixer.kicad_sch"));
+
+        assert_eq!(read(&dir.path().join("multichannel_mixer.kicad_sch")), ROOT);
+        assert_eq!(
+            read(&dir.path().join("multichannel_channel_strip.kicad_sch")),
+            CHILD
+        );
+        assert_eq!(read(&pro), PRO);
+        assert!(!dir.path().join("mixer.kicad_sch").exists());
+    }
+
+    /// KiCad holding the project under its old name is refused before
+    /// anything moves: its next save would recreate that name.
+    #[tokio::test]
+    async fn a_project_open_in_kicad_is_not_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = project(dir.path());
+        let root = dir.path().join("multichannel_mixer.kicad_sch");
+        std::fs::write(
+            dir.path().join("~multichannel_mixer.kicad_sch.lck"),
+            "user\nhost\n",
+        )
+        .unwrap();
+
+        let result = rename(&pro).await;
+        assert_conflict_on(&result, &root);
+
+        assert_eq!(read(&root), ROOT);
+        assert_eq!(read(&pro), PRO);
+        assert!(!dir.path().join("mixer.kicad_pro").exists());
+    }
+
+    /// A journal an interrupted edit left on the old root name is completed
+    /// before anything moves; after the renames it could only fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_journal_left_on_the_old_name_is_recovered_before_the_rename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pro = project(dir.path());
+        let root = dir.path().join("multichannel_mixer.kicad_sch");
+        // The sealed entry sorts first, so the root is never written and the
+        // journal stays pending on it.
+        let sealed = dir.path().join("a_sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::write(sealed.join("notes.txt"), "before").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(sealed.join("probe"), "").is_ok() {
+            return; // Permissions are not enforced (running as root).
+        }
+        let edited = format!("{ROOT}\r\n");
+        let failure = try_commit_file_transaction(
+            dir.path(),
+            vec![
+                FileTransition::replace(sealed.join("notes.txt"), "before", "after"),
+                FileTransition::replace(&root, ROOT, edited.clone()),
+            ],
+        )
+        .expect_err("the sealed entry cannot be written");
+        assert!(failure.journal.is_some(), "{:?}", failure.error);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            read(&root),
+            ROOT,
+            "the journal is still pending on the root"
+        );
+
+        let result = rename(&pro).await;
+        assert!(!result.is_error, "{:?}", body(&result));
+        let renamed = read(&dir.path().join("mixer.kicad_sch"));
+        assert_eq!(
+            renamed.replace("(project \"mixer\"", "(project \"multichannel_mixer\""),
+            edited,
+            "the recovered edit must survive the rename"
+        );
+    }
+
+    /// A rollback that cannot put a file back is not reported as one.
+    #[tokio::test]
+    async fn a_rollback_that_fails_is_reported_as_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = project(dir.path());
+        let child_path = dir.path().join("multichannel_channel_strip.kicad_sch");
+        let saved = format!("{CHILD}\r\n");
+        let result = rename_with_hook(&pro, {
+            let saved = saved.clone();
+            move |dir| {
+                std::fs::write(&child_path, saved).unwrap();
+                // Something now occupies the old root name.
+                std::fs::create_dir(dir.join("multichannel_mixer.kicad_sch")).unwrap();
+            }
+        })
+        .await;
+
+        let error = &body(&result)["error"];
+        assert_eq!(error["kind"], "mutation_outcome_uncertain", "{error}");
+        assert_eq!(error["path"], dir.path().display().to_string(), "{error}");
+        assert!(
+            error["reason"]
+                .as_str()
+                .unwrap()
+                .contains("mixer.kicad_sch back to"),
+            "{error}"
+        );
+        assert_eq!(read(&dir.path().join("mixer.kicad_sch")), ROOT);
     }
 }
 
