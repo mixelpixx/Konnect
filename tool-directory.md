@@ -135,8 +135,8 @@ and Windows servers do not.
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
 | `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
-| `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
-| `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
+| `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire, taking the other L-bend or refusing (`plan_blocked`) when a route would join another net. |
+| `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing, V+H or a `plan_blocked` refusal when a route would join another net). Use `connect_pins` if you have references instead of coordinates. |
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
@@ -188,7 +188,7 @@ and Windows servers do not.
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
-| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
+| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
 
 ### `sch_export` · 10 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.

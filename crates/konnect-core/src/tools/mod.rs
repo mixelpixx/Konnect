@@ -35,6 +35,8 @@ pub mod placement;
 pub mod project;
 #[cfg(test)]
 mod project_file_writer_tests;
+#[cfg(test)]
+mod route_obstacle_tests;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;

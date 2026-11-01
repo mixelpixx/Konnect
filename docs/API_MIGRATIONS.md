@@ -3,6 +3,32 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: routed connections refuse to join another net (patch release)
+
+`connect_pins`, `batch_connect_pins` and `add_schematic_connection` route an
+L-bend, horizontal leg first. A leg that passed over another pin's tip got a
+junction there, and a corner that landed on a sheet pin connected to it. Each
+route also dotted every junction-less T anywhere on the sheet, which KiCad
+reads as two nets. So pins, labels and sheet pins on other nets (or on none)
+silently joined, and the call still reported success (#887).
+
+Each route now dots only the T's it forms itself, and is checked before it is
+written. If the horizontal-first bend would join anything beyond the nets at
+its two endpoints, the vertical-first bend is tried. Ending on a wire mid-span
+still taps that wire's net. If both bends would join another net, or a placed
+symbol's pins cannot be resolved so the check cannot see them,
+`connect_pins` and `add_schematic_connection` refuse with `plan_blocked` and
+write nothing. `reasons` holds one entry per bend tried.
+`batch_connect_pins` skips that pair, adds
+`"<ref1>.<pin1> -> <ref2>.<pin2>: <reasons joined by '; '>"` to `errors`,
+still writes the other pairs, and counts only routed pairs in
+`connected_count`.
+
+Because the corner can now be on either side, `connect_pins` and
+`add_schematic_connection` add `path`: the route's points as `[[x, y], …]`,
+corner included. A route that merely crosses another wire without a junction
+is not a connection and is unchanged.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
