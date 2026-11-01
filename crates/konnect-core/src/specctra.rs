@@ -850,6 +850,14 @@ fn locked_routing(
             .and_then(|node| resolve_net(node, net_table))
             .context("locked via has no connected net")?;
         let (x_um, y_um) = point_um(via, "at")?;
+        refuse_per_layer_padstack(
+            via,
+            &format!(
+                "locked via at ({}, {}) mm",
+                x_um as f64 / 1000.0,
+                -y_um as f64 / 1000.0
+            ),
+        )?;
         let diameter_um = positive_um(
             via.find("size").and_then(|size| size.get_f64(1)),
             "locked via diameter",
@@ -1042,6 +1050,7 @@ fn footprints(
                     "unsupported first routing profile: pad {reference}-{number} has type '{pad_type}'"
                 );
             }
+            refuse_per_layer_padstack(pad, &format!("pad {reference}-{number}"))?;
             let shape = match pad.get(3).and_then(SexpNode::as_str) {
                 Some("circle") => PadShape::Circle,
                 Some("rect") => PadShape::Rect,
@@ -1594,6 +1603,20 @@ fn property_value<'a>(node: &'a SexpNode, property_name: &str) -> Option<&'a str
         .as_str()
 }
 
+/// KiCad omits `(padstack ...)` for a normal padstack. Any other mode can give
+/// B.Cu or inner layers a shape the front geometry does not describe (#842).
+fn refuse_per_layer_padstack(item: &SexpNode, label: &str) -> Result<()> {
+    match item.find("padstack").map(|padstack| padstack.find_str("mode")) {
+        None | Some(Some("normal")) => Ok(()),
+        Some(Some(mode)) => bail!(
+            "unsupported first routing profile: {label} has a '{mode}' padstack, which can shape copper layers differently"
+        ),
+        Some(None) => {
+            bail!("unsupported first routing profile: {label} has a padstack with no mode")
+        }
+    }
+}
+
 fn point_um(node: &SexpNode, tag: &str) -> Result<(i64, i64)> {
     let point = node.find(tag).with_context(|| format!("missing '{tag}'"))?;
     Ok((
@@ -1908,5 +1931,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("shape offset"), "{error}");
+    }
+
+    /// KiCad's stock-header boards, whose J1 pad 1 has a 2 mm circle on
+    /// `B.Cu` under its 1.7 mm square front (#842).
+    #[test]
+    fn per_layer_padstacks_are_refused() {
+        for (mode, source) in [
+            (
+                "front_inner_back",
+                include_str!("../tests/fixtures/specctra_padstack_front_inner_back.kicad_pcb"),
+            ),
+            (
+                "custom",
+                include_str!("../tests/fixtures/specctra_padstack_custom.kicad_pcb"),
+            ),
+        ] {
+            let error = export_dsn(Path::new("board.kicad_pcb"), source, &rules())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("pad J1-1 has a '{mode}' padstack")),
+                "{error}"
+            );
+        }
+    }
+
+    /// KiCad always writes a mode; a block without one is refused all the same.
+    #[test]
+    fn padstack_without_a_mode_is_refused() {
+        let source = include_str!("../tests/fixtures/specctra_padstack_custom.kicad_pcb").replacen(
+            "(mode custom)",
+            "",
+            1,
+        );
+        let error = export_dsn(Path::new("board.kicad_pcb"), &source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("pad J1-1 has a padstack with no mode"),
+            "{error}"
+        );
+    }
+
+    /// The same board with no padstack block, as KiCad saves a normal pad.
+    #[test]
+    fn stock_header_with_normal_pads_exports() {
+        let source = include_str!("../tests/fixtures/specctra_padstack_normal.kicad_pcb");
+        let export = export_dsn(Path::new("board.kicad_pcb"), source, &rules()).unwrap();
+        assert_eq!(export.pad_count, 4);
+        assert!(
+            export.dsn.contains("(rect F.Cu -850 -850 850 850)")
+                && export.dsn.contains("(rect B.Cu -850 -850 850 850)"),
+            "{}",
+            export.dsn
+        );
+    }
+
+    /// KiCad's locked-via board, its via given a 1 mm `B.Cu` size under a
+    /// 0.6 mm front (#842).
+    #[test]
+    fn locked_via_with_a_per_layer_padstack_is_refused() {
+        let source = include_str!("../tests/fixtures/specctra_padstack_locked_via.kicad_pcb");
+        let error = export_dsn(Path::new("board.kicad_pcb"), source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("locked via at (105, 50) mm has a 'front_inner_back' padstack"),
+            "{error}"
+        );
     }
 }
