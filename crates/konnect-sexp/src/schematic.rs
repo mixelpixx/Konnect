@@ -172,6 +172,28 @@ pub fn extract_no_connects(tree: &SexpNode) -> Vec<(f64, f64)> {
     at_positions(tree.find_all("no_connect"))
 }
 
+/// The file each placed hierarchical sheet names in its `Sheetfile` property
+/// (`Sheet file` in KiCad 6 files), in file order, as written: relative to
+/// the placing schematic.
+pub fn sheet_files(tree: &SexpNode) -> Vec<&str> {
+    tree.find_all("sheet")
+        .into_iter()
+        .filter_map(|sheet| {
+            sheet
+                .find_all("property")
+                .into_iter()
+                .find(|property| {
+                    matches!(
+                        property.get(1).and_then(SexpNode::as_str),
+                        Some("Sheetfile" | "Sheet file")
+                    )
+                })
+                .and_then(|property| property.get(2))
+                .and_then(SexpNode::as_str)
+        })
+        .collect()
+}
+
 /// Extract every hierarchical sheet pin position. A wire terminating on one
 /// leaves the sheet rather than dangling.
 pub fn extract_sheet_pins(tree: &SexpNode) -> Vec<(f64, f64)> {
@@ -550,6 +572,22 @@ pub fn symbol_bounds_for_instance(
         include_point(&mut placed, x, y);
     }
     placed
+}
+
+#[cfg(test)]
+mod sheet_files_tests {
+    use super::*;
+
+    /// KiCad 7 renamed the property; KiCad 10 still loads KiCad 6 sheets.
+    #[test]
+    fn both_property_names_are_read_in_file_order() {
+        let tree = parse_sexp(
+            "(kicad_sch (sheet (property \"Sheetname\" \"a\") (property \"Sheetfile\" \"a.kicad_sch\")) \
+             (sheet (property \"Sheet file\" \"b.kicad_sch\")) (sheet (property \"Sheetname\" \"c\")))",
+        )
+        .unwrap();
+        assert_eq!(sheet_files(&tree), ["a.kicad_sch", "b.kicad_sch"]);
+    }
 }
 
 #[cfg(test)]

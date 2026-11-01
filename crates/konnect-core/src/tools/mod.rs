@@ -7,6 +7,8 @@ mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
 mod board_stackup;
+#[cfg(test)]
+mod board_title_block_tests;
 pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;
@@ -47,8 +49,11 @@ pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]
 mod schematic_placement_tests;
+#[cfg(test)]
+mod schematic_title_block_tests;
 pub mod svg_import;
 pub mod templates;
+pub(crate) mod title_block_args;
 pub mod verification;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
@@ -933,7 +938,7 @@ pub(crate) fn mutation_outcome_uncertain(
             reason: reason.clone(),
         },
         format!(
-            "{operation} committed a schematic mutation, but immediate readback did not prove the requested result. The file at '{path}' may have changed; reload and inspect it before retrying. {reason}"
+            "{operation} committed a mutation, but immediate readback did not prove the requested result. The file at '{path}' may have changed; reload and inspect it before retrying. {reason}"
         ),
     )
 }

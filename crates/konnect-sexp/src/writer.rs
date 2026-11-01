@@ -222,7 +222,7 @@ pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError
 /// is stale, especially for another host. Its contents are therefore neither
 /// parsed nor trusted: any filesystem entry at the lock path blocks the write.
 /// Reads and non-design-document writes are unaffected.
-pub(crate) fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
+pub fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
     let Some(lock_path) = kicad_editor_lock_path(path) else {
         return Ok(());
     };

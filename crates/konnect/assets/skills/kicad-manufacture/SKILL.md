@@ -52,6 +52,24 @@ judged against that record.
 Completion criterion: every applicable fabrication and assembly constraint has
 one current authority, and no decision rests on an undated table in this skill.
 
+### Stamp the release revision
+
+Silkscreen, fab notes and drawing sheets that use `${REVISION}`,
+`${ISSUE_DATE}`, `${TITLE}`, `${COMPANY}` or `${COMMENT1}`..`${COMMENT9}`
+resolve them from the title block of the document they sit on. The board has
+its own, and so does every schematic sheet file. Agree the release revision and
+date with the user, then set the same values on both:
+
+```
+load_toolset('pcb_board')        # set_board_title_block
+load_toolset('sch_hierarchy')    # set_schematic_title_block with scope 'hierarchy'
+```
+
+Pass only the fields to change, and check the title block each tool reads
+back. A board result with `source: ipc` is unsaved until the board is saved in
+KiCad. Then confirm the resolved text, not the variable, in a board and
+schematic PDF or SVG export.
+
 ## 2. Establish direct design evidence
 
 Run direct KiCad DRC against the saved target board and resolve every error or

@@ -10,12 +10,14 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
+use crate::tools::title_block_args::{self, TitleBlockUpdate};
 use crate::tools::{
     get_path, invalid_arg, opt_f64, opt_positive_f64, opt_str, project_name_for, require_f64,
     require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
-use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
+use konnect_sexp::schematic::{format_hierarchical_sheet, sheet_files, HierarchicalSheetSpec};
+use konnect_sexp::title_block::TitleBlock;
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use konnect_sexp::{
     commit_command, commit_file_transaction, parse_sexp, prepare_command, read_consistent,
@@ -78,6 +80,32 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "size"]
             }),
             |args, ctx| async move { handle_set_page(args, ctx).await }
+        ),
+        tool!(
+            "set_schematic_title_block",
+            "Set fields of a schematic sheet's title block, which ${TITLE}, ${ISSUE_DATE}, \
+             ${REVISION}, ${COMPANY} and ${COMMENT1}..${COMMENT9} resolve from on that sheet. \
+             scope 'hierarchy' sets the same fields on the file and every sheet file below \
+             it, each shared file once, in one transaction. An omitted field keeps its \
+             value, an empty string clears it, and values are stored verbatim. Edits the \
+             saved files: refused while KiCad holds a target or the project's root \
+             schematic open. Returns each sheet's title block read back after the write, \
+             with the fields that changed.",
+            title_block_args::schema(
+                "schematic",
+                "Path to .kicad_sch file",
+                serde_json::Map::from_iter([(
+                    "scope".to_string(),
+                    json!({
+                        "type": "string",
+                        "enum": ["sheet", "hierarchy"],
+                        "default": "sheet",
+                        "description": "'sheet' edits this file only; 'hierarchy' also \
+                                        edits every sheet file below it"
+                    }),
+                )]),
+            ),
+            |args, ctx| async move { handle_set_schematic_title_block(args, ctx).await }
         ),
         tool!(
             "add_hierarchical_sheet",
@@ -419,6 +447,241 @@ async fn handle_set_page(
         "portrait": portrait,
         "width_mm": w,
         "height_mm": h
+    })))
+}
+
+/// One sheet file `set_schematic_title_block` edits: the exact source it was
+/// read as, and the title block in it.
+struct TitleBlockTarget {
+    path: PathBuf,
+    source: String,
+    block: TitleBlock,
+}
+
+/// `schematic` alone, or for `hierarchy` it and every sheet file below it,
+/// each once, in the order a depth-first walk first reaches them. Refuses a
+/// missing sheet file, or a title block the model cannot hold, before
+/// anything is written.
+fn title_block_targets(
+    schematic: &Path,
+    hierarchy: bool,
+) -> anyhow::Result<Result<Vec<TitleBlockTarget>, CallToolResult>> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![(schematic.to_path_buf(), 0usize)];
+    while let Some((path, depth)) = pending.pop() {
+        if !seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+            continue;
+        }
+        if depth > MAX_HIERARCHY_DEPTH {
+            return Ok(Err(CallToolResult::error_kind(
+                ToolErrorKind::UnsupportedCapability {
+                    capability: "sheet_hierarchy_deeper_than_limit".to_string(),
+                    kicad_version: None,
+                },
+                format!(
+                    "The hierarchy below '{}' is deeper than {MAX_HIERARCHY_DEPTH} sheets. No \
+                     sheet was modified.",
+                    schematic.display()
+                ),
+            )));
+        }
+        let source = read_consistent(&path)?;
+        let tree = parse_sexp(&source)?;
+        let block = match konnect_sexp::title_block::read(&tree) {
+            Ok(block) => block,
+            Err(error) => return Ok(Err(title_block_args::unrepresentable(&path, &error))),
+        };
+        if hierarchy {
+            let dir = parent_dir(&path);
+            // Reversed so the stack visits sheets in file order.
+            for file in sheet_files(&tree).into_iter().rev() {
+                let child = dir.join(file);
+                if !child.is_file() {
+                    return Ok(Err(CallToolResult::error_kind(
+                        ToolErrorKind::FileNotFound {
+                            path: child.display().to_string(),
+                        },
+                        format!(
+                            "Sheet file '{}', placed by '{}', does not exist. No sheet was \
+                             modified; restore it, or use scope 'sheet'.",
+                            child.display(),
+                            path.display()
+                        ),
+                    )));
+                }
+                pending.push((child, depth + 1));
+            }
+        }
+        targets.push(TitleBlockTarget {
+            path,
+            source,
+            block,
+        });
+    }
+    Ok(Ok(targets))
+}
+
+/// A commit refused because a sheet changed after it was read. That check
+/// runs before the journal is written, so a conflict whose journal does not
+/// exist changed nothing. Any other failure (a journal left for recovery, or
+/// a write that did not stay durable) is returned as it is.
+pub(super) fn stale_sheet_refusal(error: &konnect_sexp::SexpError) -> Option<CallToolResult> {
+    let konnect_sexp::SexpError::TransactionConflict { path, journal, .. } = error else {
+        return None;
+    };
+    if journal.exists() {
+        return None;
+    }
+    Some(CallToolResult::error_kind(
+        ToolErrorKind::Conflict {
+            paths: vec![path.display().to_string()],
+        },
+        format!(
+            "'{}' changed after it was read, so no sheet was modified. Reload and retry.",
+            path.display()
+        ),
+    ))
+}
+
+async fn handle_set_schematic_title_block(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    const OPERATION: &str = "set_schematic_title_block";
+    let schematic = get_path(args, "schematic")?;
+    let scope = opt_str(args, "scope").unwrap_or("sheet");
+    if !matches!(scope, "sheet" | "hierarchy") {
+        return Ok(invalid_arg(
+            "scope",
+            &format!("must be 'sheet' or 'hierarchy', got '{scope}'"),
+        ));
+    }
+    let update = match TitleBlockUpdate::from_arguments(args) {
+        Ok(update) => update,
+        Err(error) => return Ok(error),
+    };
+    if !schematic.is_file() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::FileNotFound {
+                path: schematic.display().to_string(),
+            },
+            format!("Schematic '{}' not found", schematic.display()),
+        ));
+    }
+
+    let root = match crate::tools::resolve_schematic_ownership(&schematic) {
+        Ok(ownership) => ownership.map(|ownership| ownership.root_schematic),
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    let targets = match title_block_targets(&schematic, scope == "hierarchy")? {
+        Ok(targets) => targets,
+        Err(refusal) => return Ok(refusal),
+    };
+    // The project's journal lives beside its root, where recovery looks.
+    let journal_dir = parent_dir(root.as_deref().unwrap_or(&schematic));
+    let journal_root = journal_dir.canonicalize()?;
+    if let Some(outside) = targets.iter().find(|target| {
+        !target
+            .path
+            .canonicalize()
+            .is_ok_and(|path| path.starts_with(&journal_root))
+    }) {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: "sheet_outside_project_directory".to_string(),
+                kicad_version: None,
+            },
+            format!(
+                "Sheet file '{}' lies outside the project directory '{}', where the \
+                 transaction journal is kept. No sheet was modified.",
+                outside.path.display(),
+                journal_dir.display()
+            ),
+        ));
+    }
+
+    let mut sheets = Vec::new();
+    let mut transitions = Vec::new();
+    for TitleBlockTarget {
+        path,
+        source,
+        block,
+    } in targets
+    {
+        let intended = update.applied_to(&block);
+        let changed = intended != block;
+        if changed {
+            let replacement = konnect_sexp::title_block::replace(&source, &intended)?;
+            transitions.push(FileTransition::replace(&path, source, replacement));
+        }
+        sheets.push((path, block, intended, changed));
+    }
+
+    // Eeschema locks only the root schematic and saves every sheet from
+    // memory, so the root's lock guards sheets the transaction never names;
+    // the transaction checks its own targets again as it writes them. An
+    // unchanged target is checked too: the editor may hold a newer one.
+    for path in root.iter().chain(sheets.iter().map(|(path, ..)| path)) {
+        konnect_sexp::writer::ensure_kicad_design_document_is_closed(path)?;
+    }
+    if !transitions.is_empty() {
+        if let Err(error) = commit_file_transaction(&journal_dir, transitions) {
+            return match stale_sheet_refusal(&error) {
+                Some(refusal) => Ok(refusal),
+                None => Err(error.into()),
+            };
+        }
+    }
+
+    let committed: Vec<String> = sheets
+        .iter()
+        .filter(|(.., changed)| *changed)
+        .map(|(path, ..)| path.display().to_string())
+        .collect();
+    let mut results = Vec::new();
+    let mut unproven = Vec::new();
+    for (path, before, intended, changed) in sheets {
+        let after = if changed {
+            match title_block_args::read_back(&path, &intended) {
+                Ok(after) => after,
+                Err(reason) => {
+                    unproven.push((path, reason));
+                    continue;
+                }
+            }
+        } else {
+            intended
+        };
+        results.push(json!({
+            "file": path.display().to_string(),
+            "title_block": title_block_args::to_json(&after),
+            "changed": after.changed_from(&before),
+        }));
+    }
+
+    if let Some((path, _)) = unproven.first() {
+        let reasons: Vec<String> = unproven
+            .iter()
+            .map(|(path, reason)| format!("{}: {reason}", path.display()))
+            .collect();
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            path,
+            OPERATION,
+            format!(
+                "{}. The transaction replaced {}.",
+                reasons.join("; "),
+                committed.join(", ")
+            ),
+        ));
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "schematic": schematic.display().to_string(),
+        "scope": scope,
+        "sheets": results,
+        "source": "file",
+        "saved": true
     })))
 }
 
