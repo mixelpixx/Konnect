@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
+- **233 registered tools** + **7 always-visible meta-tools** = **240 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -232,8 +232,8 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 13 tools
-**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import.
+### `pcb_board` · 14 tools
+**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import, custom fields on placed footprints.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -251,6 +251,7 @@ and Windows servers do not.
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
+| `set_footprint_field` | Add or update a custom field (LCSC, MPN, …) on a placed footprint via KiCAD IPC. Refuses the mandatory fields; a new field is hidden by default and sits on the footprint's Fab layer. One undo step; the response is a fresh read-back. |
 
 ### `pcb_components` · 20 tools
 **Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.
@@ -258,7 +259,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `place_component` | Place a footprint through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The fallback preserves complete footprint content and rejects duplicate references. |
+| `place_component` | Place a footprint on F.Cu or B.Cu through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The live path carries the library's 3D models, attributes and description, and reaches B.Cu through KiCad's native flip (10.0.6+). A pre-6.0 `(module …)` footprint is upgraded in a private copy with `kicad-cli fp upgrade`. The fallback preserves complete footprint content and rejects duplicate references. |
 | `move_component` | Move a placed footprint through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback. |
 | `rotate_component` | Set a placed footprint's absolute rotation through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that updates child angles. |
 | `set_component_placements` | Set X/Y positions and absolute rotations for multiple existing footprints atomically, using one live KiCAD update and one undo step or one revision-aware closed-board write. |
@@ -279,8 +280,8 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 15 tools
-**Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
+### `pcb_routing` · 19 tools
+**Purpose:** Traces, vias, pad nets, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
 | Tool | Description |
@@ -288,12 +289,16 @@ and Windows servers do not.
 | `add_net` | Idempotently add a net to a pre-KiCad-10 board's top-level net table (S-expression insert, no IPC required). Existing names return their observed ID without writing. KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
-| `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
+| `add_via` | Add a through-hole via at a position and assign it to a net via IPC. Reads the via back and reports the net KiCad stored; a via KiCad put on another net (it landed on that net's copper) is removed again and refused with `plan_blocked`. |
 | `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item and the preserved locked-track/via inventory without mutation. |
 | `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
+| `query_vias` | List vias on the live board, optionally filtered by net, with the UUID `delete_via` and `move_via` take, position, net, drill, size, type and layer span. |
+| `delete_via` | Delete one observed via by UUID via KiCad IPC. Refuses non-via or stale UUIDs before deletion and reports the observed preimage only after readback proves the via is absent. |
+| `move_via` | Move one via by UUID via KiCad IPC, keeping its net, drill, size and layers. A via KiCad put on another net at the new position is moved back and refused with `plan_blocked`. |
+| `set_pad_net` | Assign a net to a placed footprint's pad, or clear it, via KiCAD IPC: how the netlist is edited on a schematic-less KiCad 10 board. KiCad creates a net it does not have. Every pad sharing the number is set; one undo step; the response is a fresh read-back. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |

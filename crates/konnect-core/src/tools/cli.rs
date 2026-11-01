@@ -1801,6 +1801,74 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
     Ok(())
 }
 
+/// KiCAD 10: `fp upgrade --output <dir> <dir>` on the text of one pre-6.0
+/// `(module …)` footprint, returning the modern `(footprint …)` text.
+///
+/// The user's library is never touched: the text is copied into a private
+/// temporary `.pretty` directory and the upgraded copy is read back. A
+/// directory, not the file itself, is what `fp upgrade` converts — given a
+/// lone `.kicad_mod` it answers "Unable to convert library" (measured on
+/// KiCad 10.0.6) — and its output directory must not exist beforehand.
+///
+/// This is KiCad's own converter, so legacy forms such as the
+/// centre/start/angle `fp_arc` are translated by the code that defines them
+/// rather than by a second reading of an old grammar here.
+pub(crate) async fn upgrade_legacy_footprint(
+    cli: &str,
+    source: &str,
+    entry_name: &str,
+) -> Result<String> {
+    let staging = tempfile::tempdir().context("could not create a staging directory")?;
+    let input = staging.path().join("legacy.pretty");
+    let output = staging.path().join("upgraded.pretty");
+    std::fs::create_dir(&input)?;
+    // The entry name only names the staged file; KiCad reads the footprint
+    // from its contents. Anything path-like is replaced so the copy cannot
+    // escape the staging directory.
+    let file_stem: String = entry_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let file_stem = if file_stem.is_empty() {
+        "footprint".to_string()
+    } else {
+        file_stem
+    };
+    std::fs::write(input.join(format!("{file_stem}.kicad_mod")), source)?;
+    let args = [
+        "fp",
+        "upgrade",
+        "--output",
+        output.to_str().context("staging path is not UTF-8")?,
+        input.to_str().context("staging path is not UTF-8")?,
+    ];
+    run_cli(cli, &args, Duration::from_secs(60)).await?;
+    let mut upgraded = std::fs::read_dir(&output)
+        .with_context(|| "kicad-cli fp upgrade reported success but wrote no output directory")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "kicad_mod"))
+        .collect::<Vec<_>>();
+    if upgraded.len() != 1 {
+        anyhow::bail!(
+            "kicad-cli fp upgrade wrote {} footprints for one input",
+            upgraded.len()
+        );
+    }
+    let text = std::fs::read_to_string(upgraded.remove(0))?;
+    let root = konnect_sexp::parse_sexp(&text)
+        .context("kicad-cli fp upgrade wrote a footprint that does not parse")?;
+    if root.head() != Some("footprint") {
+        anyhow::bail!("kicad-cli fp upgrade did not produce a (footprint …) root");
+    }
+    Ok(text)
+}
+
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`
 ///
 /// `--layers` takes a single comma-separated value, the same as every PCB

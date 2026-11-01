@@ -109,7 +109,11 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_via",
-            "Add a through-hole via at a given position and assign it to a net via KiCAD IPC.",
+            "Add a through-hole via at a given position and assign it to a net via KiCAD IPC. \
+             The via is read back and the response reports the net KiCad actually stored. A via \
+             that lands on copper of another net can be stored on that net instead; when that \
+             happens the via is removed again and the call fails with plan_blocked naming the \
+             net KiCad chose, rather than leaving an unrequested short on the board.",
             json!({
                 "type": "object",
                 "properties": {
@@ -194,6 +198,60 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_query_traces(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "query_vias",
+            "List the vias on the live board, optionally filtered by net. Each result carries \
+             the via's UUID (which delete_via and move_via take), its position in millimetres, \
+             net, drill and pad diameters, via type and drilled layer span, all read from KiCad.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string" },
+                    "net_name": { "type": "string", "description": "Filter by net (optional); \"\" lists vias with no net" }
+                },
+                "required": ["board"],
+                "additionalProperties": false
+            }),
+            |args, ctx| async move { handle_query_vias(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "delete_via",
+            "Delete one via identified by its UUID via KiCAD IPC. Refuses UUIDs that are not \
+             observed vias on the requested board, then verifies the via is absent before \
+             reporting success. Returns the observed preimage.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid":  { "type": "string", "description": "UUID of the via, from query_vias" }
+                },
+                "required": ["board", "uuid"],
+                "additionalProperties": false
+            }),
+            |args, ctx| async move { handle_delete_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "move_via",
+            "Move one via, identified by its UUID, to a new position via KiCAD IPC, keeping its \
+             net, drill, size and layers. The result is read back. A via moved onto copper of \
+             another net can be stored on that net; when that happens it is moved back and the \
+             call fails with plan_blocked naming the net KiCad chose.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid":  { "type": "string", "description": "UUID of the via, from query_vias" },
+                    "x":     { "type": "number", "description": "New X position in millimetres" },
+                    "y":     { "type": "number", "description": "New Y position in millimetres" }
+                },
+                "required": ["board", "uuid", "x", "y"],
+                "additionalProperties": false
+            }),
+            |args, ctx| async move { handle_move_via(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
@@ -327,6 +385,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_route_diff_pair(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        super::pad_nets::tool(),
     ]
 }
 
@@ -571,10 +630,192 @@ async fn handle_add_via(
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
 
     let net_ipc = net_name.clone();
-    ipc!(ctx, args, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
+    let placement = ipc!(ctx, args, |c, document| c
+        .add_via_verified_in(document, &net_ipc, x, y, drill, pad_size));
+    match placement {
+        konnect_ipc::IpcViaPlacement::Placed(via) => Ok(CallToolResult::json(&json!({
+            "uuid": via.uuid,
+            "net": via.net_name,
+            "x": via.position.x,
+            "y": via.position.y,
+            "drill": via.drill_mm,
+            "pad_size": via.pad_size_mm,
+            "source": "ipc_readback"
+        }))),
+        konnect_ipc::IpcViaPlacement::NetMismatch {
+            requested_net,
+            stored,
+            removed: true,
+        } => Ok(via_net_mismatch_result(
+            "add_via",
+            &requested_net,
+            &stored,
+            "The via was removed again; the board holds no via from this call.",
+        )),
+        konnect_ipc::IpcViaPlacement::NetMismatch {
+            requested_net,
+            stored,
+            removed: false,
+        } => Ok(crate::tools::ipc_uncertain_result(&format!(
+            "KiCad stored the new via {} at ({}, {}) on net '{}', not the requested '{}', and \
+             removing it again could not be confirmed",
+            stored.uuid, stored.position.x, stored.position.y, stored.net_name, requested_net
+        ))),
+    }
+}
+
+/// The refusal for a via KiCad put on a net other than the one requested.
+///
+/// KiCad gives a via the net of the copper it lands on, so a mismatch means
+/// the requested position touches another net's pad or track. The board was
+/// returned to its previous state before this is reported, which is what
+/// makes `plan_blocked` (nothing applied) the honest kind.
+fn via_net_mismatch_result(
+    operation: &str,
+    requested_net: &str,
+    stored: &konnect_ipc::IpcVia,
+    restored: &str,
+) -> CallToolResult {
+    let reason = format!(
+        "at ({}, {}) KiCad stored the via on net '{}', not '{}': the position touches copper of \
+         that net",
+        stored.position.x, stored.position.y, stored.net_name, requested_net
+    );
+    CallToolResult::error_kind(
+        ToolErrorKind::PlanBlocked {
+            operation: operation.to_string(),
+            reasons: vec![reason.clone()],
+        },
+        format!("{operation} refused: {reason}. {restored} Choose a position clear of other nets' copper."),
+    )
+}
+
+async fn handle_query_vias(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let net = match &args["net_name"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(net) => Some(net.clone()),
+        _ => return Ok(crate::tools::invalid_arg("net_name", "must be a string")),
+    };
+    let vias = ipc!(ctx, args, |c, document| c.get_vias_in(document));
+    let vias: Vec<_> = vias
+        .into_iter()
+        .filter(|via| net.as_deref().is_none_or(|net| via.net_name == net))
+        .map(|via| {
+            json!({
+                "uuid": via.uuid,
+                "net": via.net_name,
+                "x": via.position.x,
+                "y": via.position.y,
+                "drill": via.drill_mm,
+                "pad_size": via.pad_size_mm,
+                "via_type": via.via_type,
+                "start_layer": via.start_layer,
+                "end_layer": via.end_layer,
+                "locked": via.locked
+            })
+        })
+        .collect();
     Ok(CallToolResult::json(
-        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
+        &json!({ "count": vias.len(), "vias": vias }),
     ))
+}
+
+async fn handle_delete_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let board_ipc = board.clone();
+    let uuid_ipc = uuid.clone();
+    let deleted = ipc!(ctx, args, |c| c.delete_via_verified(&board_ipc, &uuid_ipc));
+    let Some(via) = deleted else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed via on the requested board".to_string(),
+            },
+            "The requested UUID is not a via on the requested board. No board item was deleted.",
+        ));
+    };
+    Ok(CallToolResult::json(&json!({
+        "deleted_uuid": via.uuid,
+        "deleted_type": "via",
+        "preimage": {
+            "uuid": via.uuid,
+            "net": via.net_name,
+            "x": via.position.x,
+            "y": via.position.y,
+            "drill": via.drill_mm,
+            "pad_size": via.pad_size_mm,
+            "via_type": via.via_type
+        },
+        "postcondition": "absent_from_via_readback"
+    })))
+}
+
+async fn handle_move_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let board_ipc = board.clone();
+    let uuid_ipc = uuid.clone();
+    let outcome = ipc!(ctx, args, |c| c
+        .move_via_verified(&board_ipc, &uuid_ipc, x, y));
+    match outcome {
+        konnect_ipc::IpcViaMove::NotFound => Ok(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed via on the requested board".to_string(),
+            },
+            "The requested UUID is not a via on the requested board. Nothing was moved.",
+        )),
+        konnect_ipc::IpcViaMove::Moved { before, after } => Ok(CallToolResult::json(&json!({
+            "moved_uuid": after.uuid,
+            "net": after.net_name,
+            "from": { "x": before.position.x, "y": before.position.y },
+            "to": { "x": after.position.x, "y": after.position.y },
+            "source": "ipc_readback"
+        }))),
+        konnect_ipc::IpcViaMove::NetChanged {
+            before,
+            moved,
+            restored: true,
+        } => Ok(via_net_mismatch_result(
+            "move_via",
+            &before.net_name,
+            &moved,
+            "The via was moved back to its previous position and net.",
+        )),
+        konnect_ipc::IpcViaMove::NetChanged {
+            before,
+            moved,
+            restored: false,
+        } => Ok(crate::tools::ipc_uncertain_result(&format!(
+            "KiCad stored via {} at ({}, {}) on net '{}' instead of '{}', and moving it back \
+             could not be confirmed",
+            moved.uuid, moved.position.x, moved.position.y, moved.net_name, before.net_name
+        ))),
+    }
 }
 
 fn extension_is(path: &Path, expected: &str) -> bool {
@@ -1196,6 +1437,275 @@ mod delete_trace_tests {
         assert_eq!(body["preimage"]["from"], json!({ "x": 1.0, "y": 2.0 }));
         assert_eq!(body["preimage"]["to"], json!({ "x": 3.0, "y": 4.0 }));
         assert_eq!(body["postcondition"], json!("absent_from_trace_readback"));
+    }
+}
+
+#[cfg(test)]
+mod via_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{
+        ctx_talking_to, spawn_kicad_holding_items, ItemStore,
+    };
+    use konnect_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    fn board_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        board
+    }
+
+    fn via(kiid: &str, net: &str, x: f64, y: f64) -> prost_types::Any {
+        let mut via = konnect_ipc::builders::build_via(net, 1, x, y, 0.3, 0.6);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via")
+    }
+
+    fn via_of(item: &prost_types::Any) -> kiapi::board::types::Via {
+        kiapi::board::types::Via::decode(item.value.as_slice()).unwrap()
+    }
+
+    /// KiCad's re-netting on commit: a via anywhere right of x = 10 lands on
+    /// an LED data trace and is stored on that net.
+    fn led_trace_right_of_ten(item: &mut prost_types::Any) {
+        if !konnect_ipc::builders::any_is(item, "kiapi.board.types.Via") {
+            return;
+        }
+        let mut via = via_of(item);
+        if via.position.unwrap_or_default().x_nm > 10_000_000 {
+            via.net = Some(konnect_ipc::builders::net("LED_D1", 2));
+            *item = konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via");
+        }
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap_or_else(|_| json!(text))
+            }
+            other => panic!("expected text result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_via_reports_the_net_kicad_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec!["", "GND", "LED_D1"],
+            store.clone(),
+            led_trace_right_of_ten,
+            |_, _| None,
+        );
+
+        let result = handle_add_via(
+            &json!({ "board": board.to_string_lossy(), "net_name": "GND", "x": 1.0, "y": 2.0 }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = body(&result);
+        assert_eq!(body["net"], json!("GND"));
+        assert_eq!(body["uuid"], json!("created-1"));
+        assert_eq!(body["source"], json!("ipc_readback"));
+        assert_eq!(store.lock().unwrap().items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_via_refuses_and_removes_a_via_kicad_put_on_another_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec!["", "GND", "LED_D1"],
+            store.clone(),
+            led_trace_right_of_ten,
+            |_, _| None,
+        );
+
+        let result = handle_add_via(
+            &json!({ "board": board.to_string_lossy(), "net_name": "GND", "x": 132.8, "y": 41.0 }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_error,
+            "a via stored on LED_D1 must not report GND"
+        );
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("plan_blocked")
+        );
+        assert!(body(&result).to_string().contains("LED_D1"));
+        let held = store.lock().unwrap();
+        assert!(held.items.is_empty(), "the mis-netted via must be removed");
+        assert_eq!((held.creates, held.deletes), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn query_vias_reads_every_via_and_filters_by_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![via("v-1", "GND", 1.0, 2.0), via("v-2", "VBUS", 3.0, 4.0)],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store, |_| {}, |_, _| None);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let all = handle_query_vias(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(body(&all)["count"], json!(2));
+
+        let gnd = handle_query_vias(
+            &json!({ "board": board.to_string_lossy(), "net_name": "GND" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let gnd = body(&gnd);
+        assert_eq!(gnd["count"], json!(1));
+        assert_eq!(gnd["vias"][0]["uuid"], json!("v-1"));
+        assert_eq!(gnd["vias"][0]["drill"], json!(0.3));
+        assert_eq!(gnd["vias"][0]["pad_size"], json!(0.6));
+        assert_eq!(gnd["vias"][0]["via_type"], json!("through"));
+    }
+
+    #[tokio::test]
+    async fn delete_via_refuses_uuids_that_are_not_vias_before_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let mut track =
+            konnect_ipc::builders::build_track("GND", 1, "F.Cu", 0.2, 0.0, 0.0, 1.0, 0.0);
+        track.id = Some(kiapi::common::types::Kiid {
+            value: "track-1".to_string(),
+        });
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![konnect_ipc::builders::pack_any(
+                &track,
+                "kiapi.board.types.Track",
+            )],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+
+        for uuid in ["track-1", "missing-1"] {
+            let result = handle_delete_via(
+                &json!({ "board": board.to_string_lossy(), "uuid": uuid }),
+                &ctx_talking_to(server.address().to_string()),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{uuid} unexpectedly succeeded");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("stale_target")
+            );
+        }
+        let held = store.lock().unwrap();
+        assert_eq!(held.deletes, 0);
+        assert_eq!(held.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_via_reports_the_preimage_after_proving_the_via_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![via("v-1", "GND", 1.0, 2.0)],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(&board, vec![], store.clone(), |_| {}, |_, _| None);
+
+        let result = handle_delete_via(
+            &json!({ "board": board.to_string_lossy(), "uuid": "v-1" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = body(&result);
+        assert_eq!(body["deleted_type"], json!("via"));
+        assert_eq!(body["preimage"]["net"], json!("GND"));
+        assert_eq!(body["postcondition"], json!("absent_from_via_readback"));
+        assert!(store.lock().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_via_moves_a_via_and_reads_back_its_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![via("v-1", "GND", 1.0, 2.0)],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            led_trace_right_of_ten,
+            |_, _| None,
+        );
+
+        let result = handle_move_via(
+            &json!({ "board": board.to_string_lossy(), "uuid": "v-1", "x": 5.0, "y": 6.0 }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = body(&result);
+        assert_eq!(body["to"], json!({ "x": 5.0, "y": 6.0 }));
+        assert_eq!(body["net"], json!("GND"));
+        let held = via_of(&store.lock().unwrap().items[0]);
+        assert_eq!(held.position, Some(konnect_ipc::builders::vec2(5.0, 6.0)));
+    }
+
+    #[tokio::test]
+    async fn move_via_moves_back_a_via_kicad_put_on_another_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = board_file(&dir);
+        let store = Arc::new(Mutex::new(ItemStore {
+            items: vec![via("v-1", "GND", 1.0, 2.0)],
+            ..Default::default()
+        }));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec![],
+            store.clone(),
+            led_trace_right_of_ten,
+            |_, _| None,
+        );
+
+        let result = handle_move_via(
+            &json!({ "board": board.to_string_lossy(), "uuid": "v-1", "x": 132.8, "y": 41.0 }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("plan_blocked")
+        );
+        let held = store.lock().unwrap();
+        assert_eq!(held.updates, 2, "the move and the move back");
+        let via = via_of(&held.items[0]);
+        assert_eq!(via.position, Some(konnect_ipc::builders::vec2(1.0, 2.0)));
+        assert_eq!(via.net.unwrap().name, "GND");
     }
 }
 
