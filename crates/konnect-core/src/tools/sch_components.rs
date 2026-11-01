@@ -1864,19 +1864,6 @@ pub(crate) fn indexed_uuid_items(
     Ok(items)
 }
 
-fn dedup_points(points: impl IntoIterator<Item = (f64, f64)>) -> Vec<(f64, f64)> {
-    let mut unique = Vec::new();
-    for point in points {
-        if !unique
-            .iter()
-            .any(|&(x, y)| konnect_sexp::geometry::points_coincident(x, y, point.0, point.1, 0.01))
-        {
-            unique.push(point);
-        }
-    }
-    unique
-}
-
 fn plan_component_deletion(
     path: &std::path::Path,
     content: &str,
@@ -2019,8 +2006,8 @@ pub(crate) fn plan_component_and_item_deletions(
             remaining.extend(points);
         }
     }
-    let affected = dedup_points(affected);
-    let remaining = dedup_points(remaining);
+    let affected = crate::tools::dedup_points(affected);
+    let remaining = crate::tools::dedup_points(remaining);
 
     let mut marker_uuids = Vec::new();
     for (start, end) in find_direct_child_blocks(content, "kicad_sch") {

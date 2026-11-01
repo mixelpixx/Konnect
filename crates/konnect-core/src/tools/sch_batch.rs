@@ -459,9 +459,9 @@ async fn handle_batch_connect_to_net(
     } else {
         Some(cse::Schematic::from_source(&sch_path, content.clone())?)
     };
-    // Only a stub wire can pass over a pin mid-segment.
-    let pin_points = if stub_length > 0.0 {
-        crate::tools::all_pin_endpoints(&tree)
+    // Only a stub wire can pass over a pin mid-segment or meet other exits.
+    let exit_points = if stub_length > 0.0 {
+        crate::tools::junction_exit_points(&tree)
     } else {
         Vec::new()
     };
@@ -520,7 +520,7 @@ async fn handle_batch_connect_to_net(
         };
         if needs_wire {
             if let Some(sch) = sch.as_mut() {
-                add_stub_wire(sch, &pin_points, (px, py), (lx, ly));
+                add_stub_wire(sch, &exit_points, (px, py), (lx, ly));
             }
         }
         if needs_label {

@@ -1,7 +1,8 @@
 //! `sch_wiring` toolset — wires, net labels, power symbols, junctions, no-connects.
 //!
 //! Key rule: Every wire add operation must auto-detect T-junctions and insert
-//! junction dots. This uses `konnect_sexp::schematic::find_t_junctions`.
+//! junction dots. This uses `konnect_sexp::schematic::find_t_junctions` and
+//! `wire_end_needs_junction`.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -16,7 +17,7 @@ use konnect_sexp::{
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
         format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
-        read_schematic, Wire,
+        read_schematic, wire_end_needs_junction, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -458,12 +459,14 @@ fn cse_wires_to_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire>
 
 // ─── Wire insertion with T-junction detection ─────────────────────────────────
 
-/// Pin endpoints that lie strictly inside a wire segment. Each needs a
-/// junction dot: KiCad connects a mid-wire pin only through a junction
-/// (verified with kicad-cli 10 — no wire split required).
-fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<(f64, f64)> {
+/// Exits (pin tips, sheet pins, bus entry wire ends) that lie strictly inside
+/// a wire segment. Each needs a junction dot: KiCad connects a mid-wire pin
+/// only through a junction (verified with kicad-cli 10 — no wire split
+/// required).
+fn pins_mid_segment(exits: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<(f64, f64)> {
     let tol = 0.01;
-    pins.iter()
+    exits
+        .iter()
         .copied()
         .filter(|&(px, py)| {
             konnect_sexp::geometry::point_on_segment(px, py, x1, y1, x2, y2, tol)
@@ -471,6 +474,28 @@ fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> 
                 && !konnect_sexp::geometry::points_coincident(px, py, x2, y2, tol)
         })
         .collect()
+}
+
+/// Every junction dot a new wire `(x1, y1)→(x2, y2)` calls for. `wires` must
+/// already hold the new wire, and `exits` comes from
+/// [`crate::tools::junction_exit_points`].
+///
+/// The candidates are every T on the sheet, each exit the wire passes over,
+/// and the wire's two ends. Each is kept only where three or more exits meet
+/// (#897).
+fn new_wire_junctions(
+    wires: &[Wire],
+    exits: &[(f64, f64)],
+    (x1, y1): (f64, f64),
+    (x2, y2): (f64, f64),
+) -> Vec<(f64, f64)> {
+    let candidates = find_t_junctions(wires, 0.01)
+        .into_iter()
+        .chain(pins_mid_segment(exits, x1, y1, x2, y2))
+        .chain([(x1, y1), (x2, y2)]);
+    crate::tools::dedup_points(
+        candidates.filter(|&(px, py)| wire_end_needs_junction(wires, exits, px, py, 0.01)),
+    )
 }
 
 /// Add a junction dot at each position that does not already carry one.
@@ -519,20 +544,11 @@ pub(crate) fn insert_wire_with_junctions(
     };
     existing_wires.push(new_wire);
 
-    let mut junctions = find_t_junctions(&existing_wires, 0.01);
-    // Existing pins the new wire passes over also need junction dots.
-    let pins = tree
+    let exits = tree
         .as_ref()
-        .map(crate::tools::all_pin_endpoints)
+        .map(crate::tools::junction_exit_points)
         .unwrap_or_default();
-    for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
-        if !junctions
-            .iter()
-            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(px, py, jx, jy, 0.01))
-        {
-            junctions.push((px, py));
-        }
-    }
+    let junctions = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2));
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
@@ -599,14 +615,12 @@ async fn handle_add_wire(
         y2,
         uuid: None,
     });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    let (_, tree) = read_schematic(&sch_path)?;
+    let exits = crate::tools::junction_exit_points(&tree);
+    let junctions = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2));
 
     sch.add_wire(x1, y1, x2, y2);
     add_missing_junctions(&mut sch, &junctions);
-    // Pins the new wire passes over mid-segment also need junction dots.
-    let (_, tree) = read_schematic(&sch_path)?;
-    let pins = crate::tools::all_pin_endpoints(&tree);
-    add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
     sch.overwrite()?;
 
     Ok(CallToolResult::json(
@@ -643,9 +657,9 @@ async fn handle_batch_add_wire(
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added = 0usize;
 
-    // Pin endpoints are fixed for the whole batch (only wires change below).
-    let pins = read_schematic(&sch_path)
-        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
+    // Exit points are fixed for the whole batch (only wires change below).
+    let exits = read_schematic(&sch_path)
+        .map(|(_, tree)| crate::tools::junction_exit_points(&tree))
         .unwrap_or_default();
 
     for w in &wires {
@@ -665,12 +679,10 @@ async fn handle_batch_add_wire(
             y2,
             uuid: None,
         });
-        let junctions = find_t_junctions(&existing_wires, 0.01);
+        let junctions = new_wire_junctions(&existing_wires, &exits, (x1, y1), (x2, y2));
 
         sch.add_wire(x1, y1, x2, y2);
         add_missing_junctions(&mut sch, &junctions);
-        // Pins this wire passes over mid-segment also need junction dots.
-        add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
         added += 1;
     }
 
@@ -2551,10 +2563,10 @@ async fn handle_connect_to_net(
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let pins = crate::tools::all_pin_endpoints(&tree);
+    let exits = crate::tools::junction_exit_points(&tree);
     let (label_x, label_y, label_rot) = add_net_stub(
         &mut sch,
-        &pins,
+        &exits,
         (pin_x, pin_y),
         &dir,
         stub_length,
@@ -2577,7 +2589,7 @@ async fn handle_connect_to_net(
 /// the label's position and rotation.
 pub(crate) fn add_net_stub(
     sch: &mut cse::Schematic,
-    pins: &[(f64, f64)],
+    exits: &[(f64, f64)],
     pin: (f64, f64),
     dir: &crate::tools::StubDirection,
     stub_length: f64,
@@ -2585,16 +2597,16 @@ pub(crate) fn add_net_stub(
     net: &str,
 ) -> (f64, f64, f64) {
     let end = dir.end(pin, stub_length);
-    add_stub_wire(sch, pins, pin, end);
+    add_stub_wire(sch, exits, pin, end);
     add_stub_label(sch, label_type, net, end, dir.label_rotation);
     (end.0, end.1, dir.label_rotation)
 }
 
-/// The wire half of [`add_net_stub`]: the wire, plus junction dots where it
-/// makes a T or passes over a pin mid-segment.
+/// The wire half of [`add_net_stub`]: the wire, plus the junction dots
+/// [`new_wire_junctions`] calls for.
 pub(crate) fn add_stub_wire(
     sch: &mut cse::Schematic,
-    pins: &[(f64, f64)],
+    exits: &[(f64, f64)],
     (x1, y1): (f64, f64),
     (x2, y2): (f64, f64),
 ) {
@@ -2607,12 +2619,10 @@ pub(crate) fn add_stub_wire(
         y2,
         uuid: None,
     });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    let junctions = new_wire_junctions(&existing_wires, exits, (x1, y1), (x2, y2));
 
     sch.add_wire(x1, y1, x2, y2);
     add_missing_junctions(sch, &junctions);
-    // Pins the stub passes over mid-segment also need junction dots.
-    add_missing_junctions(sch, &pins_mid_segment(pins, x1, y1, x2, y2));
 }
 
 /// The label half of [`add_net_stub`].
@@ -4800,5 +4810,201 @@ mod batch_no_connect_tests {
         let (out, body) = run(json!([])).await;
         assert_eq!(body["added_count"], 0);
         assert_eq!(out.matches("(no_connect").count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod wire_end_junction_tests {
+    //! #897: a dot where three or more wire exits meet at a wire end. The
+    //! expected dots are KiCad's rule (`JUNCTION_HELPERS::AnalyzePoint`),
+    //! corroborated by its demo corpus; see the fixture README.
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    /// A KiCad-resaved sheet with no wires. See the fixture README for what
+    /// sits at each of these points.
+    const SHEET: &str = include_str!("../../tests/fixtures/wire_end_junctions_kicad10.kicad_sch");
+    const PIN_1: (f64, f64) = (152.4, 97.79);
+    /// `U1`'s output: pin 3 of both of its body styles.
+    const GATE_OUT: (f64, f64) = (198.12, 101.6);
+    const SHEET_PIN: (f64, f64) = (81.28, 147.32);
+    const BUS_ENTRY: (f64, f64) = (213.36, 147.32);
+    const T: (f64, f64) = (114.3, 101.6);
+
+    type Segment = ((f64, f64), (f64, f64));
+    /// A case's name, its wires, and the dots KiCad would draw.
+    type Case = (&'static str, Vec<Segment>, Vec<(f64, f64)>);
+
+    fn cases() -> Vec<Case> {
+        vec![
+            (
+                "three wire ends at a T",
+                vec![((101.6, 101.6), T), (T, (127.0, 101.6)), (T, (114.3, 88.9))],
+                vec![T],
+            ),
+            (
+                "a branch landing mid-span (control)",
+                vec![((101.6, 101.6), (127.0, 101.6)), (T, (114.3, 88.9))],
+                vec![T],
+            ),
+            (
+                "a wire laid across an existing wire end",
+                vec![(T, (114.3, 88.9)), ((101.6, 101.6), (127.0, 101.6))],
+                vec![T],
+            ),
+            (
+                "four wire ends at a cross",
+                vec![
+                    ((101.6, 101.6), T),
+                    (T, (127.0, 101.6)),
+                    (T, (114.3, 88.9)),
+                    ((114.3, 114.3), T),
+                ],
+                vec![T],
+            ),
+            (
+                "two wire ends at a corner",
+                vec![((101.6, 101.6), T), (T, (114.3, 88.9))],
+                vec![],
+            ),
+            (
+                "a duplicated segment leaves the same way twice",
+                vec![
+                    ((101.6, 101.6), T),
+                    (T, (127.0, 101.6)),
+                    (T, (127.0, 101.6)),
+                ],
+                vec![],
+            ),
+            (
+                "two wire ends at a pin tip",
+                vec![((139.7, 97.79), PIN_1), (PIN_1, (152.4, 88.9))],
+                vec![PIN_1],
+            ),
+            (
+                "one wire end at a pin tip",
+                vec![((139.7, 97.79), PIN_1)],
+                vec![],
+            ),
+            (
+                "a collinear overlap ending mid-span",
+                vec![((101.6, 101.6), (127.0, 101.6)), (T, (120.65, 101.6))],
+                vec![],
+            ),
+            (
+                "one wire end at a pin both body styles put there",
+                vec![(GATE_OUT, (210.82, 101.6))],
+                vec![],
+            ),
+            (
+                "two wire ends at a sheet pin",
+                vec![(SHEET_PIN, (93.98, 147.32)), (SHEET_PIN, (81.28, 134.62))],
+                vec![SHEET_PIN],
+            ),
+            (
+                "two wire ends at a bus entry",
+                vec![((200.66, 147.32), BUS_ENTRY), (BUS_ENTRY, (213.36, 134.62))],
+                vec![BUS_ENTRY],
+            ),
+        ]
+    }
+
+    fn wire_json(((x1, y1), (x2, y2)): Segment) -> serde_json::Value {
+        json!({ "x1": x1, "y1": y1, "x2": x2, "y2": y2 })
+    }
+
+    fn sheet() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire_end_junctions_kicad10.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        (dir, path)
+    }
+
+    fn assert_dots(case: &str, src: &str, expected: &[(f64, f64)]) {
+        let got = konnect_sexp::schematic::extract_junctions(&parse_sexp(src).unwrap());
+        assert_eq!(got.len(), expected.len(), "{case}: {got:?}");
+        for &(x, y) in expected {
+            assert!(
+                got.iter()
+                    .any(|&(gx, gy)| konnect_sexp::geometry::points_coincident(x, y, gx, gy, 0.01)),
+                "{case}: no dot at ({x}, {y}) in {got:?}"
+            );
+        }
+    }
+
+    /// The issue's table through the served `tools/call` boundary.
+    #[tokio::test]
+    async fn batch_add_wire_dots_three_exits_through_the_served_dispatch() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .expect("handler builds");
+        for (case, wires, expected) in cases() {
+            let (_dir, path) = sheet();
+            let wires: Vec<_> = wires.into_iter().map(wire_json).collect();
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": 897,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "batch_add_wire",
+                        "arguments": { "schematic": path.display().to_string(), "wires": wires }
+                    }
+                }))
+                .await
+                .expect("tools/call receives a response");
+            let result = response.result.expect("successful JSON-RPC response");
+            assert_ne!(result["isError"], json!(true), "{case}: {result}");
+            assert_dots(case, &std::fs::read_to_string(&path).unwrap(), &expected);
+        }
+    }
+
+    /// `add_wire`, one wire per call.
+    #[tokio::test]
+    async fn add_wire_dots_three_exits() {
+        let ctx = ToolContext::new(ServerConfig::default(), Arc::new(ToolRouter::new()));
+        for (case, wires, expected) in cases() {
+            let (_dir, path) = sheet();
+            for w in wires {
+                let mut args = wire_json(w);
+                args["schematic"] = json!(path.display().to_string());
+                let result = handle_add_wire(&args, &ctx).await.unwrap();
+                assert!(!result.is_error, "{case}: {:?}", result.content);
+            }
+            assert_dots(case, &std::fs::read_to_string(&path).unwrap(), &expected);
+        }
+    }
+
+    /// The string path the routed tools take.
+    #[test]
+    fn insert_wire_with_junctions_dots_three_exits() {
+        for (case, wires, expected) in cases() {
+            let mut src = SHEET.to_string();
+            for ((x1, y1), (x2, y2)) in wires {
+                src = insert_wire_with_junctions(src, x1, y1, x2, y2);
+            }
+            assert_dots(case, &src, &expected);
+        }
+    }
+
+    /// The stub path `connect_to_net` and its batch take.
+    #[test]
+    fn add_stub_wire_dots_three_exits() {
+        for (case, wires, expected) in cases() {
+            let (_dir, path) = sheet();
+            let mut sch = cse::Schematic::load(&path).unwrap();
+            let (_, tree) = read_schematic(&path).unwrap();
+            let exits = crate::tools::junction_exit_points(&tree);
+            for (a, b) in wires {
+                add_stub_wire(&mut sch, &exits, a, b);
+            }
+            sch.overwrite().unwrap();
+            assert_dots(case, &std::fs::read_to_string(&path).unwrap(), &expected);
+        }
     }
 }
