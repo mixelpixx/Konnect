@@ -48,8 +48,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
-             project file. Refuses while KiCad holds the board open, because KiCad's next save \
+            "Set board-level design rules (clearance, trace width, via size, copper-to-edge \
+             clearance, silkscreen text minima) in the sibling KiCAD project file. Refuses while KiCad holds the board open, because KiCad's next save \
              rewrites the project file from its own copy.",
             json!({
                 "type": "object",
@@ -59,7 +59,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "min_trace_width": { "type": "number", "description": "Minimum trace width in mm" },
                     "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
                     "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
-                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" }
+                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" },
+                    "min_copper_edge_clearance": { "type": "number", "minimum": -0.01, "maximum": 25, "description": "Board-wide minimum copper-to-board-edge clearance in mm (-0.01 to 25, the range KiCad loads)" },
+                    "min_text_height": { "type": "number", "minimum": 0, "maximum": 100, "description": "Board-wide minimum silkscreen text height in mm (0 to 100, the range KiCad loads)" },
+                    "min_text_thickness": { "type": "number", "minimum": 0, "maximum": 25, "description": "Board-wide minimum silkscreen text stroke thickness in mm (0 to 25, the range KiCad loads). These minima are DRC limits only: they change no item on the board and do not prove a fab accepts it." }
                 },
                 "required": ["board"]
             }),
@@ -364,6 +367,92 @@ fn project_rule_value(project: &serde_json::Value, key: &str) -> Option<f64> {
     project["board"]["design_settings"]["rules"][key].as_f64()
 }
 
+/// A board-wide minimum in `board.design_settings.rules`.
+struct DesignRule {
+    /// The tool argument and response key.
+    arg: &'static str,
+    /// The `.kicad_pro` key.
+    key: &'static str,
+    /// The range KiCad 10.0.6 loads, in mm. KiCad replaces a value outside
+    /// it with its default when it opens the project.
+    range_mm: Option<(f64, f64)>,
+}
+
+/// A function rather than a `const`, so the schema-usage test sees the
+/// handler read each argument.
+fn design_rules() -> &'static [DesignRule] {
+    &[
+        DesignRule {
+            arg: "min_clearance",
+            key: "min_clearance",
+            range_mm: None,
+        },
+        DesignRule {
+            arg: "min_trace_width",
+            key: "min_track_width",
+            range_mm: None,
+        },
+        DesignRule {
+            arg: "min_via_drill",
+            key: "min_through_hole_diameter",
+            range_mm: None,
+        },
+        DesignRule {
+            arg: "min_via_size",
+            key: "min_via_diameter",
+            range_mm: None,
+        },
+        DesignRule {
+            arg: "min_hole_to_hole",
+            key: "min_hole_to_hole",
+            range_mm: None,
+        },
+        DesignRule {
+            arg: "min_copper_edge_clearance",
+            key: "min_copper_edge_clearance",
+            range_mm: Some((-0.01, 25.0)),
+        },
+        DesignRule {
+            arg: "min_text_height",
+            key: "min_text_height",
+            range_mm: Some((0.0, 100.0)),
+        },
+        DesignRule {
+            arg: "min_text_thickness",
+            key: "min_text_thickness",
+            range_mm: Some((0.0, 25.0)),
+        },
+    ]
+}
+
+/// The rule's value in mm, if given. A present value that is not a number,
+/// or lies outside KiCad's range, is refused rather than skipped.
+fn design_rule_arg(args: &Value, rule: &DesignRule) -> Result<Option<f64>, CallToolResult> {
+    let value = match &args[rule.arg] {
+        Value::Null => return Ok(None),
+        value => value
+            .as_f64()
+            .ok_or_else(|| crate::tools::invalid_arg(rule.arg, "must be a number in mm"))?,
+    };
+    match rule.range_mm {
+        Some((min, max)) if !(min..=max).contains(&value) => Err(crate::tools::invalid_arg(
+            rule.arg,
+            &format!(
+                "must be between {min} and {max} mm, got {value}; KiCad replaces a value \
+                 outside that range with its default"
+            ),
+        )),
+        _ => Ok(Some(value)),
+    }
+}
+
+/// Whether the project holds the rule at `value`, compared in nm as KiCad
+/// stores it, so a float that does not round-trip through JSON still matches.
+fn rule_holds(project: &Value, rule: &DesignRule, value: f64) -> bool {
+    let nm = |mm: f64| (mm * 1e6).round();
+    project_rule_value(project, rule.key).is_some_and(|stored| nm(stored) == nm(value))
+}
+
 fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
     let needle = format!("(rule \"{name}\"");
     let start = content.find(&needle)?;
@@ -428,6 +517,14 @@ async fn handle_set_design_rules(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    let mut requested = Vec::new();
+    for rule in design_rules() {
+        match design_rule_arg(args, rule) {
+            Ok(Some(value)) => requested.push((rule, value)),
+            Ok(None) => {}
+            Err(refusal) => return Ok(refusal),
+        }
+    }
     // KiCad rewrites the project file from memory when it saves the board, so
     // a rule written here while it holds the board is reverted (#791). Asked
     // before the read too: the file can be older than what KiCad holds.
@@ -441,25 +538,10 @@ async fn handle_set_design_rules(
     let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
 
     let mut changed = Vec::new();
-
-    let rules: &[(&str, &str)] = &[
-        ("min_clearance", "min_clearance"),
-        ("min_track_width", "min_trace_width"),
-        ("min_through_hole_diameter", "min_via_drill"),
-        ("min_via_size", "min_via_size"),
-        ("min_hole_to_hole", "min_hole_to_hole"),
-    ];
-
-    let project_rules = project_rules_mut(&mut project)?;
-    for (project_key, arg_key) in rules {
-        if let Some(val) = args[arg_key].as_f64() {
-            let storage_key = if *project_key == "min_via_size" {
-                "min_via_diameter"
-            } else {
-                project_key
-            };
-            project_rules.insert(storage_key.to_string(), json!(val));
-            changed.push(format!("{} = {}", storage_key, val));
+    for &(rule, value) in &requested {
+        if !rule_holds(&project, rule, value) {
+            project_rules_mut(&mut project)?.insert(rule.key.to_string(), json!(value));
+            changed.push(format!("{} = {}", rule.key, value));
         }
     }
 
@@ -467,16 +549,62 @@ async fn handle_set_design_rules(
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
         write_atomic(&project_path, &content)?;
+        // The file is replaced from here on, so a failed re-read is uncertain.
+        let reread = tokio::fs::read_to_string(&project_path)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|text| Ok(serde_json::from_str(&text)?));
+        project = match reread {
+            Ok(project) => project,
+            Err(error) => {
+                return Ok(crate::tools::file_outcome_uncertain(
+                    &project_path,
+                    "set_design_rules",
+                    format!("the project could not be re-read: {error}"),
+                ))
+            }
+        };
+        let missing = rules_not_holding(&project, &requested);
+        if !missing.is_empty() {
+            return Ok(crate::tools::file_outcome_uncertain(
+                &project_path,
+                "set_design_rules",
+                format!("the re-read project does not hold {}", missing.join(", ")),
+            ));
+        }
     }
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "project": project_path,
-            "changed": changed
+            "changed": changed,
+            "rules": design_rules_json(&project)
         }))
         .unwrap(),
     ))
+}
+
+/// The requested rules the project does not hold at the requested value.
+fn rules_not_holding(project: &Value, requested: &[(&DesignRule, f64)]) -> Vec<&'static str> {
+    requested
+        .iter()
+        .filter(|(rule, value)| !rule_holds(project, rule, *value))
+        .map(|(rule, _)| rule.key)
+        .collect()
+}
+
+fn design_rules_json(project: &Value) -> Value {
+    design_rules()
+        .iter()
+        .map(|rule| {
+            (
+                rule.arg.to_string(),
+                json!(project_rule_value(project, rule.key)),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 async fn handle_get_design_rules(
@@ -492,13 +620,7 @@ async fn handle_get_design_rules(
         serde_json::to_string(&json!({
             "board": board.to_str().unwrap_or(""),
             "project": project_path.to_str().unwrap_or(""),
-            "rules": {
-                "min_clearance": project_rule_value(&project, "min_clearance"),
-                "min_trace_width": project_rule_value(&project, "min_track_width"),
-                "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
-                "min_via_size": project_rule_value(&project, "min_via_diameter"),
-                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole")
-            }
+            "rules": design_rules_json(&project)
         }))
         .unwrap(),
     ))
@@ -1617,6 +1739,58 @@ mod tests {
 
     fn blank_project() -> &'static str {
         "{\n  \"meta\": {\"filename\": \"board.kicad_pro\", \"version\": 1},\n  \"board\": {\"design_settings\": {}},\n  \"schematic\": {}\n}\n"
+    }
+
+    /// The readback names a requested rule the project does not hold, here
+    /// KiCad's own file before any write.
+    #[test]
+    fn readback_names_a_rule_the_project_does_not_hold() {
+        let project: Value = serde_json::from_str(include_str!(
+            "../../../konnect-sexp/tests/fixtures/placement/placement_fixture.kicad_pro"
+        ))
+        .unwrap();
+        let rule = |arg| design_rules().iter().find(|rule| rule.arg == arg).unwrap();
+        let held = (rule("min_text_height"), 0.8);
+        let edge = (rule("min_copper_edge_clearance"), 0.2);
+        assert_eq!(
+            rules_not_holding(&project, &[held, edge]),
+            ["min_copper_edge_clearance"]
+        );
+        assert!(rules_not_holding(&project, &[held]).is_empty());
+        // A float one ULP off what the file holds is the same nm value.
+        let ulp = (held.0, f64::from_bits(0.8f64.to_bits() + 1));
+        assert!(rules_not_holding(&project, &[ulp]).is_empty());
+    }
+
+    /// The handler holds KiCad's ranges and the number type itself, for a call
+    /// that skips dispatch.
+    #[tokio::test]
+    async fn set_design_rules_refuses_out_of_range_without_dispatch() {
+        use crate::tools::design_rules_tests::{assert_untouched, backdate};
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = dir.path().join("board.kicad_pro");
+        std::fs::write(&board, blank_board()).unwrap();
+        std::fs::write(&project, blank_project()).unwrap();
+        let bytes = std::fs::read(&project).unwrap();
+        let mtime = backdate(&project);
+        let ctx = test_ctx();
+        for (field, min, max) in [
+            ("min_copper_edge_clearance", -0.01, 25.0),
+            ("min_text_height", 0.0, 100.0),
+            ("min_text_thickness", 0.0, 25.0),
+        ] {
+            for value in [json!(min - 0.01), json!(max + 0.01), json!("1.0")] {
+                let result =
+                    handle_set_design_rules(&json!({ "board": board, field: value }), &ctx)
+                        .await
+                        .unwrap();
+                assert!(result.is_error, "{field} = {value} was accepted");
+                let body: Value = serde_json::from_str(&text_of(&result)).unwrap();
+                assert_eq!(body["error"]["field"], field);
+                assert_untouched(&project, &bytes, mtime, &format!("{field} = {value}"));
+            }
+        }
     }
 
     #[tokio::test]
