@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: Windows errors name resolved paths without `\\?\` (patch release)
+
+On Windows, errors printed a board or lock path that Konnect had resolved in
+its extended-length form, `\\?\C:\…`, beside the caller's own spelling of the
+same directory. These now print the ordinary form: `C:\…` for a drive path and
+`\\server\share\…` for a `\\?\UNC\…` network path. A path that the ordinary
+form would name differently keeps its prefix: one of 260 characters or more, or
+one with a reserved device name such as `NUL`, or a component that ends in a
+dot or a space.
+
+This covers every path in `wrong_document`, `ambiguous_target`, `stale_target`
+and `ambiguous_open_board` (`requested`/`target`/`path`, `open_documents`,
+`candidates`, `previously_bound`, and the reason text), and the sibling-lock
+path in `unsafe_file_fallback` messages and in `source_evidence.detail`. A path
+the caller typed prints as typed unless it began with `\\?\` itself. Board
+matching still compares resolved paths. Field names and error kinds are
+unchanged, and other platforms are unaffected (#673).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

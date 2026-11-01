@@ -1559,6 +1559,69 @@ fn a_bound_document_disappearing_before_a_generic_command_is_stale() {
     assert_eq!(observations.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+/// A board bound without a requested path is bound by its resolved identity,
+/// which on Windows is `\\?\C:\…`. The stale refusal names both boards as a
+/// user can paste them back (#673).
+#[test]
+fn a_stale_refusal_names_an_implicitly_bound_board_without_the_verbatim_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.kicad_pcb");
+    std::fs::write(&target, "(kicad_pcb)").unwrap();
+    let target_name = target.to_str().unwrap().to_string();
+    let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observations_in_mock = observations.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if !message.type_url.ends_with("GetOpenDocuments") {
+            return Some(ok_response());
+        }
+        let count = observations_in_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut document = doc_for("other.kicad_pcb");
+        if count == 0 {
+            document.identifier = Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    target_name.clone(),
+                ),
+            );
+        }
+        let response = kiapi::common::commands::GetOpenDocumentsResponse {
+            documents: vec![document],
+        };
+        Some(reply_with(builders::pack_any(
+            &response,
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let _ = client.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint);
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)
+            .expect_err("a closed bound board must refuse"),
+    );
+    let konnect_ipc::IpcFailure::Target {
+        error:
+            konnect_ipc::BoardTargetError::StaleDocument {
+                requested,
+                previously_bound,
+                ..
+            },
+        ..
+    } = failure
+    else {
+        panic!("unexpected classification: {failure:?}");
+    };
+    let resolved = target.canonicalize().unwrap();
+    for shown in [&requested, &previously_bound] {
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+        assert_eq!(
+            std::path::Path::new(shown).canonicalize().unwrap(),
+            resolved
+        );
+    }
+}
+
 fn board_filename(document: &kiapi::common::types::DocumentSpecifier) -> String {
     match document.identifier.as_ref() {
         Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(name)) => {
