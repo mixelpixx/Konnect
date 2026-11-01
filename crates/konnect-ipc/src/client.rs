@@ -4031,6 +4031,7 @@ impl KiCadIpcClient {
                         attributes: Some(kiapi::common::types::TextAttributes {
                             size: Some(crate::builders::vec2(1.0, 1.0)),
                             angle: Some(kiapi::common::types::Angle {
+                                // Turned by hand and not kept upright: #971.
                                 value_degrees: readable_text_angle(rotation + frot),
                             }),
                             ..Default::default()
@@ -4694,11 +4695,15 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            line_style,
         } => {
             let (x1, y1) = xf(*start);
             let (x2, y2) = xf(*end);
             builders::pack_any(
-                &builders::board_segment(layer, *width, x1, y1, x2, y2),
+                &builders::with_line_style(
+                    builders::board_segment(layer, *width, x1, y1, x2, y2),
+                    *line_style,
+                ),
                 SHAPE,
             )
         }
@@ -4707,22 +4712,19 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            line_style,
             filled,
         } => {
             if is_cardinal_rotation(rotation) {
-                // A 90°-multiple keeps the rectangle axis-aligned; rotate the
-                // corners and re-normalize which one is top-left.
+                // A 90°-multiple keeps the rectangle axis-aligned. KiCad keeps
+                // the rotated corners in order, so it saves the library's own
+                // start and end.
                 let (x1, y1) = xf(*start);
                 let (x2, y2) = xf(*end);
                 builders::pack_any(
-                    &builders::board_rectangle(
-                        layer,
-                        *width,
-                        x1.min(x2),
-                        y1.min(y2),
-                        x1.max(x2),
-                        y1.max(y2),
-                        *filled,
+                    &builders::with_line_style(
+                        builders::board_rectangle(layer, *width, x1, y1, x2, y2, *filled),
+                        *line_style,
                     ),
                     SHAPE,
                 )
@@ -4737,7 +4739,10 @@ fn build_graphic_child(
                     xf((start.0, end.1)),
                 ];
                 builders::pack_any(
-                    &builders::board_polygon(layer, *width, *filled, &[corners]),
+                    &builders::with_line_style(
+                        builders::board_polygon(layer, *width, *filled, &[corners]),
+                        *line_style,
+                    ),
                     SHAPE,
                 )
             }
@@ -4747,6 +4752,7 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            line_style,
             filled,
         } => {
             let (cx, cy) = xf(*center);
@@ -4754,7 +4760,10 @@ fn build_graphic_child(
             // circumference-point encoding by re-deriving it from the length.
             let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
             builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                &builders::with_line_style(
+                    builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                    *line_style,
+                ),
                 SHAPE,
             )
         }
@@ -4764,12 +4773,16 @@ fn build_graphic_child(
             end,
             layer,
             width,
+            line_style,
         } => {
             let (sx, sy) = xf(*start);
             let (mx, my) = xf(*mid);
             let (ex, ey) = xf(*end);
             builders::pack_any(
-                &builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                &builders::with_line_style(
+                    builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                    *line_style,
+                ),
                 SHAPE,
             )
         }
@@ -4777,11 +4790,15 @@ fn build_graphic_child(
             points,
             layer,
             width,
+            line_style,
             filled,
         } => {
             let transformed: Vec<(f64, f64)> = points.iter().map(|p| xf(*p)).collect();
             builders::pack_any(
-                &builders::board_polygon(layer, *width, *filled, &[transformed]),
+                &builders::with_line_style(
+                    builders::board_polygon(layer, *width, *filled, &[transformed]),
+                    *line_style,
+                ),
                 SHAPE,
             )
         }
@@ -4792,21 +4809,27 @@ fn build_graphic_child(
             layer,
             size,
             stroke_width_mm,
+            keep_upright,
         } => {
             let (tx, ty) = xf(*position);
-            builders::pack_any(
-                &builders::board_text_with_stroke_width(
-                    layer,
-                    text,
-                    tx,
-                    ty,
-                    *size,
-                    *stroke_width_mm,
-                    readable_text_angle(text_rotation + rotation),
-                    false,
-                ),
-                "kiapi.board.types.BoardText",
-            )
+            let mut text = builders::board_text_with_stroke_width(
+                layer,
+                text,
+                tx,
+                ty,
+                *size,
+                *stroke_width_mm,
+                // KiCad keeps the angle as placed and turns keep-upright
+                // text for reading itself.
+                (text_rotation + rotation).rem_euclid(360.0),
+                false,
+            );
+            if let Some(attributes) = text.text.as_mut().and_then(|text| text.attributes.as_mut()) {
+                // KiCad loads footprint text as multiline.
+                attributes.multiline = true;
+                attributes.keep_upright = *keep_upright;
+            }
+            builders::pack_any(&text, "kiapi.board.types.BoardText")
         }
     }
 }
@@ -6160,6 +6183,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 2.0),
                 layer: "F.CrtYd".to_string(),
                 width: 0.05,
+                line_style: crate::IpcLineStyle::Solid,
                 filled: false,
             },
             IpcGraphicDefinition::Line {
@@ -6167,6 +6191,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 0.0),
                 layer: "F.SilkS".to_string(),
                 width: 0.12,
+                line_style: crate::IpcLineStyle::Solid,
             },
             IpcGraphicDefinition::Text {
                 text: "hello".to_string(),
@@ -6175,6 +6200,7 @@ mod footprint_graphics_tests {
                 layer: "F.Fab".to_string(),
                 size: 0.5,
                 stroke_width_mm: 0.075,
+                keep_upright: true,
             },
         ];
         let fp = build(&graphics, 100.0, 50.0, 90.0);
@@ -6183,8 +6209,8 @@ mod footprint_graphics_tests {
         assert_eq!(shapes.len(), 2);
 
         // The rectangle stays axis-aligned at a cardinal rotation: corners
-        // (-1,-2) → (98, 51) and (1,2) → (102, 49), re-normalized so the
-        // top-left really is top-left.
+        // (-1,-2) → (98, 51) and (1,2) → (102, 49), kept in that order as
+        // KiCad keeps them.
         let rect = &shapes[0];
         assert_eq!(rect.layer, kiapi::board::types::BoardLayer::BlFCrtYd as i32);
         let geometry = rect.shape.as_ref().unwrap().geometry.as_ref().unwrap();
@@ -6192,9 +6218,9 @@ mod footprint_graphics_tests {
             panic!("expected Rectangle geometry, got {geometry:?}");
         };
         assert_eq!(r.top_left.unwrap().x_nm, 98_000_000);
-        assert_eq!(r.top_left.unwrap().y_nm, 49_000_000);
+        assert_eq!(r.top_left.unwrap().y_nm, 51_000_000);
         assert_eq!(r.bottom_right.unwrap().x_nm, 102_000_000);
-        assert_eq!(r.bottom_right.unwrap().y_nm, 51_000_000);
+        assert_eq!(r.bottom_right.unwrap().y_nm, 49_000_000);
 
         // Silk line (-1,0)→(1,0) rotates to (100,51)→(100,49).
         let line = &shapes[1];
@@ -6229,10 +6255,75 @@ mod footprint_graphics_tests {
         );
     }
 
-    /// At 180° the text would read upside down; KiCAD keeps labels readable by
-    /// flipping such angles 180°, and so does the emitted child.
+    /// KiCad saves each footprint shape with the line style it is given and an
+    /// unknown one as `default`, so the library's style must reach the shape.
+    /// Text keeps its upright flag, and is multiline as KiCad loads it.
     #[test]
-    fn text_angles_are_kept_readable() {
+    fn graphics_carry_their_line_style_and_text_its_upright_flag() {
+        use kiapi::common::types::StrokeLineStyle;
+        let line = |line_style| IpcGraphicDefinition::Line {
+            start: (0.0, 0.0),
+            end: (1.0, 0.0),
+            layer: "F.SilkS".to_string(),
+            width: 0.12,
+            line_style,
+        };
+        let text = |keep_upright| IpcGraphicDefinition::Text {
+            text: "hello".to_string(),
+            position: (0.0, 0.0),
+            rotation: 0.0,
+            layer: "F.Fab".to_string(),
+            size: 0.5,
+            stroke_width_mm: 0.075,
+            keep_upright,
+        };
+        let graphics = vec![
+            line(crate::IpcLineStyle::Default),
+            line(crate::IpcLineStyle::Solid),
+            line(crate::IpcLineStyle::Dash),
+            IpcGraphicDefinition::Rect {
+                start: (-1.0, -1.0),
+                end: (1.0, 1.0),
+                layer: "F.CrtYd".to_string(),
+                width: 0.05,
+                line_style: crate::IpcLineStyle::DashDotDot,
+                filled: false,
+            },
+            text(true),
+            text(false),
+        ];
+        let fp = build(&graphics, 0.0, 0.0, 0.0);
+        let styles: Vec<_> = shapes(&fp)
+            .iter()
+            .map(|shape| {
+                let stroke = shape.shape.as_ref().unwrap().attributes.as_ref().unwrap();
+                stroke.stroke.as_ref().unwrap().style()
+            })
+            .collect();
+        assert_eq!(
+            styles,
+            [
+                StrokeLineStyle::SlsDefault,
+                StrokeLineStyle::SlsSolid,
+                StrokeLineStyle::SlsDash,
+                StrokeLineStyle::SlsDashdotdot,
+            ]
+        );
+        let flags: Vec<_> = texts(&fp)
+            .iter()
+            .map(|text| {
+                let attributes = text.text.as_ref().unwrap().attributes.as_ref().unwrap();
+                (attributes.keep_upright, attributes.multiline)
+            })
+            .collect();
+        assert_eq!(flags, [(true, true), (false, true)]);
+    }
+
+    /// KiCad keeps a footprint text's angle as placed, 180° here, and turns
+    /// keep-upright text for reading on its own; flipping it here would turn
+    /// `(unlocked yes)` text upside down.
+    #[test]
+    fn text_angles_turn_with_the_footprint() {
         let graphics = vec![IpcGraphicDefinition::Text {
             text: "hello".to_string(),
             position: (0.0, 0.0),
@@ -6240,6 +6331,7 @@ mod footprint_graphics_tests {
             layer: "F.Fab".to_string(),
             size: 0.5,
             stroke_width_mm: 0.075,
+            keep_upright: true,
         }];
         let fp = build(&graphics, 0.0, 0.0, 180.0);
         let texts = texts(&fp);
@@ -6254,7 +6346,7 @@ mod footprint_graphics_tests {
                 .angle
                 .unwrap()
                 .value_degrees,
-            0.0
+            180.0
         );
     }
 
@@ -6268,6 +6360,7 @@ mod footprint_graphics_tests {
             end: (1.0, 1.0),
             layer: "F.CrtYd".to_string(),
             width: 0.05,
+            line_style: crate::IpcLineStyle::Solid,
             filled: false,
         }];
         let fp = build(&graphics, 0.0, 0.0, 45.0);
@@ -6299,6 +6392,7 @@ mod footprint_graphics_tests {
             end: (1.5, 0.0),
             layer: "F.Fab".to_string(),
             width: 0.1,
+            line_style: crate::IpcLineStyle::Solid,
             filled: true,
         }];
         let fp = build(&graphics, 10.0, 10.0, 90.0);
@@ -6384,6 +6478,7 @@ mod footprint_graphics_tests {
                 end: (1.0, 0.0),
                 layer: "Dwgs.User".to_string(),
                 width: 0.1,
+                line_style: crate::IpcLineStyle::Solid,
             },
             IpcGraphicDefinition::Text {
                 text: "PCB Edge".to_string(),
@@ -6392,6 +6487,7 @@ mod footprint_graphics_tests {
                 layer: "Dwgs.User".to_string(),
                 size: 1.0,
                 stroke_width_mm: 0.15,
+                keep_upright: true,
             },
         ];
         let any = KiCadIpcClient::build_footprint_item(
@@ -6462,6 +6558,7 @@ mod footprint_graphics_tests {
             end: (1.0, 1.0),
             layer: "In99.Cu".to_string(),
             width: 0.1,
+            line_style: crate::IpcLineStyle::Solid,
         }];
         let error = format!(
             "{:#}",

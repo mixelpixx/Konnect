@@ -331,9 +331,30 @@ fn graphic_stroke_width(node: &konnect_sexp::SexpNode) -> f64 {
         .unwrap_or(0.12)
 }
 
+/// Line style from `(stroke (type …))`. KiCad 10 loads a stroke without a
+/// type, and the legacy bare `(width w)`, as solid.
+fn graphic_line_style(node: &konnect_sexp::SexpNode) -> konnect_ipc::IpcLineStyle {
+    node.find("stroke")
+        .and_then(|stroke| stroke.find_str("type"))
+        .and_then(konnect_ipc::IpcLineStyle::from_kicad_name)
+        .unwrap_or(konnect_ipc::IpcLineStyle::Solid)
+}
+
 /// `(fill yes)` (KiCad 8+) or legacy `(fill solid)`.
 fn graphic_filled(node: &konnect_sexp::SexpNode) -> bool {
     matches!(node.find_str("fill"), Some("yes") | Some("solid"))
+}
+
+/// KiCad keeps footprint text upright unless it is `(unlocked yes)`, or, as
+/// KiCad 7 and earlier wrote it, `(at x y [angle] unlocked)`.
+fn text_keeps_upright(node: &konnect_sexp::SexpNode) -> bool {
+    let legacy = node.find("at").is_some_and(|at| {
+        at.children()
+            .unwrap_or_default()
+            .iter()
+            .any(|atom| atom.as_str() == Some("unlocked"))
+    });
+    !legacy && node.find_str("unlocked") != Some("yes")
 }
 
 /// `(hide yes)` (modern) or a bare `hide` atom (legacy).
@@ -448,6 +469,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(line, "end", "fp_line")?,
             layer: graphic_layer(line, "fp_line")?,
             width: graphic_stroke_width(line),
+            line_style: graphic_line_style(line),
         });
     }
     for rect in footprint.find_all("fp_rect") {
@@ -456,6 +478,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(rect, "end", "fp_rect")?,
             layer: graphic_layer(rect, "fp_rect")?,
             width: graphic_stroke_width(rect),
+            line_style: graphic_line_style(rect),
             filled: graphic_filled(rect),
         });
     }
@@ -465,6 +488,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(circle, "end", "fp_circle")?,
             layer: graphic_layer(circle, "fp_circle")?,
             width: graphic_stroke_width(circle),
+            line_style: graphic_line_style(circle),
             filled: graphic_filled(circle),
         });
     }
@@ -475,6 +499,7 @@ fn extract_graphic_definitions_with_properties(
             end: graphic_point(arc, "end", "fp_arc")?,
             layer: graphic_layer(arc, "fp_arc")?,
             width: graphic_stroke_width(arc),
+            line_style: graphic_line_style(arc),
         });
     }
     for poly in footprint.find_all("fp_poly") {
@@ -499,6 +524,7 @@ fn extract_graphic_definitions_with_properties(
             points,
             layer: graphic_layer(poly, "fp_poly")?,
             width: graphic_stroke_width(poly),
+            line_style: graphic_line_style(poly),
             filled: graphic_filled(poly),
         });
     }
@@ -519,6 +545,7 @@ fn extract_graphic_definitions_with_properties(
             layer: graphic_layer(text, "fp_text")?,
             size: text_size(text),
             stroke_width_mm: text_stroke_width(text),
+            keep_upright: text_keeps_upright(text),
         });
     }
     let properties = if include_properties {
@@ -549,6 +576,7 @@ fn extract_graphic_definitions_with_properties(
             layer,
             size: text_size(property),
             stroke_width_mm: text_stroke_width(property),
+            keep_upright: text_keeps_upright(property),
         });
     }
     Ok(graphics)
@@ -4236,6 +4264,79 @@ mod tests {
   (pad "1" smd roundrect (at -0.5 0) (size 0.5 0.5)
     (layers "F.Cu" "F.Paste" "F.Mask")))"#;
 
+    /// Unmodified `Connector_Card:SD_Card_Device_16mm_SlotDepth` from KiCad
+    /// 10.0.6's library. Its file draws 20 shapes `(type default)` (14 fp_line,
+    /// 5 fp_arc, 1 fp_rect), one `(type solid)` fp_poly and one `(type dash)`
+    /// fp_line, and its three user texts are `(unlocked yes)`.
+    #[test]
+    fn stock_footprint_strokes_and_unlocked_text_are_read_as_kicad_saved_them() {
+        use konnect_ipc::{IpcGraphicDefinition as Graphic, IpcLineStyle};
+        let source = include_str!("../../tests/fixtures/sd_card_device_kicad10.kicad_mod");
+        let graphics = extract_graphic_definitions(source).unwrap();
+
+        let count = |style| {
+            graphics
+                .iter()
+                .filter(|graphic| match graphic {
+                    Graphic::Line { line_style, .. }
+                    | Graphic::Rect { line_style, .. }
+                    | Graphic::Circle { line_style, .. }
+                    | Graphic::Arc { line_style, .. }
+                    | Graphic::Poly { line_style, .. } => *line_style == style,
+                    Graphic::Text { .. } => false,
+                })
+                .count()
+        };
+        assert_eq!(count(IpcLineStyle::Default), 20);
+        assert_eq!(count(IpcLineStyle::Solid), 1);
+        assert_eq!(count(IpcLineStyle::Dash), 1);
+        let upright: Vec<_> = graphics
+            .iter()
+            .filter_map(|graphic| match graphic {
+                Graphic::Text { keep_upright, .. } => Some(*keep_upright),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(upright, [false, false, false]);
+    }
+
+    /// KiCad 6 and 7 footprints from the Tiny Tapeout demo library KiCad
+    /// 10.0.6 ships. KiCad 10.0.6 loads the test point's 24 typeless
+    /// `(width …)` lines as `(type solid)` and keeps its user text upright, and
+    /// loads the jack's `(at -2.8 3.2 unlocked)` user text as `(unlocked yes)`.
+    #[test]
+    fn legacy_typeless_strokes_are_solid_and_legacy_unlocked_text_stays_unlocked() {
+        use konnect_ipc::{IpcGraphicDefinition as Graphic, IpcLineStyle};
+        let test_point = extract_graphic_definitions(include_str!(
+            "../../tests/fixtures/testpoint_keystone_5019_kicad6.kicad_mod"
+        ))
+        .unwrap();
+        let styles: Vec<_> = test_point
+            .iter()
+            .filter_map(|graphic| match graphic {
+                Graphic::Line { line_style, .. } => Some(*line_style),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(styles, [IpcLineStyle::Solid; 24]);
+        let upright = |graphics: &[Graphic]| -> Vec<bool> {
+            graphics
+                .iter()
+                .filter_map(|graphic| match graphic {
+                    Graphic::Text { keep_upright, .. } => Some(*keep_upright),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(upright(&test_point), [true]);
+
+        let jack = extract_graphic_definitions(include_str!(
+            "../../tests/fixtures/cui_ujc_hp_3_kicad7.kicad_mod"
+        ))
+        .unwrap();
+        assert_eq!(upright(&jack), [false]);
+    }
+
     #[test]
     fn extracts_all_drawable_graphics_with_layers_and_widths() {
         use konnect_ipc::IpcGraphicDefinition as Graphic;
@@ -4258,7 +4359,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rect,
-            Graphic::Rect { layer, width, filled, start, end }
+            Graphic::Rect { layer, width, filled, start, end, .. }
                 if layer == "F.CrtYd" && *width == 0.05 && !*filled
                     && *start == (-0.8, -0.7) && *end == (0.8, 0.7)
         ));

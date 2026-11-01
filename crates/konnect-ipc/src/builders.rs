@@ -457,11 +457,37 @@ pub fn any_type_name(item: &prost_types::Any) -> &str {
 fn stroke(width_mm: f64) -> kiapi::common::types::StrokeAttributes {
     kiapi::common::types::StrokeAttributes {
         width: Some(distance(width_mm)),
-        // ponytail: leave style/color at proto default (solid, board default color).
-        // Add args when a caller needs dashed/colored graphics.
-        style: 0,
+        // KiCad's `(type default)`; `with_line_style` sets another. Color stays
+        // the board default.
+        style: kiapi::common::types::StrokeLineStyle::SlsDefault as i32,
         color: None,
     }
+}
+
+/// Give a shape built by the `board_*` builders the line style `style`.
+pub fn with_line_style(
+    mut shape: kiapi::board::types::BoardGraphicShape,
+    style: crate::IpcLineStyle,
+) -> kiapi::board::types::BoardGraphicShape {
+    use crate::IpcLineStyle;
+    use kiapi::common::types::StrokeLineStyle;
+    let style = match style {
+        IpcLineStyle::Default => StrokeLineStyle::SlsDefault,
+        IpcLineStyle::Solid => StrokeLineStyle::SlsSolid,
+        IpcLineStyle::Dash => StrokeLineStyle::SlsDash,
+        IpcLineStyle::Dot => StrokeLineStyle::SlsDot,
+        IpcLineStyle::DashDot => StrokeLineStyle::SlsDashdot,
+        IpcLineStyle::DashDotDot => StrokeLineStyle::SlsDashdotdot,
+    };
+    if let Some(stroke) = shape
+        .shape
+        .as_mut()
+        .and_then(|shape| shape.attributes.as_mut())
+        .and_then(|attributes| attributes.stroke.as_mut())
+    {
+        stroke.style = style as i32;
+    }
+    shape
 }
 
 fn attrs(width_mm: f64, filled: bool) -> kiapi::common::types::GraphicAttributes {
@@ -700,6 +726,18 @@ pub fn board_text_with_stroke_width(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    /// A shape built without a style asks for KiCad's `default`, not the
+    /// proto's `SLS_UNKNOWN` (#970).
+    #[test]
+    fn shapes_default_to_kicads_default_line_style() {
+        let shape = board_segment("F.SilkS", 0.12, 0.0, 0.0, 1.0, 0.0);
+        let stroke = shape.shape.unwrap().attributes.unwrap().stroke.unwrap();
+        assert_eq!(
+            stroke.style(),
+            kiapi::common::types::StrokeLineStyle::SlsDefault
+        );
+    }
 
     /// `layer_name` is the exact inverse of `layer_from_name` over every
     /// representable layer — computed runs included. The forward map was

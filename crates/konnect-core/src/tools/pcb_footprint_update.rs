@@ -1127,8 +1127,10 @@ fn parse_property_effects(
         underlined: false,
         visible: true,
         mirrored,
-        multiline: false,
-        keep_upright: false,
+        // As KiCad loads a footprint property; `parse_library_property`
+        // refuses `(unlocked yes)`.
+        multiline: true,
+        keep_upright: true,
         size: Some(konnect_ipc::builders::vec2(width, height)),
     })
 }
@@ -1736,8 +1738,9 @@ fn transform_library_property(
     } else {
         local_angle
     };
+    // KiCad keeps the angle as placed and turns keep-upright text itself.
     attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: readable_property_angle(local_angle + footprint_rotation),
+        value_degrees: degrees_in_turn(local_angle + footprint_rotation),
     });
     if is_back {
         attributes.mirrored = !attributes.mirrored;
@@ -1749,14 +1752,6 @@ fn transform_library_property(
             konnect_ipc::builders::try_layer_from_name(&flip_layer_name(layer_name)?)? as i32;
     }
     Ok(property)
-}
-
-fn readable_property_angle(degrees: f64) -> f64 {
-    let mut angle = degrees.rem_euclid(360.0);
-    if angle > 90.0 && angle <= 270.0 {
-        angle -= 180.0;
-    }
-    angle
 }
 
 fn mirror_pad(pad: &konnect_ipc::IpcPadDefinition) -> Result<konnect_ipc::IpcPadDefinition> {
@@ -1783,23 +1778,27 @@ fn mirror_graphic(
             end,
             layer,
             width,
+            line_style,
         } => Graphic::Line {
             start: point(*start),
             end: point(*end),
             layer: flip_layer_name(layer)?,
             width: *width,
+            line_style: *line_style,
         },
         Graphic::Rect {
             start,
             end,
             layer,
             width,
+            line_style,
             filled,
         } => Graphic::Rect {
             start: point(*start),
             end: point(*end),
             layer: flip_layer_name(layer)?,
             width: *width,
+            line_style: *line_style,
             filled: *filled,
         },
         Graphic::Circle {
@@ -1807,12 +1806,14 @@ fn mirror_graphic(
             end,
             layer,
             width,
+            line_style,
             filled,
         } => Graphic::Circle {
             center: point(*center),
             end: point(*end),
             layer: flip_layer_name(layer)?,
             width: *width,
+            line_style: *line_style,
             filled: *filled,
         },
         Graphic::Arc {
@@ -1821,22 +1822,26 @@ fn mirror_graphic(
             end,
             layer,
             width,
+            line_style,
         } => Graphic::Arc {
             start: point(*end),
             mid: point(*mid),
             end: point(*start),
             layer: flip_layer_name(layer)?,
             width: *width,
+            line_style: *line_style,
         },
         Graphic::Poly {
             points,
             layer,
             width,
+            line_style,
             filled,
         } => Graphic::Poly {
             points: points.iter().copied().map(point).collect(),
             layer: flip_layer_name(layer)?,
             width: *width,
+            line_style: *line_style,
             filled: *filled,
         },
         Graphic::Text {
@@ -1846,6 +1851,7 @@ fn mirror_graphic(
             layer,
             size,
             stroke_width_mm,
+            keep_upright,
         } => Graphic::Text {
             text: text.clone(),
             position: point(*position),
@@ -1853,6 +1859,7 @@ fn mirror_graphic(
             layer: flip_layer_name(layer)?,
             size: *size,
             stroke_width_mm: *stroke_width_mm,
+            keep_upright: *keep_upright,
         },
     })
 }
@@ -1965,22 +1972,39 @@ fn normalized_items(
             if suffix == "Pad" {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
                 pad.id = None;
+                // KiCad names the footprint as each child's parent; a built
+                // child has none until KiCad adds it.
+                pad.parent = None;
                 pad.net = None;
                 pad.pad_to_die_length = None;
                 pad.symbol_pin = None;
                 pad.pad_to_die_delay = None;
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
+                    if let Some(angle) = stack.angle.as_mut() {
+                        angle.value_degrees = degrees_in_turn(angle.value_degrees);
+                    }
+                    // A zero-size drill is no hole, whatever layers it names:
+                    // KiCad reports an SMD pad's as F.Cu to B.Cu.
                     if stack.drill.as_ref().is_some_and(|drill| {
-                        drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill.end_layer
-                                == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill
-                                .diameter
-                                .as_ref()
-                                .is_none_or(|diameter| diameter.x_nm == 0 && diameter.y_nm == 0)
+                        drill
+                            .diameter
+                            .as_ref()
+                            .is_none_or(|diameter| diameter.x_nm == 0 && diameter.y_nm == 0)
                     }) {
                         stack.drill = None;
+                    }
+                    // Chamfer and anchor settings only mean something for the
+                    // shapes that use them, and KiCad saves them only there.
+                    for layer in &mut stack.copper_layers {
+                        use kiapi::board::types::PadStackShape;
+                        if layer.shape() != PadStackShape::PssChamferedrect {
+                            layer.chamfer_ratio = 0.0;
+                            layer.chamfered_corners = None;
+                        }
+                        if layer.shape() != PadStackShape::PssCustom {
+                            layer.custom_anchor_shape = PadStackShape::PssUnknown as i32;
+                        }
                     }
                     if stack.zone_settings.as_ref().is_some_and(|settings| {
                         settings.zone_connection
@@ -1995,6 +2019,7 @@ fn normalized_items(
                 field.id = None;
                 if let Some(text) = field.text.as_mut() {
                     text.id = None;
+                    text.parent = None;
                 }
                 Ok(field.encode_to_vec())
             } else {
@@ -2016,6 +2041,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                     kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).map(
                         |mut shape| {
                             shape.id = None;
+                            shape.parent = None;
                             shape.net = None;
                             shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
                             if let Some(graphic) = shape.shape.as_mut() {
@@ -2024,6 +2050,9 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                                     .as_mut()
                                     .and_then(|attributes| attributes.stroke.as_mut())
                                 {
+                                    // KiCad 10.0.6 reports a `(type default)`
+                                    // stroke as solid, so a read cannot tell
+                                    // the two apart.
                                     if matches!(
                                         stroke.style(),
                                         kiapi::common::types::StrokeLineStyle::SlsUnknown
@@ -2065,6 +2094,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                     kiapi::board::types::BoardText::decode(item.value.as_slice()).map(
                         |mut text| {
                             text.id = None;
+                            text.parent = None;
                             text.encode_to_vec()
                         },
                     ),
@@ -2076,6 +2106,17 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
         .collect::<std::result::Result<Vec<_>, _>>()?;
     graphics.sort();
     Ok(graphics)
+}
+
+/// `degrees` in [0°, 360°). `rem_euclid` alone rounds a tiny negative angle up
+/// to 360°.
+fn degrees_in_turn(degrees: f64) -> f64 {
+    let degrees = degrees.rem_euclid(360.0);
+    if degrees >= 360.0 {
+        0.0
+    } else {
+        degrees
+    }
 }
 
 fn normalize_polyset(polyset: &mut kiapi::common::types::PolySet) {
@@ -2192,6 +2233,7 @@ mod tests {
                     layer,
                     size,
                     stroke_width_mm,
+                    keep_upright: true,
                 } if text == "${REFERENCE}"
                     && *position == (0.0, 1.5)
                     && *rotation == 0.0
@@ -2666,7 +2708,7 @@ mod tests {
         assert!(attributes.mirrored);
         assert_eq!(
             attributes.angle.as_ref().unwrap().value_degrees,
-            readable_property_angle(180.0 - 15.0 + 37.0)
+            180.0 - 15.0 + 37.0
         );
 
         let pads = decoded_pads(&updated);
@@ -3165,22 +3207,28 @@ mod tests {
         builders::pack_any(&instance, "kiapi.board.types.FootprintInstance")
     }
 
-    fn plan_fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<prost_types::Any>) {
+    /// A board beside a project library `nickname` holding `entry`.
+    fn library_project(
+        nickname: &str,
+        entry: &str,
+        source: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let board = temp.path().join("board.kicad_pcb");
         std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
-        let library_dir = temp.path().join("Test.pretty");
+        let library_dir = temp.path().join(format!("{nickname}.pretty"));
         std::fs::create_dir(&library_dir).unwrap();
-        std::fs::write(
-            library_dir.join("Socket.kicad_mod"),
-            KICAD_LIBRARY_FOOTPRINT,
-        )
-        .unwrap();
+        std::fs::write(library_dir.join(format!("{entry}.kicad_mod")), source).unwrap();
         std::fs::write(
             temp.path().join("fp-lib-table"),
-            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+            format!("(fp_lib_table (lib (name \"{nickname}\") (type \"KiCad\") (uri \"${{KIPRJMOD}}/{nickname}.pretty\") (options \"\") (descr \"\")))"),
         )
         .unwrap();
+        (temp, board)
+    }
+
+    fn plan_fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<prost_types::Any>) {
+        let (temp, board) = library_project("Test", "Socket", KICAD_LIBRARY_FOOTPRINT);
         let items = vec![
             plan_item("SW2", Some("Test:Socket"), "kiid-2"),
             plan_item("TP1", None, "kiid-3"),
@@ -3475,6 +3523,177 @@ mod tests {
             definition.input_schema["properties"]["library_ids"]["items"]["type"],
             "string"
         );
+    }
+
+    const C_0603_LIBRARY: &str =
+        include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+
+    /// Stock `Capacitor_SMD:C_0603_1608Metric` instances as KiCad 10.0.6
+    /// reported them over IPC: placed from the library, then after this tool
+    /// refreshed them. Provenance is in `c_0603_ipc.README.md`.
+    const C_0603_CAPTURES: [(&str, &[u8]); 6] = [
+        (
+            "loaded_front_0",
+            include_bytes!("../../tests/fixtures/c_0603_loaded_front_0.ipc.bin"),
+        ),
+        (
+            "loaded_front_180",
+            include_bytes!("../../tests/fixtures/c_0603_loaded_front_180.ipc.bin"),
+        ),
+        (
+            "loaded_back_90",
+            include_bytes!("../../tests/fixtures/c_0603_loaded_back_90.ipc.bin"),
+        ),
+        (
+            "refreshed_front_0",
+            include_bytes!("../../tests/fixtures/c_0603_refreshed_front_0.ipc.bin"),
+        ),
+        (
+            "refreshed_front_180",
+            include_bytes!("../../tests/fixtures/c_0603_refreshed_front_180.ipc.bin"),
+        ),
+        (
+            "refreshed_back_90",
+            include_bytes!("../../tests/fixtures/c_0603_refreshed_back_90.ipc.bin"),
+        ),
+    ];
+
+    fn c_0603_capture(name: &str) -> kiapi::board::types::FootprintInstance {
+        let (_, bytes) = C_0603_CAPTURES
+            .iter()
+            .find(|(capture, _)| *capture == name)
+            .unwrap();
+        kiapi::board::types::FootprintInstance::decode(*bytes).unwrap()
+    }
+
+    #[test]
+    fn angles_fold_into_one_turn() {
+        assert_eq!(degrees_in_turn(-90.0), 270.0);
+        assert_eq!(degrees_in_turn(450.0), 90.0);
+        assert_eq!(degrees_in_turn(-1e-14), 0.0);
+    }
+
+    /// A footprint that matches its library plans no change, whether KiCad
+    /// placed it or this tool refreshed it (#970).
+    #[test]
+    fn kicad_reported_stock_footprints_plan_no_change() {
+        let library =
+            parse_library_footprint("Capacitor_SMD:C_0603_1608Metric", C_0603_LIBRARY).unwrap();
+        for (name, bytes) in C_0603_CAPTURES {
+            let prepared = build_updated_instance(
+                &kiapi::board::types::FootprintInstance::decode(bytes).unwrap(),
+                &library,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            assert!(
+                prepared.changed_domains.is_empty(),
+                "{name} changed: {:?}",
+                prepared.changed_domains
+            );
+        }
+    }
+
+    /// The library's four `(type solid)` strokes stay solid, and its text and
+    /// generator property keep upright, as KiCad saves them (#970).
+    #[test]
+    fn refresh_sends_the_library_stroke_style_and_upright_text() {
+        let library =
+            parse_library_footprint("Capacitor_SMD:C_0603_1608Metric", C_0603_LIBRARY).unwrap();
+        let prepared = build_updated_instance(
+            &c_0603_capture("loaded_front_180"),
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        let items = &updated.definition.as_ref().unwrap().items;
+
+        let styles: Vec<_> = items
+            .iter()
+            .filter(|item| item.type_url.ends_with("BoardGraphicShape"))
+            .map(|item| {
+                let shape = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                    .unwrap()
+                    .shape
+                    .unwrap();
+                shape.attributes.unwrap().stroke.unwrap().style()
+            })
+            .collect();
+        assert_eq!(styles, [kiapi::common::types::StrokeLineStyle::SlsSolid; 4]);
+
+        let mut texts: Vec<_> = items
+            .iter()
+            .filter_map(|item| {
+                if item.type_url.ends_with("BoardText") {
+                    kiapi::board::types::BoardText::decode(item.value.as_slice()).ok()
+                } else if item.type_url.ends_with("Field") {
+                    kiapi::board::types::Field::decode(item.value.as_slice())
+                        .ok()
+                        .and_then(|field| field.text)
+                } else {
+                    None
+                }
+            })
+            .map(|text| {
+                let text = text.text.unwrap();
+                let attributes = text.attributes.unwrap();
+                (text.text, attributes.keep_upright, attributes.multiline)
+            })
+            .collect();
+        texts.sort();
+        assert_eq!(
+            texts,
+            [
+                ("${REFERENCE}".to_string(), true, true),
+                ("SMD_2terminal_chip_molded".to_string(), true, true),
+            ]
+        );
+    }
+
+    /// Through the served dispatch, KiCad's own report of an unchanged stock
+    /// footprint dry-runs to `noop` (#970).
+    #[tokio::test]
+    async fn served_dry_run_of_an_unchanged_stock_footprint_is_noop() {
+        let (_temp, board) = library_project("Capacitor_SMD", "C_0603_1608Metric", C_0603_LIBRARY);
+        let footprint = builders::pack_any(
+            &c_0603_capture("loaded_back_90"),
+            "kiapi.board.types.FootprintInstance",
+        );
+        let mock = spawn_planner_mock(&board, footprint, false);
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: mock.url.clone(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
+
+        let response = handler
+            .handle_message(serde_json::json!({
+                "jsonrpc": "2.0", "id": 970, "method": "tools/call",
+                "params": {
+                    "name": "update_footprints_from_library",
+                    "arguments": { "board": board.to_string_lossy() }
+                }
+            }))
+            .await
+            .unwrap();
+        let result: crate::mcp::protocol::CallToolResult =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        let body = result_json(&result);
+        assert_eq!(body["status"], "noop", "{body}");
+        assert_eq!(body["coverage"]["unchanged"]["planned"], 1, "{body}");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
     }
 
     #[tokio::test]

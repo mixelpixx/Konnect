@@ -357,6 +357,36 @@ pub struct IpcPadDefinition {
     pub roundrect_ratio: f64,
 }
 
+/// A graphic's line style, as KiCad's `(stroke (type …))` names it.
+///
+/// `Default` is KiCad's own `(type default)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpcLineStyle {
+    #[default]
+    Default,
+    Solid,
+    Dash,
+    Dot,
+    DashDot,
+    DashDotDot,
+}
+
+impl IpcLineStyle {
+    /// The style a `(stroke (type …))` token names, or `None` for one KiCad
+    /// does not write.
+    pub fn from_kicad_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "default" => Self::Default,
+            "solid" => Self::Solid,
+            "dash" => Self::Dash,
+            "dot" => Self::Dot,
+            "dash_dot" => Self::DashDot,
+            "dash_dot_dot" => Self::DashDotDot,
+            _ => return None,
+        })
+    }
+}
+
 /// A footprint graphic item in footprint-local coordinates (mm), parsed from
 /// the library `.kicad_mod` source.
 ///
@@ -372,6 +402,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        line_style: IpcLineStyle,
     },
     /// `fp_rect` — axis-aligned rectangle between two opposite corners.
     Rect {
@@ -379,6 +410,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        line_style: IpcLineStyle,
         filled: bool,
     },
     /// `fp_circle` — center plus a point on the circumference.
@@ -387,6 +419,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        line_style: IpcLineStyle,
         filled: bool,
     },
     /// `fp_arc` — start / mid / end points.
@@ -396,12 +429,14 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        line_style: IpcLineStyle,
     },
     /// `fp_poly` — closed outline.
     Poly {
         points: Vec<(f64, f64)>,
         layer: String,
         width: f64,
+        line_style: IpcLineStyle,
         filled: bool,
     },
     /// Visible `fp_text` / `property` text.
@@ -415,6 +450,9 @@ pub enum IpcGraphicDefinition {
         size: f64,
         /// Font stroke width in mm.
         stroke_width_mm: f64,
+        /// KiCad turns the text upright for reading; the library's
+        /// `(unlocked yes)` clears it.
+        keep_upright: bool,
     },
 }
 
