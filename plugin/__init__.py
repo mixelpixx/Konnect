@@ -204,7 +204,7 @@ def _run_server():
             _clear_pid_file(pid)
 
 
-def start_server():
+def start_server(parent=None):
     """Start the MCP server in a background thread."""
     global _server_thread
 
@@ -214,6 +214,7 @@ def start_server():
             "Please reinstall the plugin.",
             "Konnect",
             wx.OK | wx.ICON_ERROR,
+            parent=parent,
         )
         return False
 
@@ -242,6 +243,71 @@ def is_server_running():
     return os.path.exists(_PID_FILE)
 
 
+def find_pcb_editor_window():
+    """Locate the active PCB Editor top-level window to parent dialogs.
+
+    On macOS, parenting dialogs to wx.GetTopLevelWindows()[0] picks the KiCad
+    project manager when KiCad was launched normally. Cocoa then raises the
+    project manager to the front and covers the open board whenever child
+    dialogs or message boxes open, focus, or close.
+    """
+    if not hasattr(wx, "GetTopLevelWindows"):
+        return None
+
+    # 1. Check window with current focus
+    if hasattr(wx.Window, "FindFocus"):
+        focus = wx.Window.FindFocus()
+        if focus and hasattr(wx, "GetTopLevelParent"):
+            top = wx.GetTopLevelParent(focus)
+            if top and getattr(top, "IsShown", lambda: True)():
+                return top
+
+    # 2. Check active top-level window
+    if hasattr(wx, "GetActiveWindow"):
+        active = wx.GetActiveWindow()
+        if active and hasattr(wx, "GetTopLevelParent"):
+            top = wx.GetTopLevelParent(active)
+            if top and getattr(top, "IsShown", lambda: True)():
+                return top
+
+    # 3. Match against open board name or PCB Editor in title
+    board = None
+    try:
+        board = pcbnew.GetBoard()
+    except Exception:
+        pass
+
+    board_name = ""
+    if board and hasattr(board, "GetFileName") and board.GetFileName():
+        board_name = os.path.splitext(os.path.basename(board.GetFileName()))[0].lower()
+
+    top_windows = [w for w in wx.GetTopLevelWindows() if getattr(w, "IsShown", lambda: True)()]
+
+    if board_name:
+        for win in top_windows:
+            title = getattr(win, "GetTitle", lambda: "")().lower()
+            if board_name in title and ("pcb editor" in title or "pcb" in title or "— kicad" not in title):
+                return win
+
+    for win in top_windows:
+        title = getattr(win, "GetTitle", lambda: "")().lower()
+        if "pcb editor" in title or "pcbnew" in title or "leiterplatten" in title:
+            return win
+
+    for win in top_windows:
+        if getattr(win, "IsActive", lambda: False)():
+            return win
+
+    # Fall back to a non-project-manager window if possible
+    non_manager = [
+        w for w in top_windows if "— kicad" not in getattr(w, "GetTitle", lambda: "")().lower()
+    ]
+    if non_manager:
+        return non_manager[-1]
+
+    return top_windows[0] if top_windows else None
+
+
 # ─── KiCAD Action Plugin entry point ─────────────────────────────────────────
 
 class KonnectPlugin(pcbnew.ActionPlugin):
@@ -257,8 +323,7 @@ class KonnectPlugin(pcbnew.ActionPlugin):
 
     def Run(self):
         """Open the settings dialog. Server start/stop is handled via dialog buttons."""
-        # Get the KiCAD main window as parent for the dialog
-        parent = wx.GetTopLevelWindows()[0] if wx.GetTopLevelWindows() else None
+        parent = find_pcb_editor_window()
 
         dlg = KonnectSettingsDialog(
             parent=parent,
@@ -267,19 +332,26 @@ class KonnectPlugin(pcbnew.ActionPlugin):
             server_running=is_server_running(),
             native_bridge_available=_native_bridge.available(),
             native_bridge_running=_native_bridge.running(),
+            on_start_server=lambda: start_server(parent=dlg),
+            on_stop_server=stop_server,
         )
 
         result = dlg.ShowModal()
 
         if result == wx.ID_YES:
-            # User clicked "Start Server"
-            start_server()
+            # Fallback if dialog delegated via EndModal
+            start_server(parent=parent)
         elif result == wx.ID_NO:
-            # User clicked "Stop Server"
             stop_server()
 
         dlg.Destroy()
         _sync_native_bridge()
+
+        if parent and hasattr(parent, "Raise"):
+            try:
+                parent.Raise()
+            except Exception:
+                pass
 
 
 # Register the plugin with KiCAD

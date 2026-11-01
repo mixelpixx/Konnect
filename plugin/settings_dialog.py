@@ -158,6 +158,8 @@ class KonnectSettingsDialog(wx.Dialog):
         server_running=False,
         native_bridge_available=False,
         native_bridge_running=False,
+        on_start_server=None,
+        on_stop_server=None,
     ):
         # No fixed pixel size: on high-DPI/scaled Windows displays a fixed
         # (520, 480) clipped the Save/Close buttons off-screen (issue #18).
@@ -174,6 +176,8 @@ class KonnectSettingsDialog(wx.Dialog):
         self._server_running = server_running
         self._native_bridge_available = native_bridge_available
         self._native_bridge_running = native_bridge_running
+        self._on_start_server = on_start_server
+        self._on_stop_server = on_stop_server
 
         self._build_ui()
         self._populate_fields()
@@ -346,13 +350,28 @@ class KonnectSettingsDialog(wx.Dialog):
     def _on_save(self, event):
         self.settings = self._collect_settings()
         save_settings(self.settings_path, self.settings)
-        wx.MessageBox("Settings saved.", "Konnect", wx.OK | wx.ICON_INFORMATION)
+        wx.MessageBox("Settings saved.", "Konnect", wx.OK | wx.ICON_INFORMATION, parent=self)
 
     def _on_start_stop(self, event):
-        """Toggle server — delegates to parent plugin via return value."""
+        """Toggle server state — executes callbacks in-place or delegates via EndModal."""
         self.settings = self._collect_settings()
         save_settings(self.settings_path, self.settings)
-        self.EndModal(wx.ID_YES if not self._server_running else wx.ID_NO)
+
+        if not self._server_running:
+            if self._on_start_server:
+                success = self._on_start_server()
+                if success is not False:
+                    self._server_running = True
+                    self._update_server_status()
+            else:
+                self.EndModal(wx.ID_YES)
+        else:
+            if self._on_stop_server:
+                self._on_stop_server()
+                self._server_running = False
+                self._update_server_status()
+            else:
+                self.EndModal(wx.ID_NO)
 
     def _on_close(self, event):
         self.EndModal(wx.ID_CLOSE)
