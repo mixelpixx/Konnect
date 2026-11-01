@@ -3,6 +3,26 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `move_region` can move a whole block rigidly (minor release)
+
+`move_region` takes an optional `include` argument. `"symbols"`, the default,
+is the behavior so far: symbol units move, snapped to the 1.27 mm grid, and
+wires stay. With `"all"`, everything inside the box moves by exactly
+`(dx, dy)`: symbols and power symbols, wires, buses, bus entries, junctions,
+local, global and hierarchical labels, directive labels, texts, text boxes and
+sheets. No-connects follow their pins, and a marker on no pin moves with the
+box. Graphic shapes and images stay where they are.
+
+The rigid move refuses before writing, with `plan_blocked` and one reason per
+problem, when a wire, bus, bus entry, symbol or sheet crosses the box edge (a
+wire passing through with both ends outside counts, and so does a symbol with
+its origin and a pin on different sides), or when any pin's net would change,
+for example because a moved pin lands on a wire outside the box. A successful
+response adds `items_moved`, counting the non-symbol items moved by kind;
+no-connects stay in `no_connects_moved`. A label now keeps its fields with it when it
+moves, as a global label's `Intersheetrefs`. Calls without `include` are
+unchanged (#896).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

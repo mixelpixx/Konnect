@@ -350,14 +350,7 @@ impl Sheet {
         self.at.x += dx;
         self.at.y += dy;
         for prop in &mut self.properties {
-            for node in &mut prop.sub_nodes {
-                if node.tag() == Some("at") {
-                    if let Some(mut at) = At::from_sexp(node) {
-                        at.translate(dx, dy);
-                        *node = at.to_sexp();
-                    }
-                }
-            }
+            prop.translate(dx, dy);
         }
         // Pins sit on the box edge; KiCad stores them in sheet coordinates too.
         for pin in &mut self.pins {

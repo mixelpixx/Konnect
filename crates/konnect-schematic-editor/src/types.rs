@@ -77,7 +77,28 @@ pub struct Property {
     pub sub_nodes: Vec<SexpNode>,
 }
 
+/// Shift every `(at …)` among `nodes` by `(dx, dy)`.
+///
+/// A field's `(at …)` is absolute in `.kicad_sch`, not an offset from its
+/// owner, so moving a symbol, sheet or label has to move its fields too. One
+/// that will not parse is left exactly as it was.
+pub fn translate_field_ats(nodes: &mut [SexpNode], dx: f64, dy: f64) {
+    for node in nodes {
+        if node.tag() == Some("at") {
+            if let Some(mut at) = At::from_sexp(node) {
+                at.translate(dx, dy);
+                *node = at.to_sexp();
+            }
+        }
+    }
+}
+
 impl Property {
+    /// Move the field by `(dx, dy)`; see [`translate_field_ats`].
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        translate_field_ats(&mut self.sub_nodes, dx, dy);
+    }
+
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Property {
             name: name.into(),
