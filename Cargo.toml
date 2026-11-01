@@ -86,7 +86,7 @@ usvg = "0.48"
 # Rasterization for the visual-feedback tools (konnect-render). resvg and
 # tiny-skia are pinned EXACTLY: visual baselines compare pixel output across
 # machines, so a silent renderer bump must be a deliberate decision.
-resvg = "=0.48.1"
+resvg = "=0.49.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Pure-Rust git for the vcs toolset (konnect-vcs). No libgit2, no C.
