@@ -3,6 +3,49 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: library symbols take Footprint, Description, keywords, filters and custom fields (minor release)
+
+`create_symbol` accepts five new optional arguments:
+
+- `footprint`
+- `description`
+- `keywords`, a space-separated string
+- `fp_filters`, an array of patterns
+- `fields`, custom fields such as `MPN` or `LCSC` as name: value, the same
+  shape `edit_schematic_component` takes
+
+Before, `create_symbol` always wrote an empty Footprint and Description and
+could write none of the others. Custom fields are written hidden, in name
+order. An empty `keywords` or `fp_filters` writes no property, as KiCad does. A
+custom field named after a mandatory field (in any case), or one with a `ki_`
+prefix, is refused as `invalid_argument`. Footprint, Description, keywords and
+filters have their own arguments, and `set_symbol_properties` does not change
+Reference, Value or Datasheet. `create_symbol` now also escapes `"` and `\` in
+field values. Before, a quote in `value` or `datasheet` produced a library that
+did not parse.
+
+The new tool `set_symbol_properties` (toolset `library`) changes the same
+fields on an existing symbol, named by `library_path` and `symbol_name`.
+
+- Only the fields passed change. An existing field keeps its position, size
+  and visibility.
+- A new field is written hidden, in KiCad's own field order.
+- An empty `keywords` or `fp_filters` removes that property.
+- On a KiCad 6/7 library, `description` replaces the `ki_description`
+  property, which is where KiCad reads it from in that format.
+- The response's `changes` gives `{"previous", "current"}` for each changed
+  field, keyed by KiCad's property name, with `null` for an absent property.
+- A call that changes nothing writes nothing.
+
+Refusals:
+
+- A file that changed after it was read is refused as `conflict`.
+- A symbol name defined twice is refused as `ambiguous_target`.
+- A file that is not a symbol library is a `handler_error`, like other paths
+  that exist but cannot be used.
+- When the file does not hold the edit on readback, the tool reports
+  `mutation_outcome_uncertain` (#892).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

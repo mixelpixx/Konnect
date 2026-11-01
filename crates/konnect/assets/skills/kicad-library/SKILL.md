@@ -22,7 +22,8 @@ using Konnect MCP tools. ALL modifications go through MCP tools — never edit
 load_toolset('library')    # search_symbols, search_footprints, create_symbol, create_footprint,
                            # edit_footprint_pad, set_footprint_graphics, set_footprint_metadata,
                            # set_footprint_models, get_footprint_info, register_symbol_library,
-                           # register_footprint_library, get_symbol_info
+                           # register_footprint_library, get_symbol_info,
+                           # set_symbol_properties
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -211,6 +212,25 @@ Optional but recommended:
 - `LCSC` — LCSC/JLCPCB part number for assembly
 - `MPN` — Manufacturer part number
 - `Description` — Short text description
+
+`create_symbol` writes all of these. Pass `footprint`, `description`,
+`keywords`, `fp_filters` and custom fields such as `MPN` and `LCSC` in
+`fields`. To fill them in on a symbol that already exists, call
+`set_symbol_properties`:
+
+```
+set_symbol_properties(
+  library_path="MyProject.kicad_sym", symbol_name="TPS7A02",
+  footprint="Package_TO_SOT_SMD:SOT-23-5",
+  description="200 mA LDO",
+  keywords="ldo regulator",
+  fp_filters=["SOT?23*"],
+  fields={"MPN": "TPS7A0233PDBVR", "LCSC": "C2862740"}
+)
+```
+
+It changes only the fields you pass. An empty `keywords` or `fp_filters`
+removes that property.
 
 ### Symbol Layout Guidelines
 
