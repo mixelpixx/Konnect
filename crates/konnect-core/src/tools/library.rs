@@ -4552,42 +4552,28 @@ async fn handle_delete_symbol(
         Err(e) => return Ok(e),
     };
 
-    let content = tokio::fs::read_to_string(&lib_path).await?;
+    let content = read_consistent(&lib_path)?;
 
-    // Find `  (symbol "NAME"` block
-    let pat = format!(r#"  (symbol "{}""#, symbol_name);
-    let start = content
-        .find(&pat)
+    // Structural, not a fixed-indent search: KiCad saves libraries
+    // tab-indented, and a nested unit `(symbol "NAME_1_1"` is never a match.
+    let (start, end) = find_direct_child_blocks(&content, "kicad_symbol_lib")
+        .into_iter()
+        .find(|&(s, e)| super::lib_symbol_name(&content[s..e]) == Some(symbol_name))
         .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
 
-    // Walk back to find preceding newline
-    let block_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-
-    // Walk forward to find end of block (depth count)
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    // Skip trailing newline
-    let end = if content[end..].starts_with('\n') {
-        end + 1
+    let line_start = content[..start].rfind('\n').map_or(0, |i| i + 1);
+    let block_start = if content[line_start..start].trim().is_empty() {
+        line_start
     } else {
-        end
+        start
+    };
+    let end = match content[end..].find('\n') {
+        Some(n) if content[end..end + n].trim().is_empty() => end + n + 1,
+        _ => end,
     };
 
     let new_content = format!("{}{}", &content[..block_start], &content[end..]);
-    write_atomic(&lib_path, &new_content)?;
+    write_atomic_if_unchanged(&lib_path, &content, &new_content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -9270,6 +9256,34 @@ mod tests {
         assert!(
             rc.contains("(pin input inverted (at "),
             "inverted style on a rectangle pin:\n{rc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_symbol_finds_tab_indented_kicad_saved_symbols() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("tabs.kicad_sym");
+        let body = "(kicad_symbol_lib\r\n\t(version 20251024)\r\n\
+            \t(symbol \"A\"\r\n\t\t(property \"Value\" \"x (y)\")\r\n\
+            \t\t(symbol \"A_1_1\"\r\n\t\t\t(pin passive line (at 0 0 0) (length 2.54) (name \"P\") (number \"1\"))\r\n\t\t)\r\n\t)\r\n\
+            \t(symbol \"B\"\r\n\t\t(symbol \"B_1_1\")\r\n\t)\r\n)\r\n";
+        std::fs::write(&lib, body).unwrap();
+        let ctx = test_ctx();
+
+        let nested = json!({"library_path": lib.to_string_lossy(), "symbol_name": "A_1_1"});
+        assert!(
+            handle_delete_symbol(&nested, &ctx).await.is_err(),
+            "a unit sub-symbol is not a library symbol"
+        );
+
+        let args = json!({"library_path": lib.to_string_lossy(), "symbol_name": "A"});
+        let res = handle_delete_symbol(&args, &ctx).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let after = std::fs::read_to_string(&lib).unwrap();
+        assert_eq!(top_level_symbol_names(&after).unwrap(), ["B"]);
+        assert_eq!(
+            after,
+            "(kicad_symbol_lib\r\n\t(version 20251024)\r\n\t(symbol \"B\"\r\n\t\t(symbol \"B_1_1\")\r\n\t)\r\n)\r\n"
         );
     }
 
