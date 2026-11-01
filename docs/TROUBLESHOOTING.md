@@ -138,7 +138,7 @@ Step by step (based on the diagnostic guide contributed in
 [#18](https://github.com/mixelpixx/Konnect/issues/18)):
 
 1. Open KiCAD normally.
-2. Go to **Edit → Preferences → Plugins** and check **"Enable KiCad API"**.
+2. Go to **Preferences → Plugins** (or **KiCad → Preferences → Plugins** on macOS) and check **"Enable KiCad API"**.
    Confirm a line like this appears:
 
    ```
