@@ -36,11 +36,17 @@ pub struct Symbol {
     pub at: At,
     pub mirror: Option<String>,
     pub unit: u32,
+    /// `(body_style …)`, eeschema's De Morgan / alternate-body selector, written
+    /// directly after `unit`. `None` for files that omit it.
+    pub body_style: Option<u32>,
     /// `(exclude_from_sim …)`, present in KiCAD 8+ files. `None` for older
     /// files that omit it, so a round-trip doesn't invent the token.
     pub exclude_from_sim: Option<bool>,
     pub in_bom: bool,
     pub on_board: bool,
+    /// `(in_pos_files …)`, written directly after `on_board`. `None` for files
+    /// that omit it.
+    pub in_pos_files: Option<bool>,
     pub dnp: bool,
     pub fields_autoplaced: bool,
     pub uuid: String,
@@ -64,6 +70,8 @@ impl Symbol {
             in_bom: true,
             on_board: true,
             dnp: false,
+            body_style: None,
+            in_pos_files: None,
             fields_autoplaced: false,
             uuid: uuid::Uuid::new_v4().to_string(),
             properties: vec![],
@@ -95,7 +103,13 @@ impl Symbol {
         let in_bom = node.get_bool("in_bom").unwrap_or(true);
         let on_board = node.get_bool("on_board").unwrap_or(true);
         let dnp = node.get_bool("dnp").unwrap_or(false);
+        // eeschema omits the token entirely when fields are not autoplaced — it
+        // never writes `no` — so presence is the whole state.
         let fields_autoplaced = node.find("fields_autoplaced").is_some();
+        let body_style = node
+            .find("body_style")
+            .and_then(|n| n.value()?.parse().ok());
+        let in_pos_files = node.get_bool("in_pos_files");
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
 
         let properties = node
@@ -114,9 +128,11 @@ impl Symbol {
             "at",
             "mirror",
             "unit",
+            "body_style",
             "exclude_from_sim",
             "in_bom",
             "on_board",
+            "in_pos_files",
             "dnp",
             "fields_autoplaced",
             "uuid",
@@ -134,6 +150,8 @@ impl Symbol {
             in_bom,
             on_board,
             dnp,
+            body_style,
+            in_pos_files,
             fields_autoplaced,
             uuid,
             properties,
@@ -161,14 +179,22 @@ impl Symbol {
             c.push(tagged("mirror", vec![atom(m.clone())]));
         }
         c.push(tagged("unit", vec![atom(self.unit.to_string())]));
+        if let Some(b) = self.body_style {
+            c.push(tagged("body_style", vec![atom(b.to_string())]));
+        }
         if let Some(x) = self.exclude_from_sim {
             c.push(tagged("exclude_from_sim", vec![atom(bool_kw(x))]));
         }
         c.push(tagged("in_bom", vec![atom(bool_kw(self.in_bom))]));
         c.push(tagged("on_board", vec![atom(bool_kw(self.on_board))]));
+        if let Some(x) = self.in_pos_files {
+            c.push(tagged("in_pos_files", vec![atom(bool_kw(x))]));
+        }
         c.push(tagged("dnp", vec![atom(bool_kw(self.dnp))]));
         if self.fields_autoplaced {
-            c.push(SexpNode::List(vec![atom("fields_autoplaced")]));
+            // eeschema writes the value; emitting the bare token made every
+            // autoplaced symbol in the sheet differ.
+            c.push(tagged("fields_autoplaced", vec![atom("yes")]));
         }
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
         for p in &self.properties {
