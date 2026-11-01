@@ -382,12 +382,25 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             // Everything that would fail the apply is found here, so `ready`
             // means ready: each footprint that cannot be prepared, named with
             // the parts that need it, and each connected pad a prepared
-            // footprint does not have.
+            // footprint does not have. So is each updated footprint that would
+            // lose what it owns, which the apply would not report.
             let mut preflight = unprepared
                 .into_iter()
                 .map(UnpreparedFootprint::into_diagnostic)
                 .collect::<Vec<_>>();
             preflight.extend(additions_missing_pads(&plan, &prepared));
+            if plan
+                .changes
+                .iter()
+                .any(|change| matches!(change, PlannedChange::Update { .. }))
+            {
+                let board_text = client.save_document_to_string_in(snapshot.document.clone())?;
+                preflight.extend(updates_not_carried(
+                    &plan,
+                    &snapshot.state.footprints,
+                    &board_text,
+                ));
+            }
             if !preflight.is_empty() {
                 refuse_plan(&mut plan, preflight);
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
@@ -2123,6 +2136,133 @@ fn additions_missing_pads(
         if !missing.is_empty() {
             diagnostics.push(pad_missing_conflict(reference, footprint_id, &missing));
         }
+    }
+    diagnostics
+}
+
+/// What a footprint owns that KiCad's API cannot carry through an update (#836).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NotCarried {
+    groups: usize,
+    points: usize,
+    variants: Vec<String>,
+}
+
+impl NotCarried {
+    fn of(footprint: &SexpNode) -> Self {
+        NotCarried {
+            groups: footprint.find_all("group").len(),
+            points: footprint.find_all("point").len(),
+            variants: footprint
+                .find_all("variant")
+                .into_iter()
+                // KiCad always writes a variant's name.
+                .map(|variant| variant.find_str("name").unwrap_or_default().to_string())
+                .collect(),
+        }
+    }
+
+    fn described(&self) -> String {
+        fn counted(count: usize, noun: &str) -> Option<String> {
+            match count {
+                0 => None,
+                1 => Some(format!("1 {noun}")),
+                n => Some(format!("{n} {noun}s")),
+            }
+        }
+        let variants = match self.variants.as_slice() {
+            [] => None,
+            [only] => Some(format!("variant '{only}'")),
+            all => Some(format!(
+                "variants {}",
+                listed(
+                    &all.iter()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<_>>()
+                )
+            )),
+        };
+        let mut parts = [
+            counted(self.groups, "group"),
+            counted(self.points, "point"),
+            variants,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let last = parts.pop().unwrap_or_default();
+        if parts.is_empty() {
+            last
+        } else {
+            format!("{} and {last}", parts.join(", "))
+        }
+    }
+}
+
+/// Every footprint in a board KiCad wrote, by KIID, with what it owns that an
+/// update would drop. A KIID written twice owns what both footprints own.
+fn not_carried_by_kiid(board_text: &str) -> Result<BTreeMap<String, NotCarried>> {
+    let tree =
+        konnect_sexp::parse_sexp(board_text).context("the board KiCad wrote did not parse")?;
+    let mut owned = BTreeMap::<String, NotCarried>::new();
+    for footprint in konnect_sexp::board::footprints(&tree) {
+        let Some(kiid) = footprint.find_str("uuid") else {
+            continue;
+        };
+        let found = NotCarried::of(footprint);
+        let entry = owned.entry(kiid.to_string()).or_default();
+        entry.groups += found.groups;
+        entry.points += found.points;
+        entry.variants.extend(found.variants);
+    }
+    Ok(owned)
+}
+
+/// Each updated footprint that owns groups, points or variants (#836).
+///
+/// KiCad's API updates a footprint by replacing it with a new one built from
+/// the `FootprintInstance` sent (`handleCreateUpdateItemsInternal`, KiCad
+/// 10.0.6), and that message carries none of these (`FOOTPRINT::Serialize`).
+/// No item read lists them, so `board_text` is the board as KiCad writes it.
+fn updates_not_carried(
+    plan: &SyncPlan,
+    footprints: &[BoardFootprint],
+    board_text: &str,
+) -> Vec<SyncDiagnostic> {
+    let owned = not_carried_by_kiid(board_text);
+    let mut diagnostics = Vec::new();
+    for change in &plan.changes {
+        let PlannedChange::Update {
+            kiid, reference, ..
+        } = change
+        else {
+            continue;
+        };
+        let message = match owned.as_ref().map(|owned| owned.get(kiid)) {
+            Ok(Some(found)) if *found == NotCarried::default() => continue,
+            Ok(Some(found)) => format!(
+                "{reference} owns {}, which KiCad drops when its API updates a footprint; \
+                 update {reference} with KiCad's Update PCB from Schematic, which edits it \
+                 in place",
+                found.described()
+            ),
+            Ok(None) => format!(
+                "{reference} ({kiid}) is not in the board KiCad wrote, so what an update \
+                 would drop is unknown; run the dry run again"
+            ),
+            Err(error) => format!("what an update of {reference} would drop is unknown: {error:#}"),
+        };
+        // The plan was made from these footprints, so the update's is among them.
+        let footprint_id = footprints
+            .iter()
+            .find(|footprint| &footprint.kiid == kiid)
+            .map_or("", |footprint| footprint.footprint_id.as_str());
+        diagnostics.push(footprint_conflict(
+            "footprint_children_not_carried",
+            message,
+            footprint_id,
+            vec![reference.clone()],
+        ));
     }
     diagnostics
 }
@@ -4757,7 +4897,8 @@ mod tests {
     /// `kicad-cli` that hands back `netlist`, and a protobuf mock holding the
     /// project's board open with nothing on it. It can also apply: the mock
     /// keeps what `CreateItems` sent and lists it back as the board's
-    /// footprints, shaped by `readback`.
+    /// footprints, shaped by `readback`, and `UpdateItems` replaces the
+    /// footprint with the KIID sent, as KiCad does.
     struct ServedSync {
         _temp: tempfile::TempDir,
         _kicad: crate::test_support::MockIpcServer,
@@ -4766,6 +4907,10 @@ mod tests {
         board: PathBuf,
         exported: PathBuf,
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+        /// What `SaveDocumentToString` answers with.
+        board_text: std::sync::Arc<std::sync::Mutex<String>>,
+        /// The command each request carried, in order.
+        commands: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     /// What the mock's board holds after `CreateItems`.
@@ -4806,17 +4951,50 @@ mod tests {
             Self::build(None, Vec::new(), readback).await
         }
 
+        /// As [`Self::new`], with KiCad holding `footprints` and `nets`.
+        async fn holding(footprints: Vec<prost_types::Any>, nets: &[&str]) -> Self {
+            Self::build_holding(None, Vec::new(), Readback::AsSent, footprints, nets).await
+        }
+
         async fn build(
             outline: Option<(f64, f64, f64, f64)>,
             refused: Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType>,
             readback: Readback,
         ) -> Self {
+            Self::build_holding(outline, refused, readback, Vec::new(), &[]).await
+        }
+
+        async fn build_holding(
+            outline: Option<(f64, f64, f64, f64)>,
+            refused: Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType>,
+            readback: Readback,
+            footprints: Vec<prost_types::Any>,
+            nets: &[&str],
+        ) -> Self {
             use crate::tools::cli::test_support::write_script;
             use konnect_ipc::gen::kiapi;
 
-            let created =
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::<prost_types::Any>::new()));
+            let held = footprints
+                .iter()
+                .filter_map(|item| {
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                        .ok()?
+                        .id
+                })
+                .map(|id| id.value)
+                .collect::<Vec<_>>();
+            let nets = nets.iter().map(|net| net.to_string()).collect::<Vec<_>>();
+            let created = std::sync::Arc::new(std::sync::Mutex::new(footprints));
             let board_items = created.clone();
+            let board_text = std::sync::Arc::new(std::sync::Mutex::new(
+                String::from_utf8_lossy(include_bytes!(
+                    "../../tests/fixtures/specctra_two_resistors.kicad_pcb"
+                ))
+                .into_owned(),
+            ));
+            let text = board_text.clone();
+            let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = commands.clone();
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -4842,6 +5020,8 @@ mod tests {
                 &board,
                 refused,
                 move |command| {
+                    let name = command.type_url.rsplit('.').next().unwrap_or_default();
+                    seen.lock().unwrap().push(name.to_string());
                     if command.type_url.ends_with("GetItems") {
                         let request =
                             kiapi::common::commands::GetItems::decode(command.value.as_slice())
@@ -4875,7 +5055,16 @@ mod tests {
                     }
                     if command.type_url.ends_with("GetNets") {
                         return Some(konnect_ipc::builders::pack_any(
-                            &kiapi::board::commands::NetsResponse { nets: Vec::new() },
+                            &kiapi::board::commands::NetsResponse {
+                                nets: nets
+                                    .iter()
+                                    .zip(1..)
+                                    .map(|(name, value)| kiapi::board::types::Net {
+                                        code: Some(kiapi::board::types::NetCode { value }),
+                                        name: name.clone(),
+                                    })
+                                    .collect(),
+                            },
                             "kiapi.board.commands.NetsResponse",
                         ));
                     }
@@ -4883,14 +5072,17 @@ mod tests {
                         return Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
                             command,
                             |kiid| {
+                                if held.iter().any(|held| held == kiid) {
+                                    return (0.0, 0.0, 2.0, 1.0);
+                                }
                                 assert_eq!(kiid, "outline", "only the outline is listed");
                                 outline.expect("an outline to measure")
                             },
                         ));
                     }
                     if command.type_url.ends_with("SaveDocumentToString") {
-                        // The apply's pre-commit snapshot: the board as KiCad
-                        // holds it, which here is the saved file.
+                        // The board as KiCad holds it: the saved file, unless a
+                        // test holds another.
                         let request = kiapi::common::commands::SaveDocumentToString::decode(
                             command.value.as_slice(),
                         )
@@ -4898,10 +5090,7 @@ mod tests {
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::SavedDocumentResponse {
                                 document: request.document,
-                                contents: String::from_utf8_lossy(include_bytes!(
-                                    "../../tests/fixtures/specctra_two_resistors.kicad_pcb"
-                                ))
-                                .into_owned(),
+                                contents: text.lock().unwrap().clone(),
                             },
                             "kiapi.common.commands.SavedDocumentResponse",
                         ));
@@ -4948,6 +5137,21 @@ mod tests {
                         let request =
                             kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
                                 .expect("UpdateItems request");
+                        let kiid = |item: &prost_types::Any| {
+                            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                                .ok()
+                                .and_then(|footprint| footprint.id)
+                        };
+                        let mut listed = board_items.lock().unwrap();
+                        for updated in &request.items {
+                            if let Some(held) = listed
+                                .iter_mut()
+                                .find(|held| kiid(held).is_some() && kiid(held) == kiid(updated))
+                            {
+                                *held = updated.clone();
+                            }
+                        }
+                        drop(listed);
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::UpdateItemsResponse {
                                 header: None,
@@ -4996,7 +5200,20 @@ mod tests {
                 board,
                 exported,
                 created,
+                board_text,
+                commands,
             }
+        }
+
+        /// Have `SaveDocumentToString` answer with `text` from now on.
+        fn hold_board_text(&self, text: &str) {
+            *self.board_text.lock().unwrap() = text.to_string();
+        }
+
+        /// How many requests carried `command`.
+        fn sent(&self, command: &str) -> usize {
+            let commands = self.commands.lock().unwrap();
+            commands.iter().filter(|name| *name == command).count()
         }
 
         /// One `tools/call`, with the result's `isError` beside the body.
@@ -5583,5 +5800,206 @@ mod tests {
             "{}",
             refusal.1
         );
+    }
+
+    // ─── #836: refuse an update that would drop what a footprint owns ───────
+
+    /// A board KiCad wrote: U1 owns a group, a point and a variant, R1 owns
+    /// none of them, and a board-level group holds both.
+    /// Provenance in `tests/fixtures/footprint_children_kicad10.README.md`.
+    const FOOTPRINT_CHILDREN: &str =
+        include_str!("../../tests/fixtures/footprint_children_kicad10.kicad_pcb");
+    const OWNS_ALL_THREE: &str = "c7901245-d0c4-476f-8215-85f1183d04de";
+    const OWNS_NONE: &str = "20a44d6b-d6bb-4ec1-ac0c-f1d3d7e20db2";
+    const REFUSED_FOR: &str = "R1 owns 1 group, 1 point and variant 'NoTimer'";
+
+    #[test]
+    fn what_a_footprint_owns_is_read_from_the_board_kicad_wrote() {
+        let owned = not_carried_by_kiid(FOOTPRINT_CHILDREN).unwrap();
+
+        assert_eq!(
+            owned[OWNS_ALL_THREE],
+            NotCarried {
+                groups: 1,
+                points: 1,
+                variants: vec!["NoTimer".to_string()],
+            }
+        );
+        assert_eq!(owned[OWNS_NONE], NotCarried::default());
+    }
+
+    /// Whichever footprint comes last, neither hides what the other owns.
+    #[test]
+    fn a_kiid_written_twice_owns_what_both_footprints_own() {
+        let owned = not_carried_by_kiid(
+            "(kicad_pcb\n\
+             (footprint \"A\" (uuid \"twice\") (group \"\" (uuid \"g\") (members \"m\")))\n\
+             (footprint \"B\" (uuid \"twice\") (point (at 0 0) (uuid \"p\"))))",
+        )
+        .unwrap();
+
+        assert_eq!(
+            owned["twice"],
+            NotCarried {
+                groups: 1,
+                points: 1,
+                variants: Vec::new(),
+            }
+        );
+    }
+
+    /// KiCad holding the captured R1 at `value` under `kiid`, a KIID of
+    /// [`FOOTPRINT_CHILDREN`], which it answers `SaveDocumentToString` with.
+    async fn served_r1(kiid: &str, value: &str) -> ServedSync {
+        use konnect_ipc::gen::kiapi;
+
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        footprint.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: ["sheet-uuid", "symbol-uuid"]
+                .into_iter()
+                .map(|value| kiapi::common::types::Kiid {
+                    value: value.to_string(),
+                })
+                .collect(),
+            path_human_readable: "/Power/".to_string(),
+        });
+        set_field_text(&mut footprint.value_field, "Value", value);
+        let held =
+            konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let served = ServedSync::holding(vec![held], &["VCC", "GND"]).await;
+        served.hold_board_text(FOOTPRINT_CHILDREN);
+        served
+    }
+
+    /// The schematic's R1, at 10k, on the captured footprint and its nets.
+    fn r1_at_10k() -> String {
+        ONE_RESISTOR
+            .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
+            .replace("/Power/VCC", "VCC")
+    }
+
+    /// A dry run, then the apply of its plan revision, whatever its status.
+    async fn dry_run_then_apply(served: &ServedSync) -> (serde_json::Value, serde_json::Value) {
+        let (_, plan) = served.dry_run_result(&r1_at_10k()).await;
+        let (_, applied) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic.to_string_lossy(),
+                "board": served.board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }))
+            .await;
+        (plan, applied)
+    }
+
+    fn assert_refused(body: &serde_json::Value, because: &str) {
+        assert_eq!(body["status"], "conflict", "{body:#}");
+        assert_eq!(body["changes"], serde_json::json!([]));
+        assert_eq!(body["coverage"]["footprints_updated"]["planned"], 0);
+        let diagnostic = &body["diagnostics"][0];
+        assert_eq!(diagnostic["code"], "footprint_children_not_carried");
+        assert_eq!(diagnostic["reference"], "R1");
+        assert_eq!(diagnostic["footprint_id"], "Resistor_SMD:R_0402");
+        let message = diagnostic["message"].as_str().unwrap();
+        assert!(message.starts_with(because), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_update_that_would_drop_what_a_footprint_owns_is_refused_before_the_commit() {
+        let served = served_r1(OWNS_ALL_THREE, "1k").await;
+
+        let (plan, applied) = dry_run_then_apply(&served).await;
+
+        assert_refused(&plan, REFUSED_FOR);
+        assert_refused(&applied, REFUSED_FOR);
+        assert_eq!(served.sent("BeginCommit"), 0, "refused before the commit");
+        assert_eq!(served.sent("UpdateItems"), 0);
+    }
+
+    /// The control: the same update of a footprint that owns none of them,
+    /// read from the same board, is applied.
+    #[tokio::test]
+    async fn a_footprint_that_owns_none_of_them_is_still_updated() {
+        let served = served_r1(OWNS_NONE, "1k").await;
+
+        let (plan, applied) = dry_run_then_apply(&served).await;
+
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_updated"]["applied"], 1);
+        let board = served.sent_footprints();
+        let r1 = board_footprint_from_instance(&board[0]).unwrap();
+        assert_eq!((r1.kiid.as_str(), r1.value.as_str()), (OWNS_NONE, "10k"));
+    }
+
+    /// The apply reads the board again: a footprint that gains a group, a
+    /// point and a variant after a `ready` dry run is refused then.
+    #[tokio::test]
+    async fn a_footprint_that_gains_them_after_the_dry_run_is_refused_at_apply() {
+        let served = served_r1(OWNS_NONE, "1k").await;
+        let (_, plan) = served.dry_run_result(&r1_at_10k()).await;
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+
+        // The same board with the two footprints' KIIDs swapped.
+        served.hold_board_text(
+            &FOOTPRINT_CHILDREN
+                .replace(OWNS_NONE, "\u{0}")
+                .replace(OWNS_ALL_THREE, OWNS_NONE)
+                .replace('\u{0}', OWNS_ALL_THREE),
+        );
+        let (_, applied) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic.to_string_lossy(),
+                "board": served.board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"],
+            }))
+            .await;
+
+        assert_refused(&applied, REFUSED_FOR);
+        assert_eq!(served.sent("UpdateItems"), 0);
+    }
+
+    /// The board text is read for updates only: R1 already holds 10k.
+    #[tokio::test]
+    async fn a_plan_without_updates_does_not_read_the_board() {
+        let served = served_r1(OWNS_ALL_THREE, "10k").await;
+
+        let (_, plan) = served.dry_run_result(&r1_at_10k()).await;
+
+        assert_eq!(plan["status"], "noop", "{plan:#}");
+        assert_eq!(served.sent("SaveDocumentToString"), 0);
+    }
+
+    /// A footprint the board text does not hold is not taken to own nothing.
+    #[tokio::test]
+    async fn a_footprint_missing_from_the_board_kicad_wrote_is_refused() {
+        let served = served_r1("00000000-0000-0000-0000-000000000836", "1k").await;
+
+        let (plan, _) = dry_run_then_apply(&served).await;
+
+        assert_refused(
+            &plan,
+            "R1 (00000000-0000-0000-0000-000000000836) is not in the board",
+        );
+        assert_eq!(served.sent("UpdateItems"), 0);
+    }
+
+    /// Nor is a footprint on a board text that cannot be read.
+    #[tokio::test]
+    async fn a_board_text_that_does_not_parse_refuses_each_update() {
+        let served = served_r1(OWNS_NONE, "1k").await;
+        served.hold_board_text("(kicad_pcb (footprint");
+
+        let (plan, _) = dry_run_then_apply(&served).await;
+
+        assert_refused(&plan, "what an update of R1 would drop is unknown");
+        assert_eq!(served.sent("UpdateItems"), 0);
     }
 }

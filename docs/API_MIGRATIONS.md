@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `update_pcb_from_schematic` refuses an update that would drop a footprint's groups, points or variants (patch release)
+
+KiCad's API updates a footprint by replacing it with one built from the
+footprint message sent, and that message carries none of the groups, points or
+variants the footprint owns, so the replacement lacked them. A planned update
+of such a footprint now makes the dry run and the apply a `conflict`, before
+any commit, with one `footprint_children_not_carried` diagnostic per footprint
+naming what it owns. Update those footprints with KiCad's Update PCB from
+Schematic, which edits them in place. No item read lists these, so the sync
+reads the board as KiCad writes it, and only when the plan updates a footprint;
+a footprint missing from that text, or text that does not parse, refuses the
+update the same way. A footprint's membership of a board-level group is not
+affected: KiCad restores it on replacement. An update still drops what a
+footprint owns beyond these three that the message does not carry, such as its
+unit metadata, which KiCad's own Update PCB restores. The response shape is
+unchanged (#836).
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
