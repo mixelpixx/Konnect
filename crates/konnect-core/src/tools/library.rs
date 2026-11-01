@@ -79,7 +79,12 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
                 "description": "Starting position, not a fixed one — see `x`."
             },
             "angle": { "type": "number", "default": 0 },
-            "length": { "type": "number", "default": 2.54 }
+            "length": { "type": "number", "default": 2.54 },
+            "hide": {
+                "type": "boolean",
+                "default": false,
+                "description": "true writes KiCad's `(hide yes)`: the pin is not drawn but still connects at its position. Stack hidden pins under one visible pin at the same x/y to tie many pads (e.g. a connector's grounds) to a single connection point."
+            }
         },
         "required": required
     })
@@ -3075,15 +3080,17 @@ fn emit_pin(
     name: &str,
     number: &str,
     name_font: f64,
+    hide: bool,
 ) -> String {
     format!(
-        "\n    (pin {} {} (at {} {} {})\n      (length {})\n      (name \"{}\" (effects (font (size {} {}))))\n      (number \"{}\" (effects (font (size {} {}))))\n    )",
+        "\n    (pin {} {} (at {} {} {})\n      (length {}){}\n      (name \"{}\" (effects (font (size {} {}))))\n      (number \"{}\" (effects (font (size {} {}))))\n    )",
         pin_type,
         style,
         fmt_f64(x),
         fmt_f64(y),
         fmt_f64(angle),
         fmt_f64(length),
+        if hide { "\n      (hide yes)" } else { "" },
         name,
         name_font,
         name_font,
@@ -3091,6 +3098,11 @@ fn emit_pin(
         PIN_TEXT,
         PIN_TEXT
     )
+}
+
+/// A pin's `hide` argument; absent means drawn.
+fn pin_is_hidden(pin: &serde_json::Value) -> bool {
+    pin["hide"].as_bool().unwrap_or(false)
 }
 
 // ── Glyph geometry (coordinates copied verbatim from KiCAD 10's stock symbols)
@@ -3357,6 +3369,7 @@ fn build_glyph_unit(
             name,
             number,
             GLYPH_PIN_NAME_TEXT,
+            pin_is_hidden(p),
         ));
     }
 
@@ -3383,6 +3396,7 @@ fn build_glyph_unit(
         out_name,
         out_number,
         GLYPH_PIN_NAME_TEXT,
+        pin_is_hidden(out),
     ));
 
     // Power pins (e.g. a single op-amp's V+/V-) enter vertically, alternating
@@ -3411,6 +3425,7 @@ fn build_glyph_unit(
             name,
             number,
             GLYPH_PIN_NAME_TEXT,
+            pin_is_hidden(p),
         ));
     }
 
@@ -3466,6 +3481,7 @@ fn build_symbol_unit(
                 pin["name"].as_str().unwrap_or("~"),
                 pin["number"].as_str().unwrap_or("1"),
                 PIN_TEXT,
+                pin_is_hidden(pin),
             ));
         }
         return Ok(BuiltUnit {
@@ -3964,6 +3980,7 @@ fn build_rect_unit(
             &g.name,
             pin["number"].as_str().unwrap_or("1"),
             PIN_TEXT,
+            pin_is_hidden(pin),
         ));
     }
     let body_sexp = match body {
@@ -4098,6 +4115,7 @@ struct ResolvedPin {
     requested: Option<(f64, f64)>,
     x: f64,
     y: f64,
+    hide: bool,
 }
 
 impl ResolvedPin {
@@ -4112,6 +4130,7 @@ impl ResolvedPin {
             requested,
             x,
             y,
+            hide: pin_is_hidden(pin),
         }
     }
 
@@ -4129,6 +4148,9 @@ impl ResolvedPin {
             "x": self.x,
             "y": self.y
         });
+        if self.hide {
+            out["hide"] = json!(true);
+        }
         // Only when it differs, so the common case stays compact and a moved
         // pin stands out.
         if let (Some((rx, ry)), Some(_)) = (self.requested, self.displacement()) {
@@ -9271,6 +9293,64 @@ mod tests {
             rc.contains("(pin input inverted (at "),
             "inverted style on a rectangle pin:\n{rc}"
         );
+    }
+
+    #[tokio::test]
+    async fn hidden_pins_stack_under_a_visible_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("h.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "H",
+            "reference_prefix": "J",
+            "units": [{
+                "graphics": [{"type":"rect","start":{"x":-5.08,"y":5.08},"end":{"x":5.08,"y":-5.08},
+                              "stroke_width_mm":0.254,"fill":"background"}],
+                "pins": [
+                    {"number":"A1","name":"GND","type":"passive","x":-7.62,"y":0.0},
+                    {"number":"A2","name":"GND","type":"passive","x":-7.62,"y":0.0,"hide":true},
+                    {"number":"A3","name":"GND","type":"passive","x":-7.62,"y":0.0,"hide":true},
+                    {"number":"B1","name":"SIG","type":"passive","x":7.62,"y":0.0,"angle":180,"hide":false}
+                ]
+            }]
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        let c = std::fs::read_to_string(&lib).unwrap();
+        let pin_of = |number: &str| -> String {
+            let at = c.find(&format!("(number \"{number}\"")).unwrap();
+            let start = c[..at].rfind("(pin ").unwrap();
+            c[start..at].to_string()
+        };
+        assert!(
+            !pin_of("A1").contains("(hide yes)"),
+            "A1 stays visible:\n{c}"
+        );
+        assert!(
+            pin_of("A2").contains("(length 2.54)\n      (hide yes)"),
+            "A2 hidden:\n{c}"
+        );
+        assert!(pin_of("A3").contains("(hide yes)"), "A3 hidden:\n{c}");
+        assert!(
+            !pin_of("B1").contains("(hide yes)"),
+            "hide:false is drawn:\n{c}"
+        );
+        assert_eq!(
+            c.matches("(hide yes)").count(),
+            2 + 3,
+            "two pins plus the three hidden fields:\n{c}"
+        );
+
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let v: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        let pins = v["units"][0]["pins"]
+            .as_array()
+            .expect("units[0].pins reported");
+        let hidden: Vec<&str> = pins
+            .iter()
+            .filter(|p| p["hide"] == json!(true))
+            .map(|p| p["number"].as_str().unwrap())
+            .collect();
+        assert_eq!(hidden, ["A2", "A3"]);
     }
 
     #[tokio::test]
