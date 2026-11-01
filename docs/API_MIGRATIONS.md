@@ -3,6 +3,34 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: sheet tools keep symbol instance paths to live sheets (patch release)
+
+`add_hierarchical_sheet` used to add a path to each symbol of a reused child
+file and never remove one. After `delete_sheet` and a re-add, the child kept a
+path naming the deleted sheet, and every later Konnect write to it was refused
+with `stale_target`. Linking a file now keys its symbols to exactly the sheets
+that place it in the project. Paths naming a sheet that no longer exists are
+dropped, but only when every sheet of the hierarchy can be read. Paths under
+another project name are kept.
+
+- `delete_sheet` drops the deleted sheet's path from a child file that other
+  sheets still place. It adds `unlinked_symbol_instances`, the number of
+  symbols it changed. A file nothing else places is left untouched.
+- `duplicate_sheet` keys the copy's symbols to the new sheet only, not also to
+  the source's sheets.
+- A sheet added inside a child sheet is keyed from the project root through
+  that sheet, as KiCad resolves it, rather than from the child file's own UUID.
+  `project_name` for `add_hierarchical_sheet` and `duplicate_sheet` now
+  defaults to the owning project's name, not the parent file's stem. A
+  different name is refused as `invalid_argument`, since symbols keyed to it
+  fail every later write. A child sheet placed more than once cannot take a
+  new sheet (`invalid_argument` on `schematic`). A sheet file in a project
+  folder that no project places is refused as `conflict`, because a sheet
+  added inside it would be keyed to no real hierarchy. Each refusal comes
+  before anything is written (#478).
+- Only a project root receives the `sheet_instances` footer. A nested parent
+  no longer gets the root's page-1 entry written into it.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
