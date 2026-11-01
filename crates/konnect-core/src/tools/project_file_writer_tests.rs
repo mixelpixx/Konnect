@@ -23,13 +23,13 @@ const FIXTURE_DIR: &str = concat!(
 );
 
 /// A copy of the fixture project, kept alive for the test's duration.
-struct Project {
+pub(super) struct Project {
     _dir: tempfile::TempDir,
-    board: PathBuf,
-    project_file: PathBuf,
+    pub(super) board: PathBuf,
+    pub(super) project_file: PathBuf,
 }
 
-fn project() -> Project {
+pub(super) fn project() -> Project {
     let dir = tempfile::tempdir().unwrap();
     for extension in ["kicad_pcb", "kicad_pro"] {
         std::fs::copy(
@@ -45,7 +45,7 @@ fn project() -> Project {
     }
 }
 
-async fn handler_talking_to(address: &str) -> McpHandler {
+pub(super) async fn handler_talking_to(address: &str) -> McpHandler {
     McpHandler::new(ServerConfig {
         kicad_cli: String::new(),
         kicad_binary: String::new(),
@@ -59,7 +59,12 @@ async fn handler_talking_to(address: &str) -> McpHandler {
     .expect("handler builds")
 }
 
-async fn call(handler: &McpHandler, tool: &str, board: &Path, arguments: &Value) -> CallToolResult {
+pub(super) async fn call(
+    handler: &McpHandler,
+    tool: &str,
+    board: &Path,
+    arguments: &Value,
+) -> CallToolResult {
     let mut arguments = arguments.clone();
     arguments["board"] = json!(board.to_string_lossy());
     let response = handler
@@ -76,7 +81,7 @@ async fn call(handler: &McpHandler, tool: &str, board: &Path, arguments: &Value)
         .expect("result uses the advertised MCP shape")
 }
 
-fn text_of(result: &CallToolResult) -> &str {
+pub(super) fn text_of(result: &CallToolResult) -> &str {
     match result.content.first() {
         Some(ToolContent::Text { text }) => text,
         other => panic!("expected text content, got {other:?}"),
