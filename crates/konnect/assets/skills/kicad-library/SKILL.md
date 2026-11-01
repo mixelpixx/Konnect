@@ -359,6 +359,15 @@ set_footprint_metadata(
   renumber one or every matching direct-child pad atomically.
 - Use `edit_footprint_pad` with `zone_connect` (`solid`, `thermal`, `none`) to
   override how zones connect to one pad, or `inherited` to remove the override.
+- Use `edit_footprint_pad` with `fabrication_property` to set KiCad's pad
+  fabrication property, such as `castellated`, `heatsink` or `testpoint` (the
+  schema lists all of KiCad's values), or `none` to remove it.
+  `create_footprint` pads take the same field. KiCad's DRC skips the
+  copper-to-edge check for a castellated pad. A property that does not suit
+  the pad type (castellated on an SMD pad) is written, and KiCad's padstack
+  warning comes back in `warnings`. The property lives in the footprint: get
+  it onto a board with KiCad's Update Footprints from Library, since KiCad 10's
+  IPC pad message cannot carry it.
 
 ### Existing Footprint 3D Models
 

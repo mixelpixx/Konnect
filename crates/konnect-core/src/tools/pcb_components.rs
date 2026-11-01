@@ -3265,7 +3265,7 @@ fn saved_pad_count(board_path: &std::path::Path, reference: &str) -> Option<usiz
         .map(|fp| fp.find_all("pad").len())
 }
 
-fn file_pad_drill(pad: &konnect_sexp::SexpNode) -> Option<konnect_ipc::IpcPadDrill> {
+pub(crate) fn file_pad_drill(pad: &konnect_sexp::SexpNode) -> Option<konnect_ipc::IpcPadDrill> {
     let drill = pad.find("drill")?;
     let oval = drill.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("oval");
     let first = if oval { 2 } else { 1 };
