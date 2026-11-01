@@ -57,24 +57,69 @@ pub(crate) fn optional_string_array(
         .collect()
 }
 
+/// The board's declared layers that `keep` selects, in layer-table order.
+fn declared_layers(
+    board_source: &str,
+    keep: fn(&konnect_sexp::layers::Layer) -> bool,
+) -> anyhow::Result<Vec<String>> {
+    let board = konnect_sexp::parser::parse_sexp(board_source)?;
+    let declared = konnect_sexp::layers::layers(&board);
+    if declared.is_empty() {
+        anyhow::bail!("board has no (layers) table");
+    }
+    Ok(declared
+        .into_iter()
+        .filter(keep)
+        .map(|layer| layer.name)
+        .collect())
+}
+
+/// `default` applied to the board at `board`, for a call that names no layers.
+async fn default_layers(
+    board: &Path,
+    default: fn(&str) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<Vec<String>> {
+    let source = tokio::fs::read_to_string(board)
+        .await
+        .with_context(|| format!("cannot read board {}", board.display()))?;
+    default(&source)
+}
+
 /// Default Gerber selection for a fabrication package: every enabled copper
 /// layer plus solder mask, silkscreen, and the board outline. It deliberately
 /// excludes drawings, comments, adhesive, courtyard, fab, and margin layers.
 pub(crate) fn standard_gerber_layers(board_source: &str) -> anyhow::Result<Vec<String>> {
-    let board = konnect_sexp::parser::parse_sexp(board_source)?;
-    let layers = konnect_sexp::layers::layers(&board)
-        .into_iter()
-        .filter(|layer| {
-            layer.is_copper()
-                || matches!(
-                    layer.name.as_str(),
-                    "F.Mask" | "B.Mask" | "F.SilkS" | "B.SilkS" | "Edge.Cuts"
-                )
-        })
-        .map(|layer| layer.name)
-        .collect::<Vec<_>>();
+    let layers = declared_layers(board_source, |layer| {
+        layer.is_copper()
+            || matches!(
+                layer.name.as_str(),
+                "F.Mask" | "B.Mask" | "F.SilkS" | "B.SilkS" | "Edge.Cuts"
+            )
+    })?;
     if layers.is_empty() {
         anyhow::bail!("board declares no standard fabrication layers");
+    }
+    Ok(layers)
+}
+
+/// The front view, bottom to top: `kicad-cli` draws a single-page plot in
+/// `--layers` order, so the silkscreen goes over the mask openings.
+const FRONT_VIEW: [&str; 4] = ["F.Cu", "F.Mask", "F.SilkS", "Edge.Cuts"];
+
+/// Default selection for a single-page PDF or SVG: the board seen from the
+/// front. `kicad-cli` needs at least one layer and has no "visible layers"
+/// option, and stacking every copper layer on one page is unreadable.
+pub(crate) fn front_view_layers(board_source: &str) -> anyhow::Result<Vec<String>> {
+    let declared = declared_layers(board_source, |layer| {
+        FRONT_VIEW.contains(&layer.name.as_str())
+    })?;
+    let layers = FRONT_VIEW
+        .into_iter()
+        .filter(|name| declared.iter().any(|layer| layer == name))
+        .map(String::from)
+        .collect::<Vec<_>>();
+    if layers.is_empty() {
+        anyhow::bail!("board declares none of {}", FRONT_VIEW.join(", "));
     }
     Ok(layers)
 }
@@ -143,7 +188,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output PDF file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Exact layer names to plot on one page. Omit or pass an empty array for the front view: F.Cu, F.Mask, F.SilkS, and Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -162,7 +207,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output SVG file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Exact layer names to plot on one page. Omit or pass an empty array for the front view: F.Cu, F.Mask, F.SilkS, and Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -434,16 +479,13 @@ async fn handle_export_gerber(
     let output_dir = get_path(args, "output_dir")?;
     let drill = args["drill_file"].as_bool().unwrap_or(true);
 
-    let requested_layers = match optional_string_array(args, "layers") {
+    let mut layers = match optional_string_array(args, "layers") {
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
-    let layers = if requested_layers.is_empty() {
-        let board_source = tokio::fs::read_to_string(&board).await?;
-        standard_gerber_layers(&board_source)?
-    } else {
-        requested_layers
-    };
+    if layers.is_empty() {
+        layers = default_layers(&board, standard_gerber_layers).await?;
+    }
     let layer_refs = layers.iter().map(String::as_str).collect::<Vec<_>>();
 
     // Ensure output dir exists
@@ -489,15 +531,13 @@ async fn handle_export_pdf(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    // Collect optional layer list
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut layers = match optional_string_array(args, "layers") {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
+    if layers.is_empty() {
+        layers = default_layers(&board, front_view_layers).await?;
+    }
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -508,6 +548,7 @@ async fn handle_export_pdf(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -521,14 +562,13 @@ async fn handle_export_svg(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut layers = match optional_string_array(args, "layers") {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
+    if layers.is_empty() {
+        layers = default_layers(&board, front_view_layers).await?;
+    }
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -539,6 +579,7 @@ async fn handle_export_svg(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -1518,5 +1559,133 @@ mod fabrication_option_tests {
         };
         let error: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(error["error"]["field"], "layers[1]");
+    }
+}
+
+/// `export_pdf` and `export_svg` documented an omitted `layers` as "all
+/// visible layers", but sent no `--layers` at all, and `kicad-cli` refuses
+/// that with "At least one layer must be specified" (#465).
+#[cfg(test)]
+mod default_plot_layers_tests {
+    use super::*;
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    /// The promised front view, bottom layer first; restated here rather than
+    /// read from the code. `kicad-cli` 10.0.6 plots this fixture with these
+    /// layers; the inner, back and documentation layers it declares stay off.
+    const PROMISED: [&str; 4] = ["F.Cu", "F.Mask", "F.SilkS", "Edge.Cuts"];
+
+    #[test]
+    fn the_default_is_the_front_view_of_a_kicad_board() {
+        let board = include_str!("../../tests/fixtures/six_layer_power_planes_kicad10.kicad_pcb");
+        assert_eq!(front_view_layers(board).unwrap(), PROMISED);
+    }
+
+    /// Calls `tool` through the served dispatch with a fake `kicad-cli` that
+    /// records its command line and writes the file named by `--output`.
+    async fn export(tool: &str, layers: Option<Value>) -> (Value, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/six_layer_power_planes_kicad10.kicad_pcb"
+            ),
+            &board,
+        )
+        .unwrap();
+        let recorded = dir.path().join("argv.txt");
+        let cli = cli::test_support::write_script(
+            dir.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --output ] && printf x > \"$2\"; shift; done\n",
+                recorded.display()
+            ),
+            &format!(
+                "@echo off\r\necho %* > \"{}\"\r\n\
+                 :next\r\nif \"%~1\"==\"--output\" (echo x> \"%~2\")\r\n\
+                 shift\r\nif not \"%~1\"==\"\" goto next\r\nexit /b 0\r\n",
+                recorded.display()
+            ),
+        );
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: cli.display().to_string(),
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut args = json!({
+            "board": board.display().to_string(),
+            "output": dir.path().join(tool.replace("export_", "out.")).display().to_string(),
+        });
+        if let Some(layers) = layers {
+            args["layers"] = layers;
+        }
+        let result = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 465, "method": "tools/call",
+                "params": {"name": tool, "arguments": args}}))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_ne!(result["isError"], true, "{tool}: {text}");
+        let body = serde_json::from_str(text).unwrap();
+        // Windows quotes batch-file arguments that hold a comma.
+        let argv = std::fs::read_to_string(&recorded).unwrap().replace('"', "");
+        (body, argv)
+    }
+
+    #[tokio::test]
+    async fn an_omitted_or_empty_layer_list_plots_the_front_view() {
+        for tool in ["export_pdf", "export_svg"] {
+            for layers in [None, Some(json!([]))] {
+                let (body, argv) = export(tool, layers.clone()).await;
+                assert!(
+                    argv.contains("--layers F.Cu,F.Mask,F.SilkS,Edge.Cuts"),
+                    "{tool} {layers:?}: {argv}"
+                );
+                assert_eq!(body["layers"], json!(PROMISED), "{tool} {layers:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_layer_list_is_plotted_as_given() {
+        for tool in ["export_pdf", "export_svg"] {
+            let (body, argv) = export(tool, Some(json!(["B.Cu", "Edge.Cuts"]))).await;
+            assert!(argv.contains("--layers B.Cu,Edge.Cuts"), "{tool}: {argv}");
+            assert_eq!(body["layers"], json!(["B.Cu", "Edge.Cuts"]), "{tool}");
+        }
+    }
+
+    /// The default reads the board before `kicad-cli` runs, so a board that
+    /// is not there must still be named in the error.
+    #[tokio::test]
+    async fn a_missing_board_is_named_when_the_default_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("missing.kicad_pcb");
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let error = handle_export_svg(
+            &json!({
+                "board": board.display().to_string(),
+                "output": dir.path().join("out.svg").display().to_string(),
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("an unreadable board fails before kicad-cli runs");
+        assert!(
+            format!("{error:#}").contains(&board.display().to_string()),
+            "{error:#}"
+        );
     }
 }
