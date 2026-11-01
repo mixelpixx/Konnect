@@ -56,11 +56,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "search_jlcpcb_parts",
-            "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive.",
+            "Search the local JLCPCB component database by keyword, value, or category. The query is split on whitespace and a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description; case-insensitive. A word that is a value (a number with an optional prefix and unit, like 20pF, 4.7uF, 1k or 0402) must match as a whole value: 20pF does not find 220pF. Unit spellings are not converted: 100nF does not find 0.1uF.",
             json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search words, separated by spaces. A part must contain every word, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive; % and _ are literal)" },
+                    "query": { "type": "string", "description": "Search words, separated by spaces. A part must contain every word, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive; % and _ are literal). Value words such as 20pF or 1k match only as whole values" },
                     "category": { "type": "string", "description": "Component category filter (optional)" },
                     "basic_only": { "type": "boolean", "description": "Restrict to JLCPCB Basic Library parts only", "default": false },
                     "in_stock": { "type": "boolean", "description": "Only return parts currently in stock", "default": true },
@@ -659,6 +659,26 @@ fn jlcpcb_search_tokens(query: &str) -> Vec<String> {
     query.split_whitespace().map(String::from).collect()
 }
 
+/// Whether a query word reads as a component value: a number, optionally
+/// followed by an SI prefix and a unit (`20pF`, `20p`, `4.7uF`, `1k`, `10kΩ`,
+/// `16V`, `8MHz`, `0402`). Such a word must match as a whole value, so `20pF`
+/// no longer finds `220pF` and `1k` no longer finds `10k` (#786). Any other
+/// word, an MPN prefix like `0603WAF` included, still matches as a substring.
+fn is_jlcpcb_value_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    let rest = lower.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if rest.len() == lower.len() || !lower.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    let rest = rest
+        .strip_prefix(['p', 'n', 'u', 'µ', 'm', 'k', 'g'])
+        .unwrap_or(rest);
+    matches!(
+        rest,
+        "" | "f" | "h" | "v" | "a" | "w" | "r" | "ω" | "ohm" | "hz"
+    )
+}
+
 async fn handle_search_jlcpcb_parts(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -739,13 +759,31 @@ async fn handle_search_jlcpcb_parts(
             params.push(format!("%{}%", cat));
             sql.push_str(&format!(" AND Category LIKE ?{}", params.len()));
         }
-        // Stable order so a LIMIT page is the same on every run (#432).
-        sql.push_str(&format!(" ORDER BY LCSC LIMIT {}", limit));
+        // Stable order so a page is the same on every run (#432). The LIKE
+        // above cannot see value boundaries, so value words are checked
+        // here, and the limit is applied after that check.
+        sql.push_str(" ORDER BY LCSC");
 
+        let value_tokens: Vec<&String> = sql_tokens
+            .iter()
+            .filter(|token| is_jlcpcb_value_token(token))
+            .collect();
         let mut stmt = conn.prepare(&sql)?;
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), row_to_part_json)?
             .filter_map(|r| r.ok())
+            .filter(|part| {
+                value_tokens.iter().all(|token| {
+                    ["description", "mpn", "lcsc", "package", "manufacturer"]
+                        .iter()
+                        .any(|field| {
+                            part[*field].as_str().is_some_and(|text| {
+                                lcsc_packages::contains_whole_value(text, token)
+                            })
+                        })
+                })
+            })
+            .take(limit)
             .collect();
         Ok(rows)
     })
@@ -756,6 +794,7 @@ async fn handle_search_jlcpcb_parts(
         "count": results.len(),
         "results": results,
         "tokens": tokens,
+        "value_tokens": tokens.iter().filter(|t| is_jlcpcb_value_token(t)).collect::<Vec<_>>(),
         "search_fields": JLCPCB_SEARCH_FIELDS
     });
     ctx.jlcpcb_cache.put(key, body.clone());
@@ -3109,6 +3148,124 @@ mod jlcpcb_cache_tests {
         assert_eq!(second_body["cached"], json!(true));
         assert_eq!(first_body["results"], second_body["results"]);
         assert_eq!(first_body["count"], json!(1));
+    }
+
+    /// A temp database holding neighbouring capacitor and resistor values.
+    fn seed_value_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, db_path) = seed_test_db();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for (lcsc, mpn, package, description) in [
+            (
+                "C1553",
+                "CL05C200JB5NNNC",
+                "0402",
+                "50V 20pF C0G ±5% 0402 Multilayer Ceramic Capacitors",
+            ),
+            (
+                "C1557",
+                "0402CG220J500NT",
+                "0402",
+                "50V 220pF C0G ±5% 0402 Multilayer Ceramic Capacitors",
+            ),
+            (
+                "C1561",
+                "0402CG121J500NT",
+                "0402",
+                "50V 120pF C0G ±5% 0402 Multilayer Ceramic Capacitors",
+            ),
+            (
+                "C11702",
+                "0402WGF1001TCE",
+                "0402",
+                "1kΩ ±1% 62.5mW 0402 Chip Resistor",
+            ),
+            (
+                "C25543",
+                "0402WGF1101TCE",
+                "0402",
+                "1.1kΩ ±1% 62.5mW 0402 Chip Resistor",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO components VALUES (?1, ?2, ?3, 'FH', 'Basic', ?4, '', 0.01, 1000, 'Capacitors')",
+                rusqlite::params![lcsc, mpn, package, description],
+            )
+            .unwrap();
+        }
+        (dir, db_path)
+    }
+
+    async fn search_lcsc(db_path: &std::path::Path, query: &str) -> Vec<String> {
+        let args = json!({ "query": query, "output_path": db_path.to_str().unwrap() });
+        let body = response_json(
+            &handle_search_jlcpcb_parts(&args, &test_ctx())
+                .await
+                .unwrap(),
+        );
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part["lcsc"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// `20pF` used to find `220pF` and `120pF`, and `1k` found `1.1k` and
+    /// `10k`, because each word was a bare substring (#786).
+    #[tokio::test]
+    async fn search_jlcpcb_parts_matches_values_whole() {
+        let (_dir, db_path) = seed_value_db();
+        assert_eq!(search_lcsc(&db_path, "20pF").await, ["C1553"]);
+        assert_eq!(search_lcsc(&db_path, "20p 0402").await, ["C1553"]);
+        assert_eq!(search_lcsc(&db_path, "20 pF").await, ["C1553"]);
+        assert_eq!(search_lcsc(&db_path, "1k").await, ["C11702"]);
+        assert_eq!(search_lcsc(&db_path, "1kΩ 0402").await, ["C11702"]);
+    }
+
+    /// Words that are not values keep substring matching, so an MPN prefix
+    /// that starts with a digit still finds the full part number.
+    #[tokio::test]
+    async fn search_jlcpcb_parts_keeps_substring_match_for_other_words() {
+        let (_dir, db_path) = seed_value_db();
+        assert_eq!(search_lcsc(&db_path, "0402CG").await, ["C1557", "C1561"]);
+        assert_eq!(search_lcsc(&db_path, "0402WGF").await, ["C11702", "C25543"]);
+        assert_eq!(search_lcsc(&db_path, "Ceramic").await.len(), 3);
+    }
+
+    /// The limit counts parts that pass the whole-value check, so a page of
+    /// rejected neighbours never leaves the result short.
+    #[tokio::test]
+    async fn search_jlcpcb_parts_limit_counts_whole_value_matches() {
+        let (_dir, db_path) = seed_value_db();
+        let args = json!({ "query": "20pF", "limit": 1, "output_path": db_path.to_str().unwrap() });
+        let body = response_json(
+            &handle_search_jlcpcb_parts(&args, &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(body["count"], 1, "{body}");
+        assert_eq!(body["results"][0]["lcsc"], "C1553", "{body}");
+        assert_eq!(body["value_tokens"], json!(["20pF"]), "{body}");
+    }
+
+    #[test]
+    fn value_tokens_are_numbers_with_an_optional_prefix_and_unit() {
+        for token in [
+            "20pF", "20p", "20P", "4.7uF", "1k", "10kΩ", "16V", "8MHz", "0402", "100",
+        ] {
+            assert!(is_jlcpcb_value_token(token), "{token}");
+        }
+        for token in [
+            "pF",
+            "0402CG",
+            "0603WAF",
+            "4k7",
+            "STM32F411",
+            "LQFP-48",
+            "C1553",
+        ] {
+            assert!(!is_jlcpcb_value_token(token), "{token}");
+        }
     }
 
     #[tokio::test]
