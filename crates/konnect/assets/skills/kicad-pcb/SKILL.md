@@ -24,8 +24,10 @@ tools fall back to the file only when the transport is unreachable and the targe
 has not been observed live during this server session. These paths use revision-aware
 atomic writes: placement preserves pads, graphics, attributes, and models; moves
 preserve the existing angle; rotations update the footprint and its child angles; the
-closed-board flip fallback mirrors supported geometry and swaps front/back layers,
-refusing any 3D model whose offset/rotation it cannot transform. On KiCad 10.0.6+,
+closed-board flip fallback mirrors supported geometry, swaps front/back layers and
+mirrors inner copper through the board's stack (In2.Cu ↔ In5.Cu on 8 layers),
+refusing any 3D model whose offset/rotation it cannot transform, a per-layer padstack,
+and an inner layer the board lacks (**plan_blocked**). On KiCad 10.0.6+,
 `flip_component` prefers KiCad's own native FlipItems IPC command instead, which
 handles that 3D-model transform correctly — the file fallback only applies when no
 live KiCad holds the board. A reachable KiCad that predates 10.0.6 returns
