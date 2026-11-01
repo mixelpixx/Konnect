@@ -3,6 +3,15 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: a listener that closes mid-negotiation is `handshake_failed` on Unix (patch release)
+
+A dial to a listener that accepts and then closes before NNG's negotiation
+could report `reason: "transport_error"` with "Socket is not connected", as
+seen on macOS (os error 57), depending on which call saw the close first. On
+every Unix target that `ENOTCONN` now reports `handshake_failed`, as `Closed`
+and `ConnectionReset` already did and as NNG itself classifies `WSAENOTCONN`
+on Windows. No other raw OS error changes, and response shapes are unchanged.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

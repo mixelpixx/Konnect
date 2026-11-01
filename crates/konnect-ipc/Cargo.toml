@@ -20,7 +20,7 @@ nng.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 
-# The euid a discovered socket must be owned by.
+# The euid a discovered socket must be owned by, and ENOTCONN on a dial.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
