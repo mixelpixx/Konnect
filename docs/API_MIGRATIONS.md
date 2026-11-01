@@ -3,6 +3,28 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `update_footprints_from_library` can reset Reference and Value text (minor release)
+
+`update_footprints_from_library` accepts two optional booleans, both
+`false` by default, named after KiCad 10's own Update Footprints options:
+
+- `reset_text_sizes_and_styles` gives each refreshed footprint's Reference and
+  Value the library's text attributes: size, thickness, angle, justification,
+  mirroring and style.
+- `reset_text_positions` moves them to the library's position.
+
+Either keeps the fields' text, layer and visibility. A library Reference or
+Value with no position, layer or effects is refused for that footprint when a
+reset is asked for. With neither flag, Reference and Value keep their placed
+effects as before, and the plan revision is unchanged.
+
+A plan that resets a field reports `text_effects` in `changed_domains`. Each
+change then lists `text_effects`: the field, and its `before` and `after`
+position, angle, size, thickness (`null` for KiCad's default of one eighth of
+the height), style, mirroring, keep-upright and alignment. After the commit
+the board is read back, and a field that does not hold its reset returns
+`mutation_outcome_uncertain`.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
@@ -18,6 +40,40 @@ coordinate outward to meet the body; use the returned resolved pin coordinates
 for wiring. Custom `graphics` still require explicit coordinates and glyphs
 that fit retain their established layout. Tool schemas and response shapes are
 unchanged; this does not infer electrical pin roles or redesign a supplied layout.
+
+## Unreleased: `update_pcb_from_schematic` gives footprints their library's fields (patch release)
+
+The previous release carried a footprint's library attributes, description,
+tags and 3D models. Its fields still came from a fixed template:
+- Value went on the silkscreen, hidden, and Reference and Value had no font
+  thickness;
+- the library's Datasheet, Description and custom properties, such as the
+  `KiLib_Generator` on 12,018 stock footprints, were left off.
+
+A footprint the sync adds now has the library's fields:
+- **Reference and Value** with the library's layer, visibility, font,
+  position and keep-upright setting, holding the schematic's text;
+- **Datasheet and Description** where the library has them;
+- **every custom property.**
+
+The post-apply readback also checks each field that was sent: its text, layer,
+visibility and whether it is kept upright. A difference is reported as
+`board_readback_differs`, as other readback differences are.
+
+A footprint whose properties cannot be read is still placed, with the default
+fields as before. The plan then carries a non-blocking `library_fields_not_carried`
+diagnostic naming the footprint, its parts and the reason. 15 of KiCad 10.0.5's
+15,451 stock footprints repeat a property name and are placed this way.
+
+The library property reader is shared with `update_footprints_from_library`.
+Both now read `(unlocked yes)` on a property instead of refusing the footprint:
+3,353 stock footprints carry it. The clause is KiCad's keep-upright setting,
+not a lock: a field without it is kept upright, and one with it is not. Fields
+used to be sent as not kept upright, so KiCad saved `(unlocked yes)` on every
+field either tool wrote; they now keep the library's setting.
+`update_footprints_from_library` still refuses footprints for any other child
+it cannot represent, including a `(locked …)` clause on a property, which no
+stock footprint carries.
 
 ## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
 

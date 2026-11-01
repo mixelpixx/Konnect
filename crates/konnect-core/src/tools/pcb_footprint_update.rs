@@ -20,17 +20,12 @@ struct LibraryFootprint {
     attributes: kiapi::board::types::FootprintAttributes,
     datasheet: Option<String>,
     description_field: Option<String>,
+    reference_field: Option<kiapi::board::types::Field>,
+    value_field: Option<kiapi::board::types::Field>,
     properties: Vec<kiapi::board::types::Field>,
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
-}
-
-#[derive(Debug)]
-struct ParsedLibraryProperties {
-    datasheet: Option<String>,
-    description: Option<String>,
-    custom: Vec<kiapi::board::types::Field>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -41,6 +36,7 @@ enum ChangedDomain {
     Attributes,
     Metadata,
     Models,
+    TextEffects,
 }
 
 #[derive(Debug)]
@@ -48,12 +44,95 @@ struct PreparedUpdate {
     item: prost_types::Any,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
+    text_effects: Vec<FieldEffectsChange>,
 }
 
+/// A field's text effects, in board millimetres and degrees. A `None`
+/// thickness is KiCad's default, one eighth of the text height; KiCad reports
+/// it over IPC as a zero stroke width.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct TextEffects {
+    position_mm: [f64; 2],
+    angle_degrees: f64,
+    size_mm: [f64; 2],
+    thickness_mm: Option<f64>,
+    bold: bool,
+    italic: bool,
+    mirrored: bool,
+    keep_upright: bool,
+    horizontal_alignment: &'static str,
+    vertical_alignment: &'static str,
+}
+
+/// Which of KiCad's Update Footprints text options apply to Reference and
+/// Value: "Update/reset text sizes and styles" (every text attribute,
+/// angle included) and "Update/reset text positions".
+///
+/// Flattened into the plan inputs, an unset flag is left out, so a call
+/// without one keeps the revision it had before the flags existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct TextReset {
+    #[serde(
+        rename = "reset_text_sizes_and_styles",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    sizes_and_styles: bool,
+    #[serde(
+        rename = "reset_text_positions",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    positions: bool,
+}
+
+impl TextReset {
+    fn any(self) -> bool {
+        self.sizes_and_styles || self.positions
+    }
+}
+
+/// The two fields a text reset covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+enum FieldName {
+    Reference,
+    Value,
+}
+
+impl FieldName {
+    fn of(
+        self,
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> Option<&kiapi::board::types::Field> {
+        match self {
+            Self::Reference => instance.reference_field.as_ref(),
+            Self::Value => instance.value_field.as_ref(),
+        }
+    }
+}
+
+impl std::fmt::Display for FieldName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Reference => "Reference",
+            Self::Value => "Value",
+        })
+    }
+}
+
+/// A Reference or Value field whose effects a text reset replaces.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct FieldEffectsChange {
+    field: FieldName,
+    before: TextEffects,
+    after: TextEffects,
+}
+
+/// Every caller input that shapes the plan, so each is part of its revision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct UpdateFilters {
     references: Option<BTreeSet<String>>,
     library_ids: Option<BTreeSet<String>>,
+    #[serde(flatten)]
+    text_reset: TextReset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,12 +219,14 @@ impl PreservedState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct PlannedUpdate {
     reference: String,
     library_id: String,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    text_effects: Vec<FieldEffectsChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -188,6 +269,16 @@ pub(crate) fn tool() -> ToolDef {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional exact Library:Footprint allowlist"
+                },
+                "reset_text_sizes_and_styles": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also give each Reference and Value field the library's text size, thickness, angle, justification and style, as KiCad's 'Update/reset text sizes and styles' option does. Off by default: Reference and Value keep their placed text effects."
+                },
+                "reset_text_positions": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also move each Reference and Value field to the library's position, as KiCad's 'Update/reset text positions' option does. Either reset keeps the fields' text, layer and visibility."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -296,9 +387,23 @@ pub(crate) async fn handle_update_footprints_from_library(
             }
 
             let update_count = plan.prepared_items.len();
+            let readback_document = document.clone();
             client.run_commit("Update footprints from libraries", |client| {
                 client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
             })?;
+            if plan.changes.iter().any(|change| !change.text_effects.is_empty()) {
+                // KiCad may drop a text attribute it does not take over IPC,
+                // so the reset is proven against the board, not the request.
+                let missing = match client
+                    .get_items_in(readback_document, ObjectType::KotPcbFootprint)
+                {
+                    Ok(footprints) => text_effects_not_held(&footprints, &plan.changes),
+                    Err(error) => vec![format!("the board could not be read back: {error:#}")],
+                };
+                if !missing.is_empty() {
+                    return Ok(text_effects_uncertain(&ipc_board_path, &missing));
+                }
+            }
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -403,6 +508,24 @@ fn plan_response(plan: &UpdatePlan, applied: bool) -> CallToolResult {
     }))
 }
 
+fn text_effects_uncertain(board: &Path, missing: &[String]) -> CallToolResult {
+    let reason = format!(
+        "the board read after the commit does not hold the reset text effects of {}",
+        missing.join(", ")
+    );
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+            operation: "update_footprints_from_library".to_string(),
+            path: board.display().to_string(),
+            reason: reason.clone(),
+        },
+        format!(
+            "KiCad committed the footprint library update, but {reason}. Inspect the board in \
+             KiCad (Ctrl-Z reverses the whole update) before retrying."
+        ),
+    )
+}
+
 fn preflight_conflict(message: impl Into<String>) -> CallToolResult {
     CallToolResult::json(&json!({
         "status": "conflict",
@@ -475,9 +598,23 @@ fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters,
         Ok(parsed)
     }
 
+    fn flag(args: &serde_json::Value, field: &str) -> std::result::Result<bool, ArgumentError> {
+        match args.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(value) => value.as_bool().ok_or_else(|| ArgumentError {
+                field: field.to_string(),
+                reason: "must be a boolean when supplied".to_string(),
+            }),
+        }
+    }
+
     Ok(UpdateFilters {
         references: parse(args, "references")?,
         library_ids: parse(args, "library_ids")?,
+        text_reset: TextReset {
+            sizes_and_styles: flag(args, "reset_text_sizes_and_styles")?,
+            positions: flag(args, "reset_text_positions")?,
+        },
     })
 }
 
@@ -669,18 +806,23 @@ fn plan_updates(
                 continue;
             }
         };
-        let prepared =
-            match build_updated_instance(&candidate.instance, &library, net_codes, routed_nets) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    diagnostics.push(UpdateDiagnostic {
-                        code: "footprint_update_conflict".to_string(),
-                        message: format!("{error:#}"),
-                        reference: Some(candidate.reference),
-                    });
-                    continue;
-                }
-            };
+        let prepared = match build_updated_instance(
+            &candidate.instance,
+            &library,
+            net_codes,
+            routed_nets,
+            filters.text_reset,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "footprint_update_conflict".to_string(),
+                    message: format!("{error:#}"),
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
 
         hasher.update(candidate.item.type_url.as_bytes());
         hasher.update(&candidate.item.value);
@@ -695,6 +837,7 @@ fn plan_updates(
                 library_id: candidate.library_id,
                 changed_domains: prepared.changed_domains,
                 preserved: prepared.preserved,
+                text_effects: prepared.text_effects,
             });
             prepared_items.push(prepared.item);
         }
@@ -741,7 +884,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     }
 
     validate_supported_children(&root)?;
-    let properties = parse_library_properties(&root)?;
+    let properties = super::library_footprint::properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
@@ -761,375 +904,14 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         library_id: library_id.to_string(),
         definition,
         attributes,
-        datasheet: properties.datasheet,
-        description_field: properties.description,
+        datasheet: properties.datasheet_value,
+        description_field: properties.description_value,
+        reference_field: properties.reference,
+        value_field: properties.value,
         properties: properties.custom,
         pads,
         graphics,
         models,
-    })
-}
-
-fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
-    let mut names = BTreeSet::new();
-    let mut datasheet = None;
-    let mut description = None;
-    let mut custom = Vec::new();
-    for property in root.find_all("property") {
-        let name = property
-            .get(1)
-            .and_then(konnect_sexp::SexpNode::as_str)
-            .context("property is missing its name")?;
-        if !names.insert(name.to_string()) {
-            bail!("property '{name}' appears more than once in the library footprint");
-        }
-
-        // Mandatory and custom properties share one lossless clause validator.
-        // The mandatory values keep their existing first-class IPC fields; the
-        // shared parser proves that none of their authored clauses would be
-        // silently ignored without requiring a typed custom Field.
-        let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
-        let parsed = parse_library_property(property, !mandatory)?;
-        let value = property
-            .get(2)
-            .and_then(konnect_sexp::SexpNode::as_str)
-            .with_context(|| format!("property '{name}' is missing its value"))?;
-        match name {
-            "Reference" | "Value" => {}
-            "Datasheet" => datasheet = Some(value.to_string()),
-            "Description" => description = Some(value.to_string()),
-            _ => custom.push(parsed.context("custom property did not produce a typed field")?),
-        }
-    }
-
-    Ok(ParsedLibraryProperties {
-        datasheet,
-        description,
-        custom,
-    })
-}
-
-/// Convert a footprint property into the typed `Field` shape carried by
-/// KiCad's IPC model. Mandatory properties are validated through this same
-/// path and then stored in their existing first-class fields. Unknown clauses
-/// refuse here: accepting a property while dropping part of its authored
-/// presentation would make the refresh lossy even when its value survived.
-fn parse_library_property(
-    property: &konnect_sexp::SexpNode,
-    require_typed_field: bool,
-) -> Result<Option<kiapi::board::types::Field>> {
-    use kiapi::common::types::LockedState;
-
-    let name = property
-        .get(1)
-        .and_then(konnect_sexp::SexpNode::as_str)
-        .context("property is missing its name")?;
-    let value = property
-        .get(2)
-        .and_then(konnect_sexp::SexpNode::as_str)
-        .with_context(|| format!("property '{name}' is missing its value"))?;
-    let mut position = None;
-    let mut rotation = 0.0;
-    let mut layer = None;
-    let mut hidden = None;
-    let mut knockout = None;
-    let mut attributes = None;
-    let mut identifier = None;
-
-    for clause in property.children().unwrap_or_default().iter().skip(3) {
-        let tag = clause
-            .head()
-            .with_context(|| format!("property '{name}' contains an unsupported atom"))?;
-        match tag {
-            "at" => {
-                if position.is_some() {
-                    bail!("property '{name}' contains duplicate 'at' clauses");
-                }
-                let count = clause.children().map_or(0, |children| children.len());
-                if !matches!(count, 3 | 4) {
-                    bail!("property '{name}' 'at' must contain x, y, and optional rotation");
-                }
-                let x = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' has an invalid X position"))?;
-                let y = clause
-                    .get_f64(2)
-                    .with_context(|| format!("property '{name}' has an invalid Y position"))?;
-                rotation = clause.get_f64(3).unwrap_or(0.0);
-                if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
-                    bail!("property '{name}' position and rotation must be finite");
-                }
-                position = Some(konnect_ipc::builders::vec2(x, y));
-            }
-            "layer" => {
-                if layer.is_some() {
-                    bail!("property '{name}' contains duplicate 'layer' clauses");
-                }
-                let layer_name = clause
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .filter(|name| !name.is_empty())
-                    .with_context(|| format!("property '{name}' has no layer name"))?;
-                if clause.children().map_or(0, |children| children.len()) != 2 {
-                    bail!("property '{name}' 'layer' must name exactly one layer");
-                }
-                layer = Some(
-                    konnect_ipc::builders::try_layer_from_name(layer_name)
-                        .with_context(|| format!("property '{name}' has an unsupported layer"))?
-                        as i32,
-                );
-            }
-            "hide" => {
-                if hidden.is_some() {
-                    bail!("property '{name}' contains duplicate 'hide' clauses");
-                }
-                hidden = Some(property_yes_no(clause, name, "hide")?);
-            }
-            "knockout" => {
-                if knockout.is_some() {
-                    bail!("property '{name}' contains duplicate 'knockout' clauses");
-                }
-                knockout = Some(property_yes_no(clause, name, "knockout")?);
-            }
-            "uuid" | "tstamp" => {
-                if let Some(previous) = identifier {
-                    bail!(
-                        "property '{name}' contains multiple identifier clauses ('{previous}' and '{tag}')"
-                    );
-                }
-                identifier = Some(tag);
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || clause
-                        .get(1)
-                        .and_then(konnect_sexp::SexpNode::as_str)
-                        .is_none_or(str::is_empty)
-                {
-                    bail!("property '{name}' '{tag}' must contain exactly one identifier");
-                }
-            }
-            "effects" => {
-                if attributes.is_some() {
-                    bail!("property '{name}' contains duplicate 'effects' clauses");
-                }
-                attributes = Some(parse_property_effects(clause, name)?);
-            }
-            unsupported => {
-                bail!("property '{name}' clause '{unsupported}' is not supported losslessly")
-            }
-        }
-    }
-
-    if !require_typed_field {
-        return Ok(None);
-    }
-
-    let position =
-        position.with_context(|| format!("property '{name}' is missing its 'at' clause"))?;
-    let layer =
-        layer.with_context(|| format!("property '{name}' is missing its 'layer' clause"))?;
-    let mut attributes =
-        attributes.with_context(|| format!("property '{name}' is missing its 'effects' clause"))?;
-    attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: rotation,
-    });
-    Ok(Some(kiapi::board::types::Field {
-        id: None,
-        name: name.to_string(),
-        text: Some(kiapi::board::types::BoardText {
-            // A library child's UUID is definition-local and cannot be reused
-            // across placed instances. Let KiCad assign the board child ID.
-            id: None,
-            text: Some(kiapi::common::types::Text {
-                position: Some(position),
-                attributes: Some(attributes),
-                text: value.to_string(),
-                hyperlink: String::new(),
-            }),
-            layer,
-            knockout: knockout.unwrap_or(false),
-            locked: LockedState::LsUnlocked as i32,
-            parent: None,
-        }),
-        visible: !hidden.unwrap_or(false),
-    }))
-}
-
-fn property_yes_no(clause: &konnect_sexp::SexpNode, name: &str, tag: &str) -> Result<bool> {
-    if clause.children().map_or(0, |children| children.len()) != 2 {
-        bail!("property '{name}' '{tag}' must contain exactly one yes/no value");
-    }
-    match clause.get(1).and_then(konnect_sexp::SexpNode::as_str) {
-        Some("yes") => Ok(true),
-        Some("no") => Ok(false),
-        _ => bail!("property '{name}' '{tag}' must be yes or no"),
-    }
-}
-
-fn parse_property_effects(
-    effects: &konnect_sexp::SexpNode,
-    name: &str,
-) -> Result<kiapi::common::types::TextAttributes> {
-    use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
-
-    let mut font = None;
-    let mut horizontal = HorizontalAlignment::HaCenter;
-    let mut vertical = VerticalAlignment::VaCenter;
-    let mut mirrored = false;
-    for clause in effects.children().unwrap_or_default().iter().skip(1) {
-        let tag = clause
-            .head()
-            .with_context(|| format!("property '{name}' effects contain an unsupported atom"))?;
-        match tag {
-            "font" => {
-                if font.replace(clause).is_some() {
-                    bail!("property '{name}' contains duplicate font clauses");
-                }
-            }
-            "justify" => {
-                for value in clause.children().unwrap_or_default().iter().skip(1) {
-                    match value.as_str().with_context(|| {
-                        format!("property '{name}' justify contains a non-atom")
-                    })? {
-                        "left" if horizontal == HorizontalAlignment::HaCenter => {
-                            horizontal = HorizontalAlignment::HaLeft
-                        }
-                        "right" if horizontal == HorizontalAlignment::HaCenter => {
-                            horizontal = HorizontalAlignment::HaRight
-                        }
-                        "top" if vertical == VerticalAlignment::VaCenter => {
-                            vertical = VerticalAlignment::VaTop
-                        }
-                        "bottom" if vertical == VerticalAlignment::VaCenter => {
-                            vertical = VerticalAlignment::VaBottom
-                        }
-                        "mirror" if !mirrored => mirrored = true,
-                        "left" | "right" => bail!(
-                            "property '{name}' has conflicting horizontal justification"
-                        ),
-                        "top" | "bottom" => {
-                            bail!("property '{name}' has conflicting vertical justification")
-                        }
-                        "mirror" => bail!("property '{name}' repeats mirrored justification"),
-                        unsupported => bail!(
-                            "property '{name}' justification '{unsupported}' is not supported losslessly"
-                        ),
-                    }
-                }
-            }
-            unsupported => bail!(
-                "property '{name}' effects clause '{unsupported}' is not supported losslessly"
-            ),
-        }
-    }
-    let font =
-        font.with_context(|| format!("property '{name}' effects are missing the font clause"))?;
-
-    let mut font_name = String::new();
-    let mut size = None;
-    let mut thickness = None;
-    let mut bold = None;
-    let mut italic = None;
-    let mut line_spacing = None;
-    for clause in font.children().unwrap_or_default().iter().skip(1) {
-        let tag = clause
-            .head()
-            .with_context(|| format!("property '{name}' font contains an unsupported atom"))?;
-        match tag {
-            "face" => {
-                if !font_name.is_empty() {
-                    bail!("property '{name}' contains duplicate font face clauses");
-                }
-                font_name = clause
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .filter(|face| !face.is_empty())
-                    .with_context(|| format!("property '{name}' font face is invalid"))?
-                    .to_string();
-            }
-            "size" => {
-                if size.is_some() {
-                    bail!("property '{name}' contains duplicate font size clauses");
-                }
-                if clause.children().map_or(0, |children| children.len()) != 3 {
-                    bail!("property '{name}' font size must contain width and height");
-                }
-                let width = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' font width is invalid"))?;
-                let height = clause
-                    .get_f64(2)
-                    .with_context(|| format!("property '{name}' font height is invalid"))?;
-                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
-                    bail!("property '{name}' font size must be finite and positive");
-                }
-                size = Some((width, height));
-            }
-            "thickness" => {
-                if thickness.is_some() {
-                    bail!("property '{name}' contains duplicate font thickness clauses");
-                }
-                let value = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' font thickness is invalid"))?;
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || !value.is_finite()
-                    || value <= 0.0
-                {
-                    bail!("property '{name}' font thickness must be finite and positive");
-                }
-                thickness = Some(value);
-            }
-            "bold" => {
-                if bold.is_some() {
-                    bail!("property '{name}' contains duplicate font 'bold' clauses");
-                }
-                bold = Some(property_yes_no(clause, name, "font bold")?);
-            }
-            "italic" => {
-                if italic.is_some() {
-                    bail!("property '{name}' contains duplicate font 'italic' clauses");
-                }
-                italic = Some(property_yes_no(clause, name, "font italic")?);
-            }
-            "line_spacing" => {
-                if line_spacing.is_some() {
-                    bail!("property '{name}' contains duplicate font 'line_spacing' clauses");
-                }
-                let value = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' line spacing is invalid"))?;
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || !value.is_finite()
-                    || value <= 0.0
-                {
-                    bail!("property '{name}' line spacing must be finite and positive");
-                }
-                line_spacing = Some(value);
-            }
-            unsupported => {
-                bail!("property '{name}' font clause '{unsupported}' is not supported losslessly")
-            }
-        }
-    }
-    let (width, height) =
-        size.with_context(|| format!("property '{name}' font is missing its size"))?;
-    Ok(kiapi::common::types::TextAttributes {
-        font_name,
-        horizontal_alignment: horizontal as i32,
-        vertical_alignment: vertical as i32,
-        angle: None,
-        line_spacing: line_spacing.unwrap_or(1.0),
-        stroke_width: Some(konnect_ipc::builders::distance(
-            thickness.unwrap_or(width * 0.15),
-        )),
-        italic: italic.unwrap_or(false),
-        bold: bold.unwrap_or(false),
-        underlined: false,
-        visible: true,
-        mirrored,
-        multiline: false,
-        keep_upright: false,
-        size: Some(konnect_ipc::builders::vec2(width, height)),
     })
 }
 
@@ -1457,6 +1239,7 @@ fn build_updated_instance(
     library: &LibraryFootprint,
     net_codes: &BTreeMap<String, i32>,
     routed_nets: &BTreeSet<String>,
+    text_reset: TextReset,
 ) -> Result<PreparedUpdate> {
     let current_definition = current
         .definition
@@ -1619,13 +1402,183 @@ fn build_updated_instance(
     }
     updated.attributes = Some(attributes);
 
+    let mut text_effects = Vec::new();
+    if text_reset.any() {
+        for (name, library_field, placed) in [
+            (
+                FieldName::Reference,
+                &library.reference_field,
+                &mut updated.reference_field,
+            ),
+            (
+                FieldName::Value,
+                &library.value_field,
+                &mut updated.value_field,
+            ),
+        ] {
+            let library_field = library_field.as_ref().with_context(|| {
+                format!("library {name} field has no position, layer or effects to reset from")
+            })?;
+            if let Some((field, change)) = reset_field_effects(
+                name,
+                placed.as_ref(),
+                library_field,
+                &position,
+                rotation,
+                is_back,
+                text_reset,
+            )? {
+                *placed = Some(field);
+                text_effects.push(change);
+            }
+        }
+        // The definition carries the same two fields as the instance.
+        let definition = updated
+            .definition
+            .as_mut()
+            .context("updated footprint has no definition")?;
+        definition.reference_field = updated.reference_field.clone();
+        definition.value_field = updated.value_field.clone();
+    }
+
     let changed_domains = changed_domains(current, &updated)?;
     let preserved = PreservedState::derive(current, &updated, &old_nets);
     Ok(PreparedUpdate {
         item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
         changed_domains,
         preserved,
+        text_effects,
     })
+}
+
+/// The placed field with the library field's text attributes and/or
+/// position, keeping its text, layer and visibility, and what that changes.
+/// `None` when the field already has them.
+fn reset_field_effects(
+    name: FieldName,
+    placed: Option<&kiapi::board::types::Field>,
+    library: &kiapi::board::types::Field,
+    footprint_position: &kiapi::common::types::Vector2,
+    footprint_rotation: f64,
+    is_back: bool,
+    text_reset: TextReset,
+) -> Result<Option<(kiapi::board::types::Field, FieldEffectsChange)>> {
+    let placed = placed.with_context(|| format!("placed footprint has no {name} field"))?;
+    let library =
+        transform_library_property(library, footprint_position, footprint_rotation, is_back)?;
+    let library_text = library
+        .text
+        .as_ref()
+        .and_then(|text| text.text.as_ref())
+        .with_context(|| format!("library {name} field has no text"))?;
+    let mut field = placed.clone();
+    let text = field
+        .text
+        .as_mut()
+        .and_then(|text| text.text.as_mut())
+        .with_context(|| format!("placed {name} field has no text"))?;
+    if text_reset.positions {
+        text.position = library_text.position;
+    }
+    if text_reset.sizes_and_styles {
+        // The deprecated per-text `visible` is visibility, which is kept.
+        let visible = text
+            .attributes
+            .as_ref()
+            .is_some_and(|attributes| attributes.visible);
+        text.attributes = library_text.attributes.clone();
+        if let Some(attributes) = text.attributes.as_mut() {
+            attributes.visible = visible;
+        }
+    }
+    if field == *placed {
+        return Ok(None);
+    }
+    let change = FieldEffectsChange {
+        field: name,
+        before: text_effects(placed)?,
+        after: text_effects(&field)?,
+    };
+    Ok(Some((field, change)))
+}
+
+fn text_effects(field: &kiapi::board::types::Field) -> Result<TextEffects> {
+    let text = field
+        .text
+        .as_ref()
+        .and_then(|text| text.text.as_ref())
+        .with_context(|| format!("{} field has no text", field.name))?;
+    let attributes = text.attributes.clone().unwrap_or_default();
+    let mm = konnect_ipc::builders::nm_to_mm;
+    let position = text.position.unwrap_or_default();
+    let size = attributes.size.unwrap_or_default();
+    Ok(TextEffects {
+        position_mm: [mm(position.x_nm), mm(position.y_nm)],
+        angle_degrees: attributes.angle.map_or(0.0, |angle| angle.value_degrees),
+        size_mm: [mm(size.x_nm), mm(size.y_nm)],
+        thickness_mm: attributes
+            .stroke_width
+            .filter(|width| width.value_nm != 0)
+            .map(|width| mm(width.value_nm)),
+        bold: attributes.bold,
+        italic: attributes.italic,
+        mirrored: attributes.mirrored,
+        keep_upright: attributes.keep_upright,
+        horizontal_alignment: attributes.horizontal_alignment().as_str_name(),
+        vertical_alignment: attributes.vertical_alignment().as_str_name(),
+    })
+}
+
+/// The `Reference field of C1` entries whose reset effects the board read
+/// after the commit does not hold.
+fn text_effects_not_held(
+    footprints: &[prost_types::Any],
+    changes: &[PlannedUpdate],
+) -> Vec<String> {
+    let wanted = changes
+        .iter()
+        .filter(|change| !change.text_effects.is_empty())
+        .map(|change| change.reference.as_str())
+        .collect::<BTreeSet<_>>();
+    let read: BTreeMap<String, kiapi::board::types::FootprintInstance> = footprints
+        .iter()
+        .filter_map(|item| {
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+        })
+        .map(|instance| (field_text(&instance.reference_field), instance))
+        .filter(|(reference, _)| wanted.contains(reference.as_str()))
+        .collect();
+    let mut missing = Vec::new();
+    for change in changes {
+        for effects in &change.text_effects {
+            let held = read
+                .get(&change.reference)
+                .and_then(|instance| effects.field.of(instance))
+                .and_then(|field| text_effects(field).ok())
+                .is_some_and(|observed| effects_match(&observed, &effects.after));
+            if !held {
+                missing.push(format!("{} field of {}", effects.field, change.reference));
+            }
+        }
+    }
+    missing
+}
+
+/// Equal at KiCad's nm resolution, with angles compared modulo 360°.
+fn effects_match(observed: &TextEffects, expected: &TextEffects) -> bool {
+    let nm = |mm: f64| (mm * 1e6).round();
+    let same = |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(a, b)| nm(*a) == nm(*b));
+    let angle = |degrees: f64| (degrees.rem_euclid(360.0) * 1e6).round();
+    same(&observed.position_mm, &expected.position_mm)
+        && same(&observed.size_mm, &expected.size_mm)
+        && observed.thickness_mm.map(nm) == expected.thickness_mm.map(nm)
+        && angle(observed.angle_degrees) == angle(expected.angle_degrees)
+        && observed.bold == expected.bold
+        && observed.italic == expected.italic
+        && observed.mirrored == expected.mirrored
+        && observed.keep_upright == expected.keep_upright
+        && observed.horizontal_alignment == expected.horizontal_alignment
+        && observed.vertical_alignment == expected.vertical_alignment
 }
 
 fn apply_field_value(field: &mut Option<kiapi::board::types::Field>, value: Option<&str>) {
@@ -1687,7 +1640,7 @@ fn merge_custom_properties(
     Ok(())
 }
 
-fn transform_library_property(
+pub(super) fn transform_library_property(
     property: &kiapi::board::types::Field,
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
@@ -1949,6 +1902,11 @@ fn changed_domains(
         != library_owned_attributes(updated.attributes.as_ref())
     {
         changed.insert(ChangedDomain::Attributes);
+    }
+    if current.reference_field != updated.reference_field
+        || current.value_field != updated.value_field
+    {
+        changed.insert(ChangedDomain::TextEffects);
     }
     Ok(changed)
 }
@@ -2577,6 +2535,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]),
+            TextReset::default(),
         )
         .unwrap();
         let updated =
@@ -2729,6 +2688,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            TextReset::default(),
         )
         .unwrap();
         let updated =
@@ -2775,6 +2735,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["COL1".to_string()]),
+            TextReset::default(),
         )
         .unwrap_err();
 
@@ -2797,13 +2758,13 @@ mod tests {
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(future_clause yes)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
-        assert!(message.contains("unlocked"), "{message}");
+        assert!(message.contains("future_clause"), "{message}");
 
         let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
             "\"KiLib_Generator\" \"konnect_test_generator\"",
@@ -2828,7 +2789,7 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(future_clause yes)\n\t\t(at"),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2836,7 +2797,7 @@ mod tests {
                 Err(error) => {
                     let message = error.to_string();
                     assert!(message.contains(name), "{message}");
-                    assert!(message.contains("unlocked"), "{message}");
+                    assert!(message.contains("future_clause"), "{message}");
                 }
             }
 
@@ -2925,6 +2886,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            TextReset::default(),
         )
         .unwrap_err();
 
@@ -3013,14 +2975,26 @@ mod tests {
                 current.orientation = Some(kiapi::common::types::Angle {
                     value_degrees: rotation,
                 });
-                let first =
-                    build_updated_instance(&current, &library, &net_codes, &routed).unwrap();
+                let first = build_updated_instance(
+                    &current,
+                    &library,
+                    &net_codes,
+                    &routed,
+                    TextReset::default(),
+                )
+                .unwrap();
                 let applied =
                     kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice())
                         .unwrap();
 
-                let second =
-                    build_updated_instance(&applied, &library, &net_codes, &routed).unwrap();
+                let second = build_updated_instance(
+                    &applied,
+                    &library,
+                    &net_codes,
+                    &routed,
+                    TextReset::default(),
+                )
+                .unwrap();
 
                 assert!(
                     second.changed_domains.is_empty(),
@@ -3040,6 +3014,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            TextReset::default(),
         )
         .unwrap();
         let mut prepared =
@@ -3194,7 +3169,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(future_clause yes)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),
@@ -3216,7 +3191,7 @@ mod tests {
         assert!(plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "unsupported_library_footprint"
                 && diagnostic.message.contains("AssemblyVendor")
-                && diagnostic.message.contains("unlocked")
+                && diagnostic.message.contains("future_clause")
         }));
     }
 
@@ -3378,14 +3353,23 @@ mod tests {
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         let routed = BTreeSet::new();
-        let applied = build_updated_instance(&current, &base, &net_codes, &routed).unwrap();
+        let applied =
+            build_updated_instance(&current, &base, &net_codes, &routed, TextReset::default())
+                .unwrap();
         let applied =
             kiapi::board::types::FootprintInstance::decode(applied.item.value.as_slice()).unwrap();
         let changed_source =
             LIBRARY_FOOTPRINT.replace("new-datasheet.pdf", "replacement-datasheet.pdf");
         let changed = parse_library_footprint("Test:Socket", &changed_source).unwrap();
 
-        let prepared = build_updated_instance(&applied, &changed, &net_codes, &routed).unwrap();
+        let prepared = build_updated_instance(
+            &applied,
+            &changed,
+            &net_codes,
+            &routed,
+            TextReset::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             prepared.changed_domains,
@@ -3563,6 +3547,17 @@ mod tests {
         footprint: prost_types::Any,
         fail_update: bool,
     ) -> PlannerMock {
+        spawn_planner_mock_keeping(board, footprint, fail_update, true)
+    }
+
+    /// `keeps_updates` off answers later reads with the board as it was, like
+    /// a KiCad that accepted the update but dropped what it could not take.
+    fn spawn_planner_mock_keeping(
+        board: &Path,
+        footprint: prost_types::Any,
+        fail_update: bool,
+        keeps_updates: bool,
+    ) -> PlannerMock {
         use nng::options::Options;
 
         static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3580,6 +3575,7 @@ mod tests {
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
+            let mut footprints = vec![footprint];
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
                 let message = request.message.expect("request message");
@@ -3605,7 +3601,7 @@ mod tests {
                     let items = if command.types
                         == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
                     {
-                        vec![footprint.clone()]
+                        footprints.clone()
                     } else {
                         Vec::new()
                     };
@@ -3643,6 +3639,9 @@ mod tests {
                         .unwrap()
                         .update_batches
                         .push(update.items.len());
+                    if keeps_updates && !fail_update {
+                        footprints = update.items.clone();
+                    }
                     let updated_items = update
                         .items
                         .into_iter()
@@ -3724,6 +3723,391 @@ mod tests {
         assert_eq!(capture.begin_count, 0);
         assert!(capture.update_batches.is_empty());
         assert!(capture.commit_actions.is_empty());
+    }
+
+    /// The library's Reference and Value effects as KiCad saved them in
+    /// `socket_kicad10.kicad_mod`: size 1 1, thickness 0.15, at (0, -4) and
+    /// (0, 4). Restated here as the oracle, not read from the parser.
+    const LIBRARY_SIZE_MM: [f64; 2] = [1.0, 1.0];
+    const LIBRARY_THICKNESS_MM: f64 = 0.15;
+    /// `current_instance` places its fields at size 1.25 mm.
+    const PLACED_SIZE_MM: [f64; 2] = [1.25, 1.25];
+
+    const BOTH: TextReset = TextReset {
+        sizes_and_styles: true,
+        positions: true,
+    };
+    const STYLES: TextReset = TextReset {
+        sizes_and_styles: true,
+        positions: false,
+    };
+    const POSITIONS: TextReset = TextReset {
+        sizes_and_styles: false,
+        positions: true,
+    };
+
+    fn reset_with(
+        current: &kiapi::board::types::FootprintInstance,
+        source: &str,
+        text_reset: TextReset,
+    ) -> Result<(PreparedUpdate, kiapi::board::types::FootprintInstance)> {
+        let library = parse_library_footprint("Test:Socket", source)?;
+        let prepared = build_updated_instance(
+            current,
+            &library,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+            text_reset,
+        )?;
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())?;
+        Ok((prepared, updated))
+    }
+
+    fn reset(
+        current: &kiapi::board::types::FootprintInstance,
+        text_reset: TextReset,
+    ) -> (PreparedUpdate, kiapi::board::types::FootprintInstance) {
+        reset_with(current, KICAD_LIBRARY_FOOTPRINT, text_reset).unwrap()
+    }
+
+    /// The library offset, turned with `current_instance`'s 37° about
+    /// (100, 50), and mirrored in y on the back.
+    fn library_position(local_y: f64, is_back: bool) -> (f64, f64) {
+        let local_y = if is_back { -local_y } else { local_y };
+        konnect_sexp::geometry::transform_pad(0.0, local_y, 100.0, 50.0, 37.0)
+    }
+
+    /// Within the 1 nm that integer IPC coordinates round to.
+    fn near(position: [f64; 2], (x, y): (f64, f64)) -> bool {
+        ((position[0] - x) * 1e6).abs() <= 1.0 && ((position[1] - y) * 1e6).abs() <= 1.0
+    }
+
+    #[test]
+    fn a_text_reset_takes_the_library_effects_and_keeps_text_layer_and_visibility() {
+        for layer in [
+            kiapi::board::types::BoardLayer::BlFCu,
+            kiapi::board::types::BoardLayer::BlBCu,
+        ] {
+            let is_back = layer == kiapi::board::types::BoardLayer::BlBCu;
+            let current = current_instance(layer);
+            for text_reset in [BOTH, STYLES, POSITIONS] {
+                let why = format!("{layer:?} {text_reset:?}");
+                let (prepared, updated) = reset(&current, text_reset);
+                assert!(
+                    prepared
+                        .changed_domains
+                        .contains(&ChangedDomain::TextEffects),
+                    "{why}"
+                );
+                let definition = updated.definition.as_ref().unwrap();
+                for (name, placed, field, definition_field, local_y) in [
+                    (
+                        FieldName::Reference,
+                        &current.reference_field,
+                        &updated.reference_field,
+                        &definition.reference_field,
+                        -4.0,
+                    ),
+                    (
+                        FieldName::Value,
+                        &current.value_field,
+                        &updated.value_field,
+                        &definition.value_field,
+                        4.0,
+                    ),
+                ] {
+                    let placed = placed.as_ref().unwrap();
+                    let field = field.as_ref().unwrap();
+                    assert_eq!(Some(field), definition_field.as_ref(), "{name} {why}");
+                    let effects = text_effects(field).unwrap();
+                    let before = text_effects(placed).unwrap();
+                    if text_reset.sizes_and_styles {
+                        assert_eq!(effects.size_mm, LIBRARY_SIZE_MM, "{name} {why}");
+                        assert_eq!(
+                            effects.thickness_mm,
+                            Some(LIBRARY_THICKNESS_MM),
+                            "{name} {why}"
+                        );
+                    } else {
+                        assert_eq!(effects.size_mm, PLACED_SIZE_MM, "{name} {why}");
+                        assert_eq!(effects.angle_degrees, before.angle_degrees, "{name} {why}");
+                    }
+                    if text_reset.positions {
+                        assert!(
+                            near(effects.position_mm, library_position(local_y, is_back)),
+                            "{name} {why}: {:?}",
+                            effects.position_mm
+                        );
+                    } else {
+                        assert_eq!(effects.position_mm, before.position_mm, "{name} {why}");
+                    }
+                    // Text, layer and visibility stay the placed field's.
+                    assert_eq!(field_text_value(field), field_text_value(placed), "{name}");
+                    assert_eq!(
+                        field.text.as_ref().unwrap().layer,
+                        placed.text.as_ref().unwrap().layer,
+                        "{name} {why}"
+                    );
+                    assert_eq!(field.visible, placed.visible, "{name} {why}");
+                    let text_visible = |field: &kiapi::board::types::Field| {
+                        field
+                            .text
+                            .as_ref()
+                            .and_then(|text| text.text.as_ref())
+                            .and_then(|text| {
+                                text.attributes
+                                    .as_ref()
+                                    .map(|attributes| attributes.visible)
+                            })
+                    };
+                    assert_eq!(text_visible(field), text_visible(placed), "{name} {why}");
+                    let change = prepared
+                        .text_effects
+                        .iter()
+                        .find(|change| change.field == name)
+                        .unwrap();
+                    assert_eq!(change.before, before, "{name} {why}");
+                    assert_eq!(change.after, effects, "{name} {why}");
+                }
+            }
+        }
+    }
+
+    /// The CheaTAG board: the field already has the library's size and place,
+    /// but no thickness, which KiCad reports as a zero stroke width.
+    #[test]
+    fn a_field_missing_only_its_thickness_gets_the_library_thickness() {
+        let (_, mut applied) = reset(
+            &current_instance(kiapi::board::types::BoardLayer::BlFCu),
+            BOTH,
+        );
+        for field in [&mut applied.reference_field, &mut applied.value_field] {
+            let attributes = field
+                .as_mut()
+                .and_then(|field| field.text.as_mut())
+                .and_then(|text| text.text.as_mut())
+                .and_then(|text| text.attributes.as_mut())
+                .unwrap();
+            attributes.stroke_width = Some(builders::distance(0.0));
+        }
+        let definition = applied.definition.as_mut().unwrap();
+        definition.reference_field = applied.reference_field.clone();
+        definition.value_field = applied.value_field.clone();
+
+        let (prepared, _) = reset(&applied, STYLES);
+        let reference = &prepared.text_effects[0];
+        assert_eq!(reference.field, FieldName::Reference);
+        assert_eq!(reference.before.thickness_mm, None, "KiCad's default");
+        assert_eq!(reference.after.thickness_mm, Some(LIBRARY_THICKNESS_MM));
+        assert_eq!(reference.before.size_mm, reference.after.size_mm);
+
+        // A board still at the default thickness does not hold the reset.
+        let change = PlannedUpdate {
+            reference: "SW1".to_string(),
+            library_id: "Test:Socket".to_string(),
+            changed_domains: prepared.changed_domains.clone(),
+            preserved: prepared.preserved.clone(),
+            text_effects: prepared.text_effects.clone(),
+        };
+        let unchanged = builders::pack_any(&applied, "kiapi.board.types.FootprintInstance");
+        assert_eq!(
+            text_effects_not_held(&[unchanged], std::slice::from_ref(&change)),
+            ["Reference field of SW1", "Value field of SW1"]
+        );
+        assert!(text_effects_not_held(
+            std::slice::from_ref(&prepared.item),
+            std::slice::from_ref(&change)
+        )
+        .is_empty());
+        // Gone from the board entirely is not held either.
+        assert_eq!(text_effects_not_held(&[], &[change]).len(), 2);
+    }
+
+    #[test]
+    fn without_a_text_reset_placed_fields_are_kept() {
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let (prepared, updated) = reset(&current, TextReset::default());
+        assert_eq!(updated.reference_field, current.reference_field);
+        assert_eq!(updated.value_field, current.value_field);
+        assert!(prepared.text_effects.is_empty());
+        assert!(!prepared
+            .changed_domains
+            .contains(&ChangedDomain::TextEffects));
+    }
+
+    #[test]
+    fn resetting_fields_that_already_hold_the_library_effects_changes_nothing() {
+        for layer in [
+            kiapi::board::types::BoardLayer::BlFCu,
+            kiapi::board::types::BoardLayer::BlBCu,
+        ] {
+            for text_reset in [BOTH, STYLES, POSITIONS] {
+                let (_, applied) = reset(&current_instance(layer), text_reset);
+                let (again, _) = reset(&applied, text_reset);
+                assert!(again.text_effects.is_empty(), "{layer:?} {text_reset:?}");
+                assert!(
+                    !again.changed_domains.contains(&ChangedDomain::TextEffects),
+                    "{layer:?} {text_reset:?}: {:?}",
+                    again.changed_domains
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_library_field_with_nothing_to_reset_from_is_refused() {
+        // KiCad's file without the Reference's `(at …)` has no typed form.
+        let source = KICAD_LIBRARY_FOOTPRINT.replacen("\t\t(at 0 -4 0)\n", "", 1);
+        assert_ne!(source, KICAD_LIBRARY_FOOTPRINT);
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let error = reset_with(&current, &source, STYLES).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("library Reference field has no position"),
+            "{error:#}"
+        );
+        assert!(reset_with(&current, &source, TextReset::default()).is_ok());
+    }
+
+    #[test]
+    fn each_text_reset_is_part_of_the_plan_revision_and_unset_ones_are_not() {
+        let (_temp, board, items) = plan_fixture();
+        let plan = |reset_text_sizes_and_styles, reset_text_positions| {
+            plan_updates(
+                &board,
+                &items,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &UpdateFilters {
+                    text_reset: TextReset {
+                        sizes_and_styles: reset_text_sizes_and_styles,
+                        positions: reset_text_positions,
+                    },
+                    ..Default::default()
+                },
+            )
+            .plan_revision
+        };
+        let revisions = BTreeSet::from([
+            plan(false, false),
+            plan(true, false),
+            plan(false, true),
+            plan(true, true),
+        ]);
+        assert_eq!(revisions.len(), 4);
+        // Unset flags serialize as they did before the flags existed.
+        assert_eq!(
+            serde_json::to_value(UpdateFilters::default()).unwrap(),
+            serde_json::json!({ "references": null, "library_ids": null })
+        );
+    }
+
+    async fn served(url: &str) -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: url.to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    async fn served_call(
+        handler: &crate::mcp::handler::McpHandler,
+        arguments: serde_json::Value,
+    ) -> crate::mcp::protocol::CallToolResult {
+        let response = handler
+            .handle_message(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "update_footprints_from_library", "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        serde_json::from_value(response.result.expect("a result")).unwrap()
+    }
+
+    /// Dry run, then apply with its revision, both through served dispatch.
+    async fn served_reset(
+        keeps_updates: bool,
+    ) -> (crate::mcp::protocol::CallToolResult, PlannerMock) {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock_keeping(&board, items[2].clone(), false, keeps_updates);
+        let handler = served(&mock.url).await;
+        let arguments = serde_json::json!({
+            "board": board,
+            "references": ["SW1"],
+            "reset_text_sizes_and_styles": true
+        });
+        let plan = result_json(&served_call(&handler, arguments.clone()).await);
+        assert_eq!(plan["status"], "ready", "{plan}");
+        let change = &plan["changes"][0];
+        assert!(change["changed_domains"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("text_effects")));
+        assert_eq!(change["text_effects"][0]["field"], "Reference");
+        assert_eq!(
+            change["text_effects"][0]["after"]["thickness_mm"],
+            LIBRARY_THICKNESS_MM
+        );
+        let mut apply = arguments;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        (served_call(&handler, apply).await, mock)
+    }
+
+    #[tokio::test]
+    async fn served_reset_is_applied_and_read_back() {
+        let (applied, mock) = served_reset(true).await;
+        assert!(!applied.is_error);
+        assert_eq!(result_json(&applied)["status"], "applied");
+        assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_reset_the_board_does_not_hold_is_uncertain() {
+        let (applied, mock) = served_reset(false).await;
+        assert!(applied.is_error);
+        let body = result_json(&applied);
+        assert_eq!(
+            body["error"]["kind"], "mutation_outcome_uncertain",
+            "{body}"
+        );
+        assert!(body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Reference field of SW1"));
+        assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_non_boolean_text_reset_is_refused_before_ipc() {
+        let (_temp, board, _) = plan_fixture();
+        let handler = served("").await;
+        for field in ["reset_text_sizes_and_styles", "reset_text_positions"] {
+            let result = served_call(
+                &handler,
+                serde_json::json!({ "board": board, field: "yes" }),
+            )
+            .await;
+            let body = result_json(&result);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{field}");
+            assert_eq!(body["error"]["field"], field);
+            // The handler holds it too, for a call that skips dispatch.
+            let direct = handle_update_footprints_from_library(
+                &serde_json::json!({ "board": board, field: 1 }),
+                &test_context(""),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result_json(&direct)["error"]["field"], field);
+        }
     }
 
     #[tokio::test]
