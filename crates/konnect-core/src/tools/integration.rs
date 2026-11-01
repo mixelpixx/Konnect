@@ -2289,7 +2289,12 @@ async fn handle_check_freerouting(
             }
 
             let mut freerouting_command = tokio::process::Command::new("java");
-            freerouting_command.args(["-jar", jar_path.to_str().unwrap_or(""), "--version"]);
+            freerouting_command.args([
+                crate::freerouting_mcp::JAVA_HEADLESS_ARG,
+                "-jar",
+                jar_path.to_str().unwrap_or(""),
+                "--version",
+            ]);
             let freerouting = run_java_command(&mut freerouting_command).await;
             let (version_checked, version_output) = match freerouting {
                 Ok(output) => (output.status.success(), command_output(&output)),

@@ -29,6 +29,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
+/// JVM flag keeping Freerouting off the macOS window server (no Dock icon).
+/// `--gui.enabled=false` alone does not prevent AWT from registering.
+pub(crate) const JAVA_HEADLESS_ARG: &str = "-Djava.awt.headless=true";
+
 fn server_arguments() -> &'static [&'static str] {
     &[
         "--api_server.enabled=true",
@@ -469,9 +473,10 @@ impl LocalMcpClient {
         Ok(client)
     }
 
-    fn spawn(jar: &Path) -> Result<Self> {
+    fn server_command(jar: &Path) -> Command {
         let mut command = Command::new("java");
         command
+            .arg(JAVA_HEADLESS_ARG)
             .arg("-jar")
             .arg(jar)
             .args(server_arguments())
@@ -479,6 +484,11 @@ impl LocalMcpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        command
+    }
+
+    fn spawn(jar: &Path) -> Result<Self> {
+        let mut command = Self::server_command(jar);
         let mut child = command
             .spawn()
             .context("start local Freerouting MCP server")?;
@@ -833,6 +843,15 @@ mod tests {
         assert_eq!(first.parent(), output.parent());
         assert_ne!(first, second);
         assert!(extension_is(&first, "ses"));
+    }
+
+    #[test]
+    fn server_command_passes_headless_as_a_jvm_option_before_jar() {
+        let command = LocalMcpClient::server_command(Path::new("freerouting.jar"));
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(arguments[0], "-Djava.awt.headless=true");
+        assert_eq!(arguments[1], "-jar");
+        assert_eq!(arguments[2], "freerouting.jar");
     }
 
     #[test]
