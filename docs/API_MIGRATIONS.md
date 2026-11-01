@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `set_footprint_metadata` reports what it replaced (patch release)
+
+`attributes` replaces the whole `(attr …)` block, so a caller who added
+`exclude_from_bom` without repeating `smd` or `through_hole` silently left the
+footprint with no type. KiCad then reads it as unspecified (#895).
+
+The response now adds `changes`, which maps each changed field to its
+`previous` and `current` value: a string, or `null` when absent, for
+`description`, and arrays for `tags` and `attributes`. It also adds `warnings`,
+an array of strings that is empty when there is nothing to say. A warning is
+given when an `attributes` replacement drops the footprint type, or drops an
+attribute the `attributes` argument does not accept, such as
+`allow_soldermask_bridges` (#902). `current` reflects what was written.
+`success`, `footprint_path` and `changed_fields` are unchanged, and so is what
+is written.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

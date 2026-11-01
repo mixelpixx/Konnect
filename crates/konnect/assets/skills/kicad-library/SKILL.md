@@ -346,13 +346,16 @@ set_footprint_metadata(
   footprint_path=".../Part.kicad_mod",
   description="Optional replacement",
   tags=["keyboard", "hot_swap"],
-  attributes=["exclude_from_pos_files"]
+  attributes=["smd", "exclude_from_pos_files"]
 )
 ```
 
 - Supply at least one metadata field.
 - Only supplied fields change.
 - Empty `tags` or `attributes` removes the corresponding block.
+- `attributes` replaces the whole list. Repeat the footprint type (`smd` or `through_hole`)
+  to keep it, and read `changes` (previous and current values) and `warnings`
+  in the response.
 - `exclude_from_pos_files` omits the footprint from pick-and-place output without
   implicitly adding `exclude_from_bom`.
 - Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to

@@ -23,7 +23,9 @@ pub(super) fn tool() -> ToolDef {
     tool!(
         "set_footprint_metadata",
         "Atomically replace a footprint's description, tags, or supported attributes while \
-         preserving pads, graphics, properties, groups, and models.",
+         preserving pads, graphics, properties, groups, and models. Reports each changed \
+         field's previous and current value, and warns when attributes drop the footprint \
+         type (smd/through_hole) or an attribute it does not accept.",
         json!({
             "type": "object",
             "properties": {
@@ -42,7 +44,7 @@ pub(super) fn tool() -> ToolDef {
                 },
                 "attributes": {
                     "type": "array",
-                    "description": "Replacement KiCad footprint attributes; an empty array removes the attr block",
+                    "description": "Replacement KiCad footprint attributes, including the type (smd or through_hole) if it should stay; an empty array removes the attr block",
                     "items": {
                         "type": "string",
                         "enum": SUPPORTED_ATTRIBUTES
@@ -73,7 +75,14 @@ struct MetadataError {
 struct PreparedMutation {
     replacement: String,
     changed_fields: Vec<&'static str>,
+    /// `{field: {"previous": …, "current": …}}` for each changed field.
+    changes: serde_json::Map<String, serde_json::Value>,
+    warnings: Vec<String>,
 }
+
+/// The attributes that set a footprint's type. With neither, KiCad types it
+/// as unspecified.
+const TYPE_ATTRIBUTES: &[&str] = &["smd", "through_hole"];
 
 async fn handle_set_footprint_metadata(
     args: &serde_json::Value,
@@ -134,7 +143,9 @@ async fn handle_set_footprint_metadata(
     Ok(CallToolResult::json(&json!({
         "success": true,
         "footprint_path": path.display().to_string(),
-        "changed_fields": prepared.changed_fields
+        "changed_fields": prepared.changed_fields,
+        "changes": prepared.changes,
+        "warnings": prepared.warnings
     })))
 }
 
@@ -316,10 +327,103 @@ fn prepare_mutation(
         ));
     }
 
+    // Both sides read the same way, `current` off the replacement itself.
+    let (before, after) = (metadata_values(&root), metadata_values(&parsed));
+    let mut changes = serde_json::Map::new();
+    for (field, previous, current) in [
+        (
+            "description",
+            json!(before.description),
+            json!(after.description),
+        ),
+        ("tags", json!(before.tags), json!(after.tags)),
+        (
+            "attributes",
+            json!(before.attributes),
+            json!(after.attributes),
+        ),
+    ] {
+        if changed_fields.contains(&field) {
+            changes.insert(
+                field.to_string(),
+                json!({ "previous": previous, "current": current }),
+            );
+        }
+    }
+    // Untouched attributes read the same on both sides, so they warn nothing.
+    let warnings = attribute_warnings(&before.attributes, &after.attributes);
+
     Ok(PreparedMutation {
         replacement,
         changed_fields,
+        changes,
+        warnings,
     })
+}
+
+/// A footprint's metadata as the response reports it: an absent block reads
+/// as null or empty.
+struct MetadataValues {
+    description: Option<String>,
+    tags: Vec<String>,
+    attributes: Vec<String>,
+}
+
+fn metadata_values(root: &konnect_sexp::SexpNode) -> MetadataValues {
+    let words = |tag: &str| -> Vec<String> {
+        root.find(tag)
+            .and_then(|node| node.children())
+            .map(|words| {
+                words[1..]
+                    .iter()
+                    .filter_map(|word| word.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let descr = words("descr");
+    MetadataValues {
+        description: (!descr.is_empty()).then(|| descr.join(" ")),
+        tags: words("tags")
+            .join(" ")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        attributes: words("attr"),
+    }
+}
+
+/// What an attribute replacement dropped without the caller saying so: the
+/// footprint type, and attributes this tool has no way to write back (#895).
+fn attribute_warnings(previous: &[String], current: &[String]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let is_type = |attribute: &&String| TYPE_ATTRIBUTES.contains(&attribute.as_str());
+    let dropped: Vec<&str> = previous
+        .iter()
+        .filter(is_type)
+        .map(String::as_str)
+        .collect();
+    if !dropped.is_empty() && !current.iter().any(|a| is_type(&a)) {
+        warnings.push(format!(
+            "attributes no longer include '{}', so KiCad types the footprint as unspecified; \
+             include it to keep the footprint type",
+            dropped.join("', '")
+        ));
+    }
+    let mut unsupported: Vec<&String> = Vec::new();
+    for attribute in previous {
+        if !SUPPORTED_ATTRIBUTES.contains(&attribute.as_str())
+            && !current.contains(attribute)
+            && !unsupported.contains(&attribute)
+        {
+            unsupported.push(attribute);
+            warnings.push(format!(
+                "attributes dropped '{attribute}', which the attributes argument does not accept"
+            ));
+        }
+    }
+    warnings
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -681,5 +785,172 @@ mod tests {
             .expect_err("a stale expected source must conflict");
         assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
         assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+
+    /// #895 through `tools/call`, on stock KiCad 10.0.6 footprints. KiCad's
+    /// own reading of each result, from `pcbnew.FootprintLoad`, is in
+    /// `tests/fixtures/footprint_attributes_kicad10.README.md`.
+    async fn served(
+        fixture: &str,
+        mut arguments: serde_json::Value,
+    ) -> (serde_json::Value, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(fixture);
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture),
+            &path,
+        )
+        .unwrap();
+        arguments["footprint_path"] = json!(path.display().to_string());
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 895, "method": "tools/call",
+                "params": { "name": "set_footprint_metadata", "arguments": arguments }
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (body, std::fs::read_to_string(&path).unwrap())
+    }
+
+    const C_0603: &str = "c_0603_1608metric_kicad10.kicad_mod";
+    const SOLDER_JUMPER: &str = "solder_jumper_open_kicad10.kicad_mod";
+
+    #[tokio::test]
+    async fn dropping_the_footprint_type_is_reported_and_warned() {
+        let (body, written) = served(C_0603, json!({ "attributes": ["exclude_from_bom"] })).await;
+        assert_eq!(
+            body["changes"],
+            json!({ "attributes": { "previous": ["smd"], "current": ["exclude_from_bom"] } })
+        );
+        assert_eq!(
+            body["warnings"],
+            json!([
+                "attributes no longer include 'smd', so KiCad types the footprint as \
+                    unspecified; include it to keep the footprint type"
+            ])
+        );
+        assert!(
+            written.contains("(attr exclude_from_bom)"),
+            "the write is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeping_the_footprint_type_warns_nothing() {
+        let (body, _) = served(C_0603, json!({ "attributes": ["smd", "exclude_from_bom"] })).await;
+        assert_eq!(
+            body["changes"]["attributes"],
+            json!({ "previous": ["smd"], "current": ["smd", "exclude_from_bom"] })
+        );
+        assert_eq!(body["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn dropping_an_attribute_the_tool_cannot_write_is_warned() {
+        let (body, _) = served(
+            SOLDER_JUMPER,
+            json!({ "attributes": ["exclude_from_pos_files", "exclude_from_bom"] }),
+        )
+        .await;
+        assert_eq!(
+            body["changes"]["attributes"]["previous"],
+            json!([
+                "exclude_from_pos_files",
+                "exclude_from_bom",
+                "allow_soldermask_bridges"
+            ])
+        );
+        assert_eq!(
+            body["warnings"],
+            json!(["attributes dropped 'allow_soldermask_bridges', which the \
+                    attributes argument does not accept"])
+        );
+    }
+
+    #[tokio::test]
+    async fn description_and_tags_report_previous_and_current_values() {
+        let (body, _) = served(
+            SOLDER_JUMPER,
+            json!({ "description": "open jumper", "tags": ["jumper"], "attributes": [
+                "exclude_from_pos_files", "exclude_from_bom"
+            ] }),
+        )
+        .await;
+        assert_eq!(
+            body["changes"]["description"],
+            json!({
+                "previous": "SMD Solder Jumper, 1x1.5mm Pads, 0.3mm gap, open",
+                "current": "open jumper"
+            })
+        );
+        assert_eq!(
+            body["changes"]["tags"],
+            json!({ "previous": ["solder", "jumper", "open"], "current": ["jumper"] })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_field_is_not_reported() {
+        let (body, _) = served(C_0603, json!({ "attributes": ["smd"], "tags": ["c"] })).await;
+        assert_eq!(body["changed_fields"], json!(["tags"]));
+        assert_eq!(
+            body["changes"],
+            json!({ "tags": { "previous": ["capacitor"], "current": ["c"] } })
+        );
+        assert_eq!(body["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_description_edit_on_an_smd_footprint_warns_nothing() {
+        let (body, _) = served(C_0603, json!({ "description": "cap" })).await;
+        assert_eq!(body["changes"].as_object().unwrap().len(), 1, "{body}");
+        assert_eq!(body["changes"]["description"]["current"], "cap");
+        assert_eq!(body["warnings"], json!([]), "attributes were not touched");
+    }
+
+    #[tokio::test]
+    async fn current_is_read_back_from_what_was_written() {
+        // KiCad stores tags as one space-separated string, so "two words" is two tags.
+        let (body, written) = served(C_0603, json!({ "tags": ["two words"] })).await;
+        assert!(written.contains("(tags \"two words\")"));
+        assert_eq!(body["changes"]["tags"]["current"], json!(["two", "words"]));
+    }
+
+    #[test]
+    fn previous_tags_keep_every_atom_of_a_legacy_block() {
+        let source = METADATA_FOOTPRINT.replace("(tags \"old tags\")", "(tags cap smd 0603)");
+        let update = parse_update(&json!({ "tags": ["cap"] })).unwrap();
+        let prepared = prepare_mutation(&source, &update).unwrap();
+        assert_eq!(
+            prepared.changes["tags"],
+            json!({ "previous": ["cap", "smd", "0603"], "current": ["cap"] })
+        );
+    }
+
+    #[test]
+    fn an_unaccepted_attribute_is_warned_once() {
+        let previous = ["virtual".to_string(), "virtual".to_string()];
+        assert_eq!(
+            attribute_warnings(&previous, &[]),
+            ["attributes dropped 'virtual', which the attributes argument does not accept"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_description_edit_keeps_an_unaccepted_attribute_without_warning() {
+        let (body, written) = served(SOLDER_JUMPER, json!({ "description": "open jumper" })).await;
+        assert!(written.contains("allow_soldermask_bridges"));
+        assert_eq!(body["warnings"], json!([]), "nothing was dropped");
     }
 }
