@@ -9,8 +9,8 @@
 
 </div>
 
-> ## Konnect has moved to Konnect-EDA
->
+ ## Konnect has moved to Konnect-EDA
+
 > **This repository will be archived at midnight (US Eastern) at the end of Sunday, October 25, 2026.**
 > After that it's read-only. Everything here stays readable, and the releases already published stay
 > available under the AGPL-3.0, but no new issues, comments or pull requests can be added.
@@ -35,18 +35,15 @@
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
 
-> ## Add realtime research to KiCAD MCP and Konnect. Introducing Nimrod
->
-> [**Nimrod**](https://nimrod.orchis.ai) is our web-research MCP server:
-> quality-scored Google search, clean webpage extraction, and deep multi-source
-> research. Design the board with Konnect while Nimrod pulls live parts availability, datasheets,
-> and errata — no more guessing from year-old training data
->
-> - Works with claude.ai, Claude Desktop, Claude Code, VS Code, and any MCP client
-> - 1 credit = 1 search · extraction always free · free 50-credit trial, no card
-> - Official MCP Registry: [`ai.orchis/nimrod`](https://registry.modelcontextprotocol.io)
 
 
+## KONECT WILL REMAIN FREE FOR STUDENTS and DEVS!!!
+## The project is continuing and we are adding some amazing changes.
+## If you want to contribute:
+
+contact me:
+
+nate.slidebyone.summers
 
 
 
