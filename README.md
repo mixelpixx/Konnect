@@ -5,48 +5,46 @@
 <img src="resources/images/KiCAD-MCP-Server-rust.svg" alt="KiCAD-MCP-Server Logo" height="240" />
 
 
-# Konnect is MOVING!!!
+# Konnect has moved to Konnect-EDA
+
+## [Go to Konnect-EDA →](https://github.com/Orchis-ai-LLC/Konnect-EDA)
 
 </div>
 
- ## Konnect has moved to Konnect-EDA
+This repository is being archived, which makes it read-only. Development continues
+at Konnect-EDA, from Orchis.ai LLC.
 
-> **This repository will be archived at midnight (US Eastern) at the end of Sunday, October 25, 2026.**
-> After that it's read-only. Everything here stays readable, and the releases already published stay
-> available under the AGPL-3.0, but no new issues, comments or pull requests can be added.
->
-> Konnect continues as **[Konnect-EDA](https://github.com/Orchis-ai-LLC/Konnect-EDA)**, from
-> Orchis.ai LLC. It's the same AI-assisted KiCad design tool, and all development continues there:
->
-> - **Downloads:** the [Konnect-EDA Releases page](https://github.com/Orchis-ai-LLC/Konnect-EDA/releases);
->   the first release is coming soon. Konnect-EDA is commercial, closed-source software, **free to use
->   during the beta** (until version 1.0).
-> - **Bugs and feature requests:** the
->   [Konnect-EDA issue tracker](https://github.com/Orchis-ai-LLC/Konnect-EDA/issues).
-> - **Want to help build it?** Sign up to contribute at
->   **[orchis.ai/konnect/join](https://orchis.ai/konnect/join)**.
-> - **Contributed to Konnect?** Please answer your sign-off email, or sign in with GitHub at
->   [orchis.ai/konnect/sign-off](https://orchis.ai/konnect/sign-off). It's open until November 20.
->
-> Thank you to everyone who built Konnect with us.
+## It stays free, unless you're a business
 
-> **Status: beta.** The core toolchain is tested and working, but this is a young
-> release and it wants real-world mileage and review. Issues and PRs are welcome —
-> see [CONTRIBUTING.md](CONTRIBUTING.md) and the
-> [naming conventions](docs/NAMING_CONVENTIONS.md).
+Konnect-EDA is now commercial and closed source. Here's what that means for you:
 
+- **Everyone, businesses included:** free until version 1.0.
+- **Personal, hobby, student and open-hardware work:** still free after 1.0. You'll
+  need a license key, and that key is free too.
+- **Businesses:** a paid license from 1.0.
 
+Business licenses pay for the work, and that's what lets us keep it free for
+everyone else.
 
-## KONECT WILL REMAIN FREE FOR STUDENTS and DEVS!!!
-## The project is continuing and we are adding some amazing changes.
-## If you want to contribute:
+**Nothing here is being taken away.** The code and releases in this repository stay
+available under the AGPL-3.0. The original
+[KiCAD MCP Server](https://github.com/mixelpixx/KiCAD-MCP-Server) stays open source
+under the MIT license and is still maintained. The boards you design are always yours.
 
-contact me:
+## Where to go now
 
-nate.slidebyone.summers
+- **Downloads:** the [Konnect-EDA releases page](https://github.com/Orchis-ai-LLC/Konnect-EDA/releases).
+  The first release is coming soon.
+- **Bugs and feature requests:** the
+  [Konnect-EDA issue tracker](https://github.com/Orchis-ai-LLC/Konnect-EDA/issues).
+- **Want to help build it?** [Sign up to contribute](https://orchis.ai/konnect/join).
+- **Contributed to Konnect?** Please [complete your sign-off](https://orchis.ai/konnect/sign-off)
+  by November 20.
+- **Using it at a company?** See [licensing](https://konnect-eda.orchis.ai/licensing/).
 
+Thank you to everyone who built Konnect with us.
 
-
+---
 
 **AI-assisted PCB design for KiCAD 10.** Konnect is a native KiCAD plugin — a single
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
